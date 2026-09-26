@@ -47,6 +47,7 @@ namespace tp = ucache::transpose;
 #include <fstream>
 #include <iterator>
 #include <pwd.h>
+#include <sched.h>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -135,7 +136,7 @@ void usage() {
       "  recompress [--jobs N] [--yes] [--strict]\n"
       "                                 transcode the cached files whose source codec is in\n"
       "                    recompress_codecs (default lzma,zlib), foreground with live\n"
-      "                    progress (default jobs: half the CPU cores). With\n"
+      "                    progress (default jobs: every core it may use). With\n"
       "                    `recompress = on` a file gets its replica as a job first\n"
       "                    reads it; this sweep is for data already cached and for\n"
       "                    files that first pass declines. With\n"
@@ -2734,6 +2735,19 @@ static uint64_t punchPerReclaim(ReplicaStore& rs, FileEntry& entry, const Replic
 
 #endif
 
+// The cores this process may run on: those its CPU affinity allows (a batch
+// slot or `taskset` confines a process to a subset of the machine), else all of
+// them. At least 1.
+int usableCores() {
+#if defined(__linux__)
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  if (::sched_getaffinity(0, sizeof set, &set) == 0 && CPU_COUNT(&set) > 0)
+    return CPU_COUNT(&set);
+#endif
+  return static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+}
+
 int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
                   bool yes = false, bool strict = false) {
 #ifndef UCACHE_HAVE_TRANSPOSE
@@ -4778,10 +4792,10 @@ int main(int argc, char** argv) {
   if (cmd == "materialize")
     return cmdMaterialize(&store, cfg, io, argc, argv);
   if (cmd == "recompress" || cmd == "transpose") { // "transpose --auto" = legacy alias
-    // Default parallelism: half the cores (user decision — no artificial cap;
-    // a laptop gets cores/2 too, floor 1).
-    int jobs =
-        static_cast<int>(std::max<unsigned>(1, std::thread::hardware_concurrency() / 2));
+    // Default parallelism: every core this process may use. The sweep is a
+    // command the user runs and waits for, so it takes what it is allowed;
+    // `--jobs N` leaves room when the machine has other work.
+    int jobs = usableCores();
     bool yes = false, strict = false;
     for (int i = 2; i < argc; ++i) {
       if (!std::strcmp(argv[i], "--jobs") && i + 1 < argc)

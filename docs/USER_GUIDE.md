@@ -894,7 +894,7 @@ below and the dedicated guide in `docs/CACHE_MANAGEMENT.md`.
 | `ucache verify <url>` | CRC-scrub an entry; quarantine (not wipe) bad pages |
 | `ucache settings`  | every setting: effective value + where it comes from (default \| conf \| state \| env) |
 | `ucache set <key> <value>` / `unset <key>` | change / drop a **current** value without touching your defaults in the conf |
-| `ucache recompress [--jobs N] [--yes]` | transcode the cached files whose source codec is in `recompress_codecs`, in the foreground with live progress (`--jobs` default cores/2). Estimates disk growth first and asks for confirmation if the sweep would push the cache into eviction; `--yes` overrides (scripts) |
+| `ucache recompress [--jobs N] [--yes]` | transcode the cached files whose source codec is in `recompress_codecs`, in the foreground with live progress (`--jobs` default: every core the process may use). Estimates disk growth first and asks for confirmation if the sweep would push the cache into eviction; `--yes` overrides (scripts) |
 | `ucache branches <url>` | which branches your analysis read: fully-cached branches with bytes + source codec, and the summary share |
 | `ucache untranspose <url>` | drop an entry's replica; the byte cache is kept |
 
