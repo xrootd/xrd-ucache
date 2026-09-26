@@ -1352,28 +1352,32 @@ TEST(Thresholds, TheOverheadBoundSitsInTheGapTheEvidenceLeftEmpty) {
       << "above the best fill that genuinely was not: a contaminated reference would be accepted";
 }
 
-TEST(Thresholds, OriginShareBoundSitsAtNineteenTwentieths) {
-  // A run is a reference only when the origin did nearly all of the work.
-  // Fractions of a file, not whole files: the split is by bytes -- so the file
-  // record carries the cached part in the byte-tier counter and the rest in the
-  // wire counter, and the two add up to the file. They are disjoint counters;
-  // putting the whole file in BOTH describes a file read twice, not a file
-  // split between two tiers.
+TEST(Thresholds, OriginShareBoundsSitAtNineTenthsAndFourFifths) {
+  // A run is a reference as it stands only when the origin did nine tenths of
+  // the work, and down to four fifths only with a correction. Fractions of a
+  // file, not whole files: the split is by bytes -- so the file record carries
+  // the cached part in the byte-tier counter and the rest in the wire counter,
+  // and the two add up to the file. They are disjoint counters; putting the
+  // whole file in BOTH describes a file read twice, not a file split between
+  // two tiers.
   // Asserted through QUALIFICATION, not through the share itself. Checking
-  // the computed fraction against 0.95 pins the arithmetic and leaves the
-  // constant free: dropping the bound to 0.80 passed such a test untouched.
-  auto qualifies = [](uint64_t cachedBytes) {
+  // the computed fraction against the bound pins the arithmetic and leaves
+  // the constant free: dropping the bound passed such a test untouched.
+  auto fill = [](uint64_t cachedBytes) {
     test::TempDir d;
     writeRun(d.path(), "h", 1, 1000, 1200,
              fillCounters(kGiB) + ",\"buffer_stall_us\":1000" + originHist(1000.0),
              {{"root://o//a", cachedBytes, 0, kGiB - cachedBytes, 1200, 0, "fill", kGiB,
                "aa11"}});
-    const auto runs = loadRuns(d.path());
+    auto runs = loadRuns(d.path());
     EXPECT_EQ(runs.size(), 1u);
-    return !runs.empty() && runs[0].baselineQualified();
+    return runs.empty() ? ucache::Run() : runs[0];
   };
-  EXPECT_TRUE(qualifies(kGiB / 25)) << "4% from cache still qualifies";
-  EXPECT_FALSE(qualifies(kGiB / 15)) << "6.7% from cache does not";
+  EXPECT_TRUE(fill(kGiB / 12).baselineQualified()) << "8% from the cache qualifies as it is";
+  EXPECT_FALSE(fill(kGiB / 8).baselineQualified()) << "12.5% does not, uncorrected";
+  EXPECT_TRUE(fill(kGiB / 8).fillCandidate()) << "but it is in the corrected band";
+  EXPECT_TRUE(fill(kGiB / 6).fillCandidate()) << "16.7% is too";
+  EXPECT_FALSE(fill(kGiB / 4).fillCandidate()) << "25% is not a reference at all";
 }
 
 TEST(Thresholds, WidthIsCollectedButNeverGatesAMatch) {
@@ -1596,5 +1600,144 @@ TEST(Gain, TheEstimateSaysWhichKindOfReferenceProducedIt) {
     const auto g = estimateGain(*warm, runs);
     ASSERT_TRUE(g.valid) << g.reason;
     EXPECT_FALSE(g.referenceDisabled) << "the reference was a fill and must say so";
+  }
+}
+
+// ---- a fill corrected for what the cache served it ------------------------
+
+namespace {
+// A fill of one 1 GiB file taking `durS` seconds from 1000, with `cachedFrac`
+// of it served from the cache (re-reads of what it had just fetched), quiet
+// enough to qualify on every other test.
+void corrFill(const std::string& dir, double cachedFrac, uint64_t durS = 200) {
+  const uint64_t cached = static_cast<uint64_t>(cachedFrac * static_cast<double>(kGiB));
+  writeRun(dir, "h", 1, 1000, 1000 + durS,
+           fillCounters(kGiB) + ",\"buffer_stall_us\":1000" + originHist(1000.0),
+           {{"root://o//a", cached, 0, kGiB - cached, 1000 + durS, 0, "fill", kGiB, "aa11"}});
+}
+// A warm run over the same file: from the byte tier, or from replicas.
+void corrWarm(const std::string& dir, uint64_t pid, uint64_t startS, uint64_t durS,
+              bool replica = false, const std::string& key = "root://o//a") {
+  writeRun(dir, "h", pid, startS, startS + durS,
+           replica ? warmCounters(0, kGiB) : warmCounters(kGiB),
+           {{key, replica ? 0 : kGiB, replica ? kGiB : 0, 0, startS + durS, 0, "cached", kGiB,
+             "aa11"}});
+}
+GainEstimate gainAt(const std::string& dir, uint64_t startS) {
+  const auto runs = loadRuns(dir);
+  for (const auto& r : runs)
+    if (r.startS == startS)
+      return estimateGain(r, runs);
+  ADD_FAILURE() << "no run starting at " << startS;
+  return {};
+}
+} // namespace
+
+TEST(Correction, AFillInTheCorrectedBandNeedsAWarmByteRun) {
+  // 15% from the cache: a reference only corrected. The correction needs a
+  // warm BYTE run of the same work; a warm replica run is not one.
+  test::TempDir d;
+  corrFill(d.path(), 0.15);
+  corrWarm(d.path(), 2, 2000, 100, /*replica=*/true);
+  EXPECT_FALSE(gainAt(d.path(), 2000).valid) << "no byte run to correct with: no reference";
+  corrWarm(d.path(), 3, 3000, 100);
+  const GainEstimate g = gainAt(d.path(), 3000);
+  ASSERT_TRUE(g.valid) << g.reason;
+  EXPECT_TRUE(g.referenceCorrected);
+  EXPECT_NEAR(g.referenceCacheShare, 0.15, 0.001);
+  // T_off = (T_fill - f*T_warm) / (1 - f) = (200 - 0.15*100) / 0.85
+  const double tOff = (200.0 - 0.15 * 100.0) / 0.85;
+  EXPECT_NEAR(g.referenceCorrectedS, tOff, 0.01);
+  EXPECT_NEAR(g.gain, tOff / 100.0, 0.001) << "against the corrected wall, not the 200 s";
+}
+
+TEST(Correction, AlsoAppliedAboveTheBandWhenPossible) {
+  // 6% from the cache qualifies as it stands; with a warm byte run the small
+  // low bias is taken out as well.
+  test::TempDir d;
+  corrFill(d.path(), 0.06);
+  corrWarm(d.path(), 2, 2000, 100);
+  const GainEstimate g = gainAt(d.path(), 2000);
+  ASSERT_TRUE(g.valid) << g.reason;
+  EXPECT_TRUE(g.referenceCorrected);
+  EXPECT_NEAR(g.gain, (200.0 - 0.06 * 100.0) / 0.94 / 100.0, 0.001);
+}
+
+TEST(Correction, WithoutAWarmByteRunAQualifyingFillStandsAsItIs) {
+  test::TempDir d;
+  corrFill(d.path(), 0.06);
+  corrWarm(d.path(), 2, 2000, 100, /*replica=*/true);
+  const GainEstimate g = gainAt(d.path(), 2000);
+  ASSERT_TRUE(g.valid) << g.reason;
+  EXPECT_FALSE(g.referenceCorrected);
+  EXPECT_NEAR(g.gain, 2.0, 0.001) << "the fill's own 200 s against the 100 s replica run";
+}
+
+TEST(Correction, AWarmRunOverOtherFilesIsNotUsed) {
+  test::TempDir d;
+  corrFill(d.path(), 0.15);
+  corrWarm(d.path(), 2, 2000, 100, false, "root://o//other");
+  const auto runs = loadRuns(d.path());
+  for (const auto& r : runs) {
+    if (r.startS == 1000) {
+      EXPECT_FALSE(referenceCorrection(r, runs).available) << "different work";
+    }
+  }
+}
+
+TEST(Correction, TheWarmRunNearestTheFillIsUsed) {
+  // Two warm byte runs; the one closer in time describes the fill's
+  // conditions better.
+  test::TempDir d;
+  corrFill(d.path(), 0.15);
+  corrWarm(d.path(), 2, 1300, 50);
+  corrWarm(d.path(), 3, 9000, 150);
+  const auto runs = loadRuns(d.path());
+  for (const auto& r : runs) {
+    if (r.startS != 1000)
+      continue;
+    {
+      const ReferenceCorrection c = referenceCorrection(r, runs);
+      ASSERT_TRUE(c.available);
+      EXPECT_EQ(c.warmStartS, 1300u);
+      EXPECT_NEAR(c.correctedS, (200.0 - 0.15 * 50.0) / 0.85, 0.01);
+    }
+  }
+}
+
+TEST(Correction, ASwitchedOffRunIsNeverCorrected) {
+  test::TempDir d;
+  twoFileBaseline(d.path(), 150);
+  writeRun(d.path(), "host", 60, 2000, 2100, warmCounters(kGiB),
+           {{"root://o//a", kGiB / 2, 0, 0, 0}, {"root://o//b", kGiB / 2, 0, 0, 0}});
+  const GainEstimate g = gainAt(d.path(), 2000);
+  ASSERT_TRUE(g.valid) << g.reason;
+  EXPECT_TRUE(g.referenceDisabled);
+  EXPECT_FALSE(g.referenceCorrected);
+  EXPECT_NEAR(g.gain, 1.5, 0.001);
+}
+
+TEST(Correction, BelowFourFifthsFromTheOriginIsNoReferenceEvenCorrected) {
+  test::TempDir d;
+  corrFill(d.path(), 0.25);
+  corrWarm(d.path(), 2, 2000, 100);
+  EXPECT_FALSE(gainAt(d.path(), 2000).valid);
+}
+
+TEST(Correction, HistoryMarksACorrectableFillAsAReference) {
+  // usableAsReference decides the `base` label: a fill in the corrected band
+  // is one exactly when its correction is available.
+  test::TempDir d;
+  corrFill(d.path(), 0.15);
+  {
+    const auto runs = loadRuns(d.path());
+    EXPECT_FALSE(usableAsReference(runs[0], runs));
+  }
+  corrWarm(d.path(), 2, 2000, 100);
+  const auto runs = loadRuns(d.path());
+  for (const auto& r : runs) {
+    if (r.startS == 1000) {
+      EXPECT_TRUE(usableAsReference(r, runs));
+    }
   }
 }

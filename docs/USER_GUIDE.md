@@ -444,9 +444,20 @@ truthfulness costs.
 
 **Two kinds of run can be the reference.** One with the cache switched off, and
 a first pass over data the cache does not have yet — a *fill* — provided the
-cache added little to it: the origin has to have delivered at least 95% of the
-bytes, and the cache's own writing must have cost no more than a tenth of the
-time spent waiting on the origin. That second figure is a coarse estimate, not
+cache added little to it: the origin has to have delivered at least 90% of the
+bytes (80%, when a correction is possible, below), and the cache's own writing
+must have cost no more than a tenth of the time spent waiting on the origin.
+
+Even a first pass over an empty cache is served some of its data from it: every
+piece of a file a thread opens re-reads the file's header and table of
+contents, and after the first time those come from what the pass has just
+fetched — 5-10% of the bytes on a multi-threaded job. That makes a fill a
+little faster than a run with the cache off, so gains measured against it read
+a little low. When a warm run over the same files, served from the byte cache,
+exists, the fill's time is corrected for it: a fill that took T with a share f
+from the cache, beside a warm run that took T_warm, counts as
+(T − f·T_warm) / (1 − f). `ucache summary --detail` says when a reference was
+corrected, and by what share. That second figure is a coarse estimate, not
 a percentage of your job: it compares time blocked writing against time blocked
 fetching, and both are summed across threads, so it can be off by a factor of
 two or three in either direction. It is used only to tell a 1-2% effect from a

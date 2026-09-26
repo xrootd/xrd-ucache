@@ -283,6 +283,77 @@ std::vector<Run> withoutTrivial(std::vector<Run> runs) {
   return runs;
 }
 
+ReferenceCorrection referenceCorrection(const Run& fill, const std::vector<Run>& all) {
+  ReferenceCorrection c;
+  // The same bars a reference itself passes: nine tenths of the files in
+  // common both ways, and where both sides left read footprints on most of
+  // them, the same parts read.
+  constexpr double kMinFileOverlap = 0.90;
+  constexpr double kMinReadAgreement = 0.90;
+  constexpr double kMinSigCoverage = 0.50;
+  // A warm BYTE-cache run: next to nothing from the origin or the replicas.
+  constexpr double kMaxOtherTier = 0.05;
+  if (fill.disabled || fill.files.empty())
+    return c;
+  const Run* best = nullptr;
+  for (const auto& r : all) {
+    if (r.stem == fill.stem || r.disabled || r.files.empty() || r.faults())
+      continue;
+    uint64_t delivered = 0, wire = 0, replica = 0;
+    for (const auto& [k, f] : r.files) {
+      (void)k;
+      delivered += f.deliveredBytes();
+      wire += f.wireBytes;
+      replica += f.replicaBytes;
+    }
+    if (!delivered || static_cast<double>(wire) > kMaxOtherTier * static_cast<double>(delivered) ||
+        static_cast<double>(replica) > kMaxOtherTier * static_cast<double>(delivered))
+      continue;
+    size_t common = 0, sigPairs = 0, sigAgree = 0;
+    for (const auto& [k, f] : fill.files) {
+      auto it = r.files.find(k);
+      if (it == r.files.end())
+        continue;
+      ++common;
+      if (!f.readSig.empty() && !it->second.readSig.empty()) {
+        ++sigPairs;
+        sigAgree += f.readSig == it->second.readSig;
+      }
+    }
+    if (static_cast<double>(common) < kMinFileOverlap * static_cast<double>(fill.files.size()) ||
+        static_cast<double>(common) < kMinFileOverlap * static_cast<double>(r.files.size()))
+      continue;
+    if (sigPairs && static_cast<double>(sigPairs) >= kMinSigCoverage * static_cast<double>(common) &&
+        static_cast<double>(sigAgree) < kMinReadAgreement * static_cast<double>(sigPairs))
+      continue;
+    const auto distance = [&](const Run& x) {
+      return x.startS > fill.startS ? x.startS - fill.startS : fill.startS - x.startS;
+    };
+    if (!best || distance(r) < distance(*best))
+      best = &r;
+  }
+  if (!best)
+    return c;
+  const double f = std::max(0.0, 1.0 - fill.originShare());
+  const double tFill = static_cast<double>(fill.durationS());
+  const double tWarm = static_cast<double>(best->durationS());
+  const double tOff = f < 1.0 ? (tFill - f * tWarm) / (1.0 - f) : 0.0;
+  if (tOff <= 0.0)
+    return c;
+  c.available = true;
+  c.cacheShare = f;
+  c.warmS = tWarm;
+  c.warmStartS = best->startS;
+  c.correctedS = tOff;
+  return c;
+}
+
+bool usableAsReference(const Run& r, const std::vector<Run>& all) {
+  if (r.disabled || r.baselineQualified())
+    return true;
+  return r.fillCandidate() && referenceCorrection(r, all).available;
+}
+
 GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   GainEstimate g;
   g.runFiles = run.files.size();
@@ -405,7 +476,12 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     // the work and the cache's own writing cost little. The second kind is
     // what an ordinary first run over new data looks like, so a measurement
     // arrives without anyone having to know to record a special run.
-    if (r.stem == run.stem || !(r.disabled || r.baselineQualified()))
+    if (r.stem == run.stem || !(r.disabled || r.fillCandidate()))
+      continue;
+    // A fill in the corrected band is a reference only with its correction.
+    // Asked only there, and only then: it scans every run, and most fills
+    // are either well inside the band or well outside it.
+    if (!r.disabled && !r.baselineQualified() && !referenceCorrection(r, all).available)
       continue;
     if (r.files.empty() || r.durationS() < kMinDurationS || r.faults())
       continue;
@@ -570,7 +646,22 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     return g;
   }
 
-  const double refDur = static_cast<double>(best->durationS());
+  // A fill's wall is corrected for what the cache served it, whenever a warm
+  // byte run of the same work makes that possible -- in the band where it is
+  // required and above it, where it removes a small bias toward low gains.
+  const double measuredRefDur = static_cast<double>(best->durationS());
+  double refDur = measuredRefDur;
+  if (!best->disabled) {
+    const ReferenceCorrection corr = referenceCorrection(*best, all);
+    if (corr.available && corr.cacheShare > 0.0) {
+      refDur = corr.correctedS;
+      g.referenceCorrected = true;
+      g.referenceCacheShare = corr.cacheShare;
+      g.referenceMeasuredS = measuredRefDur;
+      g.referenceCorrectedS = corr.correctedS;
+      g.correctionStartS = corr.warmStartS;
+    }
+  }
   const double runDur = static_cast<double>(run.durationS());
   const double originTime = refDur * refC; // what these files cost with no cache
   const double cacheTime = runDur * refD;  // what they cost from the cache now
@@ -579,7 +670,7 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   g.valid = true;
   g.savedS = originTime - cacheTime;
   g.gain = (runDur + g.savedS) / runDur;
-  g.originMBs = refWireTotalD / refDur / 1e6;
+  g.originMBs = refWireTotalD / measuredRefDur / 1e6; // the rate the fill actually saw
   g.cacheMBs = static_cast<double>(runCacheTotal) / runDur / 1e6;
   g.matchedFiles = 0;
   for (const auto& [k, f] : run.files) {
@@ -819,7 +910,7 @@ std::vector<Dataset> byDataset(const std::vector<Run>& runs, size_t maxEstimates
     ++d.runs;
     if (!r.complete)
       ++d.incomplete;
-    if (r.disabled || r.baselineQualified())
+    if (usableAsReference(r, runs))
       ++d.baselines;
     d.readBytes += r.servedBytes;
     if (r.files.size() > d.files) {

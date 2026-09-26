@@ -1581,7 +1581,7 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     char gainCell[16];
     if (g.valid)
       std::snprintf(gainCell, sizeof gainCell, "%5s", fit(g.gain, 5, 2).c_str());
-    else if (r.disabled || r.baselineQualified())
+    else if (usableAsReference(r, runs))
       std::snprintf(gainCell, sizeof gainCell, "%5s", "base");
     else
       std::snprintf(gainCell, sizeof gainCell, "%5s", "-");
@@ -1912,7 +1912,9 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
                   "\"matched_files\":%llu,\"origin_equivalent_bytes\":%llu,"
                   "\"work_verified\":%s,\"checked_files\":%llu,"
                   "\"compared_files\":%llu,"
-                  "\"reference\":{\"start\":%llu,\"kind\":\"%s\"}}",
+                  "\"reference\":{\"start\":%llu,\"kind\":\"%s\","
+                  "\"corrected\":%s,\"cache_share\":%.3f,\"measured_s\":%.1f,"
+                  "\"corrected_s\":%.1f}}",
                   gain.gain, gain.savedS, gain.originMBs,
                   (unsigned long long)gain.matchedFiles,
                   (unsigned long long)gain.originEquivBytes,
@@ -1920,7 +1922,9 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
                   (unsigned long long)gain.sigPairs,
                   (unsigned long long)gain.comparedFiles,
                   (unsigned long long)gain.referenceStartS,
-                  gain.referenceDisabled ? "disabled" : "fill");
+                  gain.referenceDisabled ? "disabled" : "fill",
+                  gain.referenceCorrected ? "true" : "false", gain.referenceCacheShare,
+                  gain.referenceMeasuredS, gain.referenceCorrectedS);
     else
       std::printf("null");
     std::printf(",\"gain_reason\":\"%s\"}\n", gain.reason.c_str());
@@ -2152,11 +2156,20 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
     std::printf("             reference: %s, same files %s, "
                 "%llu of %llu files matched; %s%.0f s\n",
                 stamp(gain.referenceStartS).c_str(),
-                gain.referenceDisabled
-                    ? "with the cache disabled"
+                gain.referenceDisabled ? "with the cache disabled"
+                : gain.referenceCorrected
+                    ? "on a first pass over data the cache did not hold yet (a qualifying fill)"
                     : "on a first pass the cache had not yet helped (a qualifying fill)",
                 (unsigned long long)gain.matchedFiles, (unsigned long long)gain.runFiles,
                 gain.savedS >= 0 ? "saved ~" : "cost ~", std::fabs(gain.savedS));
+    // A corrected fill says so, with the numbers the correction used: the
+    // reader should be able to redo it.
+    if (gain.referenceCorrected)
+      std::printf("             reference corrected: the cache served %.0f%% of that first pass "
+                  "(re-reads of what it had just fetched), so its %.0f s count as %.0f s without "
+                  "a cache, from a warm run of the same files (%s)\n",
+                  gain.referenceCacheShare * 100.0, gain.referenceMeasuredS,
+                  gain.referenceCorrectedS, stamp(gain.correctionStartS).c_str());
     // Whether the two runs were shown to have done the SAME WORK, or merely to
     // have covered the same files. Printing the gain without this leaves the
     // reader to assume the stronger of the two, which is the assumption the

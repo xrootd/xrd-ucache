@@ -151,12 +151,33 @@ struct Run {
   // denominator: cache-write time over ORIGIN-wait time, not over CPU time.
   // Kept because it is what the records of earlier runs support.
   double fillCost() const;
-  static constexpr double kMinOriginShare = 0.95;
-  bool baselineQualified() const {
-    return originShare() >= kMinOriginShare && servedLessThanFetched() && overheadKnown() &&
-           overhead() <= kMaxOverhead && prefetchIssuedBytes == 0 && prefetchServedBytes == 0 &&
-           coldReplicaInBytes == 0;
+  // How much of a fill may have come from the cache and the fill still stand
+  // for a run without one. A first run over data the cache does not hold yet
+  // is served some of it all the same: every piece of a file a thread opens
+  // re-reads the file's header and the tree's table of contents, and the
+  // second time they come from what the first read just fetched (6-10% of a
+  // NanoAOD demo on 10-64 threads). Those bytes make the fill FASTER than a
+  // run with the cache off, by f*(1 - T_warm/T_off) for a share f -- the
+  // safe direction, gains read low -- so:
+  //   * from kMinOriginShare, the fill is a reference as it stands (under 10%
+  //     from the cache: at most 10% low, about half that at a 2x cache);
+  //   * from kMinOriginShareCorrected, only CORRECTED (referenceCorrection),
+  //     which needs a warm byte run of the same work.
+  // Replayed over the 96 recorded campaigns that measured the no-cache run
+  // directly: fills 5-10% from the cache read a median 0.957 of it, corrected
+  // 0.999; the two at 10-20% read 0.85, corrected 0.91. None above 20% but
+  // three unusual ones, so the corrected band stops there.
+  static constexpr double kMinOriginShare = 0.90;
+  static constexpr double kMinOriginShareCorrected = 0.80;
+  // Everything a fill must be to serve as a reference, the share down to the
+  // corrected band included.
+  bool fillCandidate() const {
+    return originShare() >= kMinOriginShareCorrected && servedLessThanFetched() &&
+           overheadKnown() && overhead() <= kMaxOverhead && prefetchIssuedBytes == 0 &&
+           prefetchServedBytes == 0 && coldReplicaInBytes == 0;
   }
+  // ... and a reference with no correction needed.
+  bool baselineQualified() const { return fillCandidate() && originShare() >= kMinOriginShare; }
   // A run that CONVERTED baskets into replicas on its first pass is never a
   // reference. It fetches from the origin like a fill and its per-file records
   // see only what the byte cache kept, so every test above can pass for it --
@@ -344,8 +365,41 @@ struct GainEstimate {
   // said "baseline" unconditionally, both wrong whenever the reference was a
   // fill.
   bool referenceDisabled = false;
+  // A fill reference whose wall was corrected for the share of its data the
+  // cache served it (referenceCorrection): the wall as measured, the share,
+  // and when the warm run the correction used started.
+  bool referenceCorrected = false;
+  double referenceCacheShare = 0.0;
+  double referenceMeasuredS = 0.0, referenceCorrectedS = 0.0;
+  uint64_t correctionStartS = 0;
   std::string reason;         // set whenever !valid; also worth printing when valid
 };
+
+// A fill's wall, corrected for the share f of its data the cache served it.
+// With T_warm the wall of a warm BYTE-cache run of the same work, the fill
+// took (1 - f)*T_off + f*T_warm, so the run with the cache off would have
+// taken
+//     T_off = (T_fill - f*T_warm) / (1 - f).
+// It assumes the fill's cache hits cost what the warm run's did. The estimate
+// is off by f*(T_hit - T_warm)/(1 - f), T_hit being what the fill's own hits
+// cost: they are pages it has just written, likely still in memory, so if
+// anything cheaper than the warm run's -- which puts T_off LOW and the gain
+// with it, the safe side. The unsafe case is the reverse, a warm run cheaper
+// per byte than the fill's re-reads. The warm run is the one nearest the fill
+// in time: the correction describes the fill's own conditions. `available` is
+// false when there is no such run, or the arithmetic gives no positive wall.
+struct ReferenceCorrection {
+  bool available = false;
+  double cacheShare = 0.0; // f
+  double warmS = 0.0;      // T_warm
+  uint64_t warmStartS = 0;
+  double correctedS = 0.0; // T_off
+};
+ReferenceCorrection referenceCorrection(const Run& fill, const std::vector<Run>& all);
+// Whether a run can stand as a reference at all: recorded with the cache off,
+// a fill that qualifies as it is, or one in the corrected band that has a
+// correction available.
+bool usableAsReference(const Run& r, const std::vector<Run>& all);
 
 // Everything the cache has done, across every run it still has records for.
 // This is the headline: one run says what happened last time, the aggregate
