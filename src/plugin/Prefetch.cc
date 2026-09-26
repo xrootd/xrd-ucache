@@ -1,6 +1,7 @@
 #include "Prefetch.h"
 
 #include "Config.h"
+#include "Executor.h"
 #include "FileEntry.h"
 #include "Log.h"
 #include "OriginInFlight.h"
@@ -18,7 +19,6 @@
 #include <deque>
 #include <list>
 #include <mutex>
-#include <pthread.h>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -927,6 +927,7 @@ struct Shard {
 
 // The prediction threads and the state they share.
 struct Prefetcher::Impl {
+  const uint64_t gen = Executor::forkGeneration();
   Shared shared;
   std::vector<Shard*> shards; // leaked with their threads, like the executor's
 
@@ -941,28 +942,44 @@ struct Prefetcher::Impl {
   }
 };
 
-Prefetcher::Prefetcher() : impl_(new Impl()) {}
-
 namespace {
-Prefetcher* gPrefetcher = nullptr;
+// Serializes building a generation's state; replaced in a forked child, where
+// a parent thread may have held it. Leaked; made at first use (see Executor.cc).
+std::atomic<std::mutex*> g_prefBuildMu{nullptr};
+std::mutex& prefBuildMu() {
+  std::mutex* m = g_prefBuildMu.load(std::memory_order_acquire);
+  if (m)
+    return *m;
+  auto* fresh = new std::mutex;
+  if (g_prefBuildMu.compare_exchange_strong(m, fresh, std::memory_order_acq_rel))
+    return *fresh;
+  delete fresh;
+  return *m;
+}
 } // namespace
 
+// Nothing built here, for the reason Executor gives: the state (and its
+// threads) comes at first use.
+Prefetcher::Prefetcher() = default;
+
+Prefetcher::Impl* Prefetcher::impl() const {
+  const uint64_t gen = Executor::forkGeneration();
+  Impl* i = impl_.load(std::memory_order_acquire);
+  if (i && i->gen == gen)
+    return i;
+  std::lock_guard<std::mutex> g(prefBuildMu());
+  i = impl_.load(std::memory_order_acquire);
+  if (!i || i->gen != gen) {
+    i = new Impl(); // a parent's is left behind: only its threads used it
+    impl_.store(i, std::memory_order_release);
+  }
+  return i;
+}
+
+void Prefetcher::afterForkChild() { g_prefBuildMu.store(new std::mutex, std::memory_order_release); }
+
 Prefetcher& Prefetcher::instance() {
-  static Prefetcher* p = [] {
-    auto* q = new Prefetcher(); // leaked on purpose: its thread outlives static teardown
-    gPrefetcher = q;
-    // fork() copies the queue and its mutex but NOT the worker thread, so a
-    // child that inherited an open handle would post a close and wait on a
-    // thread that does not exist -- a permanent hang at file close, in
-    // exactly the Python worker pools that fork. The child starts over with
-    // an empty queue and a live thread; the old state is leaked, since the
-    // only thread that could have been using it is gone.
-    ::pthread_atfork(nullptr, nullptr, [] {
-      if (gPrefetcher)
-        gPrefetcher->impl_ = new Impl();
-    });
-    return q;
-  }();
+  static Prefetcher* p = new Prefetcher(); // leaked on purpose: its thread outlives teardown
   return *p;
 }
 
@@ -971,7 +988,7 @@ void Prefetcher::onFill(const std::shared_ptr<HandleState>& st,
                         bool anyMiss) {
   if (!st || !entry || chunks.empty())
     return;
-  if (!globalConfig().prefetch || impl_->shared.disabled.load(std::memory_order_relaxed))
+  if (!globalConfig().prefetch || impl()->shared.disabled.load(std::memory_order_relaxed))
     return;
   // A handle that has never missed is warm: nothing to read ahead of, and no
   // parse to pay. Once it has missed, every fill matters (a fill served from
@@ -994,7 +1011,7 @@ void Prefetcher::onFill(const std::shared_ptr<HandleState>& st,
   j.chunks.reserve(chunks.size());
   for (const auto& c : chunks)
     j.chunks.emplace_back(c.offset, c.length);
-  impl_->shardFor(st.get())->post(std::move(j));
+  impl()->shardFor(st.get())->post(std::move(j));
 }
 
 void Prefetcher::onClose(const std::shared_ptr<HandleState>& st,
@@ -1007,14 +1024,14 @@ void Prefetcher::onClose(const std::shared_ptr<HandleState>& st,
   j.entry = entry;
   j.close = true;
   j.sync = &sync;
-  impl_->shardFor(st.get())->post(std::move(j));
+  impl()->shardFor(st.get())->post(std::move(j));
   // Closes go to the front of the queue, so this waits for at most the job
   // in progress (a parse, a quarter second on the largest files).
   std::unique_lock<std::mutex> lk(sync.m);
   sync.cv.wait(lk, [&] { return sync.done; });
 }
 
-bool Prefetcher::confirmed() const { return impl_->shared.confirmed.load(); }
-bool Prefetcher::disabled() const { return impl_->shared.disabled.load(); }
+bool Prefetcher::confirmed() const { return impl()->shared.confirmed.load(); }
+bool Prefetcher::disabled() const { return impl()->shared.disabled.load(); }
 
 } // namespace ucache

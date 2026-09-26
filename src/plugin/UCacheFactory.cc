@@ -11,15 +11,24 @@
 // ops are naturally pass-through, and a broken cache can never break a job.
 #include "Announce.h"
 #include "CopyDetect.h"
+#include "CpuCounters.h"
 #include "Executor.h"
 #include "Log.h"
 #include "UCacheFile.h"
+#ifdef UCACHE_HAVE_PREFETCH
+#include "Prefetch.h"
+#endif
+#ifdef UCACHE_HAVE_COLDRUN
+#include "ReadRule.h"
+#endif
 
 #include <XrdCl/XrdClDefaultEnv.hh>
 #include <XrdVersion.hh>
 
+#include <atomic>
 #include <dlfcn.h>
 #include <mutex>
+#include <pthread.h>
 
 namespace ucache {
 
@@ -128,8 +137,50 @@ void scheduleCheckpoint() {
   });
 }
 
+// fork(). A child has only the thread that forked: every pool, its queue and
+// whatever the parent's threads were doing stays behind. The child starts
+// over -- each pool and registry rebuilt on its first use there, the store's
+// entries and counters its own, every inherited handle set up again at its
+// next use (HandleState::syncFork) -- and keeps one thing, the layouts it has
+// shown each file in, because a reader in the child may hold offsets it
+// learned before the fork. Nothing here does I/O or starts a thread: a child
+// that only execs pays nothing. NO lock is held across fork: XrdCl's prepare
+// handler runs after ours and waits for its callback threads, and one of
+// those may be in plugin code that needs any lock we held.
+std::atomic<bool> gResume{false};
+
+void forkPrepare() {
+#ifdef UCACHE_HAVE_COLDRUN
+  coldForkPrepare(); // copies the shown layouts, lock released on return
+#endif
+}
+
+void forkParent() {
+#ifdef UCACHE_HAVE_COLDRUN
+  coldForkParent();
+#endif
+}
+
+void forkChild() {
+  Executor::afterForkChild();
+  if (gStore && *gStore)
+    (*gStore)->afterForkChild();
+  FileEntry::afterForkChild();
+  widthSampler().afterForkChild();
+#ifdef UCACHE_HAVE_COLDRUN
+  coldAfterForkChild();
+  readRuleAfterForkChild();
+#endif
+#ifdef UCACHE_HAVE_PREFETCH
+  Prefetcher::afterForkChild();
+#endif
+  gResume.store(true, std::memory_order_release);
+}
+
 void initGlobals() {
   pinSelfInMemory(); // before any thread exists that could outlive an unload
+  // Before any plugin thread exists, so that no fork can find one unprepared.
+  ::pthread_atfork(forkPrepare, forkParent, forkChild);
   // Leaked intentionally: destruction order against XrdCl teardown and the
   // executor threads is unknowable; the final stats dump happens via atexit.
   gConfig = new Config(Config::fromEnv(gPluginConf));
@@ -168,6 +219,14 @@ const Config& globalConfig() {
 std::shared_ptr<CacheStore> globalStore() {
   std::call_once(gInitFlag, initGlobals);
   return *gStore;
+}
+
+void resumeAfterFork() {
+  if (!gResume.load(std::memory_order_acquire) || !gResume.exchange(false))
+    return;
+  // The checkpoint re-armed itself on the parent's timer, which is not here.
+  if (gStore && *gStore && gConfig->metaFlushSeconds > 0)
+    scheduleCheckpoint();
 }
 
 class UCacheFactory : public XrdCl::PlugInFactory {

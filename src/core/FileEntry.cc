@@ -43,6 +43,12 @@ std::atomic<uint64_t> FileEntry::g_bufTotal_{0};
 std::atomic<uint64_t> FileEntry::g_specTotal_{0};
 std::atomic<uint64_t> FileEntry::g_specDropped_{0};
 
+void FileEntry::afterForkChild() {
+  g_bufTotal_.store(0, std::memory_order_relaxed);
+  g_specTotal_.store(0, std::memory_order_relaxed);
+  g_specDropped_.store(0, std::memory_order_relaxed);
+}
+
 std::shared_ptr<FileEntry> FileEntry::open(IOBackend& io, const Config& cfg, Stats& stats,
                                            const UrlKey& key, uint64_t originSize,
                                            uint64_t originMtime, uint8_t cksumKind,

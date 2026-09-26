@@ -229,6 +229,23 @@ class CacheStore {
   // apart, but a CLI call that will never write must not leave one behind.
   void disableStatsDump();
 
+  // fork(): a child inherits this store as the parent left it -- the parent's
+  // open entries (their descriptors, locks and fetches in flight), its stats
+  // file and its counters. Called from the plugin's fork child handler only
+  // (single-threaded; no I/O, no thread): the child starts with no entries and
+  // zeroed counters, and claims a stats file and per-file record sink of its
+  // own the first time it uses the store, so its record is its own and names
+  // its pid. The parent's entries are left behind, never used and never
+  // destroyed: their state belongs to threads that stayed in the parent.
+  // Tracing (trace = io) does not continue in a forked child.
+  void afterForkChild();
+  // A forked child's first use of the store: its own stats file and record
+  // sink. Called by open() and the relay record, and by the plugin at a
+  // child's first open of any file, so a child that only relays (a
+  // UCACHE_DISABLE baseline, a copy) still leaves its periodic record. A no-op
+  // in a process that has not forked.
+  void ensureOwnIdentity();
+
  private:
   // Sidecar-adjacent artifacts observed in the shard listing: removal
   // paths unlink only what the scan saw instead of
@@ -279,6 +296,9 @@ class CacheStore {
   // Resolves budgetAuto -> concrete maxBytes/minFreeBytes from free disk, then
   // seeds approxUsage_. Called once from the constructor.
   void resolveBudget();
+  // The stats file stem (claimed with O_EXCL), and the record sink and tracer
+  // named after it. At construction, and in a forked child at first use.
+  void claimIdentity(bool withTracer);
 
   IOBackend& io_;
   Config cfg_;
@@ -327,6 +347,10 @@ class CacheStore {
   std::set<std::string> seenKeys_; // under regMu_
   std::shared_ptr<FileEntry::ObsSink> obsSink_;
   std::unique_ptr<Tracer> tracer_;
+  // A forked child that has not claimed its own stats file yet (see
+  // afterForkChild). Set in the child handler, cleared by ensureOwnIdentity.
+  std::atomic<bool> forkStale_{false};
+  std::mutex identityMu_;
 };
 
 } // namespace ucache

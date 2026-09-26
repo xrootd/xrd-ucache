@@ -90,6 +90,18 @@ void coldDetach(const std::shared_ptr<ColdFill>& cf);
 // checkpoint calls it, and so does exit.
 void coldCheckpoint();
 
+// fork(). The layouts this process has shown are KEPT in a child: a reader
+// there may hold offsets it learned before the fork. Everything else -- the
+// runs of files in progress, their stores and locks, the commits and memory
+// in flight -- was the parent's, and the child starts without it. Prepare
+// copies the shown layouts (under their lock, released before it returns: no
+// lock is held across fork); the child keeps the map it inherited, or that
+// copy if the map was being changed at the fork. The child call runs in the
+// plugin's fork child handler (single-threaded, no I/O, no thread).
+void coldForkPrepare();
+void coldForkParent();
+void coldAfterForkChild();
+
 // The file size the reader is shown.
 uint64_t coldVirtualSize(const ColdFill& cf);
 // The hash of the layout the run serves.

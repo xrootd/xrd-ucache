@@ -699,6 +699,12 @@ it.
   `UCACHE_VALIDATE=size+mtime`, its mtime); a changed file is re-cached. Set
   `revalidate_seconds = 0` to re-check on every open.
 - **Fail-open.** Every failure path degrades to a normal uncached read.
+- **Many processes, one cache.** Processes started separately, and workers a
+  process forks after it has read through the cache (Python's `multiprocessing`
+  and `concurrent.futures` process pools, ROOT's `TProcessExecutor`), fill and
+  read the same cache; each keeps its own counters in `ucache stats`. A worker
+  reading through a file its parent opened sees the file as the parent was
+  shown it.
 
 ## Configuration
 

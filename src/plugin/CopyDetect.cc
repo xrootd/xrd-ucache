@@ -61,10 +61,14 @@ struct Table {
 };
 
 // Leaked, like the plugin's other process-wide state: detached threads may
-// open files while the process exits.
-std::shared_ptr<const Table>* tableSlot() {
-  static auto* slot = new std::shared_ptr<const Table>();
-  return slot;
+// open files while the process exits. A plain atomic pointer, and every table
+// ever published is leaked (one per change in the set of loaded libraries):
+// the atomic operations on a shared_ptr take a lock from a process-wide pool
+// that nothing resets at fork, and a child forked while another thread held
+// one would hang at its first open.
+std::atomic<const Table*>& tableSlot() {
+  static auto* slot = new std::atomic<const Table*>(nullptr);
+  return *slot;
 }
 std::atomic<const void*> gAnchor{nullptr};
 
@@ -148,8 +152,8 @@ int scanCb(struct dl_phdr_info* info, size_t, void* data) {
 }
 #endif
 
-std::shared_ptr<const Table> buildTable(Generation gen, const Table* prev) {
-  auto t = std::make_shared<Table>();
+const Table* buildTable(Generation gen, const Table* prev) {
+  auto* t = new Table();
   t->gen = gen;
   t->anchor = gAnchor.load(std::memory_order_acquire);
   std::vector<Range> gfal;
@@ -197,13 +201,13 @@ std::shared_ptr<const Table> buildTable(Generation gen, const Table* prev) {
 // The table for the libraries loaded now. Rebuilt without a lock when the set
 // changes; two threads that notice at once each build one and the last store
 // wins -- both are correct.
-std::shared_ptr<const Table> currentTable() {
+const Table* currentTable() {
   const Generation gen = loaderGeneration();
-  std::shared_ptr<const Table> t = std::atomic_load_explicit(tableSlot(), std::memory_order_acquire);
+  const Table* t = tableSlot().load(std::memory_order_acquire);
   if (t && t->gen == gen && t->anchor == gAnchor.load(std::memory_order_acquire))
     return t;
-  t = buildTable(gen, t.get());
-  std::atomic_store_explicit(tableSlot(), t, std::memory_order_release);
+  t = buildTable(gen, t);
+  tableSlot().store(t, std::memory_order_release);
   return t;
 }
 
@@ -346,8 +350,7 @@ void copyDetectInit(const void* xrdclAnchor) {
   void* one[1];
   (void)::backtrace(one, 1); // the first call may load the unwinder: not inside an open
 #endif
-  std::atomic_store_explicit(tableSlot(), buildTable(loaderGeneration(), nullptr),
-                             std::memory_order_release);
+  tableSlot().store(buildTable(loaderGeneration(), nullptr), std::memory_order_release);
 }
 
 CopySignal copierSignal() {
@@ -363,7 +366,7 @@ CopySignal copierStackSignal(int depth) {
     return CopySignal::kNone;
   if (depth > kMaxDepth)
     depth = kMaxDepth;
-  const std::shared_ptr<const Table> t = currentTable();
+  const Table* t = currentTable();
   if (t->all.empty())
     return CopySignal::kNone;
   void* pcs[kMaxDepth];

@@ -32,6 +32,7 @@
 
 #include "CacheStore.h"
 #include "Config.h"
+#include "Executor.h"
 #include "ReplicaStore.h"
 #include "XrdClTimeout.h"
 
@@ -51,8 +52,33 @@ namespace ucache {
 class ColdFill; // ColdRun.h
 class ReadRule; // ReadRule.h
 
+// The layout a handle a forked child inherited had been set up in: its next
+// setup in the child serves exactly that one (HandleState::syncFork).
+enum class ForkLayout : uint8_t { kNone, kOriginal, kView, kCold };
+
 // State shared between the plugin object, executor tasks, and wire handlers.
 struct HandleState {
+  // fork(): a handle a child inherited may be mid-request in a thread that
+  // stayed in the parent -- its locks held, its counts waiting for requests
+  // XrdCl drops in the child without completing them, its entry the parent's.
+  // Every entry point calls syncFork() first; in a new fork generation the
+  // first caller starts the handle over (the others wait for it): the locks
+  // are made anew, the counts forgotten, the entry and slot run left behind
+  // undestroyed, and the handle is set up again at its next read in the
+  // layout it had -- the original, the same compact replica view (kept: its
+  // reads take no lock), or the same slot layout. The inner XrdCl file is
+  // kept: XrdCl recovers it. Nothing is held across fork, and nothing is done
+  // in the fork handler: a parent that never forks pays one atomic load.
+  void syncFork() {
+    const uint64_t g = Executor::forkGeneration();
+    if (forkGen.load(std::memory_order_acquire) != g)
+      startOverAfterFork(g);
+  }
+  std::atomic<uint64_t> forkGen{Executor::forkGeneration()};
+  std::atomic<uint64_t> forkClaim{Executor::forkGeneration()};
+  ForkLayout forkLayout = ForkLayout::kNone;  // under setupMu, then mu
+  std::shared_ptr<ReplicaView> keptView;       // with ForkLayout::kView
+  bool innerStale = false; // under innerOpenMu: a lazy open was in flight at the fork
   // Read-ahead (Prefetch.h) keeps its per-handle state on its own thread, keyed
   // by this object; the one bit it shares is whether this handle has ever
   // missed (a handle that never misses is never looked at).
@@ -166,6 +192,9 @@ struct HandleState {
 
   void noteCacheError(const Config& cfg);
   void noteCacheOk();
+
+ private:
+  void startOverAfterFork(uint64_t gen);
 };
 
 class UCacheFile : public XrdCl::FilePlugIn {
@@ -223,5 +252,8 @@ class UCacheFile : public XrdCl::FilePlugIn {
 // Process-wide config/store accessors (UCacheFactory.cc).
 const Config& globalConfig();
 std::shared_ptr<CacheStore> globalStore();
+// A forked child's first cache work: re-arms what lived only in the parent's
+// timer queue (the periodic checkpoint). Cheap when there is nothing to do.
+void resumeAfterFork();
 
 } // namespace ucache

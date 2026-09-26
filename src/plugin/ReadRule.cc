@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <deque>
 #include <iterator>
+#include <new>
 #include <unordered_map>
 
 namespace ucache {
@@ -47,6 +48,16 @@ std::deque<std::weak_ptr<ReadRule>>& maps() {
 std::atomic<bool> g_warned{false};
 
 } // namespace
+
+void readRuleAfterForkChild() {
+  // Moved aside untouched: a parent thread may have been changing them.
+  auto* rules = new std::unordered_map<std::string, std::shared_ptr<ReadRule>>(); // leaked
+  rules->swap(registry());
+  auto* held = new std::deque<std::weak_ptr<ReadRule>>(); // leaked
+  held->swap(maps());
+  new (&regMu()) std::mutex;
+  new (&mapsMu()) std::mutex;
+}
 
 ReadRule::~ReadRule() = default;
 

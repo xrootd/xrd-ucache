@@ -1,11 +1,20 @@
 // Internal executor: all disk I/O and buffer assembly for the
 // cache run here — never on the caller's or XrdCl's callback threads.
 //
-// Thread-safety: fully thread-safe. The process-wide instance is
-// intentionally leaked (threads end with the process): joining at static
-// destruction could deadlock against XrdCl teardown.
+// fork(): a child has only the thread that forked, so a pool's workers, its
+// timer and whatever it had queued stay in the parent. Every Executor
+// therefore keeps its locks, queues and threads in a core that belongs to one
+// fork generation: afterForkChild() starts a new generation, and each
+// Executor builds a new core -- fresh locks, empty queues, new threads -- the
+// first time it is used in the child. The parent's core is left behind in the
+// child, never run and never destroyed: its tasks are the parent's work.
+//
+// Thread-safety: fully thread-safe. Cores are intentionally leaked (threads
+// end with the process): joining at static destruction could deadlock against
+// XrdCl teardown.
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -33,27 +42,20 @@ class Executor {
   // Process-wide instance, sized per UCACHE_THREADS (0 = min(8, hw)).
   static Executor& instance(unsigned threads = 0);
 
+  // The current fork generation: 0 in the process that loaded the plugin, one
+  // more in each forked child. Other process-wide state keyed on it rebuilds
+  // itself the same way (lazily, on first use in the child).
+  static uint64_t forkGeneration();
+  // Called from the plugin's fork child handler only (single-threaded): starts
+  // a new generation. Takes no lock the parent may hold and creates no thread.
+  static void afterForkChild();
+
  private:
-  void loop();
-  void timerLoop();
+  struct Core;
+  Core* core(); // this generation's core, built on first use
 
-  std::mutex mu_;
-  std::condition_variable cv_;
-  std::deque<std::function<void()>> queue_;
-  std::vector<std::thread> threads_;
-
-  // Delayed dispatch: one timer thread drains a min-deadline queue and forwards
-  // due tasks to post(). Separate lock so scheduling never contends the work
-  // queue.
-  struct Timed {
-    uint64_t deadlineNs;
-    std::function<void()> task;
-    bool operator<(const Timed& o) const { return deadlineNs > o.deadlineNs; } // min-heap
-  };
-  std::mutex tmu_;
-  std::condition_variable tcv_;
-  std::priority_queue<Timed> timers_;
-  std::thread timer_;
+  const unsigned threads_;
+  std::atomic<Core*> core_{nullptr};
 };
 
 } // namespace ucache

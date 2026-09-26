@@ -34,7 +34,9 @@
 #include <ctime>
 #include <fcntl.h>
 #include <algorithm>
+#include <new>
 #include <thread>
+#include <unordered_set>
 
 namespace ucache {
 
@@ -293,6 +295,11 @@ bool HandleState::ensureInnerOpen() {
   std::lock_guard<std::mutex> g(innerOpenMu);
   if (innerOpened)
     return innerOpenOk;
+  if (innerStale) { // see startOverAfterFork; innerOps is 0 in the child
+    resetInner();
+    innerStale = false;
+    lazyOpenFailUs = 0;
+  }
   if (lazyOpenFailUs && nowUs() - lazyOpenFailUs < kLazyOpenRetryCooldownUs)
     return false; // recent failure: rate-limit re-attempts, keep the error
   const Config& cfg = globalConfig();
@@ -653,6 +660,54 @@ static XrdCl::XRootDStatus relayToInner(const std::shared_ptr<HandleState>& st,
     return s;
   }
   return st->missError(); // the origin's own error when the lazy open failed
+}
+
+void HandleState::startOverAfterFork(uint64_t gen) {
+  uint64_t claim = forkClaim.load(std::memory_order_acquire);
+  if (claim == gen || !forkClaim.compare_exchange_strong(claim, gen, std::memory_order_acq_rel)) {
+    while (forkGen.load(std::memory_order_acquire) != gen) // another thread is at it
+      std::this_thread::yield();
+    return;
+  }
+  // Only this thread touches the state now: every other entry point waits above.
+  new (&mu) std::mutex;
+  new (&setupMu) std::mutex;
+  new (&innerOpenMu) std::mutex;
+  new (&persistMu) std::mutex;
+  new (&innerCv) std::condition_variable;
+  new (&persistCv) std::condition_variable;
+  innerOps = 0;        // requests XrdCl dropped in this child
+  pendingPersists = 0; // tasks queued on the parent's pool, which never run here
+  if (setupDone && !closed && !tripped) // the layout its reader was shown
+    forkLayout = view ? ForkLayout::kView : cold ? ForkLayout::kCold : ForkLayout::kOriginal;
+  if (view)
+    keptView = view; // immutable map and an fd, read without a lock
+  // A lazy origin open in flight at the fork left the inner file Recovering,
+  // where XrdCl refuses a new open: the next one starts from a fresh file.
+  if (cacheOnly && !innerOpened)
+    innerStale = true;
+  struct LeftBehind {
+    std::shared_ptr<FileEntry> entry;
+    std::shared_ptr<ReplicaView> view;
+    std::shared_ptr<ColdFill> cold;
+    std::shared_ptr<ReadRule> rule;
+    std::unique_ptr<XrdCl::StatInfo> statInfo;
+  };
+  new LeftBehind{std::move(entry), std::move(view), std::move(cold), std::move(rule),
+                 std::move(statInfo)}; // leaked on purpose: the parent's
+  setupDone = closed || tripped; // a closed or tripped handle has nothing to set up
+  prefetchSeen.store(false, std::memory_order_relaxed);
+  // This process's own account of the handle starts here.
+  relayedBytes.store(0, std::memory_order_relaxed);
+  relayFirstUs.store(0, std::memory_order_relaxed);
+  relayLastUs.store(0, std::memory_order_relaxed);
+  cpu0Us = 0;
+  cpuBlended = true; // a span that began in the parent cannot be attributed here
+  forkGen.store(gen, std::memory_order_release);
+  // Used in this child: its own record, as for a file the child opens itself.
+  // Off the fork handler (this runs at the handle's first use), so I/O is fine.
+  if (store)
+    store->ensureOwnIdentity();
 }
 
 void HandleState::waitInnerIdle(std::chrono::milliseconds max) {
@@ -1325,6 +1380,7 @@ UCacheFile::UCacheFile() : st_(std::make_shared<HandleState>()) {
 }
 
 UCacheFile::~UCacheFile() {
+  st_->syncFork(); // a handle a forked child inherited starts over first
   // Drain outstanding page persists so a short-lived process still leaves a
   // fully populated cache (Close normally does this; the dtor covers the
   // no-explicit-Close path). Not on any read's latency path.
@@ -1412,6 +1468,10 @@ void noteCopier(CopySignal sig, const std::string& url) {
 XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::Flags flags,
                                      XrdCl::Access::Mode mode, ResponseHandler* handler,
                                      ucache::XrdTimeout timeout) {
+  st_->syncFork();
+  resumeAfterFork();
+  if (st_->store)
+    st_->store->ensureOwnIdentity(); // a forked child's first open: its own record
   st_->cpu0Us = processCpuUs(); // CPU-span start
   const int nowOpen = gOpenUCacheHandles.fetch_add(1) + 1;
   if (nowOpen > 1)
@@ -1604,6 +1664,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
     if (st_->setupDone)
       return (st_->closed || st_->tripped) ? nullptr : st_->entry;
   }
+  resumeAfterFork(); // a handle a forked child inherited sets up again here
   const uint64_t setupT0 = nowUs(); // entry-setup span (sidecar load,
                                     // validation, view adoption) — the per-open
                                     // cost 65k opens multiply on a slow disk
@@ -1618,10 +1679,19 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
   std::unique_ptr<XrdCl::StatInfo> statClone;
 
   bool cacheOnly;
+  ForkLayout forkLayout; // set when a forked child inherited this handle (syncFork)
+  std::shared_ptr<ReplicaView> keptView;
   {
     std::lock_guard<std::mutex> g(st_->mu);
     cacheOnly = st_->cacheOnly;
+    forkLayout = st_->forkLayout;
+    keptView = st_->keptView;
   }
+  // The layout such a handle was set up in before the fork is the one it keeps:
+  // its reader holds offsets into it. The original stays the original; a
+  // compact replica view is the same view; a slot layout is matched again.
+  const bool keepOriginal = forkLayout == ForkLayout::kOriginal;
+  const bool keepView = forkLayout == ForkLayout::kView && keptView;
 
   // Trusted recent cache (UCACHE_REVALIDATE_S): build from the local sidecar,
   // NO remote stat. If the entry is gone (evicted since Open), degrade to the
@@ -1636,7 +1706,9 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
         statClone = std::make_unique<XrdCl::StatInfo>("0", meta->fileSize,
                                                       XrdCl::StatInfo::IsReadable,
                                                       meta->originMtime);
-        if (cfg.transpose) {
+        if (keepView) {
+          view = keptView;
+        } else if (cfg.transpose && !keepOriginal) {
           ReplicaStore rs(RealIO::instance(), cfg, st_->store->stats());
           auto openView = [&] {
             return rs.openView(*key, meta->fileSize, meta->originMtime, meta->cksumKind,
@@ -1648,6 +1720,8 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
 #else
           view = openView();
 #endif
+        }
+        {
           if (view)
             statClone->SetSize(view->virtualSize());
 #ifdef UCACHE_HAVE_COLDRUN
@@ -1697,7 +1771,9 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
       // Transposed replica: adopt the stitched view when one
       // validates + fully verifies (openView); the reported size becomes
       // the stitched fEND' so ROOT's fBEGIN <= fEND <= size check holds.
-      if (entry && cfg.transpose) {
+      if (entry && keepView) {
+        view = keptView;
+      } else if (entry && cfg.transpose && !keepOriginal) {
         ReplicaStore rs(RealIO::instance(), cfg, st_->store->stats());
         auto openView = [&] { return rs.openView(*key, si->GetSize(), si->GetModTime()); };
 #ifdef UCACHE_HAVE_COLDRUN
@@ -1706,6 +1782,8 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
 #else
         view = openView();
 #endif
+      }
+      if (entry) {
         if (view) {
           statClone->SetSize(view->virtualSize());
           UCACHE_INFO("serving stitched replica view for %s (virtual %llu bytes)",
@@ -1735,6 +1813,8 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
     std::lock_guard<std::mutex> g(st_->mu);
     st_->setupDone = true;
     st_->statInfo = std::move(statClone);
+    st_->forkLayout = ForkLayout::kNone; // set up in this process now
+    st_->keptView.reset();
     if (!st_->closed && !st_->tripped) {
       st_->entry = entry;
 #ifdef UCACHE_HAVE_COLDRUN
@@ -1780,6 +1860,7 @@ uint64_t UCacheFile::shownSize() const {
 
 
 XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeout timeout) {
+  st_->syncFork();
   // Wait for queued page persists before flushing meta, so the cache is
   // complete on disk when the process (which may exit right after Close)
   // goes away. This blocks Close, never a read (§5.2 step 4).
@@ -1833,6 +1914,7 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
 
 XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
                                      ucache::XrdTimeout timeout) {
+  st_->syncFork();
   // A trusted cache-only handle (UCACHE_REVALIDATE_S) answers Stat from local
   // metadata for BOTH force values — the whole point is to not touch the
   // origin. If setup degrades (entry gone), it opens the origin and we fall
@@ -1847,12 +1929,13 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
       return XRootDStatus();
     }
   }
+  // Set up eagerly (caller thread, like the first read): ROOT may Stat before
+  // reading, and a transposed entry must report the stitched size from the
+  // very first answer -- forced or not, and for a handle a forked child is
+  // setting up again as much as for a new one.
+  if (st_->inner->IsOpen() || cacheOpen_)
+    ensureEntry();
   if (!force) {
-    // Set up eagerly (caller thread, like the first read): ROOT may Stat
-    // before reading, and a transposed entry must report the stitched size
-    // from the very first answer.
-    if (st_->inner->IsOpen() || cacheOpen_)
-      ensureEntry();
     std::lock_guard<std::mutex> g(st_->mu);
     // Serve from validated metadata: only once the entry is
     // attached (validation done) and a StatInfo clone is on hand.
@@ -1898,6 +1981,7 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
 
 XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffer,
                                      ResponseHandler* handler, ucache::XrdTimeout timeout) {
+  st_->syncFork();
   auto entry = ensureEntry();
   if (entry)
     noteRequestBytes(st_, size);
@@ -2070,6 +2154,7 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
 // locally computed kXR page checksums (crc32c, same as the wire protocol).
 XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buffer,
                                        ResponseHandler* handler, ucache::XrdTimeout timeout) {
+  st_->syncFork();
   auto entry = ensureEntry();
   if (entry)
     noteRequestBytes(st_, size); // a stitched PgRead drives the same physical
@@ -2286,6 +2371,7 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
 
 XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer,
                                            ResponseHandler* handler, ucache::XrdTimeout timeout) {
+  st_->syncFork();
   auto entry = ensureEntry();
   // ONE sample, for the footprint AND the serving decision below. The loop had
   // its own and the decision took another, so a replica published between them
@@ -2388,54 +2474,64 @@ void UCacheFile::invalidateOnWrite() {
 
 XrdCl::XRootDStatus UCacheFile::Write(uint64_t offset, uint32_t size, const void* buffer,
                                       ResponseHandler* handler, ucache::XrdTimeout timeout) {
+  st_->syncFork();
   invalidateOnWrite();
   return st_->inner->Write(offset, size, buffer, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Write(uint64_t offset, XrdCl::Buffer&& buffer,
                                       ResponseHandler* handler, ucache::XrdTimeout timeout) {
+  st_->syncFork();
   invalidateOnWrite();
   return st_->inner->Write(offset, std::move(buffer), handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::VectorWrite(const ChunkList& chunks,
                                             ResponseHandler* handler, ucache::XrdTimeout timeout) {
+  st_->syncFork();
   invalidateOnWrite();
   return st_->inner->VectorWrite(chunks, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::WriteV(uint64_t offset, const struct iovec* iov, int iovcnt,
                                        ResponseHandler* handler, ucache::XrdTimeout timeout) {
+  st_->syncFork();
   invalidateOnWrite();
   return st_->inner->WriteV(offset, iov, iovcnt, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Sync(ResponseHandler* handler, ucache::XrdTimeout timeout) {
+  st_->syncFork();
   return st_->inner->Sync(handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Truncate(uint64_t size, ResponseHandler* handler,
                                          ucache::XrdTimeout timeout) {
+  st_->syncFork();
   invalidateOnWrite();
   return st_->inner->Truncate(size, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Fcntl(const XrdCl::Buffer& arg, ResponseHandler* handler,
                                       ucache::XrdTimeout timeout) {
+  st_->syncFork();
   return st_->inner->Fcntl(arg, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Visa(ResponseHandler* handler, ucache::XrdTimeout timeout) {
+  st_->syncFork();
   return st_->inner->Visa(handler, timeout);
 }
 
 bool UCacheFile::IsOpen() const { return cacheOpen_ || st_->inner->IsOpen(); }
 
 bool UCacheFile::SetProperty(const std::string& name, const std::string& value) {
+  st_->syncFork();
   return st_->inner->SetProperty(name, value);
 }
 
 bool UCacheFile::GetProperty(const std::string& name, std::string& value) const {
+  st_->syncFork();
   if (st_->inner->GetProperty(name, value) && !value.empty())
     return true;
   // Trusted cache-only handles never opened a transport, so the properties

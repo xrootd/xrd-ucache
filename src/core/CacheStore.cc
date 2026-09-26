@@ -10,6 +10,7 @@
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
+#include <new>
 #include <set>
 #include <sstream>
 #include <sys/file.h>
@@ -56,6 +57,11 @@ std::string jsonEscape(const std::string& s) {
 CacheStore::CacheStore(IOBackend& io, Config cfg) : io_(io), cfg_(std::move(cfg)) {
   io_.mkdirs(cfg_.cacheDir + "/objects", 0700);
   io_.mkdirs(cfg_.cacheDir + "/stats", 0700);
+  claimIdentity(/*withTracer=*/true);
+  resolveBudget();
+}
+
+void CacheStore::claimIdentity(bool withTracer) {
   char host[256] = "unknown";
   ::gethostname(host, sizeof host - 1);
   // Claim the name with O_EXCL: the only authority on whether a stats file is
@@ -91,11 +97,50 @@ CacheStore::CacheStore(IOBackend& io, Config cfg) : io_(io), cfg_(std::move(cfg)
   // Stats companions share the stem: <stem>.files.jsonl (per-entry
   // records) and <stem>.trace.jsonl (sampled IO trace, opt-in).
   obsSink_ = std::make_shared<FileEntry::ObsSink>(io_, stem + ".files.jsonl");
-  if (cfg_.trace == "io") {
+  if (withTracer && cfg_.trace == "io") {
     tracer_ = std::make_unique<Tracer>(io_, stem + ".trace.jsonl", cfg_.traceSample);
     stats_.tracer = tracer_.get(); // set before any entry/thread exists
   }
-  resolveBudget();
+}
+
+void CacheStore::afterForkChild() {
+  // Everything below may be in the middle of a change by a thread that is not
+  // in this process: the locks are made anew, and what they guarded is moved
+  // aside untouched -- no destructor of a parent's entry may run here.
+  struct LeftBehind {
+    std::map<std::string, std::unique_ptr<ReadFootprint>> relayFp;
+    std::map<std::string, std::weak_ptr<FileEntry>> registry;
+    std::vector<std::string> summaries;
+    std::set<std::string> seen;
+    std::shared_ptr<FileEntry::ObsSink> sink;
+    std::unique_ptr<Tracer> tracer;
+  };
+  auto* left = new LeftBehind; // leaked on purpose
+  new (&relayFpMu_) std::mutex;
+  new (&regMu_) std::mutex;
+  new (&sumMu_) std::mutex;
+  new (&evictMu_) std::mutex;
+  new (&dumpMu_) std::mutex;
+  new (&identityMu_) std::mutex;
+  left->relayFp.swap(relayFp_);
+  left->registry.swap(registry_);
+  left->summaries.swap(entrySummaries_);
+  left->seen.swap(seenKeys_);
+  left->sink = std::move(obsSink_);
+  left->tracer = std::move(tracer_);
+  new (&stats_) Stats(); // this process's counters start at zero; no tracer
+  cpu_.reopen();         // now, before the child starts a thread of its own
+  forkStale_.store(true, std::memory_order_release);
+}
+
+void CacheStore::ensureOwnIdentity() {
+  if (!forkStale_.load(std::memory_order_acquire))
+    return;
+  std::lock_guard<std::mutex> g(identityMu_);
+  if (!forkStale_.load(std::memory_order_acquire))
+    return;
+  claimIdentity(/*withTracer=*/false);
+  forkStale_.store(false, std::memory_order_release); // publishes the stem and sink
 }
 
 uint64_t CacheStore::headroomToFloor(const Config& cfg, IOBackend& io) {
@@ -162,6 +207,7 @@ CacheStore::~CacheStore() {
 std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSize,
                                             uint64_t originMtime, uint8_t cksumKind,
                                             uint32_t originCksum, bool* declinedForSpace) {
+  ensureOwnIdentity();
   if (declinedForSpace)
     *declinedForSpace = false;
   {
@@ -878,6 +924,7 @@ ReadFootprint& CacheStore::relayFootprint(const std::string& url) {
 
 void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const char* mode,
                                 uint64_t spanUs, uint64_t originSize) {
+  ensureOwnIdentity();
   const ReadFootprint* fp = footprintFor(url);
   // No size means no way to tell content from a reader's overshoot: ROOT asks
   // past the end routinely, and a signature that counts those bytes agrees
@@ -933,6 +980,8 @@ void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const ch
 }
 
 void CacheStore::checkpoint() {
+  if (forkStale_.load(std::memory_order_acquire))
+    return; // a forked child that has not used the store: nothing of its own yet
   std::vector<std::shared_ptr<FileEntry>> live;
   {
     std::lock_guard<std::mutex> g(regMu_);
@@ -948,6 +997,10 @@ void CacheStore::checkpoint() {
 }
 
 void CacheStore::dumpStats(bool finalDump) {
+  // A forked child that never used the store did no work of its own through
+  // it, and the counters and entries it inherited were the parent's to report.
+  if (forkStale_.load(std::memory_order_acquire))
+    return;
   std::lock_guard<std::mutex> dg(dumpMu_);
   if (finalDump) {
     std::lock_guard<std::mutex> g(regMu_);

@@ -54,6 +54,7 @@
 // Nothing here runs on the hit-serving executor.
 #pragma once
 
+#include <atomic>
 #include <XrdCl/XrdClXRootDResponses.hh>
 
 #include <cstdint>
@@ -84,10 +85,18 @@ class Prefetcher {
   bool confirmed() const;
   bool disabled() const;
 
+  // fork() copies the queues and their locks but not the worker threads, so a
+  // child that inherited an open handle would post a close and wait on a
+  // thread that does not exist. A child starts over, lazily, at its first use
+  // of the prefetcher: empty queues and threads of its own; the parent's state
+  // is left behind. Called from the plugin's fork child handler only.
+  static void afterForkChild();
+
  private:
   Prefetcher();
   struct Impl;
-  Impl* impl_;
+  Impl* impl() const; // this fork generation's state, built on first use
+  mutable std::atomic<Impl*> impl_{nullptr};
 };
 
 } // namespace ucache

@@ -12,12 +12,19 @@
 // capture st_, a shared_ptr, never stack locals.)
 #include "Executor.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
+#include <dirent.h>
+#include <functional>
 #include <gtest/gtest.h>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <sys/wait.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace ucache;
@@ -103,4 +110,189 @@ TEST(Executor, PostAfterZeroDelayPostsImmediately) {
     ex.postAfter(0, [latch] { latch->bump(); });
   EXPECT_TRUE(latch->wait(100));
   EXPECT_EQ(latch->get(), 100);
+}
+
+// ------------------------------------------------------------------- fork()
+// A child has only the thread that forked. These tests run code in a forked
+// child and read what it reports over a pipe; the child always leaves with
+// _exit, so nothing of the test binary (gtest, temp dirs) runs twice. TSan
+// refuses to start threads after a multi-threaded fork, so they skip there.
+#if defined(__SANITIZE_THREAD__)
+#define UCACHE_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define UCACHE_TSAN 1
+#endif
+#endif
+
+namespace {
+
+// Runs `body` in a forked child; returns what it reported, or "TIMEOUT" when it
+// had not finished after `ms` (it is then killed).
+std::string inChild(const std::function<std::string()>& body, int ms = 10000) {
+  int p[2];
+  if (::pipe(p) != 0)
+    return "PIPE";
+  const pid_t pid = ::fork();
+  if (pid == 0) {
+    ::close(p[0]);
+    const std::string out = body();
+    if (::write(p[1], out.data(), out.size()) < 0) {
+    }
+    ::_exit(0);
+  }
+  ::close(p[1]);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+  bool done = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (::waitpid(pid, nullptr, WNOHANG) == pid) {
+      done = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  std::string out;
+  if (!done) {
+    ::kill(pid, SIGKILL);
+    ::waitpid(pid, nullptr, 0);
+    out = "TIMEOUT";
+  } else {
+    char buf[256];
+    ssize_t n;
+    while ((n = ::read(p[0], buf, sizeof buf)) > 0)
+      out.append(buf, static_cast<size_t>(n));
+  }
+  ::close(p[0]);
+  return out;
+}
+
+// Threads in this process; -1 where /proc is not there to ask.
+int threadCount() {
+#if defined(__linux__)
+  int n = 0;
+  if (DIR* d = ::opendir("/proc/self/task")) {
+    while (dirent* e = ::readdir(d))
+      if (e->d_name[0] != '.')
+        ++n;
+    ::closedir(d);
+    return n;
+  }
+#endif
+  return -1;
+}
+
+void warm(Executor& ex) { // the pool's threads exist, and have run
+  auto l = std::make_shared<Latch>();
+  ex.post([l] { l->bump(); });
+  ASSERT_TRUE(l->wait(1));
+}
+
+} // namespace
+
+TEST(ExecutorFork, WithoutStartingOverAChildRunsNothing) {
+#ifdef UCACHE_TSAN
+  GTEST_SKIP() << "fork with threads under TSan";
+#endif
+  auto& ex = Executor::instance();
+  warm(ex);
+  // The mechanism the fork handler exists for: the child's queue has no threads.
+  const std::string r = inChild([&ex] {
+    auto l = std::make_shared<Latch>();
+    ex.post([l] { l->bump(); });
+    return std::string(l->wait(1, 1500) ? "ran" : "stuck");
+  });
+  EXPECT_NE(r, "ran");
+}
+
+TEST(ExecutorFork, AChildStartsItsPoolsOverAtFirstUse) {
+#ifdef UCACHE_TSAN
+  GTEST_SKIP() << "fork with threads under TSan";
+#endif
+  auto& ex = Executor::instance();
+  Executor other(2); // any pool, not only the process-wide one
+  warm(ex);
+  warm(other);
+  const std::string r = inChild([&] {
+    Executor::afterForkChild();
+    const int before = threadCount(); // the handler starts nothing itself
+    auto l = std::make_shared<Latch>();
+    ex.post([l] { l->bump(); });
+    ex.postAfter(50, [l] { l->bump(); }); // the timer is this process's too
+    other.post([l] { l->bump(); });
+    const bool all = l->wait(3, 5000);
+    return "threads-before=" + std::to_string(before) + " done=" + (all ? "3" : "no");
+  });
+  if (threadCount() >= 0)
+    EXPECT_EQ(r, "threads-before=1 done=3");
+  else
+    EXPECT_NE(r.find("done=3"), std::string::npos) << r;
+}
+
+TEST(ExecutorFork, APoolStartsNoThreadUntilItIsUsed) {
+#ifdef UCACHE_TSAN
+  GTEST_SKIP() << "fork with threads under TSan";
+#endif
+  if (threadCount() < 0)
+    GTEST_SKIP() << "no /proc to count threads";
+  // A pool is often built inside a function-local static: a constructor that
+  // started threads would hold the static's guard meanwhile, and a child
+  // forked in that window would wait on the guard for good.
+  const int before = threadCount();
+  Executor lazy(3);
+  EXPECT_EQ(threadCount(), before);
+  warm(lazy);
+  EXPECT_EQ(threadCount(), before + 4); // three workers and the timer, at first use
+}
+
+TEST(ExecutorFork, TheParentsQueuedWorkStaysInTheParent) {
+#ifdef UCACHE_TSAN
+  GTEST_SKIP() << "fork with threads under TSan";
+#endif
+  Executor one(1);
+  auto gate = std::make_shared<Latch>();
+  auto started = std::make_shared<Latch>();
+  one.post([gate, started] { // holds the only worker until the test lets go
+    started->bump();
+    gate->wait(1, 20000);
+  });
+  ASSERT_TRUE(started->wait(1));
+  const pid_t parent = ::getpid();
+  static std::atomic<int> ranInChild{0};
+  auto ranInParent = std::make_shared<Latch>();
+  one.post([parent, ranInParent] { // queued behind the gate: the parent's work
+    if (::getpid() != parent)
+      ranInChild.store(1);
+    else
+      ranInParent->bump();
+  });
+  const std::string r = inChild([&one] {
+    Executor::afterForkChild();
+    auto l = std::make_shared<Latch>();
+    one.post([l] { l->bump(); });
+    const bool mine = l->wait(1, 5000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    return std::string(mine ? "own" : "none") + (ranInChild.load() ? "+parents" : "");
+  });
+  EXPECT_EQ(r, "own"); // its own task ran; the parent's queued one did not
+  gate->bump();
+  EXPECT_TRUE(ranInParent->wait(1)); // and it still runs where it belongs
+}
+
+TEST(ExecutorFork, AGrandchildStartsOverToo) {
+#ifdef UCACHE_TSAN
+  GTEST_SKIP() << "fork with threads under TSan";
+#endif
+  auto& ex = Executor::instance();
+  warm(ex);
+  const std::string r = inChild([&ex] {
+    Executor::afterForkChild();
+    warm(ex); // the child's pool exists and has run: the case a second fork meets
+    return inChild([&ex] {
+      Executor::afterForkChild();
+      auto l = std::make_shared<Latch>();
+      ex.post([l] { l->bump(); });
+      return std::string(l->wait(1, 5000) ? "ran" : "stuck");
+    });
+  });
+  EXPECT_EQ(r, "ran");
 }

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <ctime>
 #include <dirent.h>
+#include <new>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -40,8 +41,14 @@ int openCounter(uint64_t config, bool dropOnExec) {
   attr.exclude_hv = 1;
   attr.inherit = 1; // count every thread this process spawns
 #if defined(PERF_ATTR_SIZE_VER7)
-  if (dropOnExec)
+  if (dropOnExec) {
     attr.remove_on_exec = 1;
+    // Threads only, not forked processes: a forked worker counts its own work
+    // in its own record (CpuCounters::reopen), and a parent's count must not
+    // grow by its children's when they exit. Same kernel generation as the bit
+    // above; older kernels take the retry below and count children too.
+    attr.inherit_thread = 1;
+  }
 #else
   (void)dropOnExec;
 #endif
@@ -85,12 +92,26 @@ CpuCounters::~CpuCounters() {
 uint64_t CpuCounters::instructions() const { return readCounter(insFd_); }
 uint64_t CpuCounters::cycles() const { return readCounter(cycFd_); }
 
+void CpuCounters::reopen() {
+  if (insFd_ >= 0)
+    ::close(insFd_);
+  if (cycFd_ >= 0)
+    ::close(cycFd_);
+  insFd_ = openCounter(PERF_COUNT_HW_INSTRUCTIONS);
+  cycFd_ = openCounter(PERF_COUNT_HW_CPU_CYCLES);
+  if (insFd_ >= 0)
+    ::ioctl(insFd_, PERF_EVENT_IOC_ENABLE, 0);
+  if (cycFd_ >= 0)
+    ::ioctl(cycFd_, PERF_EVENT_IOC_ENABLE, 0);
+}
+
 #else  // not Linux: no perf_event_open, rusage still works
 
 CpuCounters::CpuCounters() = default;
 CpuCounters::~CpuCounters() = default;
 uint64_t CpuCounters::instructions() const { return 0; }
 uint64_t CpuCounters::cycles() const { return 0; }
+void CpuCounters::reopen() {}
 
 #endif
 
@@ -158,6 +179,14 @@ void WidthSampler::sample() {
 uint64_t WidthSampler::width() const {
   std::lock_guard<std::mutex> g(mu_);
   return static_cast<uint64_t>(peakCores_ + 0.5);
+}
+
+void WidthSampler::afterForkChild() {
+  new (&mu_) std::mutex; // whatever held it is not in this process
+  nextSampleUs_.store(0, std::memory_order_relaxed);
+  lastCpuUs_ = 0;
+  lastWallUs_ = 0;
+  peakCores_ = 0.0;
 }
 
 WidthSampler& widthSampler() {

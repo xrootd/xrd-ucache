@@ -154,6 +154,10 @@ class FileEntry {
   // them, or the completion found its handle gone. Read by the read-ahead
   // breaker, which needs all of them and could previously see only one.
   static uint64_t speculativeDroppedTotal();
+  // fork(): the process-wide totals above (and the staged total) count bytes of
+  // entries a forked child leaves to the parent, which never drain there. The
+  // plugin's fork child handler zeroes them (single-threaded).
+  static void afterForkChild();
   // Count n bytes never used without there being a staged page to drop --
   // a completion whose handle closed while it was on the wire.
   void noteSpeculativeDropped(uint64_t n);

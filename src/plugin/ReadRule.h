@@ -79,4 +79,9 @@ class ReadRule : public std::enable_shared_from_this<ReadRule> {
 // given a new slot store.
 bool readRuleDirect(const std::string& key);
 
+// fork(): a child decides afresh for every file (a decision costs at most a
+// few early fills, and the bytes read are the same). Called from the plugin's
+// fork child handler only (single-threaded, no I/O, no thread).
+void readRuleAfterForkChild();
+
 } // namespace ucache

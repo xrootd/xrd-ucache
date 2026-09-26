@@ -34,6 +34,7 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <unordered_map>
 
@@ -346,11 +347,23 @@ struct Shown {
   uint32_t slotFactor100 = 0; // a slot layout's
   std::string codecs;         // a slot layout's, joined
 };
+using ShownMap = std::unordered_map<std::string, Shown>;
 std::mutex g_shownMu;
-std::unordered_map<std::string, Shown>& shownMap() {
-  static auto* m = new std::unordered_map<std::string, Shown>();
-  return *m;
+// Made at first use (constant-initialized: see Executor.cc), under g_shownMu by
+// every caller; replaced only in a forked child (below).
+ShownMap* g_shown = nullptr;
+ShownMap& shownMap() {
+  if (!g_shown)
+    g_shown = new ShownMap();
+  return *g_shown;
 }
+// Odd while a change to the map is under way (under g_shownMu): a child forked
+// at that instant cannot trust the map it inherited, and takes the copy made
+// just before the fork instead (coldForkPrepare). No lock is held ACROSS fork:
+// XrdCl's own prepare handler runs after ours and waits for its callback
+// threads, and one of those may be setting up a handle, which needs this lock.
+std::atomic<uint64_t> g_shownVersion{0};
+ShownMap* g_shownCopy = nullptr; // the copy prepare made, for the child
 // The parameters of the slot layout this process showed `key` in, if any.
 bool shownSlotParams(const std::string& key, uint32_t& slotFactor100, std::string& codecs) {
   std::lock_guard<std::mutex> g(g_shownMu);
@@ -2111,6 +2124,7 @@ ShownLayout shownLayout(const std::string& key, uint64_t& hash) {
 ShownLayout noteShownLayout(const std::string& key, ShownLayout s, uint64_t hash,
                             uint64_t* winnerHash, const ColdFill* run) {
   std::lock_guard<std::mutex> g(g_shownMu);
+  g_shownVersion.fetch_add(1, std::memory_order_acq_rel); // odd: changing
   auto& v = shownMap()[key];
   // Original may later become compact or slot (the original region reads the
   // same in both); nothing else changes once shown -- not even to another
@@ -2128,7 +2142,9 @@ ShownLayout noteShownLayout(const std::string& key, ShownLayout s, uint64_t hash
   }
   if (winnerHash)
     *winnerHash = v.hash;
-  return v.layout;
+  const ShownLayout won = v.layout;
+  g_shownVersion.fetch_add(1, std::memory_order_acq_rel); // even: whole again
+  return won;
 }
 
 // -------------------------------------------------------------------- API
@@ -2201,6 +2217,37 @@ void coldCheckpoint() {
   }
   for (const auto& cf : all)
     cf->queueCommit();
+}
+
+void coldForkPrepare() {
+  // Copied under the lock, which is released before returning: see g_shownVersion.
+  auto* copy = [] {
+    std::lock_guard<std::mutex> g(g_shownMu);
+    return new ShownMap(shownMap());
+  }();
+  delete g_shownCopy; // the previous fork's; nothing here reads it
+  g_shownCopy = copy;
+}
+
+void coldForkParent() {}
+
+void coldAfterForkChild() {
+  new (&g_shownMu) std::mutex; // a parent thread may have held it
+  if (g_shownVersion.load(std::memory_order_acquire) % 2 != 0 && g_shownCopy) {
+    g_shown = g_shownCopy; // the inherited map was mid-change: use prepare's copy
+    g_shownCopy = nullptr;
+    g_shownVersion.fetch_add(1, std::memory_order_acq_rel);
+  }
+  // Left behind untouched: a ColdFill's destructor would commit, flock and
+  // write a store the parent is still using.
+  auto* left = new std::unordered_map<std::string, std::shared_ptr<ColdFill>>(); // leaked
+  left->swap(registry());
+  new (&g_regMu) std::mutex;
+  new (&g_cmtMu) std::mutex;
+  new (&g_cmtCv) std::condition_variable;
+  g_cmtPending = 0; // the parent's commits are the parent's to wait for at exit
+  g_pendingTotal.store(0, std::memory_order_relaxed);
+  g_transientTotal.store(0, std::memory_order_relaxed);
 }
 
 uint64_t coldVirtualSize(const ColdFill& cf) { return cf.L.virtualSize; }

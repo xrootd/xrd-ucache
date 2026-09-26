@@ -10,8 +10,17 @@
 #include <gtest/gtest.h>
 #include <sys/file.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <chrono>
+#include <vector>
+#include <csignal>
+#include <algorithm>
+#include <dirent.h>
+#include <functional>
+#include <iterator>
+#include <string>
 #include <thread>
+#include <unistd.h>
 
 using namespace ucache;
 using test::TempDir;
@@ -1248,4 +1257,134 @@ TEST(CacheStore, SlotStoreCreationDebrisIsSweptBesideALiveEntry) {
   EXPECT_NE(io.stat(oldTmp, &st), 0);
   EXPECT_EQ(io.stat(newTmp, &st), 0);
   EXPECT_EQ(io.stat(base + ".meta", &st), 0); // the entry itself is untouched
+}
+
+// fork(): a child inherits the store as the parent left it. After
+// afterForkChild (the plugin's fork child handler calls it) the child has no
+// entries of its own, zeroed counters, and a stats file named with its own pid;
+// a child that never uses the store writes nothing. Run in a forked child that
+// reports over a pipe and leaves with _exit.
+namespace {
+std::string forkedReport(const std::function<std::string()>& body) {
+  int p[2];
+  if (::pipe(p) != 0)
+    return "PIPE";
+  const pid_t pid = ::fork();
+  if (pid == 0) {
+    ::close(p[0]);
+    const std::string out = body();
+    if (::write(p[1], out.data(), out.size()) < 0) {
+    }
+    ::_exit(0);
+  }
+  ::close(p[1]);
+  bool done = false; // bounded: a hung child fails the test, not ctest's timeout
+  for (int i = 0; i < 1000 && !done; ++i) {
+    done = ::waitpid(pid, nullptr, WNOHANG) == pid;
+    if (!done)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!done) {
+    ::kill(pid, SIGKILL);
+    ::waitpid(pid, nullptr, 0);
+    ::close(p[0]);
+    return std::to_string(pid) + " TIMEOUT";
+  }
+  std::string out;
+  char buf[512];
+  ssize_t n;
+  while ((n = ::read(p[0], buf, sizeof buf)) > 0)
+    out.append(buf, static_cast<size_t>(n));
+  ::close(p[0]);
+  return std::to_string(pid) + " " + out;
+}
+
+// Every counter file in `dir` (not the per-file records), name and text.
+std::string allStats(const std::string& dir) {
+  std::vector<std::string> names;
+  if (DIR* d = ::opendir(dir.c_str())) {
+    while (dirent* e = ::readdir(d)) {
+      const std::string n = e->d_name;
+      if (n.size() > 6 && n.compare(n.size() - 6, 6, ".jsonl") == 0 &&
+          n.find(".files.") == std::string::npos)
+        names.push_back(n);
+    }
+    ::closedir(d);
+  }
+  std::sort(names.begin(), names.end());
+  std::string all;
+  for (const auto& n : names) {
+    std::ifstream f(dir + "/" + n);
+    all += n + ":" + std::string(std::istreambuf_iterator<char>(f), {}) + "\n";
+  }
+  return all;
+}
+
+// The stats files in `dir` whose name carries `pid`, and their text.
+std::string statsOf(const std::string& dir, const std::string& pid) {
+  std::string all;
+  if (DIR* d = ::opendir(dir.c_str())) {
+    while (dirent* e = ::readdir(d)) {
+      const std::string n = e->d_name;
+      if (n.find("-" + pid + "-") == std::string::npos || n.find(".files.") != std::string::npos)
+        continue;
+      std::ifstream f(dir + "/" + n);
+      all += n + ":" + std::string(std::istreambuf_iterator<char>(f), {}) + "\n";
+    }
+    ::closedir(d);
+  }
+  return all;
+}
+} // namespace
+
+TEST(CacheStore, AForkedChildStartsWithAStoreOfItsOwn) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  auto parentEntry = store.open(keyN(1), 1 << 20);
+  ASSERT_TRUE(parentEntry);
+  std::vector<uint8_t> page(16384, 7);
+  parentEntry->writePages(0, page.size(), page.data());
+  parentEntry->flushAll();
+  store.stats().opens.fetch_add(5); // counters the child must not report
+  FileEntry* parentRaw = parentEntry.get();
+  const std::string r = forkedReport([&] {
+    store.afterForkChild();
+    auto mine = store.open(keyN(1), 1 << 20); // its own entry, read from disk
+    std::vector<uint8_t> back(page.size());
+    const bool read = mine && mine->readCached(0, back.size(), back.data());
+    store.dumpStats(false);
+    return std::string(mine && mine.get() != parentRaw ? "own-entry" : "shared-entry") +
+           (read && back == page ? " reads-the-pages" : " no-pages");
+  });
+  const std::string pid = r.substr(0, r.find(' '));
+  EXPECT_EQ(r.substr(r.find(' ') + 1), "own-entry reads-the-pages");
+  const std::string rec = statsOf(td.path() + "/stats", pid);
+  EXPECT_NE(rec.find("\"pid\":" + pid), std::string::npos) << rec; // its own file, its own pid
+  EXPECT_NE(rec.find("\"opens\":1,"), std::string::npos) << rec;   // its one open, not the parent's 6
+  EXPECT_NE(rec.find("\"files_opened\":1"), std::string::npos) << rec;
+}
+
+TEST(CacheStore, AForkedChildThatNeverUsesTheStoreWritesNothing) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  auto e = store.open(keyN(1), 1 << 20);
+  ASSERT_TRUE(e);
+  store.stats().opens.fetch_add(3);
+  store.dumpStats(false); // the parent's own line, before the fork
+  const std::string before = allStats(td.path() + "/stats");
+  const std::string r = forkedReport([&] {
+    store.afterForkChild();
+    store.checkpoint();                  // the periodic checkpoint in such a child
+    store.dumpStats(/*finalDump=*/true); // and what the exit dump does
+    return std::string("done");
+  });
+  EXPECT_EQ(r.substr(r.find(' ') + 1), "done");
+  // Nothing written anywhere: no file of its own, and no line in the parent's.
+  EXPECT_EQ(allStats(td.path() + "/stats"), before);
 }

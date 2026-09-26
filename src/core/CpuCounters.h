@@ -47,6 +47,12 @@ class CpuCounters {
   uint64_t cycles() const;
   // True when the kernel gave us the counters.
   bool available() const { return insFd_ >= 0 && cycFd_ >= 0; }
+  // Close and open the counters again, counting from now. A forked child's
+  // descriptors are copies of the parent's and read the PARENT's event, so a
+  // child that keeps a record of its own opens its own -- before it starts any
+  // thread, since a counter follows only threads started after it opened.
+  // Two system calls each, no lock: safe in a fork child handler.
+  void reopen();
 
   // Process CPU time (user+system) in microseconds, from getrusage. Always
   // available, and covers the whole process rather than only our lifetime.
@@ -91,6 +97,10 @@ class WidthSampler {
   void sample();
   // Peak cores busy over any sampled interval; 0 before the second sample.
   uint64_t width() const;
+  // A forked child starts sampling afresh: its CPU time restarts at zero, and
+  // the lock may have been held by a thread that stayed in the parent. Called
+  // from the plugin's fork child handler only (single-threaded).
+  void afterForkChild();
 
  private:
   std::atomic<uint64_t> nextSampleUs_{0}; // lock-free gate for the hot path
