@@ -115,13 +115,17 @@ TEST(Executor, PostAfterZeroDelayPostsImmediately) {
 // ------------------------------------------------------------------- fork()
 // A child has only the thread that forked. These tests run code in a forked
 // child and read what it reports over a pipe; the child always leaves with
-// _exit, so nothing of the test binary (gtest, temp dirs) runs twice. TSan
-// refuses to start threads after a multi-threaded fork, so they skip there.
-#if defined(__SANITIZE_THREAD__)
-#define UCACHE_TSAN 1
+// _exit, so nothing of the test binary (gtest, temp dirs) runs twice. They
+// skip under the sanitizers: TSan refuses to start threads after a
+// multi-threaded fork, and under ASan a thread still starting in the parent at
+// the fork can hold the sanitizer's own allocator lock, so the child's first
+// new thread waits on it for good (seen: stuck in pthread_getattr_np inside
+// the sanitizer's thread start).
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+#define UCACHE_FORK_SKIP 1
 #elif defined(__has_feature)
-#if __has_feature(thread_sanitizer)
-#define UCACHE_TSAN 1
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#define UCACHE_FORK_SKIP 1
 #endif
 #endif
 
@@ -190,8 +194,8 @@ void warm(Executor& ex) { // the pool's threads exist, and have run
 } // namespace
 
 TEST(ExecutorFork, WithoutStartingOverAChildRunsNothing) {
-#ifdef UCACHE_TSAN
-  GTEST_SKIP() << "fork with threads under TSan";
+#ifdef UCACHE_FORK_SKIP
+  GTEST_SKIP() << "fork with threads under a sanitizer";
 #endif
   auto& ex = Executor::instance();
   warm(ex);
@@ -205,8 +209,8 @@ TEST(ExecutorFork, WithoutStartingOverAChildRunsNothing) {
 }
 
 TEST(ExecutorFork, AChildStartsItsPoolsOverAtFirstUse) {
-#ifdef UCACHE_TSAN
-  GTEST_SKIP() << "fork with threads under TSan";
+#ifdef UCACHE_FORK_SKIP
+  GTEST_SKIP() << "fork with threads under a sanitizer";
 #endif
   auto& ex = Executor::instance();
   Executor other(2); // any pool, not only the process-wide one
@@ -229,8 +233,8 @@ TEST(ExecutorFork, AChildStartsItsPoolsOverAtFirstUse) {
 }
 
 TEST(ExecutorFork, APoolStartsNoThreadUntilItIsUsed) {
-#ifdef UCACHE_TSAN
-  GTEST_SKIP() << "fork with threads under TSan";
+#ifdef UCACHE_FORK_SKIP
+  GTEST_SKIP() << "fork with threads under a sanitizer";
 #endif
   if (threadCount() < 0)
     GTEST_SKIP() << "no /proc to count threads";
@@ -245,8 +249,8 @@ TEST(ExecutorFork, APoolStartsNoThreadUntilItIsUsed) {
 }
 
 TEST(ExecutorFork, TheParentsQueuedWorkStaysInTheParent) {
-#ifdef UCACHE_TSAN
-  GTEST_SKIP() << "fork with threads under TSan";
+#ifdef UCACHE_FORK_SKIP
+  GTEST_SKIP() << "fork with threads under a sanitizer";
 #endif
   Executor one(1);
   auto gate = std::make_shared<Latch>();
@@ -279,8 +283,8 @@ TEST(ExecutorFork, TheParentsQueuedWorkStaysInTheParent) {
 }
 
 TEST(ExecutorFork, AGrandchildStartsOverToo) {
-#ifdef UCACHE_TSAN
-  GTEST_SKIP() << "fork with threads under TSan";
+#ifdef UCACHE_FORK_SKIP
+  GTEST_SKIP() << "fork with threads under a sanitizer";
 #endif
   auto& ex = Executor::instance();
   warm(ex);

@@ -58,14 +58,16 @@ struct Table {
   std::vector<Range> copyEngine; // fixed for the life of the anchor's library
   std::vector<RootIo> rootIo;
   std::vector<Range> all; // what a walk compares against
+  const Table* older = nullptr; // the table this one replaced, kept
 };
 
 // Leaked, like the plugin's other process-wide state: detached threads may
 // open files while the process exits. A plain atomic pointer, and every table
-// ever published is leaked (one per change in the set of loaded libraries):
-// the atomic operations on a shared_ptr take a lock from a process-wide pool
-// that nothing resets at fork, and a child forked while another thread held
-// one would hang at its first open.
+// ever published is kept, each linked to the one it replaced (one per change
+// in the set of loaded libraries): a walk may still be reading a replaced one,
+// and the atomic operations on a shared_ptr take a lock from a process-wide
+// pool that nothing resets at fork, so a child forked while another thread
+// held one would hang at its first open.
 std::atomic<const Table*>& tableSlot() {
   static auto* slot = new std::atomic<const Table*>(nullptr);
   return *slot;
@@ -152,7 +154,7 @@ int scanCb(struct dl_phdr_info* info, size_t, void* data) {
 }
 #endif
 
-const Table* buildTable(Generation gen, const Table* prev) {
+Table* buildTable(Generation gen, const Table* prev) {
   auto* t = new Table();
   t->gen = gen;
   t->anchor = gAnchor.load(std::memory_order_acquire);
@@ -198,17 +200,31 @@ const Table* buildTable(Generation gen, const Table* prev) {
   return t;
 }
 
+// Publish `t` in place of whatever is published now, keeping that one linked.
+void publish(Table* t) {
+  const Table* cur = tableSlot().load(std::memory_order_acquire);
+  do
+    t->older = cur;
+  while (!tableSlot().compare_exchange_weak(cur, t, std::memory_order_acq_rel,
+                                            std::memory_order_acquire));
+}
+
 // The table for the libraries loaded now. Rebuilt without a lock when the set
-// changes; two threads that notice at once each build one and the last store
-// wins -- both are correct.
+// changes; of two threads that notice at once, the first to publish wins and
+// the other drops its own table, which nothing has seen -- both are correct.
 const Table* currentTable() {
   const Generation gen = loaderGeneration();
   const Table* t = tableSlot().load(std::memory_order_acquire);
   if (t && t->gen == gen && t->anchor == gAnchor.load(std::memory_order_acquire))
     return t;
-  t = buildTable(gen, t);
-  tableSlot().store(t, std::memory_order_release);
-  return t;
+  Table* fresh = buildTable(gen, t);
+  fresh->older = t;
+  const Table* expected = t;
+  if (tableSlot().compare_exchange_strong(expected, fresh, std::memory_order_acq_rel,
+                                          std::memory_order_acquire))
+    return fresh;
+  delete fresh;
+  return expected;
 }
 
 std::string computeExecutable() {
@@ -351,7 +367,7 @@ void copyDetectInit(const void* xrdclAnchor) {
   void* one[1];
   (void)::backtrace(one, 1); // the first call may load the unwinder: not inside an open
 #endif
-  tableSlot().store(buildTable(loaderGeneration(), nullptr), std::memory_order_release);
+  publish(buildTable(loaderGeneration(), nullptr));
 }
 
 CopySignal copierSignal() {

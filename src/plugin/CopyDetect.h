@@ -61,10 +61,10 @@
 //
 // Thread-safety: every function here may be called concurrently from any
 // thread. The address table is immutable once built and is published through
-// an atomic pointer (superseded tables are leaked); a thread that sees the set
-// of loaded libraries change builds a fresh one without taking a lock (so a
-// process that forks while another thread is building cannot inherit a held
-// lock).
+// an atomic pointer (a replaced table is kept, linked from the one that
+// replaced it); a thread that sees the set of loaded libraries change builds a
+// fresh one without taking a lock (so a process that forks while another
+// thread is building cannot inherit a held lock).
 #pragma once
 
 #include <cstdint>
