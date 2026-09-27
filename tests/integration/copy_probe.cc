@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <fcntl.h>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -59,6 +60,17 @@ std::vector<std::string> listDir(const std::string& dir) {
     ::closedir(d);
   }
   return out;
+}
+
+// Push a cache file's data to disk, so that its allocated size is final. The
+// plugin does not sync by default, and on some filesystems (ext4) the blocks a
+// file occupies change when the kernel writes it out, seconds later.
+void settle(const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd >= 0) {
+    (void)::fsync(fd);
+    ::close(fd);
+  }
 }
 
 bool endsWith(const std::string& s, const std::string& tail) {
@@ -121,6 +133,8 @@ int child(const std::string& url, const std::string& local, const std::string& c
   check(readAll(url, got) && got == want, "a reader in the same process reads identically");
   const auto metas = cacheFiles(cache, ".meta"), datas = cacheFiles(cache, ".data");
   struct ::stat before{};
+  if (datas.size() == 1)
+    settle(datas[0]);
   const bool cached = metas.size() == 1 && datas.size() == 1 &&
                       ::stat(datas[0].c_str(), &before) == 0 && before.st_blocks > 0;
   check(cached, "... and the reader's handle cached the file (one entry, holding data)");
@@ -129,9 +143,17 @@ int child(const std::string& url, const std::string& local, const std::string& c
   XrdCl::DefaultEnv::GetEnv()->PutInt("CpUsePgWrtRd", 0);
   check(copy(url, dst2) && slurp(dst2) == want, "copy 2 (plain reads, file cached) is identical");
   struct ::stat after{};
-  check(cached && ::stat(datas[0].c_str(), &after) == 0 && after.st_blocks == before.st_blocks &&
-            after.st_size == before.st_size && cacheFiles(cache, ".meta") == metas,
-        "copy 2 left the cached entry as it was");
+  if (cached)
+    settle(datas[0]);
+  const bool same = cached && ::stat(datas[0].c_str(), &after) == 0 &&
+                    after.st_blocks == before.st_blocks && after.st_size == before.st_size &&
+                    cacheFiles(cache, ".meta") == metas;
+  check(same, "copy 2 left the cached entry as it was");
+  if (!same)
+    std::printf("  before: %lld B, %lld blocks; after: %lld B, %lld blocks; entries %zu -> %zu\n",
+                static_cast<long long>(before.st_size), static_cast<long long>(before.st_blocks),
+                static_cast<long long>(after.st_size), static_cast<long long>(after.st_blocks),
+                metas.size(), cacheFiles(cache, ".meta").size());
   ::unlink(dst1.c_str());
   ::unlink(dst2.c_str());
   return fails ? 1 : 0;
