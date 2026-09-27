@@ -67,6 +67,10 @@ struct Stats {
   // Handles opened for a copy (a copy tool or copy engine): served straight
   // from the origin and never cached; their bytes are in relayBytes.
   std::atomic<uint64_t> copierHandles{0};
+  // Requests refused because they would have completed a copy of a file the
+  // cache shows in another layout, sized from the origin (CopyGuard.h): the
+  // copy fails instead of coming out corrupt.
+  std::atomic<uint64_t> copiesRefused{0};
   // max_read_fraction: files a process decided to read straight from the
   // origin, and the bytes it fetched for their data and did not keep (also in
   // relayBytes).
@@ -201,7 +205,8 @@ struct StatsTotals {
   uint64_t opens = 0, validationsFailed = 0, hitBytes = 0, missBytes = 0, originBytes = 0,
            servedBytes = 0, originReads = 0, fetchesJoined = 0, originReadvs = 0, pageWrites = 0, crcFailures = 0,
            metaCorrupt = 0, evictedEntries = 0, evictedBytes = 0, failopenEvents = 0,
-           admissionsBypassed = 0, copierHandles = 0, directReadFiles = 0, directReadBytes = 0,
+           admissionsBypassed = 0, copierHandles = 0, copiesRefused = 0, directReadFiles = 0,
+           directReadBytes = 0,
            openRetries = 0, openRetriesExhausted = 0,
            replicaOpens = 0, replicaPublished = 0, replicaInvalid = 0, replicaCrcFailures = 0,
            replicaPunchedBytes = 0, replicaOrphansSwept = 0;

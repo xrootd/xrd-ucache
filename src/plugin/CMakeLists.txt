@@ -69,6 +69,7 @@ function(ucache_add_plugin target include_dir library suffix)
   add_library(${target} SHARED
     Announce.cc
     CopyDetect.cc
+    CopyGuard.cc
     Executor.cc
     OpenRetry.cc
     UCacheFactory.cc

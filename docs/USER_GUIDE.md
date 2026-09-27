@@ -827,12 +827,27 @@ end of a copy (`xrdcp --cksum`, `gfal-copy -K`) is the origin's. Because a copy
 reads the origin, it needs the origin to be reachable, even for a file that is
 cached.
 
+A file with a replica is also recognised by how it is read. A handle whose
+first request reads the whole file at once (fsspec's `open().read()`,
+`cat_file(path, 0, size)`) is a copy, and gets the origin's bytes. A handle that
+reads the file in pieces up to the size the origin reports, without first
+reading any of the replica's own part, is stopped with an error at the piece
+that would complete it, naming the remedy: fsspec reading block by block, a loop
+sized by the file system's `stat`, whose result would be the first part of the
+replica's layout -- not a valid file -- and also fsspec's `get`, which reads
+pieces until the end and cannot be told from them at that piece.
+`copies_refused` in `ucache stats` counts these.
+
 A copy made any other way reads through the cache like any reader, and for a
-file with a replica it copies the replica's layout: reading a file handle in a
-loop (fsspec's `get` or `open().read()`, a hand-written loop), fast cloning
-inside a program of your own (`CloneTree(-1, "fast")` on a tree it opened), and
-copies through an XRootD proxy or a FUSE mount with uCache inside it. Make those
-copies with the cache switched off: `UCACHE_DISABLE=1 …`. The same holds for
+file with a replica it copies what it is shown. The whole layout, read in one
+request (`cat_file(path, None, None)`, `read_bytes`) or by a loop sized by the
+handle's own `stat`, is a valid file but not the origin's. Pieces of one copy
+spread over several handles or processes (a download in parallel segments,
+workers each copying a part, pieces on a handle an earlier reader in the same
+process used) are not seen together, and come out corrupt. The same goes for
+fast cloning inside a program of your own (`CloneTree(-1, "fast")` on a tree it
+opened) and copies through an XRootD proxy or a FUSE mount with uCache inside
+it. Make those copies with the cache switched off: `UCACHE_DISABLE=1 …`. The same holds for
 inspecting a file's real form from your own session: `TTree::Print`,
 `TFile::Map` or the `RNTupleInspector` report the sizes and codecs of the layout
 they are shown. Each handle recognised as a copy is counted in

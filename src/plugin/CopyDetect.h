@@ -41,21 +41,30 @@
 // process, and a copy handle never enters the per-process record of which
 // layout a file was shown in.
 //
-// Not recognised, by construction: a copy made by reading a file handle in a
-// loop (fsspec's get and open().read(), a hand-written loop), fast cloning or
-// inspection inside a program of the user's own (TTree::CloneTree(-1, "fast"),
-// TTree::Print on a file it opened to analyse), a merge of files the program
-// opened itself before handing them to TFileMerger, and a copy through an
-// XRootD proxy or a FUSE mount that has uCache inside it. Those copy with the
-// cache switched off.
+// Recognised when the read shows it, not the opener: a handle whose FIRST
+// request reads the whole file at once (fsspec's open().read(),
+// cat_file(path, 0, size)) is a copy too, for a file with a compact replica or
+// a slot store (UCacheFile.cc). A copy in pieces up to the origin's size that
+// never reads the layout's own part is not a reader's pattern either, and is
+// refused before it completes (CopyGuard.h).
+//
+// Not recognised, by construction: the whole layout the cache shows read in
+// one request (cat_file(path, None, None)) or by a loop sized by the handle's
+// own stat -- a valid file, but not the origin's -- the pieces of one copy spread over several handles or processes,
+// fast cloning or inspection inside a program of the user's own
+// (TTree::CloneTree(-1, "fast"), TTree::Print on a file it opened to analyse),
+// a merge of files the program opened itself before handing them to
+// TFileMerger, and a copy through an XRootD proxy or a FUSE mount that has
+// uCache inside it. Those copy with the cache switched off.
 //
 // This file has no XRootD dependency, so it is unit-tested on its own.
 //
 // Thread-safety: every function here may be called concurrently from any
 // thread. The address table is immutable once built and is published through
-// an atomic shared pointer; a thread that sees the set of loaded libraries
-// change builds a fresh one without taking a lock (so a process that forks
-// while another thread is building cannot inherit a held lock).
+// an atomic pointer (superseded tables are leaked); a thread that sees the set
+// of loaded libraries change builds a fresh one without taking a lock (so a
+// process that forks while another thread is building cannot inherit a held
+// lock).
 #pragma once
 
 #include <cstdint>
@@ -72,6 +81,7 @@ enum class CopySignal : uint8_t {
   kGfal,       // opened from inside gfal2's xrootd plugin
   kRootTool,   // the program is hadd or one of ROOT's command-line tools
   kMerge,      // opened from inside ROOT's TFileMerger
+  kWholeFile,  // the handle's first request read the whole file at once
 };
 
 // What the signal was, in words, for a log line ("XRootD's copy engine").

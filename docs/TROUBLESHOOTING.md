@@ -158,15 +158,25 @@ download`), ROOT's `TFile::Cp`, `hadd`, ROOT's command-line tools (`rootcp`,
 ROOT's file merger (`TFileMerger`, given the file's name). `ucache stats`
 counts each such handle in `copier_handles`.
 
+For a file with a replica, a handle whose first request reads the whole file
+at once (fsspec's `open().read()`, `cat_file(path, 0, size)`) is a copy too and
+gets the origin's bytes. A copy in pieces up to the origin's size (fsspec
+reading block by block, a loop sized by the file system's `stat`, and fsspec's
+`get`) fails with "uCache: this read would complete a copy of ... copy it with
+the cache off (UCACHE_DISABLE=1)" before it completes; `copies_refused` counts
+them.
+
 A copy made any other way reads through the cache like an analysis job, and a
 file with a replica is then shown in the replica's layout — the same data to
-ROOT, but a larger file with different bytes. That is the case for reading a
-file handle in a loop (fsspec's `get` or `open().read()`, a hand-written
-loop), fast cloning inside a program of your own (`CloneTree(-1, "fast")` on a
-tree it opened), and copies through an XRootD proxy or a FUSE mount with uCache
-inside it. Make those copies with the cache switched off, and inspect a file's
-real sizes and codecs the same way (`TTree::Print`, `TFile::Map`, the
-`RNTupleInspector` report what they are shown):
+ROOT, but a larger file with different bytes. Read whole (in one request, such
+as `cat_file(path, None, None)`, or by a loop sized by the handle's own `stat`)
+that is a valid file, not the origin's; in pieces spread over several handles
+or processes (parallel segments, workers each copying a part) it comes out
+corrupt. The same holds for fast cloning inside a program of your own
+(`CloneTree(-1, "fast")` on a tree it opened) and copies through an XRootD proxy
+or a FUSE mount with uCache inside it. Make those copies with the cache switched
+off, and inspect a file's real sizes and codecs the same way (`TTree::Print`,
+`TFile::Map`, the `RNTupleInspector` report what they are shown):
 
 ```sh
 UCACHE_DISABLE=1 python3 my_copy.py

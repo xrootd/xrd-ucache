@@ -270,6 +270,7 @@ const char* copySignalName(CopySignal s) {
     case CopySignal::kGfal: return "gfal2's xrootd plugin";
     case CopySignal::kRootTool: return "a ROOT command-line tool";
     case CopySignal::kMerge: return "ROOT's TFileMerger";
+    case CopySignal::kWholeFile: return "a read of the whole file at once";
   }
   return "?";
 }

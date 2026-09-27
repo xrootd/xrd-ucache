@@ -370,6 +370,7 @@ void printStats(const StatsTotals& t) {
   row("failopen_events", t.failopenEvents);
   row("admissions_bypassed", t.admissionsBypassed);
   row("copier_handles", t.copierHandles);
+  row("copies_refused", t.copiesRefused);
   row("direct_read_files", t.directReadFiles);
   rowB("direct_read_bytes", t.directReadBytes);
   row("open_retries", t.openRetries);
@@ -391,6 +392,10 @@ void printStats(const StatsTotals& t) {
     std::printf("  copies             %llu file handle%s opened for a copy, read straight from "
                 "the origin (counted in direct)\n",
                 (unsigned long long)t.copierHandles, t.copierHandles == 1 ? "" : "s");
+  if (t.copiesRefused) // a copy that would have come out corrupt, stopped with an error
+    std::printf("  copies refused     %llu: a copy of a recompressed file sized from the origin "
+                "would not have been the origin's file (copy with UCACHE_DISABLE=1)\n",
+                (unsigned long long)t.copiesRefused);
   if (t.directReadFiles) // the other source of direct bytes: max_read_fraction
     std::printf("  read directly      %llu file%s whose first read asked for more than "
                 "max_read_fraction of the data: %s fetched and not kept (counted in direct)\n",

@@ -57,7 +57,7 @@ the consumers together.
  "evicted_entries": 0, "evicted_bytes": 0,
  "failopen_events": 0, "admissions_bypassed": 0,
  "open_retries": 0, "open_retries_exhausted": 0,
- "disabled_handles": 0, "copier_handles": 0,
+ "disabled_handles": 0, "copier_handles": 0, "copies_refused": 0,
  "direct_read_files": 0, "direct_read_bytes": 0,
  "replica_opens": 0, "replica_published": 0, "replica_invalid": 0,
  "replica_crc_failures": 0, "replica_punched_bytes": 0, "replica_orphans_swept": 0,
@@ -139,8 +139,15 @@ not to cache, and says the cache is under pressure rather than broken.
   ROOT's command-line tools, from inside XRootD's copy engine, from ROOT's
   `TFile::Cp` or `TFileMerger`, or from gfal2's xrootd plugin. They are
   served as pure pass-through, so a copy is the origin's bytes: their reads
-  are in `relay_bytes`, and they add nothing to the cache. Zero with
-  `copy_detect = off`.
+  are in `relay_bytes`, and they add nothing to the cache. Also counted: a
+  handle whose first request read the whole file at once, for a file with a
+  compact replica or a slot store. Zero with `copy_detect = off`.
+- `copies_refused` (plugin layer) — requests refused because they would have
+  completed a copy, in pieces up to the origin's size, of a file shown in a
+  replica's layout (the handle read all of [0, origin size) without reading
+  any of the replica's own part first): the copy fails with an error naming
+  `UCACHE_DISABLE=1` instead of coming out corrupt. Not a cache error: never
+  in `failopen_events`.
 - `direct_read_files` / `direct_read_bytes` (plugin layer) — ROOT files this
   process decided to read straight from the origin because its reads covered
   branches holding more than `max_read_fraction` of the file's data, and the

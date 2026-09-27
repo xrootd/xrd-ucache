@@ -32,6 +32,7 @@
 
 #include "CacheStore.h"
 #include "Config.h"
+#include "CopyGuard.h"
 #include "Executor.h"
 #include "ReplicaStore.h"
 #include "XrdClTimeout.h"
@@ -79,6 +80,12 @@ struct HandleState {
   ForkLayout forkLayout = ForkLayout::kNone;  // under setupMu, then mu
   std::shared_ptr<ReplicaView> keptView;       // with ForkLayout::kView
   bool innerStale = false; // under innerOpenMu: a lazy open was in flight at the fork
+
+  // Set by the handle's first read or Stat. A handle whose FIRST request reads
+  // the whole file at once is a copy (UCacheFile::ensureEntry).
+  std::atomic<bool> opsSeen{false};
+  // The truncated-copy guard of a handle shown another layout (CopyGuard.h).
+  CopyGuard copyGuard;
   // Read-ahead (Prefetch.h) keeps its per-handle state on its own thread, keyed
   // by this object; the one bit it shares is whether this handle has ever
   // missed (a handle that never misses is never looked at).
@@ -238,7 +245,11 @@ class UCacheFile : public XrdCl::FilePlugIn {
   // a synchronous inner Stat. Returns the entry, or nullptr for
   // pass-through (write-open, disabled, denied host, Stat failure, closed).
   // Also adopts the transposed-replica view when one validates.
-  std::shared_ptr<FileEntry> ensureEntry();
+  // `firstRead` is the handle's first request when this is its first operation:
+  // a whole-file read there makes the handle a copy (no entry, the origin's
+  // bytes) where a compact replica or slot store exists, and shows it the file
+  // as stored where recompression could make one.
+  std::shared_ptr<FileEntry> ensureEntry(const std::pair<uint64_t, uint64_t>* firstRead = nullptr);
   std::shared_ptr<ReplicaView> currentView() const;
   std::shared_ptr<ColdFill> currentCold() const;
   // The size a replica or cold-run handle shows its reader; 0 for a plain one.

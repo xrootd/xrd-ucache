@@ -676,6 +676,7 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   new (&persistMu) std::mutex;
   new (&innerCv) std::condition_variable;
   new (&persistCv) std::condition_variable;
+  copyGuard.afterForkChild();
   innerOps = 0;        // requests XrdCl dropped in this child
   pendingPersists = 0; // tasks queued on the parent's pool, which never run here
   if (setupDone && !closed && !tripped) // the layout its reader was shown
@@ -1647,7 +1648,62 @@ void chooseLayout(const std::shared_ptr<HandleState>& st, const std::shared_ptr<
 } // namespace
 #endif
 
-std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
+namespace {
+// What a handle's first request says about it, when that request reads the
+// whole file at once (fsspec's open().read(), cat_file(path, 0, size)): only a
+// copy asks that as its first request, but so does a reader that fetches in
+// blocks larger than a small file (ROOT's raw-file layer reads 128 KiB).
+enum class WholeFirstRead : uint8_t {
+  kNo,       // not a whole-file first read, or nothing to decide
+  kCopy,     // a compact replica or a slot store exists: the handle is a copy,
+             // and reads the origin's bytes straight from the origin
+  kAsStored, // recompress = on and nothing converted yet: shown as stored and
+             // cached, and no layout of its own is made for this handle
+};
+
+// Either answer is the origin's bytes, which is right for a copy and for a
+// reader alike; a copy of a layout the cache made would not be.
+WholeFirstRead wholeFirstRead(const std::pair<uint64_t, uint64_t>* firstRead,
+                              uint64_t originSize, const UrlKey& key, const Config& cfg,
+                              ForkLayout forkLayout) {
+  if (!firstRead || !cfg.copyDetect || !cfg.transpose || forkLayout != ForkLayout::kNone)
+    return WholeFirstRead::kNo;
+  if (originSize == 0 || firstRead->first != 0 || firstRead->second < originSize)
+    return WholeFirstRead::kNo;
+  const std::string base = key.objectDir(cfg.cacheDir) + "/" + key.hashHex;
+  struct ::stat sb;
+  if (::stat((base + ".tmeta").c_str(), &sb) == 0 || ::stat((base + ".slots").c_str(), &sb) == 0)
+    return WholeFirstRead::kCopy;
+  return cfg.recompress ? WholeFirstRead::kAsStored : WholeFirstRead::kNo;
+}
+
+// A request the truncated-copy guard refused (CopyGuard.h): the copy fails
+// here, loudly, instead of coming out corrupt. Not a cache error -- never
+// counted as a fail-open, never trips the handle.
+XrdCl::XRootDStatus refuseCopy(const std::shared_ptr<HandleState>& st) {
+  static std::atomic<bool> said{false};
+  if (st->store)
+    st->store->stats().copiesRefused.fetch_add(1, std::memory_order_relaxed);
+  const std::string where = st->url.substr(0, st->url.find('?')); // no token in the log
+  const std::string msg = "uCache: this read would complete a copy of " + where +
+                          " as the cache lays the file out, which is not the origin's file; "
+                          "copy it with the cache off (UCACHE_DISABLE=1)";
+  if (!said.exchange(true, std::memory_order_relaxed))
+    UCACHE_WARN("%s", msg.c_str());
+  return XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errNotSupported, 0, msg);
+}
+
+bool guardAllowsChunks(const std::shared_ptr<HandleState>& st, uint64_t originSize,
+                       uint64_t shownSize, const XrdCl::ChunkList& chunks) {
+  std::vector<CopyGuard::Range> r;
+  r.reserve(chunks.size());
+  for (const auto& c : chunks)
+    r.emplace_back(c.offset, c.length);
+  return st->copyGuard.allowRanges(originSize, shownSize, r.data(), r.size());
+}
+} // namespace
+
+std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uint64_t>* firstRead) {
   // Pass-through handles -- write opens, UCACHE_DISABLE, no store, and copies
   // (CopyDetect.h) -- never get an entry: nothing is created, stored or
   // shown in another layout for them.
@@ -1690,8 +1746,11 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
   // The layout such a handle was set up in before the fork is the one it keeps:
   // its reader holds offsets into it. The original stays the original; a
   // compact replica view is the same view; a slot layout is matched again.
-  const bool keepOriginal = forkLayout == ForkLayout::kOriginal;
+  // A handle whose first request read the whole file is shown the file as
+  // stored too (wholeFirstRead), or is a copy: no entry, the origin's bytes.
+  bool keepOriginal = forkLayout == ForkLayout::kOriginal;
   const bool keepView = forkLayout == ForkLayout::kView && keptView;
+  bool copy = false;
 
   // Trusted recent cache (UCACHE_REVALIDATE_S): build from the local sidecar,
   // NO remote stat. If the entry is gone (evicted since Open), degrade to the
@@ -1700,8 +1759,17 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
   if (cacheOnly && allowed) {
     if (auto meta = MetaFile::load(RealIO::instance(), key->metaPath(cfg.cacheDir));
         meta && meta->key == key->key) {
-      entry = st_->store->open(*key, meta->fileSize, meta->originMtime, meta->cksumKind,
-                               meta->originCksum);
+      const WholeFirstRead whole = wholeFirstRead(firstRead, meta->fileSize, *key, cfg, forkLayout);
+      keepOriginal = keepOriginal || whole == WholeFirstRead::kAsStored;
+      if (whole == WholeFirstRead::kCopy) {
+        copy = true; // read from the origin; the Stat answer is the origin's
+        statClone = std::make_unique<XrdCl::StatInfo>("0", meta->fileSize,
+                                                      XrdCl::StatInfo::IsReadable,
+                                                      meta->originMtime);
+      } else {
+        entry = st_->store->open(*key, meta->fileSize, meta->originMtime, meta->cksumKind,
+                                 meta->originCksum);
+      }
       if (entry) {
         statClone = std::make_unique<XrdCl::StatInfo>("0", meta->fileSize,
                                                       XrdCl::StatInfo::IsReadable,
@@ -1731,7 +1799,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
         }
       }
     }
-    if (!entry) {
+    if (!entry && !copy) {
       std::lock_guard<std::mutex> g(st_->mu);
       st_->cacheOnly = false; // no usable trusted cache — hit the origin once
       degraded = true;
@@ -1751,7 +1819,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
   // snapshot, and gating on it alone left the handle entry-less on an
   // unopened inner file — every read failed errInvalidOp (found by the
   // revalidate degrade-race gate).
-  if (!entry && (!cacheOnly || degraded)) {
+  if (!entry && !copy && (!cacheOnly || degraded)) {
     if (degraded)
       st_->ensureInnerOpen();
     XrdCl::StatInfo* si = nullptr;
@@ -1760,13 +1828,18 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
     if (s.IsOK() && si && allowed) {
       statClone = std::make_unique<XrdCl::StatInfo>(*si);
       bool declinedForSpace = false;
-      entry = st_->store->open(*key, si->GetSize(), si->GetModTime(),
-                               MetaData::kCksumNone, 0, &declinedForSpace);
+      const WholeFirstRead whole = wholeFirstRead(firstRead, si->GetSize(), *key, cfg, forkLayout);
+      keepOriginal = keepOriginal || whole == WholeFirstRead::kAsStored;
+      if (whole == WholeFirstRead::kCopy)
+        copy = true;
+      else
+        entry = st_->store->open(*key, si->GetSize(), si->GetModTime(),
+                                 MetaData::kCksumNone, 0, &declinedForSpace);
       // A capacity DECISION is not a fail-open. failopenEvents means something
       // went wrong and every benchmark requires it to be zero, so counting a
       // deliberate decline there would make a cache that is merely full look
       // broken. The read proceeds uncached either way; only the reason differs.
-      if (!entry && !declinedForSpace)
+      if (!entry && !declinedForSpace && !copy)
         st_->store->stats().failopenEvents.fetch_add(1, std::memory_order_relaxed);
       // Transposed replica: adopt the stitched view when one
       // validates + fully verifies (openView); the reported size becomes
@@ -1800,6 +1873,10 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
       if (entry && cfg.revalidateSeconds > 0)
         touchVal(*key, cfg.cacheDir);
     }
+  }
+  if (copy) {
+    st_->store->stats().copierHandles.fetch_add(1, std::memory_order_relaxed);
+    noteCopier(CopySignal::kWholeFile, st_->url);
   }
   if (st_->store) {
     auto& stats = st_->store->stats();
@@ -1915,6 +1992,14 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
 XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
                                      ucache::XrdTimeout timeout) {
   st_->syncFork();
+  st_->opsSeen.store(true, std::memory_order_relaxed); // a reader that stats first is no copy by read
+  struct SizeShown { // every answer below gives a relocated handle's shown size
+    UCacheFile* f;
+    ~SizeShown() {
+      if (f->shownSize())
+        f->st_->copyGuard.sizeShown();
+    }
+  } sizeShown{this};
   // A trusted cache-only handle (UCACHE_REVALIDATE_S) answers Stat from local
   // metadata for BOTH force values — the whole point is to not touch the
   // origin. If setup degrades (entry gone), it opens the origin and we fall
@@ -1982,7 +2067,8 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
 XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffer,
                                      ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
-  auto entry = ensureEntry();
+  const std::pair<uint64_t, uint64_t> req{offset, size};
+  auto entry = ensureEntry(st_->opsSeen.exchange(true) ? nullptr : &req);
   if (entry)
     noteRequestBytes(st_, size);
   // ONE sample of the view, used for both. Taking it twice is not merely
@@ -2018,6 +2104,8 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
       complete(handler, okStatus(), chunkResponse(offset, 0, buffer));
       return XRootDStatus();
     }
+    if (!st_->copyGuard.allow(entry->fileSize(), vsize, offset, size))
+      return refuseCopy(st_);
     auto st = st_;
     ChunkList one;
     one.emplace_back(offset, served, buffer);
@@ -2155,7 +2243,8 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
 XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buffer,
                                        ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
-  auto entry = ensureEntry();
+  const std::pair<uint64_t, uint64_t> req{offset, size};
+  auto entry = ensureEntry(st_->opsSeen.exchange(true) ? nullptr : &req);
   if (entry)
     noteRequestBytes(st_, size); // a stitched PgRead drives the same physical
                                  // reads as Read, so it must be sampled too
@@ -2192,6 +2281,8 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
       complete(handler, okStatus(), obj);
       return XRootDStatus();
     }
+    if (!st_->copyGuard.allow(entry->fileSize(), pgVsize, offset, size))
+      return refuseCopy(st_);
     if (offset + size > pgVsize)
       size = static_cast<uint32_t>(pgVsize - offset);
     struct PgAdapter : ResponseHandler {
@@ -2372,6 +2463,7 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
 XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer,
                                            ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
+  st_->opsSeen.store(true, std::memory_order_relaxed);
   auto entry = ensureEntry();
   // ONE sample, for the footprint AND the serving decision below. The loop had
   // its own and the decision took another, so a replica published between them
@@ -2409,6 +2501,8 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
     for (const auto& c : chunks)
       if (c.offset + c.length < c.offset || c.offset + c.length > vsize)
         return XRootDStatus(XrdCl::stError, XrdCl::errInvalidArgs);
+    if (!guardAllowsChunks(st_, entry->fileSize(), vsize, chunks))
+      return refuseCopy(st_);
     auto st = st_;
     noteVectorRequest(st_, chunks);
     ChunkList userChunks = chunks;
@@ -2428,6 +2522,8 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
     for (const auto& c : chunks)
       if (c.offset + c.length < c.offset || c.offset + c.length > view->virtualSize())
         return XRootDStatus(XrdCl::stError, XrdCl::errInvalidArgs);
+    if (!guardAllowsChunks(st_, entry->fileSize(), view->virtualSize(), chunks))
+      return refuseCopy(st_);
     auto st = st_;
     noteVectorRequest(st_, chunks);
     ChunkList userChunks = chunks;
