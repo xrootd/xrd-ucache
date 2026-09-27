@@ -1477,6 +1477,12 @@ std::string historyJson(const std::vector<Run>& runs, size_t shown, bool redacte
   return s;
 }
 
+// Where `summary` and `history` send someone who wants to know what to do
+// about their numbers: both end with it whenever there is a run to report.
+static const char* const kPublishHint =
+    "publish    : `ucache publish` — a report with recommendations from this history;\n"
+    "             paths, hostnames and file names never leave the machine (docs/PUBLISH.md)";
+
 int cmdHistory(const Config& cfg, int argc, char** argv) {
   size_t top = 20;
   bool asJson = false;
@@ -1666,6 +1672,8 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
   if (runs.size() > shown)
     std::printf("(%zu older run(s) not shown — `--top %zu` for more)\n", runs.size() - shown,
                 runs.size());
+  std::putchar('\n');
+  std::puts(kPublishHint);
   return 0;
 }
 
@@ -2091,10 +2099,11 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
       std::printf("  %s\n", c.c_str());
   }
   if (!detail) {
-    if (last)
+    if (last) {
       std::puts("next       : `ucache summary --detail` for the last run; "
                 "`ucache history` for the trend");
-    else
+      std::puts(kPublishHint);
+    } else
       std::puts("next       : run your analysis once, then `ucache summary` again");
     return 0;
   }
@@ -2195,8 +2204,7 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
     std::printf("gain       : not measured — %s\n", gain.reason.c_str());
   }
   std::puts("next       : `ucache history` for the trend across runs");
-  std::puts("publish    : `ucache publish` — a report with recommendations from this history;\n"
-            "             paths, hostnames and file names never leave the machine (docs/PUBLISH.md)");
+  std::puts(kPublishHint);
   return 0;
 }
 

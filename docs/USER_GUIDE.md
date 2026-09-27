@@ -406,6 +406,8 @@ cache      : /scratch/ucache — 694 entries, 202.8 GB on disk (61.4 byte + 141.
 notes
   8 of 12 runs not measured:  3 baseline(s) — they are the reference  3 filled the cache  2 under 30s
 next       : `ucache summary --detail` for the last run; `ucache history` for the trend
+publish    : `ucache publish` — a report with recommendations from this history;
+             paths, hostnames and file names never leave the machine (docs/PUBLISH.md)
 ```
 
 Runs are grouped by the set of files they read, so a cache used for more than
@@ -525,6 +527,9 @@ ALL 12 runs  22m40s                               1133   336.8   23/  26/  24/  
 
 4 of 12 runs measured vs baseline: took 4m49s, no cache would have taken about 15m32s — saved 10m43s
 (4 older run(s) not shown — `--top 12` for more)
+
+publish    : `ucache publish` — a report with recommendations from this history;
+             paths, hostnames and file names never leave the machine (docs/PUBLISH.md)
 ```
 
 Reading it: two datasets, kept apart. In the lower group the two `base` rows are
