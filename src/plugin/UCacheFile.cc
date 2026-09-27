@@ -296,7 +296,7 @@ bool HandleState::ensureInnerOpen() {
   if (innerOpened)
     return innerOpenOk;
   if (innerStale) { // see startOverAfterFork; innerOps is 0 in the child
-    resetInner();
+    resetInner(/*leakOld=*/true);
     innerStale = false;
     lazyOpenFailUs = 0;
   }
@@ -384,6 +384,16 @@ void HandleState::releaseInner() {
     innerCv.notify_all();
 }
 
+// A forked child's first cache work -- a setup, a relayed byte, an open --
+// gives it a record of its own and re-arms its periodic checkpoint, together;
+// a child that only destroys a handle it inherited does neither. One atomic
+// load each in a process that never forked.
+static void childWork(const std::shared_ptr<HandleState>& st) {
+  resumeAfterFork();
+  if (st->store)
+    st->store->ensureOwnIdentity();
+}
+
 // Pass-through relay to the origin for ops the cache never serves (PgRead,
 // legacy/beyond-EOF geometries): acquire the inner FIRST — on a trusted-cache
 // handle (UCACHE_REVALIDATE_S) that lazy-opens the origin. A never-opened
@@ -400,6 +410,7 @@ static void noteRelayBytes(const std::shared_ptr<HandleState>& st, uint64_t n,
   (void)off;
   (void)len; // the footprint is recorded once, at the entry point
   if (st->store && n) {
+    childWork(st);
     st->store->stats().relayBytes.fetch_add(n, std::memory_order_relaxed);
     st->relayedBytes.fetch_add(n, std::memory_order_relaxed);
     const uint64_t t = nowUs();
@@ -679,14 +690,26 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   copyGuard.afterForkChild();
   innerOps = 0;        // requests XrdCl dropped in this child
   pendingPersists = 0; // tasks queued on the parent's pool, which never run here
-  if (setupDone && !closed && !tripped) // the layout its reader was shown
+  // The layout its reader was shown, unless the handle has not been set up
+  // since an earlier fork (a grandchild forked while a child was at it): then
+  // that one is still the one to keep, and so is a layout lost for good.
+  if (forkLayout == ForkLayout::kNone && setupDone && !closed && !tripped && !layoutLost)
     forkLayout = view ? ForkLayout::kView : cold ? ForkLayout::kCold : ForkLayout::kOriginal;
-  if (view)
+  if (view && !keptView)
     keptView = view; // immutable map and an fd, read without a lock
-  // A lazy origin open in flight at the fork left the inner file Recovering,
-  // where XrdCl refuses a new open: the next one starts from a fresh file.
-  if (cacheOnly && !innerOpened)
+  // The inner file is the parent's open. XrdCl recovers such a file at its
+  // first use in the child, and that recovery does not survive vector reads
+  // issued at once -- the reader's threads and the cache's own. A handle the
+  // cache serves opens the file afresh instead, once, at its first need of the
+  // origin (ensureInnerOpen, under innerOpenMu), and the parent's File is left
+  // behind undestroyed; a lazy open in flight at the fork is replaced the same
+  // way. A handle that only relays (write, disabled, a copy tool's) keeps
+  // XrdCl's own behaviour.
+  if ((reopenInChild || (cacheOnly && !innerOpened)) && !closed) {
     innerStale = true;
+    innerOpened = false;
+    cacheOnly = true; // opened on the first miss, as a trusted handle is
+  }
   struct LeftBehind {
     std::shared_ptr<FileEntry> entry;
     std::shared_ptr<ReplicaView> view;
@@ -696,7 +719,7 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   };
   new LeftBehind{std::move(entry), std::move(view), std::move(cold), std::move(rule),
                  std::move(statInfo)}; // leaked on purpose: the parent's
-  setupDone = closed || tripped; // a closed or tripped handle has nothing to set up
+  setupDone = closed || tripped || layoutLost; // nothing to set up again
   prefetchSeen.store(false, std::memory_order_relaxed);
   // This process's own account of the handle starts here.
   relayedBytes.store(0, std::memory_order_relaxed);
@@ -705,10 +728,8 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   cpu0Us = 0;
   cpuBlended = true; // a span that began in the parent cannot be attributed here
   forkGen.store(gen, std::memory_order_release);
-  // Used in this child: its own record, as for a file the child opens itself.
-  // Off the fork handler (this runs at the handle's first use), so I/O is fine.
-  if (store)
-    store->ensureOwnIdentity();
+  // No record is claimed here: this may be the child's destructor of a handle
+  // it never used. The first real work claims one (childWork).
 }
 
 void HandleState::waitInnerIdle(std::chrono::milliseconds max) {
@@ -716,7 +737,7 @@ void HandleState::waitInnerIdle(std::chrono::milliseconds max) {
   innerCv.wait_for(lk, max, [this] { return innerOps == 0; });
 }
 
-void HandleState::shutdownInner() {
+void HandleState::shutdownInner(bool leak) {
   std::unique_ptr<XrdCl::File> dead;
   {
     std::unique_lock<std::mutex> lk(mu);
@@ -725,11 +746,13 @@ void HandleState::shutdownInner() {
     inner = nullptr;
     dead = std::move(innerOwned);
   }
+  if (leak)
+    (void)dead.release();
   // `dead`'s File dtor (a synchronous Close) runs here with mu released —
   // matching the old by-value member, destroyed after shutdownInner unlocked.
 }
 
-XrdCl::File* HandleState::resetInner() {
+XrdCl::File* HandleState::resetInner(bool leakOld) {
   // Swap the terminally-failed inner file for a fresh one — a failed open is
   // terminal on the object, so retry needs a new File.
   // Precondition innerOps == 0: no legitimate inner op is in flight before the
@@ -743,7 +766,14 @@ XrdCl::File* HandleState::resetInner() {
     inner = innerOwned.get();
     fresh = inner;
   }
+  if (leakOld)
+    (void)dead.release(); // the parent's file, which calls without the lock may still use
   return fresh; // `dead` (terminal Error — its Close is a no-op) destroyed here
+}
+
+bool HandleState::reopenPending() {
+  std::lock_guard<std::mutex> g(innerOpenMu);
+  return innerStale;
 }
 
 void HandleState::noteCacheError(const Config& cfg) {
@@ -1408,7 +1438,9 @@ UCacheFile::~UCacheFile() {
   if (e)
     e->flushAll(); // synchronous (covers the no-explicit-Close path)
   emitRelayObs(st_, e);
-  st_->shutdownInner();
+  // A forked child that never opened afresh the file it inherited leaves it
+  // be: it is the parent's, and closing it is not this process's to do.
+  st_->shutdownInner(/*leak=*/st_->reopenPending());
 }
 
 // CPU-span evidence: process user+sys CPU in µs, and a counter of
@@ -1470,9 +1502,7 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
                                      XrdCl::Access::Mode mode, ResponseHandler* handler,
                                      ucache::XrdTimeout timeout) {
   st_->syncFork();
-  resumeAfterFork();
-  if (st_->store)
-    st_->store->ensureOwnIdentity(); // a forked child's first open: its own record
+  childWork(st_); // a forked child's first open: its own record
   st_->cpu0Us = processCpuUs(); // CPU-span start
   const int nowOpen = gOpenUCacheHandles.fetch_add(1) + 1;
   if (nowOpen > 1)
@@ -1509,6 +1539,7 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
       noteCopier(sig, url);
     }
   }
+  st_->reopenInChild = !passthroughOnly_; // before any fork can find it unset
   if (passthroughOnly_ && st_->store) {
     // Start a relayed handle's span at open for the same reason: its cost
     // includes reaching the origin, and a one-read file must still have a span.
@@ -1580,10 +1611,13 @@ uint64_t compactId(const ReplicaView& v) {
   return (static_cast<uint64_t>(crc32c(img.data(), img.size())) << 32) ^ v.virtualSize();
 }
 
+// `inherited`: the handle is one a forked child is setting up again, and says
+// itself what happens when its layout is gone.
 void chooseLayout(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEntry>& entry,
                   const UrlKey& key, const Config& cfg, uint64_t mtime, uint8_t cksumKind,
                   uint32_t cksum, const std::function<std::shared_ptr<ReplicaView>()>& openView,
-                  std::shared_ptr<ReplicaView>& view, std::shared_ptr<ColdFill>& cold) {
+                  std::shared_ptr<ReplicaView>& view, std::shared_ptr<ColdFill>& cold,
+                  bool inherited) {
   // Each pass either settles on a layout this process has not contradicted, or
   // learns which layout another handle settled on meanwhile and follows it.
   for (int pass = 0;; ++pass) {
@@ -1591,7 +1625,7 @@ void chooseLayout(const std::shared_ptr<HandleState>& st, const std::shared_ptr<
     const ShownLayout shown = shownLayout(key.key, hash);
     if (shown == ShownLayout::kSlot) {
       cold = coldAttach(st, entry, key, mtime, cksumKind, cksum, AttachMode::kMatch, hash);
-      if (!cold)
+      if (!cold && !inherited)
         UCACHE_WARN("%s was shown in a slot layout earlier in this process and that layout is "
                     "gone; it is served as stored, and offsets read from the layout fail",
                     key.key.c_str());
@@ -1601,7 +1635,7 @@ void chooseLayout(const std::shared_ptr<HandleState>& st, const std::shared_ptr<
       std::shared_ptr<ReplicaView> v = openView();
       if (v && compactId(*v) == hash)
         view = std::move(v);
-      else
+      else if (!inherited)
         UCACHE_WARN("%s was shown as a replica earlier in this process and that replica is "
                     "gone or rebuilt; it is served as stored, and offsets read from the "
                     "replica fail",
@@ -1693,6 +1727,15 @@ XrdCl::XRootDStatus refuseCopy(const std::shared_ptr<HandleState>& st) {
   return XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errNotSupported, 0, msg);
 }
 
+// A read through an inherited handle whose layout is gone (ensureEntry).
+XrdCl::XRootDStatus lostLayoutError(const std::shared_ptr<HandleState>& st) {
+  const std::string where = st->url.substr(0, st->url.find('?'));
+  return XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errInvalidOp, 0,
+                             "uCache: " + where +
+                                 " was shown in a layout that is gone since this process was "
+                                 "forked; open the file again");
+}
+
 bool guardAllowsChunks(const std::shared_ptr<HandleState>& st, uint64_t originSize,
                        uint64_t shownSize, const XrdCl::ChunkList& chunks) {
   std::vector<CopyGuard::Range> r;
@@ -1720,7 +1763,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
     if (st_->setupDone)
       return (st_->closed || st_->tripped) ? nullptr : st_->entry;
   }
-  resumeAfterFork(); // a handle a forked child inherited sets up again here
+  childWork(st_); // a handle a forked child inherited sets up again here
   const uint64_t setupT0 = nowUs(); // entry-setup span (sidecar load,
                                     // validation, view adoption) — the per-open
                                     // cost 65k opens multiply on a slow disk
@@ -1784,7 +1827,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
           };
 #ifdef UCACHE_HAVE_COLDRUN
           chooseLayout(st_, entry, *key, cfg, meta->originMtime, meta->cksumKind,
-                       meta->originCksum, openView, view, cold);
+                       meta->originCksum, openView, view, cold, forkLayout != ForkLayout::kNone);
 #else
           view = openView();
 #endif
@@ -1851,7 +1894,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
         auto openView = [&] { return rs.openView(*key, si->GetSize(), si->GetModTime()); };
 #ifdef UCACHE_HAVE_COLDRUN
         chooseLayout(st_, entry, *key, cfg, si->GetModTime(), MetaData::kCksumNone, 0, openView,
-                     view, cold);
+                     view, cold, forkLayout != ForkLayout::kNone);
 #else
         view = openView();
 #endif
@@ -1878,6 +1921,20 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
     st_->store->stats().copierHandles.fetch_add(1, std::memory_order_relaxed);
     noteCopier(CopySignal::kWholeFile, st_->url);
   }
+  // A handle a forked child inherited whose layout cannot be had again (the
+  // replica or slot store was removed, or rebuilt differently, and the cache
+  // cannot take the file back): its reader holds offsets into that layout,
+  // and the file as stored would give other bytes at some of them. Every read
+  // fails instead.
+  const bool lost =
+      (forkLayout == ForkLayout::kView || forkLayout == ForkLayout::kCold) && !view && !cold;
+  if (lost) {
+    UCACHE_WARN("%s was shown in a layout of the cache's before this process was forked, and "
+                "that layout is gone: reads through the handle the process inherited fail; "
+                "open the file again",
+                key ? key->key.c_str() : st_->url.c_str());
+    entry.reset();
+  }
   if (st_->store) {
     auto& stats = st_->store->stats();
     stats.openUs.add(nowUs() - setupT0);
@@ -1892,6 +1949,8 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
     st_->statInfo = std::move(statClone);
     st_->forkLayout = ForkLayout::kNone; // set up in this process now
     st_->keptView.reset();
+    if (lost)
+      st_->layoutLost.store(true, std::memory_order_release);
     if (!st_->closed && !st_->tripped) {
       st_->entry = entry;
 #ifdef UCACHE_HAVE_COLDRUN
@@ -1980,8 +2039,10 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
   // bounded wait for what was already sent.
   st_->waitInnerIdle(std::chrono::seconds(10));
   // A trusted cache-only handle that never hit a miss never opened the origin;
-  // there is nothing to close remotely (UCACHE_REVALIDATE_S).
-  if (!st_->inner->IsOpen()) {
+  // there is nothing to close remotely (UCACHE_REVALIDATE_S). Nor has a forked
+  // child that never opened afresh the handle it inherited: that file is the
+  // parent's.
+  if (st_->reopenPending() || !st_->inner->IsOpen()) {
     if (handler)
       complete(handler, okStatus(), nullptr);
     return XRootDStatus();
@@ -2018,8 +2079,10 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
   // reading, and a transposed entry must report the stitched size from the
   // very first answer -- forced or not, and for a handle a forked child is
   // setting up again as much as for a new one.
-  if (st_->inner->IsOpen() || cacheOpen_)
+  if (st_->inner->IsOpen() || cacheOpen_ || st_->reopenPending())
     ensureEntry();
+  if (st_->layoutLost.load(std::memory_order_acquire))
+    return lostLayoutError(st_);
   if (!force) {
     std::lock_guard<std::mutex> g(st_->mu);
     // Serve from validated metadata: only once the entry is
@@ -2053,6 +2116,8 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
         delete this;
       }
     };
+    if (st_->reopenPending() && !st_->ensureInnerOpen())
+      return st_->missError(); // an inherited handle opens the origin afresh first
     auto* relay = new SizeRelay;
     relay->user = handler;
     relay->vsize = vsize;
@@ -2061,6 +2126,8 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
       delete relay;
     return s;
   }
+  if (st_->reopenPending() && !st_->ensureInnerOpen())
+    return st_->missError();
   return st_->inner->Stat(force, handler, timeout);
 }
 
@@ -2069,6 +2136,8 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
   st_->syncFork();
   const std::pair<uint64_t, uint64_t> req{offset, size};
   auto entry = ensureEntry(st_->opsSeen.exchange(true) ? nullptr : &req);
+  if (!entry && st_->layoutLost.load(std::memory_order_acquire))
+    return lostLayoutError(st_);
   if (entry)
     noteRequestBytes(st_, size);
   // ONE sample of the view, used for both. Taking it twice is not merely
@@ -2245,6 +2314,8 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
   st_->syncFork();
   const std::pair<uint64_t, uint64_t> req{offset, size};
   auto entry = ensureEntry(st_->opsSeen.exchange(true) ? nullptr : &req);
+  if (!entry && st_->layoutLost.load(std::memory_order_acquire))
+    return lostLayoutError(st_);
   if (entry)
     noteRequestBytes(st_, size); // a stitched PgRead drives the same physical
                                  // reads as Read, so it must be sampled too
@@ -2465,6 +2536,8 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
   st_->syncFork();
   st_->opsSeen.store(true, std::memory_order_relaxed);
   auto entry = ensureEntry();
+  if (!entry && st_->layoutLost.load(std::memory_order_acquire))
+    return lostLayoutError(st_);
   // ONE sample, for the footprint AND the serving decision below. The loop had
   // its own and the decision took another, so a replica published between them
   // recorded the chunks in the original file's coordinates and served them in

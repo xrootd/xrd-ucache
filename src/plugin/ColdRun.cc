@@ -2225,11 +2225,16 @@ void coldForkPrepare() {
     std::lock_guard<std::mutex> g(g_shownMu);
     return new ShownMap(shownMap());
   }();
-  delete g_shownCopy; // the previous fork's; nothing here reads it
   g_shownCopy = copy;
+  // A child's handler may use these; a first use in progress in another thread
+  // at the fork would leave the child waiting on it for good.
+  (void)registry();
 }
 
-void coldForkParent() {}
+void coldForkParent() {
+  delete g_shownCopy; // only a child could need it, and has its own
+  g_shownCopy = nullptr;
+}
 
 void coldAfterForkChild() {
   new (&g_shownMu) std::mutex; // a parent thread may have held it
@@ -2238,6 +2243,8 @@ void coldAfterForkChild() {
     g_shownCopy = nullptr;
     g_shownVersion.fetch_add(1, std::memory_order_acq_rel);
   }
+  delete g_shownCopy; // not needed: the inherited map is whole
+  g_shownCopy = nullptr;
   // Left behind untouched: a ColdFill's destructor would commit, flock and
   // write a store the parent is still using.
   auto* left = new std::unordered_map<std::string, std::shared_ptr<ColdFill>>(); // leaked

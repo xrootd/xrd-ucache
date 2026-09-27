@@ -150,8 +150,12 @@ void scheduleCheckpoint() {
 std::atomic<bool> gResume{false};
 
 void forkPrepare() {
+  // The child's handler reaches these through function-local statics: any
+  // first use another thread has under way is finished before the fork.
+  (void)widthSampler();
 #ifdef UCACHE_HAVE_COLDRUN
   coldForkPrepare(); // copies the shown layouts, lock released on return
+  readRuleBeforeFork();
 #endif
 }
 

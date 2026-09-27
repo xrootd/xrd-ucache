@@ -704,7 +704,8 @@ it.
   and `concurrent.futures` process pools, ROOT's `TProcessExecutor`), fill and
   read the same cache; each keeps its own counters in `ucache stats`. A worker
   reading through a file its parent opened sees the file as the parent was
-  shown it.
+  shown it, or, if that layout was removed since and cannot be had again, gets
+  an error on every read of that file handle (opening the file again works).
 
 ## Configuration
 

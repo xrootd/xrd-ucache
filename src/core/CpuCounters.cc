@@ -5,6 +5,7 @@
 #include <cstring>
 #include <ctime>
 #include <dirent.h>
+#include <fcntl.h>
 #include <new>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -30,7 +31,7 @@ namespace {
 //
 // Kernels before 5.13 have no such bit and reject the attribute outright, so
 // the open is retried without it rather than losing the counters entirely.
-int openCounter(uint64_t config, bool dropOnExec) {
+int openCounter(uint64_t config, bool dropOnExec, int pid) {
   struct perf_event_attr attr;
   ::memset(&attr, 0, sizeof attr);
   attr.type = PERF_TYPE_HARDWARE;
@@ -53,14 +54,45 @@ int openCounter(uint64_t config, bool dropOnExec) {
   (void)dropOnExec;
 #endif
   // CLOEXEC as well: the helper has no use for the descriptor either.
-  const int fd = static_cast<int>(::syscall(SYS_perf_event_open, &attr, /*pid=*/0, /*cpu=*/-1,
+  const int fd = static_cast<int>(::syscall(SYS_perf_event_open, &attr, pid, /*cpu=*/-1,
                                             /*group=*/-1, PERF_FLAG_FD_CLOEXEC));
   return fd; // < 0 simply means "not permitted here"
 }
 
-int openCounter(uint64_t config) {
-  const int fd = openCounter(config, /*dropOnExec=*/true);
-  return fd >= 0 ? fd : openCounter(config, /*dropOnExec=*/false);
+// pid 0: the calling thread and every thread started after; a thread id: that
+// thread and every thread it starts after.
+int openCounter(uint64_t config, int pid = 0) {
+  const int fd = openCounter(config, /*dropOnExec=*/true, pid);
+  const int any = fd >= 0 ? fd : openCounter(config, /*dropOnExec=*/false, pid);
+  if (any >= 0)
+    ::ioctl(any, PERF_EVENT_IOC_ENABLE, 0);
+  return any;
+}
+
+// Calls f(tid) for each thread of this process but the calling one. No memory
+// is allocated: this runs in a fork child handler.
+template <typename F> void forOtherThreads(F f) {
+  const int dir = ::open("/proc/self/task", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dir < 0)
+    return;
+  const long self = ::syscall(SYS_gettid);
+  alignas(8) char buf[4096];
+  for (;;) {
+    const long n = ::syscall(SYS_getdents64, dir, buf, sizeof buf);
+    if (n <= 0)
+      break;
+    for (long at = 0; at < n;) {
+      const auto* d = reinterpret_cast<const struct dirent64*>(buf + at);
+      at += d->d_reclen;
+      long tid = 0;
+      const char* c = d->d_name;
+      for (; *c >= '0' && *c <= '9'; ++c)
+        tid = tid * 10 + (*c - '0');
+      if (*c == 0 && tid > 0 && tid != self)
+        f(static_cast<int>(tid));
+    }
+  }
+  ::close(dir);
 }
 
 uint64_t readCounter(int fd) {
@@ -76,33 +108,54 @@ uint64_t readCounter(int fd) {
 CpuCounters::CpuCounters() {
   insFd_ = openCounter(PERF_COUNT_HW_INSTRUCTIONS);
   cycFd_ = openCounter(PERF_COUNT_HW_CPU_CYCLES);
-  if (insFd_ >= 0)
-    ::ioctl(insFd_, PERF_EVENT_IOC_ENABLE, 0);
-  if (cycFd_ >= 0)
-    ::ioctl(cycFd_, PERF_EVENT_IOC_ENABLE, 0);
 }
 
-CpuCounters::~CpuCounters() {
+void CpuCounters::closeAll() {
   if (insFd_ >= 0)
     ::close(insFd_);
   if (cycFd_ >= 0)
     ::close(cycFd_);
+  insFd_ = cycFd_ = -1;
+  for (int i = 0; i < nOther_; ++i) {
+    if (otherIns_[i] >= 0)
+      ::close(otherIns_[i]);
+    if (otherCyc_[i] >= 0)
+      ::close(otherCyc_[i]);
+  }
+  nOther_ = 0;
 }
 
-uint64_t CpuCounters::instructions() const { return readCounter(insFd_); }
-uint64_t CpuCounters::cycles() const { return readCounter(cycFd_); }
+CpuCounters::~CpuCounters() { closeAll(); }
+
+uint64_t CpuCounters::instructions() const {
+  uint64_t v = readCounter(insFd_);
+  for (int i = 0; i < nOther_; ++i)
+    v += readCounter(otherIns_[i]);
+  return v;
+}
+uint64_t CpuCounters::cycles() const {
+  uint64_t v = readCounter(cycFd_);
+  for (int i = 0; i < nOther_; ++i)
+    v += readCounter(otherCyc_[i]);
+  return v;
+}
 
 void CpuCounters::reopen() {
-  if (insFd_ >= 0)
-    ::close(insFd_);
-  if (cycFd_ >= 0)
-    ::close(cycFd_);
+  closeAll();
   insFd_ = openCounter(PERF_COUNT_HW_INSTRUCTIONS);
   cycFd_ = openCounter(PERF_COUNT_HW_CPU_CYCLES);
-  if (insFd_ >= 0)
-    ::ioctl(insFd_, PERF_EVENT_IOC_ENABLE, 0);
-  if (cycFd_ >= 0)
-    ::ioctl(cycFd_, PERF_EVENT_IOC_ENABLE, 0);
+  if (insFd_ < 0 || cycFd_ < 0)
+    return;
+  // Threads the client library's own fork handler started before this one
+  // ran (its I/O threads): each is counted on its own, as in a process that
+  // never forked, where they start after the counters opened.
+  forOtherThreads([this](int tid) {
+    if (nOther_ < kMaxOther) {
+      otherIns_[nOther_] = openCounter(PERF_COUNT_HW_INSTRUCTIONS, tid);
+      otherCyc_[nOther_] = openCounter(PERF_COUNT_HW_CPU_CYCLES, tid);
+      ++nOther_;
+    }
+  });
 }
 
 #else  // not Linux: no perf_event_open, rusage still works

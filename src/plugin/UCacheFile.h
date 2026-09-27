@@ -67,9 +67,12 @@ struct HandleState {
   // are made anew, the counts forgotten, the entry and slot run left behind
   // undestroyed, and the handle is set up again at its next read in the
   // layout it had -- the original, the same compact replica view (kept: its
-  // reads take no lock), or the same slot layout. The inner XrdCl file is
-  // kept: XrdCl recovers it. Nothing is held across fork, and nothing is done
-  // in the fork handler: a parent that never forks pays one atomic load.
+  // reads take no lock), or the same slot layout; if that layout cannot be had
+  // again, every read on the handle fails. A handle the cache serves opens
+  // the origin file afresh at its first need of it (the parent's is left
+  // behind); one that only relays keeps it, and XrdCl recovers it. Nothing is
+  // held across fork, and nothing is done in the fork handler: a parent that
+  // never forks pays one atomic load.
   void syncFork() {
     const uint64_t g = Executor::forkGeneration();
     if (forkGen.load(std::memory_order_acquire) != g)
@@ -79,7 +82,11 @@ struct HandleState {
   std::atomic<uint64_t> forkClaim{Executor::forkGeneration()};
   ForkLayout forkLayout = ForkLayout::kNone;  // under setupMu, then mu
   std::shared_ptr<ReplicaView> keptView;       // with ForkLayout::kView
-  bool innerStale = false; // under innerOpenMu: a lazy open was in flight at the fork
+  bool innerStale = false;    // under innerOpenMu: the inner file is to be opened afresh
+  bool reopenInChild = false; // set at Open: the cache serves this handle
+  // The layout this handle's reader was shown before a fork could not be set
+  // up again in the child: reads fail rather than give other bytes.
+  std::atomic<bool> layoutLost{false};
 
   // Set by the handle's first read or Stat. A handle whose FIRST request reads
   // the whole file at once is a copy (UCacheFile::ensureEntry).
@@ -176,15 +183,18 @@ struct HandleState {
   // next real miss would then inherit are all the wrong trade.
   XrdCl::File* acquireInnerIfOpen();
   void releaseInner();
-  void shutdownInner();
+  void shutdownInner(bool leak = false); // leak: the file is not destroyed
   // Wait, up to `max`, for the cache's own requests on the inner file to
   // finish. Close must do this: XrdCl refuses to close a file with requests
   // in flight, and read-ahead's are not the application's to lose a close
   // over. Bounded, because a hung origin request must not hang a close.
   void waitInnerIdle(std::chrono::milliseconds max);
   // Destroy the terminally-failed inner file and install a fresh one; returns
-  // the new raw pointer. Retry only; precondition innerOps==0.
-  XrdCl::File* resetInner();
+  // the new raw pointer. Retry only; precondition innerOps==0. `leakOld`: the
+  // old file is not destroyed (a forked child's inherited one).
+  XrdCl::File* resetInner(bool leakOld = false);
+  // A forked child has yet to open this handle's origin file afresh.
+  bool reopenPending();
 
   // Async page-persist accounting. Persists are posted off the read path
   // (§5.2 step 4), but Close/destruction must wait for them so short-lived

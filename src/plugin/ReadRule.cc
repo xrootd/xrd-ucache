@@ -49,6 +49,15 @@ std::atomic<bool> g_warned{false};
 
 } // namespace
 
+void readRuleBeforeFork() {
+  // The child's handler uses these: a first use in progress in another thread
+  // at the fork would leave the child waiting on it for good.
+  (void)regMu();
+  (void)registry();
+  (void)mapsMu();
+  (void)maps();
+}
+
 void readRuleAfterForkChild() {
   // Moved aside untouched: a parent thread may have been changing them.
   auto* rules = new std::unordered_map<std::string, std::shared_ptr<ReadRule>>(); // leaked

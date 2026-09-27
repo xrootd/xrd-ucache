@@ -50,8 +50,10 @@ class CpuCounters {
   // Close and open the counters again, counting from now. A forked child's
   // descriptors are copies of the parent's and read the PARENT's event, so a
   // child that keeps a record of its own opens its own -- before it starts any
-  // thread, since a counter follows only threads started after it opened.
-  // Two system calls each, no lock: safe in a fork child handler.
+  // thread, since a counter follows only threads started after it opened; the
+  // threads already running (the client library's, started by its own fork
+  // handler) get a counter each. System calls only, no lock and no
+  // allocation: safe in a fork child handler.
   void reopen();
 
   // Process CPU time (user+system) in microseconds, from getrusage. Always
@@ -65,8 +67,14 @@ class CpuCounters {
   static uint64_t liveThreads();
 
  private:
+  void closeAll();
+
+  static constexpr int kMaxOther = 64;
   int insFd_ = -1;
   int cycFd_ = -1;
+  int otherIns_[kMaxOther];
+  int otherCyc_[kMaxOther];
+  int nOther_ = 0; // written only by reopen (a fork child, one thread)
 };
 
 // How wide a run COULD go, measured rather than declared.

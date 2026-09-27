@@ -128,6 +128,7 @@ void CacheStore::afterForkChild() {
   left->seen.swap(seenKeys_);
   left->sink = std::move(obsSink_);
   left->tracer = std::move(tracer_);
+  new (&statsPath_) std::string; // the parent's (or half-written) name, left behind
   new (&stats_) Stats(); // this process's counters start at zero; no tracer
   cpu_.reopen();         // now, before the child starts a thread of its own
   forkStale_.store(true, std::memory_order_release);

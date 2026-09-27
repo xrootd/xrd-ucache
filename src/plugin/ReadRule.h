@@ -80,8 +80,11 @@ class ReadRule : public std::enable_shared_from_this<ReadRule> {
 bool readRuleDirect(const std::string& key);
 
 // fork(): a child decides afresh for every file (a decision costs at most a
-// few early fills, and the bytes read are the same). Called from the plugin's
-// fork child handler only (single-threaded, no I/O, no thread).
+// few early fills, and the bytes read are the same). Before is called from the
+// plugin's fork prepare handler (it finishes any first use of the registry
+// under way), after from its child handler (single-threaded, no I/O, no
+// thread).
+void readRuleBeforeFork();
 void readRuleAfterForkChild();
 
 } // namespace ucache

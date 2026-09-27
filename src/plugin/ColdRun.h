@@ -96,7 +96,7 @@ void coldCheckpoint();
 // in flight -- was the parent's, and the child starts without it. Prepare
 // copies the shown layouts (under their lock, released before it returns: no
 // lock is held across fork); the child keeps the map it inherited, or that
-// copy if the map was being changed at the fork. The child call runs in the
+// copy if the map was being changed at the fork, and the parent drops it. The child call runs in the
 // plugin's fork child handler (single-threaded, no I/O, no thread).
 void coldForkPrepare();
 void coldForkParent();
