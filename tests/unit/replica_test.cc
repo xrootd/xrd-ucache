@@ -10,12 +10,14 @@
 #include "CacheStore.h"
 #include "TestUtil.h"
 #include "testing/FaultIO.h"
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #include <utime.h>
 
@@ -218,7 +220,11 @@ TEST(ReplicaStoreFailOpen, TdataCorruptionCaughtAtOpen) {
   ASSERT_EQ(f.rs->publish(key(), sampleMeta(1 << 20, overlay.size()), overlay.data(),
                           overlay.size()),
             0);
-  // Flip one byte in the middle overlay page.
+  // Flip one byte in the middle overlay page, as a later write would: past the
+  // file-time tick, so the verify-once marker (size and modification time)
+  // stops matching. A flip within the tick of the publish leaves the time as
+  // recorded, and open trusts the marker; the per-read checks catch it then.
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
   const std::string dPath = ReplicaStore::tdataPath(key(), f.cfg.cacheDir);
   int fd = ::open(dPath.c_str(), O_RDWR);
   ASSERT_GE(fd, 0);
