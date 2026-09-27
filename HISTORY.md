@@ -11,6 +11,17 @@ Recompression stays off unless you turn it on. Nothing is published unless you
 run `ucache publish`. Any XRootD 5.6 or newer 5.x client works; 6.x from
 v0.21.0.
 
+### v1.3.1 — 2026-09-27
+- `ucache summary` and `ucache history` show the gain after a first run over
+  an empty cache and a second run; a separate run with the cache off is no
+  longer needed.
+- `ucache recompress` uses all cores by default (`--jobs N` to use fewer).
+- Bug fixes:
+  - Python process pools (`multiprocessing`, `concurrent.futures`) work with
+    uCache.
+  - Copying a recompressed file with fsspec or your own script gives the
+    original file, or an error telling you to copy with the cache off.
+
 ## v1.3.0 — 2026-09-26
 - With `recompress = on`, a file's replica is built while it is first read; no
   separate `ucache recompress` pass is needed.
