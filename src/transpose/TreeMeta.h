@@ -47,6 +47,13 @@ std::optional<KeyInfo> parseKey(const uint8_t* p, size_t n, uint64_t off);
 // exactly `objlen` bytes; empty vector on failure or unknown frames.
 std::vector<uint8_t> decompressFrames(const uint8_t* payload, size_t n, uint64_t objlen);
 
+// The codec a ROOT compression block names in the first two bytes of its
+// 9-byte header: "zlib" (ZL), "lzma" (XZ), "zstd" (ZS) or "lz4" (L4). "" for
+// anything else, the old ROOT algorithm (CS) included, which is not decoded
+// here, and for fewer than 9 bytes. The one reading of these bytes, so that
+// every place that asks what a basket or page holds gets the same answer.
+std::string blockCodec(const uint8_t* p, size_t n);
+
 // The TFile container level: header geometry, root directory, keys list. This
 // is shared by every payload type — a TTree and an RNTuple differ only in the
 // class of the key they hang off, so the walk to the keys list is identical
@@ -105,6 +112,10 @@ struct BranchInfo {
   // changes basket lengths patches it; the offset is into the decompressed blob.
   int64_t zipBytes = 0;
   uint64_t zipBytesOff = 0;
+  // fTotBytes: the same sum before compression. Below it, fZipBytes says from
+  // the metadata alone that some of the branch's baskets are compressed --
+  // whatever the setting above claims (see blockCodec).
+  int64_t totBytes = 0;
   // fFileName is set: the baskets live in another file, so their seeks mean
   // nothing in this one and nothing may relocate them.
   bool externalFile = false;

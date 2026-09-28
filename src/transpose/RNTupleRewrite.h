@@ -112,9 +112,13 @@ RNTupleRewrite buildRNTupleRewriteFromPages(
 inline constexpr uint32_t kSlotChecksumBytes = 8;
 void sealDecodedPage(const uint8_t* page, size_t n, uint8_t out[kSlotChecksumBytes]);
 
+//
+// A column range is relocated when its codec (rangeCodec, with `unnamedCodec`
+// from unnamedRNTupleCodec) is in `codecs`.
 FillLayout layoutForRNTupleFill(const RNTupleMeta& m, uint64_t fileSize,
                                 const std::vector<uint8_t>& header,
-                                const std::vector<std::string>& codecs);
+                                const std::vector<std::string>& codecs,
+                                const std::string& unnamedCodec = "");
 
 // One page prepared for a cold run from its ORIGINAL on-disk bytes (block, plus
 // the 8-byte checksum when it carries one): `raw` = the decoded page, what the
@@ -129,8 +133,25 @@ ConvertedPage convertPage(const uint8_t* onDisk, size_t n, uint32_t nbytes, bool
                           uint64_t uncompressed);
 
 // Codec name for a page-list compression setting ("lzma"/"zlib"/"zstd"/"lz4"/
-// "none"), the same vocabulary the recompress policy is written in.
+// "none"), the same vocabulary the recompress policy is written in. "" for a
+// setting that names no codec: an unknown algorithm, or algorithm 0 above
+// level 0 -- "the global default", which `hadd -f1` and SetCompression(1)
+// record while the pages are compressed with whatever that default was.
 std::string rnTupleCodecName(int32_t compressionSettings);
+
+// The codec the pages of a file's UNNAMED column ranges are stored in: ranges
+// whose setting names no codec (rnTupleCodecName gives "") while the page list
+// shows compressed pages (stored smaller than they decode). Named by the block
+// header of ONE such page read through `src` -- the first one `src` has -- so a
+// file whose settings name their codecs reads nothing here. `codec` = "" when
+// there is no such page, or it names no codec converted here. False only when
+// a read failed: nothing is decided then.
+bool unnamedRNTupleCodec(const RNTupleMeta& m, Source& src, std::string& codec);
+
+// A range's codec: the one its setting names; for an unnamed range with
+// compressed pages, `unnamedCodec`; "none" for one whose pages are stored
+// uncompressed.
+std::string rangeCodec(const ColumnRange& r, const std::string& unnamedCodec);
 
 // Apply a rewrite to a copy of `srcPath`, producing a standalone file. This is
 // the verification path: the arbiter for any change here is whether ROOT reads

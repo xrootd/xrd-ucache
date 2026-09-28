@@ -196,6 +196,20 @@ std::optional<KeyInfo> parseKey(const uint8_t* p, size_t n, uint64_t off) {
   return o;
 }
 
+std::string blockCodec(const uint8_t* p, size_t n) {
+  if (n < 9)
+    return "";
+  if (p[0] == 'X' && p[1] == 'Z')
+    return "lzma";
+  if (p[0] == 'Z' && p[1] == 'L')
+    return "zlib";
+  if (p[0] == 'Z' && p[1] == 'S')
+    return "zstd";
+  if (p[0] == 'L' && p[1] == '4')
+    return "lz4";
+  return "";
+}
+
 std::vector<uint8_t> decompressFrames(const uint8_t* payload, size_t n, uint64_t objlen) {
   std::vector<uint8_t> out;
   // objlen is attacker-influenceable: cap the upfront reservation (growth past
@@ -360,6 +374,7 @@ bool parseBranch(Cur& c, FileMeta& fm,
     return false;
   b.zipBytesOff = c.at - 8;
   b.zipBytes = beGet<int64_t>(c.p + c.at - 8);
+  b.totBytes = beGet<int64_t>(c.p + c.at - 16);
   if (!objArray(c, classRefs, "fBranches(sub)", [&](const AnyObj&) {
         c.fail_ = true;
         c.why = "sub-branches unsupported (flat trees only)";

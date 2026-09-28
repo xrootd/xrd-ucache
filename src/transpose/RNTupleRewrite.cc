@@ -16,6 +16,41 @@
 namespace ucache::transpose {
 namespace {
 
+// Some page of the range is stored smaller than it decodes: compressed.
+bool hasCompressedPage(const ColumnRange& r) {
+  for (const auto& pg : r.pages)
+    if (pg.nbytes < pg.uncompressedBytes) return true;
+  return false;
+}
+
+} // namespace
+
+std::string rangeCodec(const ColumnRange& r, const std::string& unnamedCodec) {
+  const std::string named = rnTupleCodecName(r.compressionSettings);
+  if (!named.empty()) return named;
+  return hasCompressedPage(r) ? unnamedCodec : "none";
+}
+
+bool unnamedRNTupleCodec(const RNTupleMeta& m, Source& src, std::string& codec) {
+  codec.clear();
+  if (!m.error.empty()) return true;
+  for (const auto& r : m.ranges) {
+    if (!rnTupleCodecName(r.compressionSettings).empty()) continue;
+    for (const auto& pg : r.pages) {
+      if (pg.nbytes >= pg.uncompressedBytes || pg.nbytes < 9 || pg.offset < 100 ||
+          !src.has(pg.offset, 9))
+        continue;
+      uint8_t head[9];
+      if (!src.read(head, sizeof head, pg.offset)) return false;
+      codec = blockCodec(head, sizeof head);
+      return true;
+    }
+  }
+  return true;
+}
+
+namespace {
+
 void putLE(uint8_t* p, uint64_t v, size_t bytes) {
   for (size_t i = 0; i < bytes; ++i) p[i] = (uint8_t)((v >> (8 * i)) & 0xFF);
 }
@@ -65,8 +100,9 @@ uint64_t appendBlob(std::vector<uint8_t>& ext, uint64_t extBase, const std::vect
 } // namespace
 
 std::string rnTupleCodecName(int32_t compressionSettings) {
+  if (compressionSettings < 0) return "";
   switch (compressionSettings / 100) {
-    case 0: return "none";
+    case 0: return compressionSettings % 100 == 0 ? "none" : ""; // else: the global default
     case 1: return "zlib";
     case 2: return "lzma";
     case 4: return "lz4";
@@ -292,9 +328,16 @@ RNTupleRewrite buildImpl(const RNTupleMeta& m, uint64_t fileSize, int level,
 RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t fileSize, int level,
                                    const std::vector<std::string>& codecs) {
   std::vector<uint8_t> raw, buf;
+  // Asked once, and only when a range's setting names no codec.
+  std::string unnamed;
+  bool unnamedAsked = false;
   EligibleFn eligible = [&](size_t, const ColumnRange& range, std::string& codecOut) {
     if (!codecs.empty()) {
-      const std::string codec = rnTupleCodecName(range.compressionSettings);
+      if (!unnamedAsked && rnTupleCodecName(range.compressionSettings).empty()) {
+        unnamedAsked = true;
+        if (!unnamedRNTupleCodec(m, src, unnamed)) return 2; // unreadable now: not a verdict
+      }
+      const std::string codec = rangeCodec(range, unnamed);
       if (std::find(codecs.begin(), codecs.end(), codec) == codecs.end()) {
         codecOut = codec;
         return 1;
@@ -407,11 +450,13 @@ RNTupleRewrite buildRNTupleRewriteFromPages(
 
 FillLayout layoutForRNTupleFill(const RNTupleMeta& m, uint64_t fileSize,
                                 const std::vector<uint8_t>& header,
-                                const std::vector<std::string>& codecs) {
+                                const std::vector<std::string>& codecs,
+                                const std::string& unnamedCodec) {
   FillLayout L;
-  auto decline = [&](std::string why) {
+  auto decline = [&](std::string why, bool forCodec = false) {
     L = FillLayout();
     L.error = std::move(why);
+    L.codecDecline = forCodec;
     return L;
   };
   if (!m.error.empty()) return decline("parse: " + m.error);
@@ -422,16 +467,43 @@ FillLayout layoutForRNTupleFill(const RNTupleMeta& m, uint64_t fileSize,
   if (m.anchor.payloadLength < 78) return decline("anchor payload too short to patch");
   if (m.anchor.payloadOffset + 78 > fileSize) return decline("anchor outside the file");
 
+  std::vector<std::string> unlisted; // codecs seen and not listed, for the decline
+  bool unconverted = false;          // compressed in a codec named nowhere
+  bool anyListed = false;            // else a decline is for the codec alone
   for (uint32_t ri = 0; ri < m.ranges.size(); ++ri) {
     const auto& r = m.ranges[ri];
-    const std::string codec = rnTupleCodecName(r.compressionSettings);
-    if (r.pages.empty() || std::find(codecs.begin(), codecs.end(), codec) == codecs.end())
+    if (r.pages.empty()) continue;
+    const std::string codec = rangeCodec(r, unnamedCodec);
+    if (std::find(codecs.begin(), codecs.end(), codec) == codecs.end()) {
+      if (codec.empty())
+        unconverted = true;
+      else if (std::find(unlisted.begin(), unlisted.end(), codec) == unlisted.end())
+        unlisted.push_back(codec);
       continue;
+    }
+    anyListed = true;
     bool ok = true;
     for (const auto& pg : r.pages)
       ok = ok && pg.uncompressedBytes > 0 && pg.uncompressedBytes <= 0x7FFFFFFFull &&
            pg.offset + pg.nbytes + (pg.hasChecksum ? 8 : 0) <= fileSize && pg.offset >= 100;
     if (ok) L.relocated.push_back(ri);
+  }
+  if (L.relocated.empty() && !anyListed) {
+    std::string seen, list; // the compressed codecs: "none" is said on its own below
+    for (const auto& c : unlisted)
+      if (c != "none") seen += (seen.empty() ? "" : ", ") + c;
+    for (const auto& c : codecs) list += (list.empty() ? "" : ",") + c;
+    if (!seen.empty())
+      return decline("no convertible column range: its pages are " + seen +
+                         ", which recompress_codecs (" + (list.empty() ? "empty" : list) +
+                         ") does not name",
+                     true);
+    if (unconverted)
+      return decline("no convertible column range: its pages are compressed in a codec that is "
+                     "not converted",
+                     true);
+    if (!unlisted.empty())
+      return decline("no convertible column range: its pages are stored uncompressed", true);
   }
   if (L.relocated.empty()) return decline("no convertible column range");
 

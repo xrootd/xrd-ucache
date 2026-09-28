@@ -32,6 +32,14 @@ bool writeAll(int fd, const void* src, size_t n) {
   }
   return true;
 }
+// The file itself, as the layout's one basket or page read sees it.
+struct FdSource : ucache::transpose::Source {
+  int fd = -1;
+  uint64_t size = 0;
+  bool has(uint64_t off, uint64_t n) override { return off + n >= off && off + n <= size; }
+  bool read(void* dst, uint64_t n, uint64_t off) override { return preadAll(fd, dst, n, off); }
+};
+
 bool writeZeros(int fd, uint64_t n) {
   static const std::vector<uint8_t> z(1 << 20, 0);
   while (n) {
@@ -56,7 +64,15 @@ int rntupleMain(const char* inPath, const char* outPath, const std::vector<std::
     std::fprintf(stderr, "cannot read %s\n", inPath);
     return 1;
   }
-  FillLayout L = layoutForRNTupleFill(m, m.fileSize, header, codecs);
+  FdSource src;
+  src.fd = in;
+  src.size = m.fileSize;
+  std::string unnamed;
+  if (!unnamedRNTupleCodec(m, src, unnamed)) {
+    std::fprintf(stderr, "cannot read a page of %s\n", inPath);
+    return 1;
+  }
+  FillLayout L = layoutForRNTupleFill(m, m.fileSize, header, codecs, unnamed);
   if (!L.error.empty()) {
     std::fprintf(stderr, "declined: %s\n", L.error.c_str());
     return 3;
@@ -171,7 +187,16 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "short read on keys list\n");
     return 1;
   }
-  FillLayout L = layoutForFill(fm, (uint64_t)st.st_size, header, treeKeyHeader, kl, codecs, k);
+  FdSource src;
+  src.fd = in;
+  src.size = (uint64_t)st.st_size;
+  std::string unnamed;
+  if (!unnamedSettingCodec(fm, header, src, unnamed)) {
+    std::fprintf(stderr, "cannot read a basket of %s\n", argv[1]);
+    return 1;
+  }
+  FillLayout L =
+      layoutForFill(fm, (uint64_t)st.st_size, header, treeKeyHeader, kl, codecs, k, unnamed);
   const double setupMs =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   if (!L.error.empty()) {

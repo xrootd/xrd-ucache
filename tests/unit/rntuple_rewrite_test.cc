@@ -423,10 +423,113 @@ TEST(RNTupleFill, Declines) {
   ASSERT_TRUE(m.error.empty()) << m.error;
   const auto orig = slurp(fixture());
   const std::vector<uint8_t> header(orig.begin(), orig.begin() + 100);
-  EXPECT_FALSE(layoutForRNTupleFill(m, m.fileSize, header, {"lz4"}).error.empty());
-  EXPECT_FALSE(layoutForRNTupleFill(m, m.fileSize + 1, header,
-                                    {rnTupleCodecName(m.ranges[0].compressionSettings)})
-                   .error.empty());
+  FillLayout unlisted = layoutForRNTupleFill(m, m.fileSize, header, {"lz4"});
+  EXPECT_NE(unlisted.error.find("its pages are zstd"), std::string::npos) << unlisted.error;
+  EXPECT_TRUE(unlisted.codecDecline);
+  FillLayout past = layoutForRNTupleFill(m, m.fileSize + 1, header,
+                                         {rnTupleCodecName(m.ranges[0].compressionSettings)});
+  EXPECT_FALSE(past.error.empty());
+  EXPECT_FALSE(past.codecDecline);
+}
+
+// A compression setting that names no codec: `hadd -f1` records setting 1 --
+// algorithm 0, "the global default" -- on every column range of the merged
+// file, and the pages are ZLIB. The committed fixture is exactly that: two
+// copies of make_rntuple_fixture.C's tree written with 101, merged with
+// `hadd -f1 rntuple_unnamed_codec_fixture.root in.root in.root`.
+namespace {
+std::string unnamedFixture() {
+  return std::string(UCACHE_TEST_DATA_DIR) + "/rntuple_unnamed_codec_fixture.root";
+}
+struct CountingFileSource : FileSource {
+  using FileSource::FileSource;
+  int reads = 0;
+  bool read(void* dst, uint64_t n, uint64_t off) override {
+    ++reads;
+    return FileSource::read(dst, n, off);
+  }
+};
+} // namespace
+
+TEST(RNTupleFill, UnnamedSettingTakesThePagesCodec) {
+  EXPECT_EQ(rnTupleCodecName(0), "none");
+  EXPECT_EQ(rnTupleCodecName(1), ""); // the global default: named by the pages
+  EXPECT_EQ(rnTupleCodecName(505), "zstd");
+
+  RNTupleMeta m = parseRNTuple(unnamedFixture(), "");
+  ASSERT_TRUE(m.error.empty()) << m.error;
+  ASSERT_FALSE(m.ranges.empty());
+  size_t compressed = 0;
+  for (const auto& r : m.ranges) {
+    EXPECT_EQ(r.compressionSettings, 1);
+    for (const auto& pg : r.pages) compressed += pg.nbytes < pg.uncompressedBytes;
+  }
+  ASSERT_GT(compressed, 0u) << "the fixture's pages are compressed";
+  const auto orig = slurp(unnamedFixture());
+  const std::vector<uint8_t> header(orig.begin(), orig.begin() + 100);
+
+  int fd = ::open(unnamedFixture().c_str(), O_RDONLY | O_CLOEXEC);
+  ASSERT_GE(fd, 0);
+  CountingFileSource src(fd, m.fileSize);
+  std::string codec;
+  ASSERT_TRUE(unnamedRNTupleCodec(m, src, codec));
+  EXPECT_EQ(codec, "zlib");
+  EXPECT_EQ(src.reads, 1);
+
+  // The first pass converts the file...
+  FillLayout L = layoutForRNTupleFill(m, m.fileSize, header, {"lzma", "zlib"}, codec);
+  ASSERT_TRUE(L.error.empty()) << L.error;
+  EXPECT_EQ(L.relocated.size(), m.ranges.size());
+  for (const auto& s : L.slots) { // every page decodes into its slot
+    const auto& pg = m.ranges[s.branch].pages[s.basket];
+    ConvertedPage c = convertPage(orig.data() + s.origSeek, s.origLen, pg.nbytes, pg.hasChecksum,
+                                  pg.uncompressedBytes);
+    ASSERT_TRUE(c.error.empty()) << c.error;
+  }
+  // ...keeps recompress_codecs' meaning...
+  FillLayout unlisted = layoutForRNTupleFill(m, m.fileSize, header, {"lzma"}, codec);
+  EXPECT_NE(unlisted.error.find("its pages are zlib"), std::string::npos) << unlisted.error;
+  EXPECT_TRUE(unlisted.codecDecline);
+  // ...and without the pages' codec it would decline the file whole.
+  FillLayout blind = layoutForRNTupleFill(m, m.fileSize, header, {"lzma", "zlib"});
+  EXPECT_NE(blind.error.find("not converted"), std::string::npos) << blind.error;
+
+  // A sweep decides the same.
+  RNTupleRewrite rw = buildRNTupleRewrite(m, src, m.fileSize, 1, {"lzma", "zlib"});
+  ASSERT_TRUE(rw.error.empty()) << rw.error;
+  EXPECT_EQ(rw.rangesRelocated, m.ranges.size());
+  RNTupleRewrite no = buildRNTupleRewrite(m, src, m.fileSize, 1, {"lzma"});
+  EXPECT_EQ(no.rangesRelocated, 0u);
+  EXPECT_EQ(no.declinedCodec, "zlib");
+  ::close(fd);
+
+  // A range whose pages are all stored as they are is "none", whatever codec
+  // the file's other pages are in.
+  ColumnRange raw;
+  raw.compressionSettings = 1;
+  PageInfo pg;
+  pg.nbytes = 64;
+  pg.uncompressedBytes = 64;
+  raw.pages.push_back(pg);
+  EXPECT_EQ(rangeCodec(raw, "zlib"), "none");
+  raw.pages[0].nbytes = 40;
+  EXPECT_EQ(rangeCodec(raw, "zlib"), "zlib");
+  raw.compressionSettings = 207;
+  EXPECT_EQ(rangeCodec(raw, "zlib"), "lzma"); // a named setting is taken as it is
+}
+
+// A file whose settings name their codecs reads nothing for this.
+TEST(RNTupleFill, NamedSettingsReadNothing) {
+  RNTupleMeta m = parseRNTuple(fixture(), "");
+  ASSERT_TRUE(m.error.empty()) << m.error;
+  int fd = ::open(fixture().c_str(), O_RDONLY | O_CLOEXEC);
+  ASSERT_GE(fd, 0);
+  CountingFileSource src(fd, m.fileSize);
+  std::string codec = "x";
+  ASSERT_TRUE(unnamedRNTupleCodec(m, src, codec));
+  EXPECT_EQ(codec, "");
+  EXPECT_EQ(src.reads, 0);
+  ::close(fd);
 }
 
 // ---------------------------------------------------------------------------

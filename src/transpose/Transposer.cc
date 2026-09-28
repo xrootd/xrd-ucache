@@ -254,16 +254,7 @@ std::string branchCodec(const FileMeta& fm, const BranchInfo& b, Source& src) {
   // Uncompressed basket: payload == object bytes.
   if (static_cast<uint64_t>(k->objlen) + k->keylen == static_cast<uint64_t>(k->nbytes))
     return "none";
-  const char m0 = static_cast<char>(head[k->keylen]), m1 = static_cast<char>(head[k->keylen + 1]);
-  if (m0 == 'X' && m1 == 'Z')
-    return "lzma";
-  if (m0 == 'Z' && m1 == 'L')
-    return "zlib";
-  if (m0 == 'Z' && m1 == 'S')
-    return "zstd";
-  if (m0 == 'L' && m1 == '4')
-    return "lz4";
-  return "";
+  return blockCodec(head + k->keylen, static_cast<size_t>(want - k->keylen));
 }
 
 uint64_t hotUncompressedBytes(const FileMeta& fm, const std::vector<std::string>& hot,

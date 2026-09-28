@@ -50,15 +50,30 @@ bool putKeySeek(uint8_t* rec, uint16_t ver, int64_t seek) {
   return true;
 }
 
-// The frame header names the codec a payload was actually written with.
-std::string frameCodec(const uint8_t* p, size_t n) {
-  if (n < 9)
-    return "";
-  if (p[0] == 'X' && p[1] == 'Z') return "lzma";
-  if (p[0] == 'Z' && p[1] == 'L') return "zlib";
-  if (p[0] == 'Z' && p[1] == 'S') return "zstd";
-  if (p[0] == 'L' && p[1] == '4') return "lz4";
-  return "";
+// The codec EVERY compression block of a basket's payload names, walked as
+// decompressFrames walks them (until they hold `objlen` bytes); "" when two
+// blocks disagree, one names no codec, or the chain runs out. ROOT writes one
+// codec per basket; a payload that says otherwise is kept as stored rather
+// than converted from a codec the policy does not name.
+std::string payloadCodec(const uint8_t* p, size_t n, uint64_t objlen) {
+  std::string codec;
+  size_t at = 0;
+  uint64_t decoded = 0;
+  while (decoded < objlen) {
+    if (n - at < 9)
+      return "";
+    const std::string c = blockCodec(p + at, n - at);
+    if (c.empty() || (!codec.empty() && c != codec))
+      return "";
+    codec = c;
+    const uint64_t csize = p[at + 3] | p[at + 4] << 8 | p[at + 5] << 16;
+    const uint64_t usize = p[at + 6] | p[at + 7] << 8 | p[at + 8] << 16;
+    if (usize == 0 || csize > n - at - 9)
+      return "";
+    at += 9 + csize;
+    decoded += usize;
+  }
+  return codec;
 }
 
 bool listed(const std::vector<std::string>& codecs, const std::string& c) {
@@ -166,13 +181,65 @@ std::string codecOfSetting(int32_t compress, int32_t fileCompress) {
   }
 }
 
+bool unnamedSettingCodec(const FileMeta& fm, const std::vector<uint8_t>& header, Source& src,
+                         std::string& codec) {
+  codec.clear();
+  Header H;
+  if (!fm.error.empty() || !parseHeader(header, H))
+    return true; // nothing to decide: the layout declines on these itself
+  std::vector<const BranchInfo*> unnamed;
+  for (const auto& br : fm.branches)
+    if (br.writeBasket > 0 && !br.externalFile && !br.basketSeek.empty() && br.basketSeek[0] > 0 &&
+        br.basketBytes[0] > 0 && br.zipBytes < br.totBytes &&
+        codecOfSetting(br.compress, H.compress).empty())
+      unnamed.push_back(&br);
+  // The most compressed first: its first basket is the least likely to be one
+  // that did not shrink and was stored uncompressed.
+  std::stable_sort(unnamed.begin(), unnamed.end(), [](const BranchInfo* a, const BranchInfo* b) {
+    return a->totBytes - a->zipBytes > b->totBytes - b->zipBytes;
+  });
+  constexpr size_t kTries = 3;
+  // A key header is at most ~560 bytes (three names of up to 255); the
+  // compression header follows it.
+  constexpr uint64_t kHead = 1024;
+  for (size_t i = 0; i < unnamed.size() && i < kTries; ++i) {
+    const BranchInfo& br = *unnamed[i];
+    const uint64_t off = static_cast<uint64_t>(br.basketSeek[0]);
+    const uint64_t want = std::min<uint64_t>(static_cast<uint64_t>(br.basketBytes[0]), kHead);
+    if (off + want > static_cast<uint64_t>(fm.fend))
+      continue; // outside the file: the layout never relocates it
+    uint8_t head[kHead];
+    if (!src.has(off, want) || !src.read(head, want, off))
+      return false;
+    auto k = parseKey(head, static_cast<size_t>(want), 0);
+    if (!k || k->cls != "TBasket" || k->nbytes <= 0 || k->keylen >= want)
+      continue; // not a basket record where the metadata says one is
+    if (k->objlen == k->nbytes - static_cast<int32_t>(k->keylen))
+      continue; // this basket did not shrink and was stored as it is: ask the next
+    codec = blockCodec(head + k->keylen, static_cast<size_t>(want - k->keylen));
+    return true;
+  }
+  return true;
+}
+
+std::string declineNote(const FillLayout& L) {
+  if (L.error.empty())
+    return "";
+  if (L.codecDecline)
+    return L.error;
+  return L.error + "; `ucache recompress` can build its replica after the run, from what the run "
+                   "caches";
+}
+
 FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vector<uint8_t>& header,
                          const std::vector<uint8_t>& treeKeyHeader,
                          const std::vector<uint8_t>& keysList,
-                         const std::vector<std::string>& codecs, uint32_t slotFactor100) {
+                         const std::vector<std::string>& codecs, uint32_t slotFactor100,
+                         const std::string& unnamedCodec) {
   FillLayout L;
-  auto decline = [&](std::string why) {
+  auto decline = [&](std::string why, bool forCodec = false) {
     L.error = std::move(why);
+    L.codecDecline = forCodec;
     L.windows.clear();
     L.slots.clear();
     L.relocated.clear();
@@ -195,11 +262,28 @@ FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vecto
 
   // Which branches, in which order. Branch-major and in tree order, so a
   // column's slots are adjacent in the virtual file.
+  std::vector<std::string> unlisted; // codecs seen and not listed, for the decline
+  bool unconverted = false;          // compressed in a codec named nowhere
+  bool stored = false;               // uncompressed: nothing to convert
+  bool anyListed = false;            // else a decline is for the codec alone
   for (uint32_t b = 0; b < fm.branches.size(); ++b) {
     const BranchInfo& br = fm.branches[b];
-    if (br.writeBasket <= 0 || br.externalFile || br.zipBytesOff == 0 ||
-        !listed(codecs, codecOfSetting(br.compress, H.compress)))
+    if (br.writeBasket <= 0 || br.externalFile || br.zipBytesOff == 0)
       continue;
+    std::string codec = codecOfSetting(br.compress, H.compress);
+    if (codec.empty() && br.zipBytes < br.totBytes) { // compressed all the same
+      codec = unnamedCodec;
+      unconverted = unconverted || codec.empty();
+    } else if (codec.empty()) {
+      stored = true;
+      continue;
+    }
+    if (!listed(codecs, codec)) {
+      if (!codec.empty() && std::find(unlisted.begin(), unlisted.end(), codec) == unlisted.end())
+        unlisted.push_back(codec);
+      continue;
+    }
+    anyListed = true;
     bool inside = true;
     for (int32_t i = 0; i < br.writeBasket && inside; ++i)
       inside = br.basketSeek[i] > 0 && br.basketBytes[i] > 0 &&
@@ -208,6 +292,25 @@ FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vecto
     if (inside) // a basket with no seek lives inside the tree record itself;
                 // one past EOF is a parse nothing should act on
       L.relocated.push_back(b);
+  }
+  if (L.relocated.empty() && !anyListed) {
+    if (!unlisted.empty()) {
+      std::string seen, list;
+      for (const auto& c : unlisted)
+        seen += (seen.empty() ? "" : ", ") + c;
+      for (const auto& c : codecs)
+        list += (list.empty() ? "" : ",") + c;
+      return decline("no relocatable branch: its baskets are " + seen +
+                         ", which recompress_codecs (" + (list.empty() ? "empty" : list) +
+                         ") does not name",
+                     true);
+    }
+    if (unconverted)
+      return decline("no relocatable branch: its baskets are compressed in a codec that is not "
+                     "converted",
+                     true);
+    if (stored)
+      return decline("no relocatable branch: its baskets are stored uncompressed", true);
   }
   if (L.relocated.empty())
     return decline("no relocatable branch");
@@ -331,8 +434,12 @@ ConvertedBasket convertBasket(const uint8_t* rec, size_t n, uint32_t slotLen,
   const bool storedRaw = k->objlen == k->nbytes - static_cast<int32_t>(k->keylen);
   if (storedRaw)
     return original(); // nothing for the reader to decode already
-  c.codec = frameCodec(pay, payLen);
-  if (!listed(codecs, c.codec) || k->objlen <= 0)
+  if (k->objlen <= 0)
+    return original();
+  // The basket's own blocks name what it holds, never the branch's setting.
+  c.codec = blockCodec(pay, payLen);
+  if (!listed(codecs, c.codec) ||
+      payloadCodec(pay, payLen, static_cast<uint64_t>(k->objlen)) != c.codec)
     return original();
   std::vector<uint8_t> raw = decompressFrames(pay, payLen, static_cast<uint64_t>(k->objlen));
   if (raw.empty())

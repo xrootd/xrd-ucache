@@ -10,9 +10,12 @@
 
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 using namespace ucache::transpose;
@@ -481,7 +484,10 @@ TEST(FillLayout, Declines) {
   }
   {
     Fx fx = fixture();
-    EXPECT_NE(layout(fx, {"lz4"}).error.find("no relocatable branch"), std::string::npos);
+    FillLayout L = layout(fx, {"lz4"});
+    EXPECT_NE(L.error.find("no relocatable branch: its baskets are lzma, zstd"), std::string::npos)
+        << L.error;
+    EXPECT_TRUE(L.codecDecline);
   }
   {
     Fx fx = fixture(); // a branch whose baskets are in another file is left alone
@@ -662,4 +668,289 @@ TEST(FillLayout, PlaceInSlotRefuses) {
   s.vSeek = 2000;
   EXPECT_TRUE(placeInSlot(n, s, out.data(), err)) << err;
   EXPECT_EQ(beGet32(&out[18]), 2000u);
+}
+
+// ---------------------------------------------------------------------------
+// A compression setting that names no codec. Files written by older ROOT
+// versions (and `hadd -f1`) record setting 1 on the file and every branch:
+// algorithm 0, "the global default", level 1 -- and the baskets are ZLIB. The
+// committed fixture has exactly that property, and its last basket in each
+// branch was fast-copied from an LZMA tree, so a branch also holds a basket in
+// another codec than the one the layout takes for it.
+// tests/data/make_unnamed_codec_fixture.C regenerates it.
+namespace {
+
+std::string unnamedFixture() {
+  return std::string(UCACHE_TEST_DATA_DIR) + "/unnamed_codec_fixture.root";
+}
+
+std::vector<uint8_t> slurpFile(const std::string& path) {
+  std::vector<uint8_t> out;
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f)
+    return out;
+  uint8_t buf[65536];
+  size_t n;
+  while ((n = std::fread(buf, 1, sizeof buf, f)) > 0)
+    out.insert(out.end(), buf, buf + n);
+  std::fclose(f);
+  return out;
+}
+
+// A file held in memory, counting the reads made through it.
+struct CountingSource : Source {
+  std::vector<uint8_t> b;
+  int reads = 0;
+  bool failReads = false;
+  bool has(uint64_t off, uint64_t n) override { return off + n >= off && off + n <= b.size(); }
+  bool read(void* dst, uint64_t n, uint64_t off) override {
+    ++reads;
+    if (failReads || off + n > b.size())
+      return false;
+    std::memcpy(dst, b.data() + off, n);
+    return true;
+  }
+};
+
+struct UnnamedFx {
+  FileMeta fm;
+  std::vector<uint8_t> file, header, treeKeyHeader, keysList;
+};
+
+UnnamedFx unnamedFx() {
+  UnnamedFx u;
+  u.fm = parseFile(unnamedFixture(), "Events");
+  u.file = slurpFile(unnamedFixture());
+  if (!u.fm.error.empty() || u.file.size() < 100)
+    return u;
+  u.header.assign(u.file.begin(), u.file.begin() + 100);
+  const uint64_t tk = static_cast<uint64_t>(u.fm.treeKey.seekkey);
+  u.treeKeyHeader.assign(u.file.begin() + tk, u.file.begin() + tk + u.fm.treeKey.keylen);
+  const uint64_t kl = static_cast<uint64_t>(u.fm.keyslistSeek);
+  const uint32_t n = beGet32(u.file.data() + kl);
+  u.keysList.assign(u.file.begin() + kl, u.file.begin() + kl + n);
+  return u;
+}
+
+FillLayout unnamedLayout(const UnnamedFx& u, std::vector<std::string> codecs,
+                         const std::string& unnamed) {
+  return layoutForFill(u.fm, u.file.size(), u.header, u.treeKeyHeader, u.keysList, codecs, 300,
+                       unnamed);
+}
+
+// The payload of the basket record at `seek`, decoded by its own blocks.
+std::vector<uint8_t> decodedBasket(const uint8_t* rec, size_t n) {
+  auto k = parseKey(rec, n, 0);
+  if (!k || k->keylen > n)
+    return {};
+  if (k->objlen == k->nbytes - static_cast<int32_t>(k->keylen))
+    return std::vector<uint8_t>(rec + k->keylen, rec + n);
+  return decompressFrames(rec + k->keylen, n - k->keylen, static_cast<uint64_t>(k->objlen));
+}
+
+} // namespace
+
+TEST(FillLayoutUnnamed, FixtureHasTheProperty) {
+  UnnamedFx u = unnamedFx();
+  ASSERT_TRUE(u.fm.error.empty()) << u.fm.error;
+  ASSERT_EQ(u.fm.branches.size(), 4u);
+  for (const auto& b : u.fm.branches) {
+    EXPECT_EQ(b.compress, 1) << b.name;
+    EXPECT_EQ(codecOfSetting(b.compress, 1), "") << b.name; // the setting names no codec
+    EXPECT_LT(b.zipBytes, b.totBytes) << b.name;            // and yet it is compressed
+    ASSERT_EQ(b.writeBasket, 3) << b.name;
+    const std::string want[] = {"zlib", "zlib", "lzma"};
+    for (int i = 0; i < 3; ++i) {
+      const uint8_t* rec = u.file.data() + b.basketSeek[i];
+      auto k = parseKey(rec, static_cast<size_t>(b.basketBytes[i]), 0);
+      ASSERT_TRUE(k);
+      EXPECT_EQ(blockCodec(rec + k->keylen, static_cast<size_t>(b.basketBytes[i]) - k->keylen),
+                want[i])
+          << b.name << " basket " << i;
+    }
+  }
+}
+
+// The codec comes from ONE basket read, and the layout then relocates every
+// such branch -- where before this file was declined whole.
+TEST(FillLayoutUnnamed, TakesTheCodecOfTheBaskets) {
+  UnnamedFx u = unnamedFx();
+  ASSERT_TRUE(u.fm.error.empty()) << u.fm.error;
+  CountingSource src;
+  src.b = u.file;
+  std::string codec;
+  ASSERT_TRUE(unnamedSettingCodec(u.fm, u.header, src, codec));
+  EXPECT_EQ(codec, "zlib");
+  EXPECT_EQ(src.reads, 1);
+
+  FillLayout L = unnamedLayout(u, {"lzma", "zlib"}, codec);
+  ASSERT_TRUE(L.error.empty()) << L.error;
+  EXPECT_EQ(L.relocated, (std::vector<uint32_t>{0, 1, 2, 3}));
+  EXPECT_EQ(L.slots.size(), 12u);
+
+  // Without the baskets' codec the file is declined, for its codec.
+  FillLayout none = unnamedLayout(u, {"lzma", "zlib"}, "");
+  EXPECT_NE(none.error.find("not converted"), std::string::npos) << none.error;
+  EXPECT_TRUE(none.codecDecline);
+}
+
+// recompress_codecs keeps its meaning: the baskets' codec must be listed.
+TEST(FillLayoutUnnamed, AnUnlistedCodecIsStillDeclined) {
+  UnnamedFx u = unnamedFx();
+  ASSERT_TRUE(u.fm.error.empty()) << u.fm.error;
+  FillLayout L = unnamedLayout(u, {"lzma"}, "zlib");
+  EXPECT_NE(L.error.find("zlib"), std::string::npos) << L.error;
+  EXPECT_NE(L.error.find("recompress_codecs (lzma)"), std::string::npos) << L.error;
+  EXPECT_TRUE(L.codecDecline);
+  EXPECT_TRUE(L.slots.empty());
+  // A codec decline does not point at `ucache recompress`: a sweep declines it too.
+  EXPECT_EQ(declineNote(L), L.error);
+  // A layout decline does: the sweep builds that file's replica from the byte cache.
+  FillLayout past = layoutForFill(u.fm, u.file.size() + 1, u.header, u.treeKeyHeader, u.keysList,
+                                  {"lzma", "zlib"}, 300, "zlib");
+  EXPECT_FALSE(past.codecDecline);
+  EXPECT_NE(declineNote(past).find("`ucache recompress`"), std::string::npos) << declineNote(past);
+  EXPECT_EQ(declineNote(FillLayout()), ""); // nothing declined, nothing to say
+}
+
+// Every basket of the fixture, converted for its slot: each is decided by its
+// own blocks. The LZMA basket in a branch taken as ZLIB is kept as stored when
+// only zlib is listed and converted when lzma is, and whatever is converted
+// decodes to exactly the original's bytes.
+TEST(FillLayoutUnnamed, BasketsInAnotherCodecAreDecidedByTheirOwnBlocks) {
+  UnnamedFx u = unnamedFx();
+  ASSERT_TRUE(u.fm.error.empty()) << u.fm.error;
+  FillLayout L = unnamedLayout(u, {"lzma", "zlib"}, "zlib");
+  ASSERT_TRUE(L.error.empty()) << L.error;
+  for (const auto& codecs :
+       {std::vector<std::string>{"zlib"}, std::vector<std::string>{"lzma", "zlib"}}) {
+    int converted = 0, kept = 0;
+    for (const auto& s : L.slots) {
+      const uint8_t* rec = u.file.data() + s.origSeek;
+      ConvertedBasket c = convertBasket(rec, s.origLen, s.vLen, codecs);
+      ASSERT_TRUE(c.error.empty()) << c.error;
+      const bool lzmaBasket = s.basket == 2;
+      EXPECT_EQ(c.codec, lzmaBasket ? "lzma" : "zlib");
+      if (lzmaBasket && codecs.size() == 1) {
+        EXPECT_EQ(c.kind, ConvertedBasket::kOriginal);
+        EXPECT_EQ(c.record, std::vector<uint8_t>(rec, rec + s.origLen));
+        ++kept;
+        continue;
+      }
+      ASSERT_NE(c.kind, ConvertedBasket::kOriginal) << "slot " << s.vSeek;
+      EXPECT_EQ(decodedBasket(c.record.data(), c.record.size()), decodedBasket(rec, s.origLen));
+      // The key header is the original's but for fNbytes.
+      EXPECT_EQ(0, std::memcmp(c.record.data() + 4, rec + 4, 14));
+      ++converted;
+    }
+    EXPECT_EQ(kept, codecs.size() == 1 ? 4 : 0);
+    EXPECT_EQ(converted, codecs.size() == 1 ? 8 : 12);
+  }
+}
+
+// A basket whose blocks disagree on their codec, or whose block names none
+// this converts, is kept exactly as stored -- never converted from a codec
+// the policy does not name, never served as anything but the origin's bytes.
+TEST(FillLayoutUnnamed, MismatchedBlocksAreKeptAsStored) {
+  UnnamedFx u = unnamedFx();
+  ASSERT_TRUE(u.fm.error.empty()) << u.fm.error;
+  const BranchInfo& b = u.fm.branches[2]; // Jet_pt: the largest baskets
+  auto payloadOf = [&](int i, int32_t& objlen) {
+    const uint8_t* rec = u.file.data() + b.basketSeek[i];
+    auto k = parseKey(rec, static_cast<size_t>(b.basketBytes[i]), 0);
+    objlen = k->objlen;
+    return std::vector<uint8_t>(rec + k->keylen, rec + b.basketBytes[i]);
+  };
+  int32_t o0 = 0, o2 = 0;
+  const auto zl = payloadOf(0, o0), xz = payloadOf(2, o2);
+  // One basket of two blocks: ZLIB, then LZMA. Each decodes, so a decoder
+  // alone would convert it.
+  std::vector<uint8_t> both = zl;
+  both.insert(both.end(), xz.begin(), xz.end());
+  auto mixed = basketRecord(o0 + o2, both);
+  ASSERT_EQ(decompressFrames(both.data(), both.size(), static_cast<uint64_t>(o0 + o2)).size(),
+            static_cast<size_t>(o0 + o2));
+  ConvertedBasket c = convertBasket(mixed.data(), mixed.size(), 4 * mixed.size(), {"lzma", "zlib"});
+  EXPECT_EQ(c.kind, ConvertedBasket::kOriginal);
+  EXPECT_EQ(c.record, mixed);
+  // The same blocks, one codec: converted.
+  std::vector<uint8_t> twice = zl;
+  twice.insert(twice.end(), zl.begin(), zl.end());
+  auto same = basketRecord(2 * o0, twice);
+  EXPECT_EQ(convertBasket(same.data(), same.size(), 4 * same.size(), {"zlib"}).kind,
+            ConvertedBasket::kZstd);
+  // The old ROOT algorithm's header: not decoded here, kept as stored.
+  auto cs = basketRecord(o0, zl);
+  const size_t kl = (cs[14] << 8) | cs[15];
+  cs[kl] = 'C';
+  cs[kl + 1] = 'S';
+  ConvertedBasket old = convertBasket(cs.data(), cs.size(), 4 * cs.size(), {"lzma", "zlib"});
+  EXPECT_EQ(old.kind, ConvertedBasket::kOriginal);
+  EXPECT_EQ(old.record, cs);
+  // A block chain that runs past the payload: kept as stored.
+  auto cut = basketRecord(o0, std::vector<uint8_t>(zl.begin(), zl.end() - 1));
+  EXPECT_EQ(convertBasket(cut.data(), cut.size(), 4 * cut.size(), {"zlib"}).kind,
+            ConvertedBasket::kOriginal);
+}
+
+// A file whose settings name their codecs reads nothing; a basket stored
+// uncompressed sends the question to the next branch; a failed read decides
+// nothing.
+TEST(FillLayoutUnnamed, ReadsOnlyWhatItMust) {
+  {
+    Fx fx = fixture(); // every setting names a codec
+    CountingSource src;
+    src.b.assign(static_cast<size_t>(fx.fileSize), 0);
+    std::string codec = "x";
+    ASSERT_TRUE(unnamedSettingCodec(fx.fm, fx.header, src, codec));
+    EXPECT_EQ(codec, "");
+    EXPECT_EQ(src.reads, 0);
+  }
+  {
+    Fx fx = fixture(); // an unnamed branch whose metadata shows no compression
+    fx.fm.branches[1].compress = 0;
+    fx.fm.branches[1].totBytes = fx.fm.branches[1].zipBytes;
+    CountingSource src;
+    src.b.assign(static_cast<size_t>(fx.fileSize), 0);
+    std::string codec;
+    ASSERT_TRUE(unnamedSettingCodec(fx.fm, fx.header, src, codec));
+    EXPECT_EQ(src.reads, 0);
+    FillLayout L = layout(fx, {"lzma", "zlib"});
+    ASSERT_TRUE(L.error.empty()) << L.error;
+    EXPECT_EQ(L.relocated, (std::vector<uint32_t>{0, 2})); // never relocated: nothing to convert
+  }
+  {
+    // Two unnamed branches: the more compressed one's first basket was stored
+    // uncompressed, so the next one is asked.
+    Fx fx = fixture();
+    for (auto* b : {&fx.fm.branches[0], &fx.fm.branches[1]}) {
+      b->compress = 1;
+      b->totBytes = b->zipBytes * 4;
+    }
+    fx.fm.branches[0].totBytes = fx.fm.branches[0].zipBytes * 10; // asked first
+    CountingSource src;
+    src.b.assign(static_cast<size_t>(fx.fileSize), 0);
+    auto raw = compressible(1000);
+    auto stored = basketRecord(static_cast<int32_t>(raw.size()), raw);
+    std::memcpy(src.b.data() + fx.fm.branches[0].basketSeek[0], stored.data(), stored.size());
+    auto z = encodeZstdFrames(raw.data(), raw.size(), 1);
+    auto zs = basketRecord(static_cast<int32_t>(raw.size()), z);
+    std::memcpy(src.b.data() + fx.fm.branches[1].basketSeek[0], zs.data(), zs.size());
+    std::string codec;
+    ASSERT_TRUE(unnamedSettingCodec(fx.fm, fx.header, src, codec));
+    EXPECT_EQ(codec, "zstd");
+    EXPECT_EQ(src.reads, 2);
+    // Both unnamed branches take it: zstd, which only the second list names.
+    FillLayout L = layoutForFill(fx.fm, fx.fileSize, fx.header, fx.treeKeyHeader, fx.keysList,
+                                 {"lzma"}, 400, codec);
+    ASSERT_TRUE(L.error.empty()) << L.error;
+    EXPECT_EQ(L.relocated, (std::vector<uint32_t>{2}));
+    L = layoutForFill(fx.fm, fx.fileSize, fx.header, fx.treeKeyHeader, fx.keysList,
+                      {"lzma", "zstd"}, 400, codec);
+    ASSERT_TRUE(L.error.empty()) << L.error;
+    EXPECT_EQ(L.relocated, (std::vector<uint32_t>{0, 1, 2}));
+
+    src.failReads = true;
+    EXPECT_FALSE(unnamedSettingCodec(fx.fm, fx.header, src, codec)); // nothing decided
+  }
 }

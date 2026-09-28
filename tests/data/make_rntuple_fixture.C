@@ -1,6 +1,12 @@
 // Build a tiny RNTuple that still exercises what the recompressor cares about:
 // bit-packed booleans, several clusters, identical (shared) pages, and a
 // variable-length column.
+//
+// rntuple_unnamed_codec_fixture.root is two copies of this tree written with
+// compression 101, merged by `hadd -f1`, which records setting 1 (algorithm 0,
+// "the global default") on every column range while the pages are ZLIB:
+//   root -l -b -q -e '.L make_rntuple_fixture.C' -e 'mkfixture("in.root", 2000, 4096, 101)'
+//   hadd -f1 rntuple_unnamed_codec_fixture.root in.root in.root
 #include <ROOT/RNTupleModel.hxx>
 #include <ROOT/RNTupleWriter.hxx>
 #include <ROOT/RNTupleWriteOptions.hxx>

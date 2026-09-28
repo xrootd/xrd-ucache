@@ -59,6 +59,11 @@ struct FillSlot {
 
 struct FillLayout {
   std::string error;        // non-empty => DECLINED: serve the file as it is
+  // With `error`: declined for the codec the file is stored in -- one
+  // `recompress_codecs` does not name, or one not converted at all. A sweep
+  // declines such a file too; any other decline is the slot layout's own, and
+  // `ucache recompress` can still build the file's replica from the byte cache.
+  bool codecDecline = false;
   uint64_t originSize = 0;  // the original fEND
   uint64_t virtualSize = 0; // the fEND the reader is shown
   // Ranges of the ORIGINAL file that read differently, in place: the header
@@ -89,17 +94,39 @@ bool headerWindowForEnd(const std::vector<uint8_t>& header, uint64_t newEnd, uin
 // algorithm this code does not transcode. -1 inherits `fileCompress`.
 std::string codecOfSetting(int32_t compress, int32_t fileCompress);
 
+// The codec the baskets of a file's UNNAMED branches are stored in: branches
+// whose setting names no codec (codecOfSetting gives "") while their metadata
+// shows compression (fZipBytes below fTotBytes). Setting 1 -- algorithm 0,
+// "the global default", which files from older ROOT versions and `hadd -f1`
+// carry -- is one such setting; a basket copied in under another setting is
+// the other. Named by the compression header of ONE basket read through
+// `src`: basket 0 of the branch whose metadata shows the most compression (of
+// the next such branch when that basket was stored uncompressed, three at
+// most), so a file whose settings name their codecs reads nothing here.
+// `codec` = that basket's codec, or "" (no branch in that state, or a codec
+// not converted here). False only when a read failed: nothing is decided.
+bool unnamedSettingCodec(const FileMeta& fm, const std::vector<uint8_t>& header, Source& src,
+                         std::string& codec);
+
 // Compute the layout. `fileSize` = the origin's size, which must equal fEND
 // (anything past fEND would lie under the extension). `header` = the file's
 // first fBEGIN bytes (at least 75),
 // `treeKeyHeader` = the tree key's first keylen bytes, `keysList` = the whole
-// keys-list record at fm.keyslistSeek. A branch is relocated when its setting
-// names a codec in `codecs`, it has baskets, all inside the file, and none
-// lives in another file. Declines (error set) rather than guess.
+// keys-list record at fm.keyslistSeek. A branch is relocated when its codec is
+// in `codecs`, it has baskets, all inside the file, and none lives in another
+// file. Its codec is the one its setting names; for an unnamed branch (see
+// unnamedSettingCodec) it is `unnamedCodec`. Declines (error set) rather than
+// guess.
 FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vector<uint8_t>& header,
                          const std::vector<uint8_t>& treeKeyHeader,
                          const std::vector<uint8_t>& keysList,
-                         const std::vector<std::string>& codecs, uint32_t slotFactor100 = 300);
+                         const std::vector<std::string>& codecs, uint32_t slotFactor100 = 300,
+                         const std::string& unnamedCodec = "");
+
+// What to tell a user about a first pass the file's own content declined
+// (`L.error` set): the reason, and -- when it is not the codec -- that
+// `ucache recompress` can build the replica after the run from what it cached.
+std::string declineNote(const FillLayout& L);
 
 // A basket prepared for its slot, from its ORIGINAL record.
 struct ConvertedBasket {
@@ -118,6 +145,14 @@ struct ConvertedBasket {
 // shrink); else the original record, which always fits. A basket that cannot
 // be decoded is kept as its original record: the reader then gets exactly the
 // origin's bytes, and fails exactly as it would have.
+//
+// What the basket holds is read from the basket itself -- its key header says
+// whether it is stored uncompressed, and each compression block's header names
+// the block's codec -- never from the branch's setting or from the codec the
+// layout took for the branch. So a basket stored in another codec than its
+// branch's other baskets (a file merged from inputs written differently) is
+// converted when that codec is listed and kept as stored when it is not, and
+// a basket stored uncompressed is kept as stored.
 ConvertedBasket convertBasket(const uint8_t* record, size_t n, uint32_t slotLen,
                               const std::vector<std::string>& codecs);
 
