@@ -66,6 +66,38 @@ std::string fieldStr(const std::string& line, const char* key) {
   return e == std::string::npos ? std::string() : line.substr(p, e - p);
 }
 
+// `"<key>":<digits>[.<digits>]`, the only shape the writers give a fraction.
+// Parsed by hand rather than with strtod, whose decimal point follows the
+// locale. Negative when the key is absent or its value is not that shape.
+double fieldFraction(const std::string& line, const char* key) {
+  const std::string needle = std::string("\"") + key + "\":";
+  auto p = line.find(needle);
+  if (p == std::string::npos)
+    return -1.0;
+  p += needle.size();
+  const size_t start = p;
+  double v = 0.0;
+  while (p < line.size() && line[p] >= '0' && line[p] <= '9')
+    v = v * 10.0 + (line[p++] - '0');
+  if (p == start)
+    return -1.0;
+  if (p < line.size() && line[p] == '.') {
+    double scale = 0.1;
+    for (++p; p < line.size() && line[p] >= '0' && line[p] <= '9'; ++p, scale /= 10.0)
+      v += (line[p] - '0') * scale;
+  }
+  return v;
+}
+
+// A log2 histogram added bucket-wise into `acc`. Buckets are trimmed of
+// trailing zeros by the writer, so two histograms need not be one length.
+void addHist(std::vector<uint64_t>& acc, const std::vector<uint64_t>& h) {
+  if (h.size() > acc.size())
+    acc.resize(h.size(), 0);
+  for (size_t i = 0; i < h.size(); ++i)
+    acc[i] += h[i];
+}
+
 bool endsWith(const std::string& s, const char* suf) {
   const size_t l = std::strlen(suf);
   return s.size() >= l && s.compare(s.size() - l, l, suf) == 0;
@@ -112,7 +144,25 @@ void loadCounters(const std::string& path, Run& r) {
   if (last.empty())
     return;
   r.complete = true;
+  {
+    // Like the counts it describes, from the last line: the kernel's enabled
+    // and running times are cumulative from when the counters opened, so the
+    // last line's duty is the whole run's -- the one that scaled the counts
+    // reported -- and an earlier line's is only a prefix of it.
+    const double duty = fieldFraction(last, "pmu_duty");
+    if (duty >= 0.0 && duty <= 1.0)
+      r.pmuDuty = duty;
+  }
   r.endS = fieldU64(last, "ts");
+  r.startMs = fieldU64(last, "start_ms");
+  r.endMs = fieldU64(last, "ts_ms");
+  {
+    const std::string src = fieldStr(last, "counter_source");
+    if (src == "perf" || src == "rusage")
+      r.counterSource = src;
+  }
+  r.haveRelayRt = hasField(last, "hist_relay_rt_us");
+  fieldHist(last, "hist_relay_rt_us", r.histRelayRt);
   r.disabled = fieldU64(last, "disabled") != 0;
   r.handlesHighWater = fieldU64(last, "handles_high_water");
   r.threadsHighWater = fieldU64(last, "threads_high_water");
@@ -201,6 +251,37 @@ void loadFiles(const std::string& path, Run& r) {
         f.readBuckets = rb;
       }
     }
+    f.tsMs = std::max(f.tsMs, fieldU64(line, "ts_ms"));
+    // The footprint in original coordinates is cumulative for the process
+    // (one footprint per URL), so the record that read the most holds the
+    // rest; on a tie the later one, which saw at least as much. Its two totals
+    // move as one unit: a later record whose range set overflowed has no
+    // distinct-byte count, and that is the answer, not the count an earlier
+    // and smaller record had.
+    if (hasField(line, "orig_bytes")) {
+      const uint64_t ob = fieldU64(line, "orig_bytes");
+      if (!f.haveOrigBytes || ob >= f.origBytes) {
+        f.haveOrigBytes = true;
+        f.origBytes = ob;
+        f.haveUniqueBytes = hasField(line, "unique_bytes");
+        f.uniqueBytes = f.haveUniqueBytes ? fieldU64(line, "unique_bytes") : 0;
+      }
+    } else if (hasField(line, "ts_ms")) {
+      // A record from a writer that has the byte totals, carrying none: the
+      // footprint became unknown after the records that had them -- poisoned,
+      // or asked past the file's end more often than it could follow -- and
+      // since it only grows, what they said is part of the answer at best.
+      // Unknown beats stale: the unit is cleared, until a later record knows
+      // the totals again.
+      f.haveOrigBytes = f.haveUniqueBytes = false;
+      f.origBytes = f.uniqueBytes = 0;
+    }
+    // Per record: each one timed only its own requests.
+    {
+      std::vector<uint64_t> rt;
+      fieldHist(line, "origin_rt_us", rt);
+      addHist(f.originRt, rt);
+    }
     const std::string m = fieldStr(line, "mode");
     // A re-opened entry emits a second record. Modes agree in practice (the
     // mode is a per-key property, not per-open; if they ever disagree, the
@@ -256,6 +337,7 @@ std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiv
     for (const auto& [k, f] : r.files) {
       (void)k;
       r.endS = std::max(r.endS, f.ts);
+      r.endMs = std::max(r.endMs, f.tsMs);
     }
     if (!r.complete && r.files.empty())
       continue; // an empty claimed name, or a store that never served anything
@@ -263,10 +345,12 @@ std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiv
     r.sig = signatureOf(r.files);
     r.readSig = readSignatureOf(r.files);
     for (const auto& [k, f] : r.files) {
-      (void)f;
       const std::string h = hostOf(k);
-      if (!h.empty())
-        ++r.originHosts[h];
+      if (h.empty())
+        continue;
+      ++r.originHosts[h];
+      if (!f.originRt.empty())
+        addHist(r.originRtByHost[h], f.originRt);
     }
     runs.push_back(std::move(r));
   }
@@ -278,7 +362,10 @@ std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiv
 
 std::vector<Run> withoutTrivial(std::vector<Run> runs) {
   runs.erase(std::remove_if(runs.begin(), runs.end(),
-                            [](const Run& r) { return r.durationS() < kMinListedDurationS; }),
+                            [](const Run& r) {
+                              return r.files.empty() && r.filesOpened == 0 && r.servedBytes == 0 &&
+                                     r.relayBytes == 0 && r.originBytes == 0;
+                            }),
              runs.end());
   return runs;
 }
@@ -297,7 +384,8 @@ ReferenceCorrection referenceCorrection(const Run& fill, const std::vector<Run>&
     return c;
   const Run* best = nullptr;
   for (const auto& r : all) {
-    if (r.stem == fill.stem || r.disabled || r.files.empty() || r.faults())
+    if (r.stem == fill.stem || r.disabled || r.files.empty() || r.faults() ||
+        r.durationS() < kMinEstimatedDurationS)
       continue;
     uint64_t delivered = 0, wire = 0, replica = 0;
     for (const auto& [k, f] : r.files) {
@@ -349,6 +437,8 @@ ReferenceCorrection referenceCorrection(const Run& fill, const std::vector<Run>&
 }
 
 bool usableAsReference(const Run& r, const std::vector<Run>& all) {
+  if (r.durationS() < kMinEstimatedDurationS)
+    return false;
   if (r.disabled || r.baselineQualified())
     return true;
   return r.fillCandidate() && referenceCorrection(r, all).available;
@@ -709,6 +799,8 @@ Totals summarize(const std::vector<Run>& runs, size_t maxEstimates) {
   // record anyone is actually asking about.
   size_t done = 0;
   for (const auto& r : runs) {
+    if (r.durationS() < kMinEstimatedDurationS)
+      continue; // could not be estimated, and must not take a place that could
     if (done >= maxEstimates) {
       ++t.gainCapped;
       continue;
@@ -928,7 +1020,7 @@ std::vector<Dataset> byDataset(const std::vector<Run>& runs, size_t maxEstimates
       d.dirs = dirs.size();
       d.originSize = osz;
     }
-    if (r.disabled || estimated >= maxEstimates)
+    if (r.disabled || r.durationS() < kMinEstimatedDurationS || estimated >= maxEstimates)
       continue;
     ++estimated;
     const GainEstimate g = estimateGain(r, runs);

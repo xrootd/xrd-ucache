@@ -36,6 +36,7 @@ add_executable(ucache-unit-tests
   unit/executor_test.cc
   unit/copyguard_test.cc
   unit/runlog_test.cc
+  unit/history_json_test.cc
   unit/readfootprint_test.cc
   unit/origin_inflight_test.cc
   unit/publish_test.cc
@@ -46,6 +47,7 @@ add_executable(ucache-unit-tests
   ${CMAKE_SOURCE_DIR}/src/plugin/OpenRetry.cc  # pure policy TU (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/Executor.cc   # thread pool (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/cli/RunLog.cc        # run reader (pure file parsing)
+  ${CMAKE_SOURCE_DIR}/src/cli/HistoryJson.cc   # the history emitter (pure)
   ${CMAKE_SOURCE_DIR}/src/cli/Publish.cc       # redaction + hashes (pure; no network in tests)
 )
 target_link_libraries(ucache-unit-tests PRIVATE ucache-core ucache-core-testing gtest gtest_main

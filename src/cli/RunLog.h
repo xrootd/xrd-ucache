@@ -54,6 +54,29 @@ struct Run {
   // Whether the record carried these at all. Zero is a real reading for both.
   bool havePeakCores = false, haveOriginReadsInFlight = false;
 
+  // The same bracket as startS/endS in epoch MILLISECONDS: the store's start
+  // (from the counter line) and the newest counter line or per-file record.
+  // Zero on records written before they existed; durationMs() then has no
+  // answer rather than a rounded one.
+  uint64_t startMs = 0, endMs = 0;
+  bool haveDurationMs() const { return startMs && endMs >= startMs; }
+  uint64_t durationMs() const { return haveDurationMs() ? endMs - startMs : 0; }
+  // Where `instructions`/`cycles` came from: "perf" (Linux performance
+  // counters, user space, since the cache engaged) or "rusage" (the macOS
+  // per-process counters, the whole process from its start). Empty when the
+  // record says nothing, which older records never do.
+  std::string counterSource;
+  // perf only: the share of the time the counters were enabled that they were
+  // actually counting, over the whole run -- from the last counter line, like
+  // the counts, which are already scaled up by it. Negative when that line
+  // carries none.
+  double pmuDuty = -1.0;
+  // Answer times of relayed (pass-through) requests, log2 microseconds. Kept
+  // apart from histOriginRt, which is the cache's own fetches and must keep
+  // meaning only that.
+  std::vector<uint64_t> histRelayRt;
+  bool haveRelayRt = false;
+
   // Cumulative counters, from the last complete line.
   uint64_t opens = 0, filesOpened = 0;
   uint64_t servedBytes = 0, hitBytes = 0, ramHitBytes = 0, replicaBytesServed = 0;
@@ -83,6 +106,23 @@ struct Run {
                              // origin coordinates; empty when unknown (a
                              // replica built before the map existed)
     std::string mode;        // cached | fill | relay ("" = pre-span record)
+    uint64_t tsMs = 0;       // newest record's epoch milliseconds, 0 if none
+
+    // What the application read of this file, in ORIGINAL-file coordinates
+    // whatever route served it: every byte asked for, re-reads counted
+    // (origBytes), and the distinct bytes among them (uniqueBytes, absent
+    // when the writer's range set overflowed). Both come from a footprint the
+    // process keeps for the whole URL, so a later record holds everything an
+    // earlier one did: the record with the most origBytes is the answer, never
+    // a sum -- the two travel together as one unit. A later record of the same
+    // writer generation (it has ts_ms) that carries no origBytes says the
+    // footprint became unknown, and clears the unit.
+    bool haveOrigBytes = false, haveUniqueBytes = false;
+    uint64_t origBytes = 0, uniqueBytes = 0;
+    // Answer times of this file's requests to the origin, log2 microseconds.
+    // Unlike the footprint this is per record (each relayed handle or entry
+    // reports its own requests), so a key's records are SUMMED bucket-wise.
+    std::vector<uint64_t> originRt;
 
     // The three tiers a byte can reach the application by. They are DISJOINT
     // counters written at three different places -- the byte tier in
@@ -137,6 +177,9 @@ struct Run {
   // a run whose data came from another.
   std::map<std::string, uint64_t> originHosts;
   std::string topOriginHost() const;
+  // The per-file origin answer times, summed by origin host. Hosts whose
+  // files carried no timing are absent.
+  std::map<std::string, std::vector<uint64_t>> originRtByHost;
 
   // ---- baseline qualification --------------------------------------------
   // A run is usable as a baseline when it is close enough to a pure direct
@@ -433,12 +476,24 @@ inline constexpr size_t kMaxSummaryEstimates = 100;
 
 // Records nobody made. The store writes a counter line when it closes, and
 // every `ucache` invocation opens one, so a cache directory fills up with
-// one-second entries carrying no files and no bytes, sitting among the runs
-// that matter and burying them. Ten seconds is far under the floor any
-// measurement needs and far over anything a CLI call takes, so it separates
-// the two without argument.
-inline constexpr uint64_t kMinListedDurationS = 10;
+// entries carrying no files, sitting among the runs that matter and burying
+// them -- and so does every parent process that started workers and read
+// nothing itself. What separates them from a run is that a run read a file:
+// a run that read nothing -- no per-file record, and counters that opened no
+// file and moved no byte -- is left out, however long it lasted, and a run
+// that read is kept, however short. A worker that _exit()s with its files
+// still open leaves counter lines and no per-file record, and is a run.
+// Duration used to be the test, and it threw away short jobs that did real
+// work.
 std::vector<Run> withoutTrivial(std::vector<Run> runs);
+
+// Runs shorter than this take no part in any gain estimate: they are never
+// the warm run a reference correction uses, never shown as a reference, and
+// never spend a place under the estimate cap (none could be estimated anyway:
+// the floor for that is thirty seconds). They were once left out of every
+// listing, which is what kept them out; the listing now shows them, and the
+// estimates keep the population they were validated on.
+inline constexpr uint64_t kMinEstimatedDurationS = 10;
 
 // NOTE. An estimate built from per-file spans lived here and was REMOVED. It
 // compared per-file COST between the two routes and was blind to OVERLAP --

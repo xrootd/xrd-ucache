@@ -1741,3 +1741,326 @@ TEST(Correction, HistoryMarksACorrectableFillAsAReference) {
     }
   }
 }
+
+// ---- raw fields for the report service --------------------------------------
+//
+// Records written by current builds carry fields the CLI does not interpret,
+// only collects and passes on. These fixtures are record lines in the shape the
+// writers emit, next to lines in the old shape, which must still read exactly
+// as before.
+
+namespace {
+
+void writeLines(const std::string& dir, const std::string& stem,
+                const std::vector<std::string>& counters, const std::vector<std::string>& files) {
+  {
+    std::ofstream o(dir + "/" + stem + ".jsonl");
+    for (const auto& l : counters)
+      o << l << "\n";
+  }
+  if (files.empty())
+    return;
+  std::ofstream o(dir + "/" + stem + ".files.jsonl");
+  for (const auto& l : files)
+    o << l << "\n";
+}
+
+// One per-file record in the current shape.
+std::string newFileLine(const std::string& key, uint64_t tsMs, uint64_t orig,
+                        const std::string& unique, const std::string& rt,
+                        uint64_t originSize = 1000) {
+  std::string l = "{\"ts\":" + std::to_string(tsMs / 1000) + ",\"key\":\"" + key +
+                  "\",\"opens\":1,\"served_bytes\":100,\"ram_bytes\":0,\"replica_bytes\":0,"
+                  "\"wire_bytes\":0,\"span_us\":5,\"origin_size\":" +
+                  std::to_string(originSize) + ",\"read_sig\":\"ab\",\"read_buckets\":1," +
+                  "\"mode\":\"cached\",\"ts_ms\":" + std::to_string(tsMs) +
+                  ",\"orig_bytes\":" + std::to_string(orig);
+  if (!unique.empty())
+    l += ",\"unique_bytes\":" + unique;
+  if (!rt.empty())
+    l += ",\"origin_rt_us\":" + rt;
+  return l + "}";
+}
+
+const Run& onlyRun(const std::vector<Run>& runs) {
+  EXPECT_EQ(runs.size(), 1u);
+  return runs.front();
+}
+
+} // namespace
+
+TEST(RawFields, APerFileRecordInTheCurrentShapeIsRead) {
+  test::TempDir td;
+  writeLines(td.path(), "h-1-1000-0", {"{\"ts\":1100,\"ts_ms\":1100000,\"start_ms\":1000250}"},
+             {newFileLine("root://eos.cern.ch//a", 1099500, 5000, "4000", "[0,0,3,4]")});
+  const auto runs = loadRuns(td.path());
+  const auto& f = onlyRun(runs).files.at("root://eos.cern.ch//a");
+  EXPECT_EQ(f.tsMs, 1099500u);
+  EXPECT_TRUE(f.haveOrigBytes);
+  EXPECT_EQ(f.origBytes, 5000u);
+  EXPECT_TRUE(f.haveUniqueBytes);
+  EXPECT_EQ(f.uniqueBytes, 4000u);
+  EXPECT_EQ(f.originRt, (std::vector<uint64_t>{0, 0, 3, 4}));
+}
+
+TEST(RawFields, AnOldRecordCarriesNoneOfThem) {
+  test::TempDir td;
+  writeRun(td.path(), "h", 1, 1000, 1100, warmCounters(kGiB), {{"root://o//a", kGiB, 0, 0, 0}});
+  const auto runs = loadRuns(td.path());
+  const ucache::Run& r = onlyRun(runs);
+  const auto& f = r.files.at("root://o//a");
+  EXPECT_FALSE(f.haveOrigBytes);
+  EXPECT_FALSE(f.haveUniqueBytes);
+  EXPECT_TRUE(f.originRt.empty());
+  EXPECT_EQ(f.tsMs, 0u);
+  EXPECT_FALSE(r.haveDurationMs());
+  EXPECT_TRUE(r.counterSource.empty());
+  EXPECT_LT(r.pmuDuty, 0.0);
+  EXPECT_FALSE(r.haveRelayRt);
+  EXPECT_TRUE(r.originRtByHost.empty());
+  // ... and everything it did carry reads as it always did.
+  EXPECT_EQ(f.servedBytes, kGiB);
+  EXPECT_EQ(r.durationS(), 100u);
+}
+
+TEST(RawFields, TheRecordThatReadTheMostCarriesTheFootprintAndTimingsAreSummed) {
+  // One key, three records in one process: the footprint is cumulative, so
+  // the record with the most orig_bytes is the answer, as one unit -- the
+  // last record here overflowed its range set and has no distinct-byte count,
+  // and that is the answer, not the earlier count. The answer times are per
+  // record, so they add.
+  test::TempDir td;
+  const std::string k = "root://eos.cern.ch//a";
+  writeLines(td.path(), "h-1-1000-0", {"{\"ts\":1100}"},
+             {newFileLine(k, 1001000, 100, "90", "[1,2]"),
+              newFileLine(k, 1002000, 700, "", "[0,0,5]"),
+              newFileLine(k, 1003000, 400, "380", "[1]")});
+  const auto runs = loadRuns(td.path());
+  const auto& f = onlyRun(runs).files.at(k);
+  EXPECT_EQ(f.origBytes, 700u);
+  EXPECT_FALSE(f.haveUniqueBytes) << "the unit moves whole: no count beats a stale count";
+  EXPECT_EQ(f.originRt, (std::vector<uint64_t>{2, 2, 5}));
+  EXPECT_EQ(f.tsMs, 1003000u) << "the newest record, whichever carried the footprint";
+}
+
+TEST(RawFields, ALaterRecordWithoutTheTotalsMakesThemUnknown) {
+  // The footprint only grows; a later record of the same writer that carries
+  // no orig_bytes says it became unknown since (poisoned, or asked past the
+  // end more often than it could follow). The earlier record's totals are
+  // part of the answer at best: neither is published.
+  test::TempDir td;
+  const std::string k = "root://o//a";
+  std::string later = newFileLine(k, 1002000, 0, "", "[0,3]");
+  const size_t at = later.find(",\"orig_bytes\":");
+  ASSERT_NE(at, std::string::npos);
+  later.erase(at, std::string(",\"orig_bytes\":0").size());
+  ASSERT_EQ(later.find("orig_bytes"), std::string::npos) << later;
+  writeLines(td.path(), "h-1-1000-0", {"{\"ts\":1100}"},
+             {newFileLine(k, 1001000, 842310, "140371", "[1]"),
+              later});
+  {
+    const auto runs = loadRuns(td.path());
+    const auto& f = onlyRun(runs).files.at(k);
+    EXPECT_FALSE(f.haveOrigBytes);
+    EXPECT_FALSE(f.haveUniqueBytes);
+    EXPECT_EQ(f.originRt, (std::vector<uint64_t>{1, 3})) << "timings still add";
+  }
+  // ... until a record after it knows them again.
+  test::TempDir td2;
+  writeLines(td2.path(), "h-1-1000-0", {"{\"ts\":1100}"},
+             {newFileLine(k, 1001000, 842310, "140371", ""),
+              later,
+              newFileLine(k, 1003000, 900000, "239745", "")});
+  const auto runs = loadRuns(td2.path());
+  const auto& f = onlyRun(runs).files.at(k);
+  ASSERT_TRUE(f.haveOrigBytes);
+  EXPECT_EQ(f.origBytes, 900000u);
+  EXPECT_EQ(f.uniqueBytes, 239745u);
+}
+
+TEST(RawFields, AnOldRecordWithoutTheTotalsClearsNothing) {
+  // A record without ts_ms comes from a writer that never had the totals: its
+  // silence says nothing about them.
+  test::TempDir td;
+  const std::string k = "root://o//a";
+  writeLines(td.path(), "h-1-1000-0", {"{\"ts\":1100}"},
+             {newFileLine(k, 1001000, 500, "400", ""),
+              "{\"ts\":1002,\"key\":\"" + k + "\",\"opens\":1,\"served_bytes\":1,"
+              "\"origin_size\":1000,\"mode\":\"cached\"}"});
+  const auto runs = loadRuns(td.path());
+  const auto& f = onlyRun(runs).files.at(k);
+  ASSERT_TRUE(f.haveOrigBytes);
+  EXPECT_EQ(f.origBytes, 500u);
+}
+
+TEST(RawFields, OnATieTheLaterRecordWins) {
+  test::TempDir td;
+  const std::string k = "root://o//a";
+  writeLines(td.path(), "h-1-1000-0", {"{\"ts\":1100}"},
+             {newFileLine(k, 1001000, 500, "100", ""),
+              newFileLine(k, 1002000, 500, "200", "")});
+  const auto runs = loadRuns(td.path());
+  const auto& f = onlyRun(runs).files.at(k);
+  EXPECT_EQ(f.uniqueBytes, 200u);
+}
+
+TEST(RawFields, TheCounterLineCarriesTimesSourceDutyAndRelayTiming) {
+  test::TempDir td;
+  writeLines(td.path(), "h-1-1000-0",
+             {"{\"ts\":1050,\"ts_ms\":1050000,\"start_ms\":1000250,\"counter_source\":\"perf\","
+              "\"pmu_duty\":0.5581,\"instructions\":10,\"hist_relay_rt_us\":[0,1]}",
+              "{\"ts\":1100,\"ts_ms\":1100500,\"start_ms\":1000250,\"counter_source\":\"perf\","
+              "\"pmu_duty\":0.9000,\"instructions\":20,\"hist_relay_rt_us\":[0,2,7]}"},
+             {newFileLine("root://o//a", 1099000, 1, "", "")});
+  const auto runs = loadRuns(td.path());
+  const ucache::Run& r = onlyRun(runs);
+  EXPECT_EQ(r.instructions, 20u) << "counters from the last line, as ever";
+  EXPECT_EQ(r.startMs, 1000250u);
+  EXPECT_EQ(r.endMs, 1100500u);
+  ASSERT_TRUE(r.haveDurationMs());
+  EXPECT_EQ(r.durationMs(), 100250u);
+  EXPECT_EQ(r.counterSource, "perf");
+  // The lines are cumulative: the first one's duty is the start of the run,
+  // the last one's the whole of it -- the duty that scaled the counts reported.
+  EXPECT_DOUBLE_EQ(r.pmuDuty, 0.9) << "the whole run's, from the last line";
+  EXPECT_TRUE(r.haveRelayRt);
+  EXPECT_EQ(r.histRelayRt, (std::vector<uint64_t>{0, 2, 7}));
+}
+
+TEST(RawFields, TheDutyIsTheLastLinesOrNone) {
+  // A shared PMU early in a run and not after: an early checkpoint's duty is
+  // low, the whole run's is not, and the whole run's is what is reported. A
+  // last line with no duty (no perf counters by then) reports none, whatever
+  // came before it.
+  test::TempDir td;
+  writeLines(td.path(), "h-1-1000-0",
+             {"{\"ts\":1030,\"counter_source\":\"perf\",\"pmu_duty\":0.5000,\"instructions\":5}",
+              "{\"ts\":4600,\"counter_source\":\"perf\",\"pmu_duty\":0.9912,\"instructions\":900}"},
+             {newFileLine("root://o//a", 4599000, 1, "", "")});
+  EXPECT_DOUBLE_EQ(onlyRun(loadRuns(td.path())).pmuDuty, 0.9912);
+  test::TempDir td2;
+  writeLines(td2.path(), "h-1-1000-0",
+             {"{\"ts\":1030,\"counter_source\":\"perf\",\"pmu_duty\":0.5000,\"instructions\":5}",
+              "{\"ts\":4600,\"instructions\":0}"},
+             {newFileLine("root://o//a", 4599000, 1, "", "")});
+  EXPECT_LT(onlyRun(loadRuns(td2.path())).pmuDuty, 0.0);
+}
+
+TEST(RawFields, ARecordNewerThanTheLastCounterLineEndsTheRun) {
+  test::TempDir td;
+  writeLines(td.path(), "h-1-1000-0", {"{\"ts\":1100,\"ts_ms\":1100000,\"start_ms\":1000000}"},
+             {newFileLine("root://o//a", 1100900, 1, "", "")});
+  const auto runs = loadRuns(td.path());
+  EXPECT_EQ(onlyRun(runs).durationMs(), 100900u);
+}
+
+TEST(RawFields, WithoutAStartThereIsNoMillisecondDuration) {
+  // A killed run leaves no counter line, and so no start_ms: its per-file
+  // records say when it ended, not when it began.
+  test::TempDir td;
+  writeLines(td.path(), "h-1-1000-0", {}, {newFileLine("root://o//a", 1100900, 1, "", "")});
+  const auto runs = loadRuns(td.path());
+  EXPECT_FALSE(onlyRun(runs).haveDurationMs());
+  EXPECT_EQ(onlyRun(runs).durationMs(), 0u);
+}
+
+TEST(RawFields, AnUnknownCounterSourceOrDutyIsIgnored) {
+  test::TempDir td;
+  writeLines(td.path(), "h-1-1000-0",
+             {"{\"ts\":1100,\"counter_source\":\"/home/x\",\"pmu_duty\":1.5}"},
+             {newFileLine("root://o//a", 1099000, 1, "", "")});
+  const auto runs = loadRuns(td.path());
+  EXPECT_TRUE(onlyRun(runs).counterSource.empty());
+  EXPECT_LT(onlyRun(runs).pmuDuty, 0.0);
+}
+
+TEST(RawFields, OriginTimingIsSummedByHost) {
+  test::TempDir td;
+  writeLines(td.path(), "h-1-1000-0", {"{\"ts\":1100}"},
+             {newFileLine("root://eos1.cern.ch:1094//a", 1001000, 1, "", "[1,1]"),
+              newFileLine("root://eos1.cern.ch:1094//b", 1001000, 1, "", "[0,1,1]"),
+              newFileLine("root://eos2.cern.ch//c", 1001000, 1, "", "[4]"),
+              newFileLine("root://xrootd.example.org//d", 1001000, 1, "", "")});
+  const auto runs = loadRuns(td.path());
+  const auto& by = onlyRun(runs).originRtByHost;
+  ASSERT_EQ(by.size(), 2u) << "a host whose files carried no timing is absent";
+  EXPECT_EQ(by.at("eos1.cern.ch"), (std::vector<uint64_t>{1, 2, 1}));
+  EXPECT_EQ(by.at("eos2.cern.ch"), (std::vector<uint64_t>{4}));
+}
+
+// ---- the listing ----------------------------------------------------------
+
+TEST(Listing, RunsThatReadNothingAreLeftOutAndShortRunsAreKept) {
+  test::TempDir td;
+  const std::string nothing = "\"opens\":0,\"files_opened\":0,\"served_bytes\":0,"
+                              "\"origin_bytes\":0,\"relay_bytes\":0";
+  writeRun(td.path(), "h", 1, 1000, 1001, nothing, {}); // a CLI call
+  writeRun(td.path(), "h", 2, 2000, 5000, nothing, {}); // a parent process
+  writeRun(td.path(), "h", 3, 6000, 6003, warmCounters(kMiB), {{"root://o//a", kMiB, 0, 0, 0}});
+  writeRun(td.path(), "h", 4, 7000, 7100, warmCounters(kGiB), {{"root://o//a", kGiB, 0, 0, 0}});
+  const auto listed = withoutTrivial(loadRuns(td.path()));
+  ASSERT_EQ(listed.size(), 2u);
+  EXPECT_EQ(listed[0].pid, 4u);
+  EXPECT_EQ(listed[1].pid, 3u) << "a 3 s run that read a file is a run";
+}
+
+TEST(Listing, AWorkerThatEndedWithItsFilesOpenIsARun) {
+  // A process that _exit()s with a file still open runs no destructor: its
+  // counter lines (the periodic checkpoints) say what it read, and no
+  // per-file record exists. It read, so it is listed -- and so is a long job
+  // seen while it runs, whose files are all still open.
+  test::TempDir td;
+  writeRun(td.path(), "h", 1, 1000, 1011, warmCounters(4 * kMiB), {});
+  writeRun(td.path(), "h", 2, 2000, 2011, fillCounters(4 * kMiB), {});
+  writeRun(td.path(), "h", 3, 3000, 3011, baselineCounters(4 * kMiB), {});
+  writeRun(td.path(), "h", 4, 4000, 4011,
+           "\"opens\":1,\"files_opened\":1,\"served_bytes\":0,\"origin_bytes\":0", {});
+  const auto listed = withoutTrivial(loadRuns(td.path()));
+  ASSERT_EQ(listed.size(), 4u) << "served, fetched, relayed, opened: each read";
+  for (const auto& r : listed)
+    EXPECT_TRUE(r.files.empty());
+}
+
+TEST(Listing, AShortRunNeverTakesPartInAGainEstimate) {
+  // The listing now keeps runs under ten seconds, which it used to drop, and
+  // that must not change any gain: a short warm run nearer the fill is not
+  // the one its correction uses, a short fill is not shown as a reference, and
+  // short runs spend no place under the estimate cap.
+  test::TempDir d;
+  corrFill(d.path(), 0.15);
+  corrWarm(d.path(), 2, 1210, 5);   // 5 s, right after the fill
+  corrWarm(d.path(), 3, 5000, 100); // the one the correction has always used
+  const auto runs = withoutTrivial(loadRuns(d.path()));
+  ASSERT_EQ(runs.size(), 3u);
+  for (const auto& r : runs)
+    if (r.startS == 1000) {
+      const ReferenceCorrection c = referenceCorrection(r, runs);
+      ASSERT_TRUE(c.available);
+      EXPECT_EQ(c.warmStartS, 5000u);
+    }
+  const GainEstimate g = gainAt(d.path(), 5000);
+  ASSERT_TRUE(g.valid) << g.reason;
+  EXPECT_NEAR(g.gain, (200.0 - 0.15 * 100.0) / 0.85 / 100.0, 0.001);
+
+  test::TempDir s;
+  corrFill(s.path(), 0.0, 5); // quiet, from the origin, 5 s
+  const auto shortRuns = withoutTrivial(loadRuns(s.path()));
+  ASSERT_EQ(shortRuns.size(), 1u);
+  EXPECT_FALSE(usableAsReference(shortRuns[0], shortRuns));
+}
+
+TEST(Listing, ShortRunsDoNotSpendTheEstimateCap) {
+  test::TempDir d;
+  twoFileBaseline(d.path(), 100);
+  writeRun(d.path(), "host", 200, 2000, 2050, warmCounters(kGiB),
+           {{"root://o//a", kGiB / 2, 0, 0, 0}, {"root://o//b", kGiB / 2, 0, 0, 0}});
+  for (uint64_t i = 0; i < 5; ++i) // newer, and short
+    writeRun(d.path(), "host", 300 + i, 3000 + 10 * i, 3002 + 10 * i, warmCounters(kMiB),
+             {{"root://o//a", kMiB, 0, 0, 0}});
+  const auto runs = withoutTrivial(loadRuns(d.path()));
+  ASSERT_EQ(runs.size(), 7u);
+  const Totals t = summarize(runs, /*maxEstimates=*/2);
+  EXPECT_TRUE(t.haveGain) << "the two runs that can be estimated fit under a cap of two";
+  EXPECT_EQ(t.gainCapped, 0u);
+  EXPECT_EQ(t.runs, 7u) << "the totals count every listed run";
+}
