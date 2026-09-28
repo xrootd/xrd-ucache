@@ -330,12 +330,18 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
   std::vector<uint8_t> raw, buf;
   // Asked once, and only when a range's setting names no codec.
   std::string unnamed;
-  bool unnamedAsked = false;
+  bool unnamedAsked = false, unnamedFailed = false;
   EligibleFn eligible = [&](size_t, const ColumnRange& range, std::string& codecOut) {
     if (!codecs.empty()) {
-      if (!unnamedAsked && rnTupleCodecName(range.compressionSettings).empty()) {
-        unnamedAsked = true;
-        if (!unnamedRNTupleCodec(m, src, unnamed)) return 2; // unreadable now: not a verdict
+      if (rnTupleCodecName(range.compressionSettings).empty()) {
+        if (!unnamedAsked) {
+          unnamedAsked = true;
+          unnamedFailed = !unnamedRNTupleCodec(m, src, unnamed);
+        }
+        // Unreadable now: not a verdict, for this range or any later one whose
+        // codec the same page was to name.
+        if (unnamedFailed)
+          return 2;
       }
       const std::string codec = rangeCodec(range, unnamed);
       if (std::find(codecs.begin(), codecs.end(), codec) == codecs.end()) {

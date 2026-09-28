@@ -451,6 +451,27 @@ struct CountingFileSource : FileSource {
 };
 } // namespace
 
+// The one read that names an unnamed setting's codec fails: that is not a
+// verdict for any range -- the sweep leaves every such range for next time
+// rather than declining the later ones for an empty codec.
+TEST(RNTupleFill, AFailedCodecReadDeclinesNoRange) {
+  struct FailingSource : FileSource {
+    using FileSource::FileSource;
+    bool read(void*, uint64_t, uint64_t) override { return false; }
+  };
+  RNTupleMeta m = parseRNTuple(unnamedFixture(), "");
+  ASSERT_TRUE(m.error.empty()) << m.error;
+  ASSERT_GT(m.ranges.size(), 1u) << "the case needs more than one unnamed range";
+  int fd = ::open(unnamedFixture().c_str(), O_RDONLY | O_CLOEXEC);
+  ASSERT_GE(fd, 0);
+  FailingSource src(fd, m.fileSize);
+  RNTupleRewrite rw = buildRNTupleRewrite(m, src, m.fileSize, 1, {"lzma", "zlib"});
+  ::close(fd);
+  EXPECT_EQ(rw.rangesRelocated, 0u);
+  EXPECT_TRUE(rw.declinedCodec.empty()) << rw.declinedCodec;
+  EXPECT_TRUE(rw.transient);
+}
+
 TEST(RNTupleFill, UnnamedSettingTakesThePagesCodec) {
   EXPECT_EQ(rnTupleCodecName(0), "none");
   EXPECT_EQ(rnTupleCodecName(1), ""); // the global default: named by the pages
