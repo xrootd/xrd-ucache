@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
@@ -20,6 +21,13 @@
 namespace ucache {
 namespace {
 uint64_t nowS() { return static_cast<uint64_t>(::time(nullptr)); }
+// Wall-clock epoch milliseconds. A record that carries both takes its seconds
+// from this same reading, so the two never disagree across a second boundary.
+uint64_t nowMs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count());
+}
 // Starting point for the stats-file suffix, so multiple CacheStore instances
 // (same host+pid+second) get distinct files — else they share one, dumpStats
 // appends both, and aggregateStats' last-line-per-file rule silently drops the
@@ -72,9 +80,13 @@ void CacheStore::claimIdentity(bool withTracer) {
   // between choosing a name and first writing to it.
   std::string stem;
   bool collided = false;
+  // The store's start: the seconds in the stem and the counter line's
+  // start_ms are this one reading.
+  const uint64_t startMs = nowMs();
+  startMs_.store(startMs, std::memory_order_relaxed);
   for (unsigned tries = 0; tries < 1024; ++tries) {
     std::ostringstream p;
-    p << cfg_.cacheDir << "/stats/" << host << "-" << ::getpid() << "-" << nowS() << "-"
+    p << cfg_.cacheDir << "/stats/" << host << "-" << ::getpid() << "-" << startMs / 1000 << "-"
       << g_statsSeq.fetch_add(1, std::memory_order_relaxed);
     stem = p.str();
     int fd = io_.open(stem + ".jsonl", O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -130,6 +142,7 @@ void CacheStore::afterForkChild() {
   left->tracer = std::move(tracer_);
   new (&statsPath_) std::string; // the parent's (or half-written) name, left behind
   new (&stats_) Stats(); // this process's counters start at zero; no tracer
+  ReadFootprint::afterForkChild(); // the footprints left behind held the ranges counted
   cpu_.reopen();         // now, before the child starts a thread of its own
   forkStale_.store(true, std::memory_order_release);
 }
@@ -924,9 +937,10 @@ ReadFootprint& CacheStore::relayFootprint(const std::string& url) {
 }
 
 void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const char* mode,
-                                uint64_t spanUs, uint64_t originSize) {
+                                uint64_t spanUs, uint64_t originSize,
+                                const Histogram* originRt) {
   ensureOwnIdentity();
-  const ReadFootprint* fp = footprintFor(url);
+  ReadFootprint* fp = footprintFor(url);
   // No size means no way to tell content from a reader's overshoot: ROOT asks
   // past the end routinely, and a signature that counts those bytes agrees
   // with no other route. Unknown is the honest answer, and every reader
@@ -946,12 +960,21 @@ void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const ch
   // One locked read for the pair -- see FileEntry::emitObsRecord. Separate
   // sig()/count() calls leave a window for a concurrent poison() between them.
   const bool sizeKnown = fp && originSize;
+  // Taught the size, the footprint clips the requests of the file's later
+  // handles as they come: a file opened again and again asks past its end
+  // more often than the footprint can follow without it (kTail).
+  if (sizeKnown)
+    fp->learnSize(originSize);
   std::string readSig;
   uint64_t readBuckets = 0;
   if (sizeKnown && !fp->sigAndCount(originSize, readSig, readBuckets)) {
     readSig.clear();
     readBuckets = 0;
   }
+  // The byte totals are clipped at the size too, so they have the same gate.
+  ReadFootprint::Totals reads;
+  if (sizeKnown)
+    reads = fp->totals(originSize);
   // Sample the process width here too: a cache-disabled run -- the BASELINE --
   // never creates an entry, so this is its only chance to record the width its
   // wall must be divided by.
@@ -968,13 +991,22 @@ void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const ch
   // Normalized exactly like a cached entry's key, or the baseline record could
   // never match the warm runs it exists to be compared against.
   auto key = UrlKey::parse(url, cfg_.keepCgi);
+  const uint64_t ms = nowMs();
   std::ostringstream os;
-  os << "{\"ts\":" << nowS() << ",\"key\":\"" << jsonEscape(key ? key->key : url) << '\"'
+  os << "{\"ts\":" << ms / 1000 << ",\"ts_ms\":" << ms << ",\"key\":\""
+     << jsonEscape(key ? key->key : url) << '\"'
      << ",\"opens\":1,\"served_bytes\":0,\"ram_bytes\":0,\"replica_bytes\":0"
      << ",\"disk_reads\":0,\"disk_seq\":0,\"disk_bytes\":0,\"first_touch_bytes\":0"
-     << ",\"wire_bytes\":" << bytes << ",\"span_us\":" << spanUs
-     << ",\"origin_size\":" << originSize << ",\"read_sig\":\"" << readSig
+     << ",\"wire_bytes\":" << bytes << ",\"span_us\":" << spanUs;
+  // The answer times of the reads this handle relayed; absent when it has none.
+  if (originRt && !originRt->empty())
+    os << ",\"origin_rt_us\":" << originRt->toJson();
+  os << ",\"origin_size\":" << originSize << ",\"read_sig\":\"" << readSig
      << "\",\"read_buckets\":" << readBuckets;
+  if (reads.origKnown)
+    os << ",\"orig_bytes\":" << reads.origBytes;
+  if (reads.uniqueKnown)
+    os << ",\"unique_bytes\":" << reads.uniqueBytes;
   os << ",\"mode\":\""
      << mode << "\"}\n";
   obsSink_->append(os.str());
@@ -1003,23 +1035,33 @@ void CacheStore::dumpStats(bool finalDump) {
   if (forkStale_.load(std::memory_order_acquire))
     return;
   std::lock_guard<std::mutex> dg(dumpMu_);
+  // The line's time and its work figures are read FIRST. At the final dump the
+  // job has ended, and writing the records of the files still open is the
+  // cache's own work: it must be neither in the run's wall (which a gain
+  // divides by, against a cache-disabled run that has nothing of the kind to
+  // do) nor in its CPU counts. Those records carry the dump's start as their
+  // time, so they do not move the run's end either.
+  const uint64_t ms = nowMs();
+  const uint64_t cpuUs = CpuCounters::processCpuUs();
+  const CpuCounters::Sample cpu = cpu_.sample();
   if (finalDump) {
     std::lock_guard<std::mutex> g(regMu_);
     for (auto& [hash, weak] : registry_)
       if (auto e = weak.lock())
-        e->emitObsRecord();
+        e->emitObsRecord(ms);
   }
   std::ostringstream line;
-  line << "{\"ts\":" << nowS() << ",\"pid\":" << ::getpid();
+  line << "{\"ts\":" << ms / 1000 << ",\"ts_ms\":" << ms
+       << ",\"start_ms\":" << startMs_.load(std::memory_order_relaxed)
+       << ",\"pid\":" << ::getpid();
   if (cfg_.disable)
     line << ",\"disabled\":1"; // a BASELINE run: the cache was out of the loop
   // Work accounting for the run record. cpu_us covers the whole process;
   // instructions/cycles come from the source named beside them (CpuCounters.h)
   // and are absent when the platform gives no counters. perf counts are scaled
   // for multiplexing, and pmu_duty says how much of them was measured.
-  line << ",\"cpu_us\":" << CpuCounters::processCpuUs()
-       << ",\"peak_cores\":" << widthSampler().width();
-  if (const CpuCounters::Sample cpu = cpu_.sample(); cpu.source) {
+  line << ",\"cpu_us\":" << cpuUs << ",\"peak_cores\":" << widthSampler().width();
+  if (cpu.source) {
     line << ",\"counter_source\":\"" << cpu.source << '"';
     if (std::strcmp(cpu.source, "perf") == 0)
       line << ",\"pmu_duty\":" << dutyText(cpu.duty);

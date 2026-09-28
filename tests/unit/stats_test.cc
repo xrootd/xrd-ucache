@@ -31,6 +31,21 @@ TEST(Histogram, JsonTrimsTrailingZeros) {
   EXPECT_EQ(h.toJson(), "[1,0,1]");
 }
 
+TEST(Histogram, EmptyClearAndAddFrom) {
+  Histogram a, b;
+  EXPECT_TRUE(a.empty());
+  a.add(4);
+  b.add(4);
+  b.add(1000);
+  EXPECT_FALSE(a.empty());
+  a.addFrom(b); // bucket by bucket
+  EXPECT_EQ(a.toJson(), "[0,0,2,0,0,0,0,0,0,1]");
+  EXPECT_EQ(b.toJson(), "[0,0,1,0,0,0,0,0,0,1]"); // the source is untouched
+  a.clear();
+  EXPECT_TRUE(a.empty());
+  EXPECT_EQ(a.toJson(), "[]");
+}
+
 TEST(Stats, JsonBodyHasAllCounters) {
   Stats s;
   s.opens = 3;
@@ -58,6 +73,11 @@ TEST(Stats, JsonBodyHasAllCounters) {
   EXPECT_NE(j.find("\"hist_req_read_bytes\":[0,0,0,0,0,0,0,0,0,0,0,0,1]"), std::string::npos);
   EXPECT_NE(j.find("\"hist_hit_read_bytes\":[0,0,0,0,0,0,0,0,0,0,0,0,1]"), std::string::npos);
   EXPECT_NE(j.find("\"hist_replica_read_bytes\":[]"), std::string::npos);
+  // Relayed answer times are their own histogram, never the cache's fetches'.
+  s.relayRtUs.add(1000);
+  j = "{" + s.toJsonBody() + "}";
+  EXPECT_NE(j.find("\"hist_relay_rt_us\":[0,0,0,0,0,0,0,0,0,1]"), std::string::npos);
+  EXPECT_NE(j.find("\"hist_origin_rt_us\":[]"), std::string::npos);
   // Braces balanced, no trailing comma before '}'.
   EXPECT_EQ(j.find(",}"), std::string::npos);
 }

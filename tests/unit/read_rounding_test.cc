@@ -248,3 +248,34 @@ TEST(ReadRounding, UnroundedLargeReadIsPermanentlyUncacheable) {
   EXPECT_EQ(fx.stats.pageWrites.load(), before);
   EXPECT_FALSE(e->hasRange(off, len));
 }
+
+namespace {
+struct Chunk {
+  uint64_t offset;
+  uint32_t length;
+};
+std::vector<std::pair<uint64_t, uint64_t>> runs(const std::vector<Chunk>& chunks) {
+  std::vector<std::pair<uint64_t, uint64_t>> out;
+  forEachEndToEndRun(chunks, [&](uint64_t o, uint64_t n) { out.emplace_back(o, n); });
+  return out;
+}
+} // namespace
+
+// A request a reader split into consecutive pieces is one run again; chunks
+// out of order, apart or overlapping stay as they are.
+TEST(EndToEndRuns, PiecesOfOneRequestJoinAndNothingElseDoes) {
+  using R = std::vector<std::pair<uint64_t, uint64_t>>;
+  EXPECT_TRUE(runs({}).empty());
+  EXPECT_EQ(runs({{100, 50}}), (R{{100, 50}}));
+  // One 5 MiB element cut at 2 MiB, then a chunk elsewhere.
+  const uint32_t two = 2u << 20;
+  EXPECT_EQ(runs({{1000, two}, {1000 + two, two}, {1000 + 2ull * two, 1u << 20}, {9000000, 10}}),
+            (R{{1000, 2ull * two + (1u << 20)}, {9000000, 10}}));
+  EXPECT_EQ(runs({{200, 100}, {100, 100}}), (R{{200, 100}, {100, 100}})) << "order is kept";
+  EXPECT_EQ(runs({{0, 100}, {101, 100}}), (R{{0, 100}, {101, 100}})) << "a gap";
+  EXPECT_EQ(runs({{0, 100}, {50, 100}}), (R{{0, 100}, {50, 100}})) << "an overlap";
+  EXPECT_EQ(runs({{0, 100}, {100, 0}, {100, 5}}), (R{{0, 105}}));
+  // A run never wraps past the top of the address space.
+  const uint64_t top = std::numeric_limits<uint64_t>::max() - 99;
+  EXPECT_EQ(runs({{top, 99}, {top + 99, 1}, {0, 1}}), (R{{top, 99}, {top + 99, 1}, {0, 1}}));
+}

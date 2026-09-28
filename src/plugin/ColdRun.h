@@ -112,6 +112,11 @@ uint64_t coldLayoutHash(const ColdFill& cf);
 // original file's range reads as itself, padding carries nothing.
 void coldOriginRanges(const ColdFill& cf, uint64_t off, uint64_t len,
                       std::vector<std::pair<uint64_t, uint64_t>>& out);
+// The original bytes the same read carried byte for byte, for the byte counts
+// that must be right or absent (transpose::exactOriginRanges): false when it
+// covers only part of a slot or of the relocated metadata.
+bool coldExactOriginRanges(const ColdFill& cf, uint64_t off, uint64_t len,
+                           std::vector<std::pair<uint64_t, uint64_t>>& out);
 
 // Serve Read/VectorRead-shaped chunks, each already inside the virtual size.
 // Completes `user` exactly once: with the chunks (VectorReadInfo when isVRead,

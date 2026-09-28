@@ -174,7 +174,9 @@ class CacheStore {
   // Appends one JSON line to stats/<host>-<pid>-<start_ts>.jsonl. finalDump:
   // this is the process's LAST dump (atexit/dtor) — also emit the Layer-2
   // per-file records of entries still alive (their destructors may never run;
-  // emit-once guard prevents doubles).
+  // emit-once guard prevents doubles). The line's time and CPU figures are
+  // read before anything else, so writing those records is in neither the
+  // run's wall nor its work; they carry the dump's start as their time.
   void dumpStats(bool finalDump = false);
   // Periodic checkpoint for processes that may never exit cleanly. A
   // multiprocessing worker _exit()s: no destructors, no atexit, so without this
@@ -194,9 +196,12 @@ class CacheStore {
   // UCACHE_DISABLE, write-opened, no store entry). Same companion file and
   // shape as FileEntry's lifetime records, with the bytes under `wire_bytes` —
   // it is what a cache-disabled BASELINE run leaves behind, and the gain
-  // readout matches later cached runs against it by key.
+  // readout matches later cached runs against it by key. `originRt`: the
+  // answer times of the reads this handle relayed (only its own, so records
+  // of one file sum), written as `origin_rt_us` when not empty.
   void recordRelayObs(const std::string& url, uint64_t bytes, const char* mode = "relay",
-                      uint64_t spanUs = 0, uint64_t originSize = 0);
+                      uint64_t spanUs = 0, uint64_t originSize = 0,
+                      const Histogram* originRt = nullptr);
 
   // The read footprint of one file, shared by every handle on it for as long
   // as this process lives. Both routes need that lifetime: a relayed file has
@@ -339,6 +344,9 @@ class CacheStore {
   std::atomic<bool> admissionBlocked_{false};
   std::atomic<bool> blockedWarned_{false}; // WARN once per process, not per entry
   std::string statsPath_;
+  // Epoch ms of the claim that named statsPath_ (the stem's seconds are this
+  // reading): when this process's store started, for the counter line.
+  std::atomic<uint64_t> startMs_{0};
   bool dumpStatsOnDtor_ = true;
   std::mutex dumpMu_; // dumpStats: the checkpoint, the destructor and atexit may overlap
   // Distinct keys opened this process (drives stats.filesOpened);

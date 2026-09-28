@@ -36,7 +36,10 @@
 #include "UrlKey.h"
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
+#include <utility>
+#include <vector>
 
 namespace ucache {
 
@@ -70,6 +73,20 @@ class ReplicaView {
   void originRanges(uint64_t off, uint64_t len,
                     std::vector<ReplicaMeta::Range>& out) const;
   bool hasOriginMap() const { return !meta_.origMap.empty(); }
+
+  // The same read twice over, from one walk, as (offset, length) pairs -- the
+  // two things a footprint takes (ReadFootprint::noteMapped). `units` is what
+  // originRanges gives. `exact` is the original bytes the read carried byte
+  // for byte, for counts that must be right or absent: bytes the overlay does
+  // not cover pass through as in `units`; a window patched in place is its own
+  // original range, so any part of it is the same part of the original; a
+  // relocated range read WHOLE is its whole original range. Returns false when
+  // the read covers only PART of a relocated range -- a part of a recompressed
+  // basket or page has no original offset, so neither its whole original range
+  // nor a share of it would be a count -- and `exact` is then not to be used.
+  // False, and both empty, for a sidecar without a map.
+  bool mapToOrigin(uint64_t off, uint64_t len, std::vector<std::pair<uint64_t, uint64_t>>& units,
+                   std::vector<std::pair<uint64_t, uint64_t>>& exact) const;
 
   // Read overlay bytes [tdataOff, +len), verifying every touched overlay
   // page's CRC. false => bad page or IO error: replica_crc_failures counted,

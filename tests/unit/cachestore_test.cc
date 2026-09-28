@@ -452,6 +452,237 @@ TEST(CacheStore, StatsDumpWritesJsonLine) {
   EXPECT_NE(line.find("\"wire_bytes\":12288"), std::string::npos);
 }
 
+namespace {
+// Every per-file record a store in `dir` has written, in order.
+std::vector<std::string> fileRecords(IOBackend& io, const std::string& dir) {
+  std::vector<std::string> names, out;
+  io.listDir(dir + "/stats", names);
+  std::sort(names.begin(), names.end());
+  for (const auto& n : names)
+    if (n.size() > 12 && n.compare(n.size() - 12, 12, ".files.jsonl") == 0) {
+      std::ifstream in(dir + "/stats/" + n);
+      std::string line;
+      while (std::getline(in, line))
+        out.push_back(line);
+    }
+  return out;
+}
+// A record's unsigned member, or -1 when it has none.
+int64_t member(const std::string& rec, const std::string& name) {
+  const std::string k = "\"" + name + "\":";
+  const size_t p = rec.find(k);
+  return p == std::string::npos ? -1 : std::stoll(rec.substr(p + k.size()));
+}
+} // namespace
+
+TEST(CacheStore, FileRecordCarriesWhatTheReaderAskedFor) {
+  // Original-file coordinates, both totals: every request counted (re-reads
+  // included), and the distinct bytes; clipped at the file's end.
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  auto e = store.open(keyN(0), 100000);
+  ASSERT_TRUE(e);
+  e->noteRead(0, 4096);
+  e->noteRead(0, 4096);       // read again
+  e->noteRead(90000, 20000);  // runs 10000 past the end
+  e.reset();                  // last reference: the record is written
+  const auto recs = fileRecords(io, td.path());
+  ASSERT_EQ(recs.size(), 1u);
+  EXPECT_EQ(member(recs[0], "orig_bytes"), 4096 + 4096 + 10000) << recs[0];
+  EXPECT_EQ(member(recs[0], "unique_bytes"), 4096 + 10000) << recs[0];
+}
+
+TEST(CacheStore, AReopenedFileRecordsItsWholeProcessTotal) {
+  // The footprint is the store's, per file, so the record of a second entry
+  // for the same file is cumulative -- the reader takes the larger.
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  auto e = store.open(keyN(0), 100000);
+  e->noteRead(0, 1000);
+  e.reset();
+  e = store.open(keyN(0), 100000);
+  e->noteRead(5000, 1000);
+  e.reset();
+  const auto recs = fileRecords(io, td.path());
+  ASSERT_EQ(recs.size(), 2u);
+  EXPECT_EQ(member(recs[0], "orig_bytes"), 1000);
+  EXPECT_EQ(member(recs[1], "orig_bytes"), 2000);
+  EXPECT_EQ(member(recs[1], "unique_bytes"), 2000);
+}
+
+TEST(CacheStore, AnEntryThatGoesLeavesItsFilesRangesCompact) {
+  // The store's footprint outlives the entry, and nobody reads the file once
+  // the entry is gone: its ranges are stored compactly, which is what keeps a
+  // job over many files inside the process bound. A later entry's reads
+  // restore them and add to them.
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const uint64_t base = ReadFootprint::rangeBytesTotal();
+  const uint64_t n = 4000;
+  auto e = store.open(keyN(0), 64 << 20);
+  ASSERT_TRUE(e);
+  for (uint64_t i = 0; i < n; ++i)
+    e->noteRead(i * 16384, 4096); // disjoint: one range each
+  const uint64_t open = ReadFootprint::rangeBytesTotal() - base;
+  ASSERT_GE(open, n * 16);
+  e.reset();
+  const uint64_t closed = ReadFootprint::rangeBytesTotal() - base;
+  EXPECT_LT(closed * 3, open) << "frozen: " << closed << " bytes, open: " << open;
+  e = store.open(keyN(0), 64 << 20);
+  e->noteRead(n * 16384, 4096);
+  e.reset();
+  const auto recs = fileRecords(io, td.path());
+  ASSERT_EQ(recs.size(), 2u);
+  EXPECT_EQ(member(recs[0], "unique_bytes"), static_cast<int64_t>(n * 4096)) << recs[0];
+  EXPECT_EQ(member(recs[1], "unique_bytes"), static_cast<int64_t>((n + 1) * 4096)) << recs[1];
+}
+
+TEST(CacheStore, APoisonedFileRecordsNoByteTotals) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  auto e = store.open(keyN(0), 100000);
+  e->noteRead(0, 1000);
+  e->footprint().poison(); // a read that could not be put in original coordinates
+  e.reset();
+  const auto recs = fileRecords(io, td.path());
+  ASSERT_EQ(recs.size(), 1u);
+  EXPECT_EQ(member(recs[0], "orig_bytes"), -1) << recs[0];
+  EXPECT_EQ(member(recs[0], "unique_bytes"), -1) << recs[0];
+}
+
+TEST(CacheStore, AReplicaReadTheMapCannotNameRecordsNoByteTotalsButItsSignature) {
+  // A read of a rewritten layout that the layout's map names exactly counts
+  // as its original bytes; one it cannot name (part of a relocated basket)
+  // leaves the file with no byte totals for the process, and with the read
+  // signature it always had -- the gain comparison matches files on that.
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const std::vector<ReadFootprint::Span> named{{0, 4096}, {8192, 1000}};
+  auto e = store.open(keyN(0), 100000);
+  ASSERT_TRUE(e);
+  e->noteMappedRead(named, &named);
+  e.reset();
+  const std::vector<ReadFootprint::Span> units{{20000, 30000}};
+  e = store.open(keyN(0), 100000);
+  e->noteMappedRead(units, nullptr);
+  e.reset();
+  e = store.open(keyN(1), 100000);
+  e->noteRead(0, 4096);
+  e->noteRead(8192, 1000);
+  e->noteRead(20000, 30000);
+  e.reset();
+  const auto recs = fileRecords(io, td.path());
+  ASSERT_EQ(recs.size(), 3u);
+  EXPECT_EQ(member(recs[0], "orig_bytes"), 5096) << recs[0];
+  EXPECT_EQ(member(recs[0], "unique_bytes"), 5096) << recs[0];
+  EXPECT_EQ(member(recs[1], "orig_bytes"), -1) << recs[1];
+  EXPECT_EQ(member(recs[1], "unique_bytes"), -1) << recs[1];
+  auto sigOf = [](const std::string& rec) {
+    const size_t p = rec.find("\"read_sig\":\"");
+    return p == std::string::npos ? std::string()
+                                  : rec.substr(p + 12, rec.find('"', p + 12) - p - 12);
+  };
+  EXPECT_FALSE(sigOf(recs[1]).empty()) << recs[1];
+  EXPECT_EQ(sigOf(recs[1]), sigOf(recs[2])) << "the same buckets as the same reads noted plainly";
+  EXPECT_EQ(member(recs[1], "read_buckets"), member(recs[2], "read_buckets"));
+}
+
+TEST(CacheStore, RelayRecordCarriesWhatTheReaderAskedFor) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const std::string url = "root://h//data/relayed.root";
+  store.relayFootprint(url).note(0, 3000);
+  store.relayFootprint(url).note(1000, 3000);
+  store.recordRelayObs(url, 6000, "relay", 10, 50000);
+  // With no size known neither total can be clipped, so neither is written.
+  const std::string other = "root://h//data/sizeless.root";
+  store.relayFootprint(other).note(0, 3000);
+  store.recordRelayObs(other, 3000, "relay", 10, 0);
+  const auto recs = fileRecords(io, td.path());
+  ASSERT_EQ(recs.size(), 2u);
+  EXPECT_EQ(member(recs[0], "orig_bytes"), 6000) << recs[0];
+  EXPECT_EQ(member(recs[0], "unique_bytes"), 4000) << recs[0];
+  EXPECT_EQ(member(recs[1], "orig_bytes"), -1) << recs[1];
+  EXPECT_EQ(member(recs[1], "unique_bytes"), -1) << recs[1];
+}
+
+TEST(CacheStore, ARelayedFileOpenedAgainAndAgainKeepsItsByteTotal) {
+  // A relayed read is noted with no size, and a reader that opens the file
+  // again and again (an RNTuple reader asks past the end at every open) runs
+  // past its end more often than the footprint can follow. The first record,
+  // written with the size, teaches it to the footprint, and the later
+  // requests are clipped as they come: the later record still has the total.
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const std::string url = "root://h//data/reopened.root";
+  const uint64_t size = 100000;
+  store.relayFootprint(url).note(0, 1000);
+  for (int i = 0; i < 3; ++i)
+    store.relayFootprint(url).note(size - 100, 200); // 100 past the end each
+  store.recordRelayObs(url, 1300, "relay", 10, size);
+  for (uint64_t i = 0; i < 3 * ReadFootprint::kTail; ++i)
+    store.relayFootprint(url).note(size - 50, 100); // 50 past the end each
+  store.recordRelayObs(url, 3 * ReadFootprint::kTail * 50, "relay", 10, size);
+  const auto recs = fileRecords(io, td.path());
+  ASSERT_EQ(recs.size(), 2u);
+  EXPECT_EQ(member(recs[0], "orig_bytes"), 1000 + 3 * 100) << recs[0];
+  EXPECT_EQ(member(recs[1], "orig_bytes"),
+            static_cast<int64_t>(1000 + 3 * 100 + 3 * ReadFootprint::kTail * 50))
+      << recs[1];
+  EXPECT_EQ(member(recs[1], "unique_bytes"), 1000 + 100) << recs[1];
+}
+
+TEST(CacheStore, TheFinalDumpsRecordsCarryItsStart) {
+  // The run has ended when the final dump starts: its line's time is read
+  // first, and the records it writes for the entries still open carry that
+  // same time, so writing them moves neither the run's end nor theirs.
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  auto e = store.open(keyN(0), 100000);
+  e->noteRead(0, 1000);
+  store.dumpStats(/*finalDump=*/true);
+  const auto recs = fileRecords(io, td.path());
+  ASSERT_EQ(recs.size(), 1u);
+  std::vector<std::string> names;
+  io.listDir(td.path() + "/stats", names);
+  std::string line;
+  for (const auto& n : names)
+    if (n.size() > 6 && n.compare(n.size() - 6, 6, ".jsonl") == 0 &&
+        n.find(".files.") == std::string::npos) {
+      std::ifstream in(td.path() + "/stats/" + n);
+      std::getline(in, line);
+    }
+  ASSERT_FALSE(line.empty());
+  ASSERT_GT(member(line, "ts_ms"), 0) << line;
+  EXPECT_EQ(member(recs[0], "ts_ms"), member(line, "ts_ms")) << recs[0] << "\n" << line;
+  e.reset(); // its record is written already, once
+  EXPECT_EQ(fileRecords(io, td.path()).size(), 1u);
+}
+
 TEST(CacheStore, InvalidateRemovesEntry) {
   TempDir td;
   RealIO io;
@@ -1411,7 +1642,44 @@ std::string fieldOf(const std::string& line, const std::string& key) {
       ++e;
   return line.substr(b, e - b);
 }
+uint64_t numOf(const std::string& line, const std::string& key) {
+  return std::strtoull(fieldOf(line, key).c_str(), nullptr, 10);
+}
+uint64_t epochMs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count());
+}
 } // namespace
+
+TEST(CacheStore, TheCounterLineCarriesItsTimesInMillisecondsAndTheStoresStart) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  const uint64_t before = epochMs();
+  CacheStore store(io, cfg);
+  store.disableStatsDump(); // the one line below, not the destructor's too
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  store.dumpStats(false);
+  const uint64_t after = epochMs();
+  const std::string path = counterFile(io, td.path());
+  const auto lines = completeLines(path);
+  ASSERT_EQ(lines.size(), 1u);
+  const std::string& l = lines[0];
+  const uint64_t ts = numOf(l, "ts"), tsMs = numOf(l, "ts_ms"), startMs = numOf(l, "start_ms");
+  EXPECT_GE(tsMs, before);
+  EXPECT_LE(tsMs, after);
+  EXPECT_EQ(ts, tsMs / 1000) << "the seconds and the milliseconds are one reading";
+  EXPECT_GE(startMs, before);
+  EXPECT_GE(tsMs, startMs + 20) << "the store started before the line was written";
+  // The stem's seconds (<host>-<pid>-<seconds>-<seq>.jsonl) are the start's.
+  const std::string name = path.substr(path.rfind('/') + 1);
+  const std::string pid = "-" + std::to_string(::getpid()) + "-";
+  const size_t p = name.find(pid);
+  ASSERT_NE(p, std::string::npos) << name;
+  EXPECT_EQ(std::strtoull(name.c_str() + p + pid.size(), nullptr, 10), startMs / 1000) << name;
+}
 
 TEST(CacheStore, TheCounterLineNamesWhereItsCountsComeFromAndHowMuchWasMeasured) {
   TempDir td;
@@ -1443,4 +1711,108 @@ TEST(CacheStore, TheCounterLineNamesWhereItsCountsComeFromAndHowMuchWasMeasured)
   EXPECT_EQ(fieldOf(l, "counter_source"), "\"rusage\"") << l;
   EXPECT_EQ(fieldOf(l, "pmu_duty"), "") << l; // perf only
 #endif
+}
+
+TEST(CacheStore, RelayedAnswerTimesHaveAHistogramOfTheirOwn) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  store.disableStatsDump();
+  store.stats().relayRtUs.add(1000);  // bucket 9
+  store.stats().relayRtUs.add(1023);  // bucket 9
+  store.stats().relayRtUs.add(70000); // bucket 16
+  store.dumpStats(false);
+  const auto lines = completeLines(counterFile(io, td.path()));
+  ASSERT_EQ(lines.size(), 1u);
+  EXPECT_EQ(fieldOf(lines[0], "hist_relay_rt_us"), "[0,0,0,0,0,0,0,0,0,2,0,0,0,0,0,0,1]");
+  // The cache's own fetches keep their histogram, and its meaning.
+  EXPECT_EQ(fieldOf(lines[0], "hist_origin_rt_us"), "[]");
+}
+
+TEST(CacheStore, PerFileRecordsCarryTheirOwnOriginAnswerTimesAndMilliseconds) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  const uint64_t before = epochMs();
+  {
+    CacheStore store(io, cfg); // dumping on: a store that does not writes no per-file records
+    {
+      auto fetched = store.open(keyN(1), 1 << 20);
+      ASSERT_TRUE(fetched);
+      fetched->obs().originRtUs.add(3);    // bucket 1
+      fetched->obs().originRtUs.add(1500); // bucket 10
+      auto untouched = store.open(keyN(2), 1 << 20);
+      ASSERT_TRUE(untouched);
+    } // both released: one record each
+    // The relay route: one record per relayed handle, with that handle's times.
+    Histogram relayed;
+    relayed.add(20000); // bucket 14
+    store.recordRelayObs("root://h//data/relayed.root", 4096, "relay", 10, 8192, &relayed);
+    Histogram none;
+    store.recordRelayObs("root://h//data/quiet.root", 4096, "relay", 10, 8192, &none);
+    store.recordRelayObs("root://h//data/older.root", 4096, "relay", 10, 8192);
+  }
+  const uint64_t after = epochMs();
+  const auto recs = fileRecords(io, td.path());
+  std::string all;
+  for (const auto& r : recs)
+    all += r + "\n";
+  ASSERT_EQ(recs.size(), 5u) << all;
+  auto recordOf = [&](const std::string& path) -> std::string {
+    for (const auto& r : recs)
+      if (r.find(path) != std::string::npos)
+        return r;
+    return "";
+  };
+  const std::string fetched = recordOf("/data/file1.root");
+  const std::string untouched = recordOf("/data/file2.root");
+  const std::string relayed = recordOf("/data/relayed.root");
+  EXPECT_EQ(fieldOf(fetched, "origin_rt_us"), "[0,1,0,0,0,0,0,0,0,0,1]") << fetched;
+  EXPECT_EQ(fieldOf(untouched, "origin_rt_us"), "") << "absent when there were none";
+  EXPECT_EQ(fieldOf(relayed, "origin_rt_us"), "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]") << relayed;
+  EXPECT_EQ(fieldOf(recordOf("/data/quiet.root"), "origin_rt_us"), "");
+  EXPECT_EQ(fieldOf(recordOf("/data/older.root"), "origin_rt_us"), "");
+  for (const auto& r : recs) {
+    const uint64_t tsMs = numOf(r, "ts_ms");
+    EXPECT_GE(tsMs, before) << r;
+    EXPECT_LE(tsMs, after) << r;
+    EXPECT_EQ(numOf(r, "ts"), tsMs / 1000) << r;
+  }
+}
+
+TEST(CacheStore, AForkedChildsCounterLineStartsWithItsOwnStore) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  store.disableStatsDump();
+  store.dumpStats(false);
+  const std::string parentLine = completeLines(counterFile(io, td.path())).at(0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  const std::string r = forkedReport([&] {
+    store.afterForkChild();
+    auto mine = store.open(keyN(1), 1 << 20); // its first work claims its record
+    store.dumpStats(false);
+    return std::string("done");
+  });
+  const std::string pid = r.substr(0, r.find(' '));
+  ASSERT_EQ(r.substr(r.find(' ') + 1), "done");
+  const std::string rec = statsOf(td.path() + "/stats", pid);
+  const std::string line = rec.substr(rec.find('{'));
+  // The child's store starts when it claims its own record, after the parent's.
+  EXPECT_GE(numOf(line, "start_ms"), numOf(parentLine, "start_ms") + 20) << line;
+  EXPECT_GE(numOf(line, "ts_ms"), numOf(line, "start_ms")) << line;
+  if (CpuCounters().available()) {
+    // Counted from the child's own reopen (CpuCounters' own fork test checks
+    // the count), with its own source and duty cycle.
+    EXPECT_NE(fieldOf(line, "counter_source"), "") << line;
+    EXPECT_NE(fieldOf(line, "instructions"), "") << line;
+#if defined(__linux__)
+    EXPECT_EQ(fieldOf(line, "pmu_duty").size(), 6u) << line;
+#endif
+  }
 }

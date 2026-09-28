@@ -52,18 +52,23 @@ std::vector<ReplicaView::Seg> ReplicaView::map(uint64_t off, uint64_t len) const
   return out;
 }
 
-void ReplicaView::originRanges(uint64_t off, uint64_t len,
-                               std::vector<ReplicaMeta::Range>& out) const {
-  if (meta_.origMap.empty() || len == 0)
+namespace {
+
+// One walk of a virtual read over the origin map, for both answers:
+// `pass(a, b)` for each piece of origin bytes it carried as they are (below
+// originSize, [a, b)), `mapped(r, a, b)` for each piece [a, b) of a mapped
+// range r it touched.
+template <typename Pass, typename Mapped>
+void walkOrigin(const ReplicaMeta& m, uint64_t off, uint64_t len, Pass pass, Mapped mapped) {
+  if (m.origMap.empty() || len == 0)
     return;
-  const uint64_t end = std::min(off + len, meta_.virtualSize);
+  const uint64_t end = std::min(off + len, m.virtualSize);
   if (end <= off)
     return;
   // First mapping whose end lies past `off` (sorted, non-overlapping).
-  auto it = std::lower_bound(meta_.origMap.begin(), meta_.origMap.end(), off,
-                             [](const ReplicaMeta::OrigRange& r, uint64_t o) {
-                               return r.virtOff + r.len <= o;
-                             });
+  auto it = std::lower_bound(
+      m.origMap.begin(), m.origMap.end(), off,
+      [](const ReplicaMeta::OrigRange& r, uint64_t o) { return r.virtOff + r.len <= o; });
   // A virtual offset the overlay does not cover is an ORIGIN offset — but only
   // below originSize. The stitched file is larger than the original, and the
   // extension's uncovered gaps (alignment, record headers) are overlay
@@ -71,13 +76,13 @@ void ReplicaView::originRanges(uint64_t off, uint64_t len,
   // coordinates past the end of the origin file and make the same work look
   // different depending on the tier that served it.
   const auto passThrough = [&](uint64_t a, uint64_t b) {
-    const uint64_t hi = std::min(b, meta_.originSize);
+    const uint64_t hi = std::min(b, m.originSize);
     if (hi > a)
-      out.push_back({a, hi - a});
+      pass(a, hi);
   };
   uint64_t pos = off;
   while (pos < end) {
-    if (it == meta_.origMap.end() || it->virtOff >= end) {
+    if (it == m.origMap.end() || it->virtOff >= end) {
       passThrough(pos, end);
       break;
     }
@@ -87,12 +92,49 @@ void ReplicaView::originRanges(uint64_t off, uint64_t len,
     }
     const uint64_t segEnd = std::min(end, it->virtOff + it->len);
     if (pos < segEnd) {
-      // The whole original range, not a slice of it.
-      out.push_back({it->origOff, it->origLen});
+      mapped(*it, pos, segEnd);
       pos = segEnd;
     }
     ++it;
   }
+}
+
+} // namespace
+
+void ReplicaView::originRanges(uint64_t off, uint64_t len,
+                               std::vector<ReplicaMeta::Range>& out) const {
+  walkOrigin(
+      meta_, off, len,
+      [&](uint64_t a, uint64_t b) {
+        out.push_back({a, b - a});
+      },
+      [&](const ReplicaMeta::OrigRange& r, uint64_t, uint64_t) {
+        out.push_back({r.origOff, r.origLen}); // the whole original range, not a slice of it
+      });
+}
+
+bool ReplicaView::mapToOrigin(uint64_t off, uint64_t len,
+                              std::vector<std::pair<uint64_t, uint64_t>>& units,
+                              std::vector<std::pair<uint64_t, uint64_t>>& exact) const {
+  if (meta_.origMap.empty())
+    return false;
+  bool known = true;
+  walkOrigin(
+      meta_, off, len,
+      [&](uint64_t a, uint64_t b) {
+        units.emplace_back(a, b - a);
+        exact.emplace_back(a, b - a);
+      },
+      [&](const ReplicaMeta::OrigRange& r, uint64_t a, uint64_t b) {
+        units.emplace_back(r.origOff, r.origLen);
+        if (r.virtOff == r.origOff && r.len == r.origLen) // patched in place: itself
+          exact.emplace_back(a, b - a);
+        else if (a == r.virtOff && b == r.virtOff + r.len) // relocated, read whole
+          exact.emplace_back(r.origOff, r.origLen);
+        else // part of a relocated range: no original offset to give it
+          known = false;
+      });
+  return known;
 }
 
 bool ReplicaView::read(uint64_t tdataOff, uint64_t len, void* buf) {

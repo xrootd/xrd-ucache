@@ -42,6 +42,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ucache::transpose {
@@ -128,5 +129,18 @@ bool patchKeySeek(uint8_t* record, size_t n, uint64_t seek);
 // to slot.vSeek, then zeros. False (err set) when the record does not fit, or
 // its key is the 32-bit kind and the slot lies past 2^31.
 bool placeInSlot(const ConvertedBasket& c, const FillSlot& slot, uint8_t* out, std::string& err);
+
+// The ORIGINAL-file bytes a read of [off, off + len) of the layout carried,
+// byte for byte, as (offset, length) -- for counts that must be right or
+// absent. The original file's range reads as itself (its in-place windows
+// too: each is the same range of the original); a slot read WHOLE is its
+// basket or page; the relocated metadata record read whole is `metaOrigin`,
+// the original ranges it stands for; the alignment and padding between them
+// carry nothing. False when the read covers only PART of a slot or of the
+// metadata record: their bytes have no original offset, and `out` is then not
+// to be used.
+bool exactOriginRanges(const FillLayout& L,
+                       const std::vector<std::pair<uint64_t, uint64_t>>& metaOrigin, uint64_t off,
+                       uint64_t len, std::vector<std::pair<uint64_t, uint64_t>>& out);
 
 } // namespace ucache::transpose

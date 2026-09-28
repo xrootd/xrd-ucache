@@ -488,13 +488,16 @@ static void noteAppRead(const std::shared_ptr<HandleState>& st,
     return;
 #ifdef UCACHE_HAVE_COLDRUN
   if (entry && cold) {
-    // The cold run's layout maps back exactly: a slot is its basket, the rest
-    // is the original file or the original tree record.
+    // The cold run's layout maps back through its slot table: a slot is its
+    // basket, the rest is the original file or the original tree record. The
+    // buckets take every one the read touched, whole; the byte counts only
+    // what it read of them exactly, or nothing, for good, when it read part
+    // of a slot (ReadFootprint::noteMapped).
     widthSampler().sample();
-    std::vector<std::pair<uint64_t, uint64_t>> orig;
-    coldOriginRanges(*cold, off, len, orig);
-    for (const auto& r : orig)
-      entry->noteRead(r.first, r.second);
+    std::vector<std::pair<uint64_t, uint64_t>> units, exact;
+    coldOriginRanges(*cold, off, len, units);
+    const bool known = coldExactOriginRanges(*cold, off, len, exact);
+    entry->noteMappedRead(units, known ? &exact : nullptr);
     return;
   }
 #else
@@ -528,15 +531,36 @@ static void noteAppRead(const std::shared_ptr<HandleState>& st,
       entry->footprint().poison();
       return;
     }
-    std::vector<ReplicaMeta::Range> orig;
-    view->originRanges(off, len, orig);
-    for (const auto& r : orig)
-      entry->noteRead(r.off, r.len);
+    // The buckets take each relocated range the read touched, whole; the
+    // byte counts only the bytes it carried exactly, or nothing, for good,
+    // when it read part of a recompressed basket or page
+    // (ReplicaView::mapToOrigin).
+    std::vector<std::pair<uint64_t, uint64_t>> units, exact;
+    const bool known = view->mapToOrigin(off, len, units, exact);
+    entry->noteMappedRead(units, known ? &exact : nullptr);
     return;
   }
   entry->noteRead(off, len);
 }
 
+// The chunks of one vector read. On a rewritten layout (a replica, the slot
+// store), chunks that follow one another end to end are noted as the one span
+// they make (forEachEndToEndRun): a basket a reader read in pieces is still
+// read whole. The buckets come out the same either way; the byte counts stay
+// exact where each piece alone would read part of the basket. Elsewhere every
+// chunk is noted as it is.
+static void noteAppChunks(const std::shared_ptr<HandleState>& st,
+                          const std::shared_ptr<FileEntry>& entry,
+                          const std::shared_ptr<ReplicaView>& view, const XrdCl::ChunkList& chunks,
+                          const std::shared_ptr<ColdFill>& cold) {
+  if (!entry || (!view && !cold)) {
+    for (const auto& c : chunks)
+      noteAppRead(st, entry, view, c.offset, c.length, cold);
+    return;
+  }
+  forEachEndToEndRun(
+      chunks, [&](uint64_t off, uint64_t len) { noteAppRead(st, entry, view, off, len, cold); });
+}
 
 // Vector relay: the byte total and the footprint come from the same walk.
 static void noteRelayChunks(const std::shared_ptr<HandleState>& st,
@@ -555,6 +579,11 @@ static void emitRelayObs(const std::shared_ptr<HandleState>& st,
                          const std::shared_ptr<FileEntry>& entry) {
   if (st->relayObsDone.exchange(true))
     return;
+  // A handle with an entry relays too (a file read directly, a fail-open): its
+  // answer times are this file's, and go in the entry's record, which is
+  // written only once the entry's last handle has let go of it.
+  if (entry)
+    entry->obs().originRtUs.addFrom(st->relayRtUs);
   const uint64_t n = st->relayedBytes.load(std::memory_order_relaxed);
   if (!entry && st->store && n) {
     const uint64_t a = st->relayFirstUs.load(std::memory_order_relaxed);
@@ -596,7 +625,8 @@ static void emitRelayObs(const std::shared_ptr<HandleState>& st,
       }
       st->releaseInner();
     }
-    st->store->recordRelayObs(st->url, n, "relay", b > a ? b - a : 0, originSize);
+    st->store->recordRelayObs(st->url, n, "relay", b > a ? b - a : 0, originSize,
+                              &st->relayRtUs);
   }
 }
 
@@ -627,12 +657,60 @@ static void noteVectorRequest(const std::shared_ptr<HandleState>& st,
 // three routes carried their own copy of these fifteen lines, and only one of
 // the copies ever acquired the in-flight guard, so an origin read issued while
 // failing open was invisible to the counter that exists to see it.
+//
+// It also times the read, from issue to completion: the origin's answer time on
+// the route that bypasses the cache (hist_relay_rt_us, and the handle's own
+// share for its per-file record). A successful answer only, as the cache's own
+// fetches are timed; a clock reading on each side is all it adds, so what is
+// relayed and when is unchanged.
+//
+// A relayed plain read of a file with no entry also teaches the file's
+// footprint its size when the answer is SHORT: the origin gives fewer bytes
+// than asked only at the end of the file, so the file ends there. The
+// footprint then clips the requests that follow at once, where it could
+// otherwise follow only kTail of those that run past the end. The answer is
+// only looked at, never changed.
 struct RelayHandler : XrdCl::ResponseHandler {
   std::shared_ptr<HandleState> st;
   XrdCl::ResponseHandler* user = nullptr;
   OriginInFlight inflight;
+  uint64_t t0 = 0;      // when the read was issued
+  uint64_t readLen = 0; // a plain read's length (Read, PgRead), else 0
+  void learnSizeFrom(XrdCl::AnyObject* r) {
+    uint64_t off = 0, got = 0;
+    XrdCl::ChunkInfo* ci = nullptr;
+    r->Get(ci); // checked against the type held: null for any other answer
+    if (ci) {
+      off = ci->offset;
+      got = ci->length;
+    } else {
+      XrdCl::PageInfo* pi = nullptr;
+      r->Get(pi);
+      if (!pi)
+        return;
+      off = pi->GetOffset();
+      got = pi->GetLength();
+    }
+    if (got >= readLen)
+      return; // not short: the end of the file is further on
+    try {
+      if (ReadFootprint* fp = st->store->footprintFor(st->url))
+        fp->learnSize(off + got);
+    } catch (...) {
+      // a callback of the client library: nothing may leave it
+    }
+  }
   void HandleResponseWithHosts(XrdCl::XRootDStatus* s, XrdCl::AnyObject* r,
                                XrdCl::HostList* h) override {
+    // Timed before the inner file is given back, so a Close that waits for
+    // this read finds its time already on the handle.
+    if (st->store && t0 && s && s->IsOK()) {
+      const uint64_t rt = nowUs() - t0;
+      st->store->stats().relayRtUs.add(rt);
+      st->relayRtUs.add(rt);
+      if (readLen && r)
+        learnSizeFrom(r);
+    }
     st->releaseInner();
     inflight.release();
     if (user)
@@ -653,16 +731,23 @@ static RelayHandler* newRelay(const std::shared_ptr<HandleState>& st,
   auto* relay = new RelayHandler;
   relay->st = st;
   relay->user = user;
-  if (st->store)
+  if (st->store) {
     relay->inflight = OriginInFlight(&st->store->stats());
+    relay->t0 = nowUs();
+  }
   return relay;
 }
 
+// `readLen`: the length of a plain read (Read, PgRead) of a handle with no
+// entry, whose short answer tells its footprint where the file ends; 0 for
+// anything else.
 template <typename Issue>
 static XrdCl::XRootDStatus relayToInner(const std::shared_ptr<HandleState>& st,
-                                        XrdCl::ResponseHandler* user, Issue issue) {
+                                        XrdCl::ResponseHandler* user, Issue issue,
+                                        uint64_t readLen = 0) {
   if (XrdCl::File* f = st->acquireInner()) {
     auto* relay = newRelay(st, user);
+    relay->readLen = readLen;
     XrdCl::XRootDStatus s = issue(f, static_cast<XrdCl::ResponseHandler*>(relay));
     if (!s.IsOK()) {
       delete relay;
@@ -725,6 +810,7 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   relayedBytes.store(0, std::memory_order_relaxed);
   relayFirstUs.store(0, std::memory_order_relaxed);
   relayLastUs.store(0, std::memory_order_relaxed);
+  relayRtUs.clear();
   cpu0Us = 0;
   cpuBlended = true; // a span that began in the parent cannot be attributed here
   forkGen.store(gen, std::memory_order_release);
@@ -903,7 +989,9 @@ class MissReadHandler : public ResponseHandler {
       stats.servedBytes.fetch_add(userLen_, std::memory_order_relaxed);
       stats.originBytes.fetch_add(got, std::memory_order_relaxed);
       stats.originReads.fetch_add(1, std::memory_order_relaxed);
-      stats.originRtUs.add(nowUs() - t0_);
+      const uint64_t rt = nowUs() - t0_;
+      stats.originRtUs.add(rt);
+      entry_->obs().originRtUs.add(rt);
       if (stats.tracer)
         stats.tracer->rec("wire", entry_->key().key, wireOff_, got, nowUs() - t0_);
     }
@@ -1098,7 +1186,9 @@ class MissVReadHandler : public ResponseHandler {
       for (const auto& c : userChunks_)
         total += c.length;
       stats.servedBytes.fetch_add(total - directBytes, std::memory_order_relaxed);
-      stats.originRtUs.add(nowUs() - t0_);
+      const uint64_t rt = nowUs() - t0_;
+      stats.originRtUs.add(rt);
+      entry_->obs().originRtUs.add(rt);
       if (stats.tracer)
         stats.tracer->rec("wire", entry_->key().key, wire_.front().off, wireBytes,
                           nowUs() - t0_);
@@ -2193,9 +2283,12 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
   }
   if (!entry || offset + size < offset) {
     noteRelayBytes(st_, size, offset, size);
-    return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
-      return f->Read(offset, size, buffer, rh, timeout);
-    });
+    return relayToInner(
+        st_, handler,
+        [=](XrdCl::File* f, ResponseHandler* rh) {
+          return f->Read(offset, size, buffer, rh, timeout);
+        },
+        entry ? 0 : size);
   }
   // Past EOF is a SHORT read, and it must still be cached. Relaying it here
   // was correct in what it returned — the origin has the same file — but relay
@@ -2405,9 +2498,12 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
     return XRootDStatus();
   }
   noteRelayBytes(st_, size, offset, size);
-  return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
-    return f->PgRead(offset, size, buffer, rh, timeout);
-  });
+  return relayToInner(
+      st_, handler,
+      [=](XrdCl::File* f, ResponseHandler* rh) {
+        return f->PgRead(offset, size, buffer, rh, timeout);
+      },
+      entry ? 0 : size);
 }
 
 // The plain byte-cache vector-read serve, as a free function so a request that
@@ -2556,8 +2652,7 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
     }
     return VectorRead(placed, nullptr, handler, timeout);
   }
-  for (const auto& c : chunks)
-    noteAppRead(st_, entry, view, c.offset, c.length, cold);
+  noteAppChunks(st_, entry, view, chunks, cold);
   // The combined-buffer variant is legacy and rare: pass through unchanged.
   if (!entry || buffer || chunks.empty()) {
     noteRelayChunks(st_, chunks);

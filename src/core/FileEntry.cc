@@ -19,6 +19,14 @@ namespace ucache {
 namespace {
 uint64_t nowS() { return static_cast<uint64_t>(::time(nullptr)); }
 
+// Wall-clock epoch milliseconds for the record's ts_ms; its ts is taken from
+// the same reading.
+uint64_t nowMsWall() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count());
+}
+
 uint64_t nowUsSteady() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                    std::chrono::steady_clock::now().time_since_epoch())
@@ -173,6 +181,13 @@ FileEntry::~FileEntry() {
   // Per-file record: one lifetime record per entry, at last release (or at
   // the final stats dump for entries teardown never releases — emit-once).
   emitObsRecord();
+  // The store's footprint outlives the entry, and no one reads the file
+  // through it any more: its ranges are stored compactly, in about a third of
+  // the space, so a job over many files stays inside the process bound
+  // (ReadFootprint::kMaxRangeBytes) and its files keep their distinct-byte
+  // counts. A later entry's first read restores them. Never throws.
+  if (shared_)
+    shared_->freeze();
   // Drop any staged bytes that a failed flush left behind from the global
   // accounting (the pages themselves die with the maps).
   std::lock_guard<std::mutex> g(mu_);
@@ -196,11 +211,20 @@ void FileEntry::noteActivity() {
     ;
 }
 
-void FileEntry::emitObsRecord() {
+void FileEntry::emitObsRecord(uint64_t tsMs) {
   if (!obsSink_ || obs_.opens.load(std::memory_order_relaxed) == 0)
     return;
   if (obsEmitted_.exchange(true))
     return;
+  // The destructor calls this: a record lost for want of memory is a lost
+  // record, never a terminated job.
+  try {
+    writeObsRecord(tsMs);
+  } catch (...) {
+  }
+}
+
+void FileEntry::writeObsRecord(uint64_t tsMs) {
   auto v = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
   // ONE look at the footprint, under ONE lock, for the signature AND the count.
   // Holding a single reference was not enough: sig() and count() each take the
@@ -214,8 +238,12 @@ void FileEntry::emitObsRecord() {
     readSig.clear();
     readBuckets = 0;
   }
+  // What the reader asked for, in the original file's coordinates.
+  const ReadFootprint::Totals reads = footprint().totals(meta_.fileSize);
+  const uint64_t ms = tsMs ? tsMs : nowMsWall();
   std::ostringstream os;
-  os << "{\"ts\":" << nowS() << ",\"key\":\"" << jsonEscapeMin(key_.key) << '"'
+  os << "{\"ts\":" << ms / 1000 << ",\"ts_ms\":" << ms << ",\"key\":\""
+     << jsonEscapeMin(key_.key) << '"'
      << ",\"opens\":" << v(obs_.opens) << ",\"served_bytes\":" << v(obs_.servedBytes)
      << ",\"ram_bytes\":" << v(obs_.ramBytes)
      << ",\"replica_bytes\":" << v(obs_.replicaBytes)
@@ -227,18 +255,25 @@ void FileEntry::emitObsRecord() {
      << ",\"prefetch_issued\":" << v(obs_.prefetchIssued)
      << ",\"prefetch_served\":" << v(obs_.prefetchServed)
      << ",\"prefetch_dropped\":" << v(obs_.prefetchDropped)
-     << ",\"span_us\":" << spanUs()
-     // The one size that means the same thing on both routes. Bytes SERVED
-     // differ by route -- the replica tier hands over decompressed data, the
-     // origin compressed -- so they cannot normalise a comparison between
-     // routes; the file's size at the origin can.
-     << ",\"origin_size\":" << meta_.fileSize
-     << ",\"read_sig\":\"" << readSig << "\",\"read_buckets\":" << readBuckets
-     // A file this process mostly FETCHED is a fill, whatever else it also
-     // served; the distinction decides which population a measurement joins.
-     // One it mostly read straight from the origin without keeping it
-     // (max_read_fraction) is relayed, as a pass-through file is.
-     << ",\"mode\":\""
+     << ",\"span_us\":" << spanUs();
+  // The answer times of this file's requests to the origin; absent when none.
+  if (!obs_.originRtUs.empty())
+    os << ",\"origin_rt_us\":" << obs_.originRtUs.toJson();
+  // The one size that means the same thing on both routes. Bytes SERVED
+  // differ by route -- the replica tier hands over decompressed data, the
+  // origin compressed -- so they cannot normalise a comparison between
+  // routes; the file's size at the origin can.
+  os << ",\"origin_size\":" << meta_.fileSize
+     << ",\"read_sig\":\"" << readSig << "\",\"read_buckets\":" << readBuckets;
+  if (reads.origKnown)
+    os << ",\"orig_bytes\":" << reads.origBytes;
+  if (reads.uniqueKnown)
+    os << ",\"unique_bytes\":" << reads.uniqueBytes;
+  // A file this process mostly FETCHED is a fill, whatever else it also
+  // served; the distinction decides which population a measurement joins.
+  // One it mostly read straight from the origin without keeping it
+  // (max_read_fraction) is relayed, as a pass-through file is.
+  os << ",\"mode\":\""
      << (v(obs_.directBytes) > v(obs_.servedBytes) + v(obs_.replicaBytes) ? "relay"
          : v(obs_.wireBytes) > v(obs_.servedBytes)                        ? "fill"
                                                                             : "cached")

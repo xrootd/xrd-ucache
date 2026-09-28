@@ -28,6 +28,23 @@ struct Histogram {
     b[i].fetch_add(1, std::memory_order_relaxed);
   }
   std::string toJson() const; // "[n0,n1,...]" trailing zeros trimmed
+  bool empty() const {
+    for (const auto& x : b)
+      if (x.load(std::memory_order_relaxed))
+        return false;
+    return true;
+  }
+  // Every bucket back to zero (a forked child's own account starts empty).
+  void clear() {
+    for (auto& x : b)
+      x.store(0, std::memory_order_relaxed);
+  }
+  // Adds another histogram's samples to this one, bucket by bucket.
+  void addFrom(const Histogram& o) {
+    for (int i = 0; i < kBuckets; ++i)
+      if (const uint64_t n = o.b[i].load(std::memory_order_relaxed))
+        b[i].fetch_add(n, std::memory_order_relaxed);
+  }
 };
 
 struct Stats {
@@ -172,7 +189,11 @@ struct Stats {
   std::atomic<uint64_t> readsInFlightHighWater{0};
   Histogram hitReadUs;
   Histogram missReadUs;
-  Histogram originRtUs;
+  Histogram originRtUs;    // the cache's own origin reads, issue to completion
+  // Relayed (pass-through) reads, issue to completion: the origin's answer
+  // times on the route that bypasses the cache. Kept apart from originRtUs,
+  // which counts the cache's own fetches and nothing else.
+  Histogram relayRtUs;
   Histogram openUs;        // open-to-completion for cache-engaged handles
   Histogram replicaReadUs; // stitched serve spans
   Histogram flushWriteUs;  // per coalesced flush pwrite

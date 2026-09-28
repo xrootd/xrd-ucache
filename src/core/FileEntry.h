@@ -232,6 +232,12 @@ class FileEntry {
     std::atomic<uint64_t> prefetchIssued{0};
     std::atomic<uint64_t> prefetchServed{0};
     std::atomic<uint64_t> prefetchDropped{0};
+    // Answer times (issue to completion, log2 µs) of this file's requests to
+    // the origin: the reads the cache sent for this entry (the ones the
+    // process-wide hist_origin_rt_us counts), and the reads its handles relayed
+    // past the cache (a file read directly, fail-open), which the plugin adds
+    // as each handle closes (their process-wide account is hist_relay_rt_us).
+    Histogram originRtUs;
     // Wall span this entry was live and doing work for, in µs of a steady
     // clock: first activity to last. In a slot-based analysis (one worker per
     // file at a time) this is that thread's FULL cost for the file — waits
@@ -271,17 +277,28 @@ class FileEntry {
   // Writes the Layer-2 record exactly once (atomic guard): called by the
   // destructor AND by the store's FINAL stats dump — an entry whose last
   // reference is dropped only at process teardown (leaked plugin globals,
-  // executor task captures) would otherwise never record.
-  void emitObsRecord();
+  // executor task captures) would otherwise never record. `tsMs`, when not 0,
+  // is the record's time (the final dump's start) in place of the clock's.
+  void emitObsRecord(uint64_t tsMs = 0);
   // Stamp activity onto the span. Cheap (two relaxed atomics, one CAS only on
   // the first call); called from the serve and fill paths.
   void noteActivity();
-  // Record that [off, off+len) of the ORIGINAL file was read. Callers on the
-  // replica path must translate first (ReplicaView::originRanges); every other
-  // route already addresses the origin's layout.
-  void noteRead(uint64_t off, uint64_t len) { footprint().note(off, len); }
+  // Record that [off, off+len) of the ORIGINAL file was read. A read of a
+  // rewritten layout (a replica, the slot store) goes to noteMappedRead
+  // instead; every other route already addresses the origin's layout.
+  void noteRead(uint64_t off, uint64_t len) { footprint().note(off, len, meta_.fileSize); }
+  // A read of a rewritten layout, mapped back to the original file by the
+  // caller (ReplicaView::mapToOrigin, or the slot store's map): see
+  // ReadFootprint::noteMapped. `exact` null = the original bytes are not known
+  // exactly, and the file then records no byte totals for this process.
+  void noteMappedRead(const std::vector<ReadFootprint::Span>& units,
+                      const std::vector<ReadFootprint::Span>* exact) {
+    footprint().noteMapped(units, exact, meta_.fileSize);
+  }
   // The store hands over a footprint that outlives this entry, so a file
-  // opened twice accumulates instead of recording two halves.
+  // opened twice accumulates instead of recording two halves. It must outlive
+  // the entry's destructor too, which freezes it (ReadFootprint::freeze): no
+  // one reads the file through this entry any more.
   //
   // A NULL pointer means the store's table is full and it is declining to
   // track this file. The entry's own footprint then stands in, but it is
@@ -404,6 +421,7 @@ class FileEntry {
   ReadFootprint* shared_ = nullptr;
   std::shared_ptr<ObsSink> obsSink_;
   std::atomic<bool> obsEmitted_{false};
+  void writeObsRecord(uint64_t tsMs); // emitObsRecord's body; may throw
   PageBitmap servedOnce_;
   std::atomic<uint64_t> lastDiskEnd_{~0ull};
 };

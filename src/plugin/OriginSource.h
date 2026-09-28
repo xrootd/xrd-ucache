@@ -73,7 +73,9 @@ struct OriginSource : transpose::Source {
       auto& stats = st->store->stats();
       stats.originBytes.fetch_add(got, std::memory_order_relaxed);
       stats.originReads.fetch_add(1, std::memory_order_relaxed);
-      stats.originRtUs.add(nowUs() - t0);
+      const uint64_t rt = nowUs() - t0;
+      stats.originRtUs.add(rt);
+      entry->obs().originRtUs.add(rt);
     }
     entry->writePages(ws, got, buf.data());
     if (n)

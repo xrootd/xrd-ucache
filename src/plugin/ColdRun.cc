@@ -1329,7 +1329,9 @@ class PartHandler : public ResponseHandler {
       auto& stats = st->store->stats();
       stats.originBytes.fetch_add(bytes, std::memory_order_relaxed);
       stats.originReadvs.fetch_add(1, std::memory_order_relaxed);
-      stats.originRtUs.add(nowUs() - t0_);
+      const uint64_t rt = nowUs() - t0_;
+      stats.originRtUs.add(rt);
+      req_->entry->obs().originRtUs.add(rt);
     }
     req_->cf->wireBytes.fetch_add(bytes, std::memory_order_relaxed);
     for (const auto& it : items_) {
@@ -2276,6 +2278,11 @@ void coldOriginRanges(const ColdFill& cf, uint64_t off, uint64_t len,
     for (--it; it != L.slots.end() && it->vSeek < end; ++it)
       out.emplace_back(it->origSeek, it->origLen);
   }
+}
+
+bool coldExactOriginRanges(const ColdFill& cf, uint64_t off, uint64_t len,
+                           std::vector<std::pair<uint64_t, uint64_t>>& out) {
+  return tp::exactOriginRanges(cf.L, cf.metaOrigin, off, len, out);
 }
 
 void coldServe(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,

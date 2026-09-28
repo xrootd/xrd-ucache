@@ -263,6 +263,64 @@ TEST(FillLayout, SlotsAreContiguousAndSized) {
   EXPECT_LE(L.metaSeek + L.metaRecord.size(), L.slotsBegin);
 }
 
+// The original bytes a read of the layout carried, for counts that must be
+// right or absent. A reader reads a slot whole (fBasketBytes is the slot) and
+// the relocated tree key whole (its fNbytes): each is its whole original
+// record. A read into part of a slot is not a count of anything in the
+// original file; the padding between the pieces is nothing.
+TEST(FillLayout, ExactOriginRangesTakeWholePiecesOnly) {
+  Fx fx = fixture();
+  FillLayout L = layout(fx);
+  ASSERT_TRUE(L.error.empty()) << L.error;
+  const std::vector<std::pair<uint64_t, uint64_t>> metaOrigin{
+      {static_cast<uint64_t>(kTreeKeySeek), 2000}};
+  std::vector<std::pair<uint64_t, uint64_t>> out;
+  // What the reader reads, whole: header, keys list, the tree key, each slot.
+  ASSERT_TRUE(exactOriginRanges(L, metaOrigin, 0, 100, out));
+  ASSERT_TRUE(exactOriginRanges(L, metaOrigin, kKeysListSeek, fx.keysList.size(), out));
+  ASSERT_TRUE(exactOriginRanges(L, metaOrigin, L.metaSeek, L.metaRecord.size(), out));
+  for (const auto& s : L.slots)
+    ASSERT_TRUE(exactOriginRanges(L, metaOrigin, s.vSeek, s.vLen, out));
+  const std::vector<std::pair<uint64_t, uint64_t>> want{{0, 100},
+                                                        {kKeysListSeek, fx.keysList.size()},
+                                                        {kTreeKeySeek, 2000},
+                                                        {1000, 1500},
+                                                        {3000, 2500},
+                                                        {7000, 900}};
+  EXPECT_EQ(out, want);
+
+  // One read over the padding after the tree key and two whole slots.
+  out.clear();
+  const uint64_t from = L.metaSeek + L.metaRecord.size();
+  ASSERT_TRUE(
+      exactOriginRanges(L, metaOrigin, from, L.slots[1].vSeek + L.slots[1].vLen - from, out));
+  EXPECT_EQ(out, (std::vector<std::pair<uint64_t, uint64_t>>{{1000, 1500}, {3000, 2500}}));
+  // Past the original end and before the tree key: alignment, nothing.
+  out.clear();
+  ASSERT_TRUE(exactOriginRanges(L, metaOrigin, L.originSize, L.metaSeek - L.originSize, out));
+  EXPECT_TRUE(out.empty());
+
+  // Parts: the record in a slot without its padding, a slot's tail, the tree
+  // key's header alone, a read that ends inside the next slot.
+  const auto& s0 = L.slots[0];
+  out.clear();
+  EXPECT_FALSE(exactOriginRanges(L, metaOrigin, s0.vSeek, s0.origLen, out));
+  out.clear();
+  EXPECT_FALSE(exactOriginRanges(L, metaOrigin, s0.vSeek + 1, s0.vLen - 1, out));
+  out.clear();
+  EXPECT_FALSE(exactOriginRanges(L, metaOrigin, L.metaSeek, fx.fm.treeKey.keylen, out));
+  out.clear();
+  EXPECT_FALSE(exactOriginRanges(L, metaOrigin, s0.vSeek, s0.vLen + 1, out));
+  // Nothing to read, and a request no layout holds, carry nothing.
+  out.clear();
+  EXPECT_TRUE(exactOriginRanges(L, metaOrigin, s0.vSeek, 0, out));
+  EXPECT_TRUE(exactOriginRanges(L, metaOrigin, ~uint64_t(0) - 10, 100, out));
+  EXPECT_TRUE(out.empty());
+  // Past the last slot.
+  EXPECT_TRUE(exactOriginRanges(L, metaOrigin, L.virtualSize, 4096, out));
+  EXPECT_TRUE(out.empty());
+}
+
 // The factor is in hundredths: 2.5x, and a factor whose slots must be rounded
 // down to a byte (the plugin fixes it at 3; the layout takes any). The tree's
 // totals are left as the file states them, whatever the factor.

@@ -6,8 +6,12 @@
 // seek at the wrong site's width — the keys-list record is patched in place
 // precisely so that a narrow directory field never has to address the
 // extension, which for such a file necessarily starts past 2 GiB.
-#include "TreeMeta.h"
+#include "CacheStore.h"
+#include "IOBackend.h"
+#include "ReadFootprint.h"
+#include "ReplicaStore.h"
 #include "Transposer.h"
+#include "TreeMeta.h"
 
 #include <cstdio>
 #include <cstring>
@@ -413,4 +417,78 @@ TEST(TransposeWidth, FromRecordsMatchesBuildOverlay) {
   Overlay range = buildOverlayFromRecords(fx.fm, tkh, kl, {RelocatedBasket{0, 5}},
                                           [](size_t, std::vector<uint8_t>&) { return true; });
   EXPECT_FALSE(range.error.empty());
+}
+
+// A TTree compact replica read back in the ORIGINAL file's coordinates, for the
+// byte counts a run records (orig_bytes, unique_bytes). A reader reads each
+// relocated record WHOLE -- a basket at its fBasketSeek for its fBasketBytes, the
+// tree key for its fNbytes -- and each maps to its whole original record, so
+// the counts come out what the byte route counts for the same reads, and the
+// read signature is unchanged. A read into part of a relocated record has no
+// original bytes to give, and leaves the counts unknown.
+TEST(TransposeWidth, ReplicaReadsCountTheOriginalBytesOrNothing) {
+  Fixture fx = mixedWidthFixture(/*wideBasketKey=*/true);
+  Overlay ov = buildOverlay(fx.fm, fx.src, {"Muon_pt"});
+  ASSERT_EQ(ov.error, "");
+  const ucache::ReplicaMeta::OrigRange *basket = nullptr, *tree = nullptr;
+  for (const auto& r : ov.meta.origMap) {
+    if (r.origOff == static_cast<uint64_t>(kBasketSeek))
+      basket = &r;
+    if (r.origOff == static_cast<uint64_t>(kTreeKeySeek))
+      tree = &r;
+  }
+  ASSERT_NE(basket, nullptr);
+  ASSERT_NE(tree, nullptr);
+  ASSERT_NE(basket->virtOff, basket->origOff) << "the basket is relocated";
+
+  ucache::test::TempDir td;
+  ucache::RealIO io;
+  ucache::Config cfg;
+  cfg.cacheDir = td.path();
+  ucache::CacheStore store(io, cfg);
+  store.disableStatsDump();
+  ucache::Stats stats;
+  ucache::ReplicaStore rs(io, cfg, stats);
+  const auto key = *ucache::UrlKey::parse("root://origin//data/tree.root");
+  ov.meta.originSize = static_cast<uint64_t>(kFend);
+  ASSERT_EQ(rs.publish(key, ov.meta, ov.tdata.data(), ov.tdata.size()), 0);
+  auto view = rs.openView(key, static_cast<uint64_t>(kFend));
+  ASSERT_TRUE(view && view->hasOriginMap());
+
+  using Spans = std::vector<std::pair<uint64_t, uint64_t>>;
+  const uint64_t size = static_cast<uint64_t>(kFend);
+  // (replica read, the same read of the original file)
+  const std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::pair<uint64_t, uint64_t>>> reads{
+      {{0, 512}, {0, 512}}, // the header, fEND patched in place
+      {{static_cast<uint64_t>(kKeysListSeek), fx.klNbytes},
+       {static_cast<uint64_t>(kKeysListSeek), fx.klNbytes}}, // the keys list, in place
+      {{tree->virtOff, tree->len}, {tree->origOff, tree->origLen}},
+      {{basket->virtOff, basket->len}, {basket->origOff, basket->origLen}},
+      {{basket->virtOff, basket->len}, {basket->origOff, basket->origLen}}, // read again
+  };
+  ucache::ReadFootprint replica, byteRoute;
+  for (const auto& [r, o] : reads) {
+    Spans units, exact;
+    ASSERT_TRUE(view->mapToOrigin(r.first, r.second, units, exact)) << "at " << r.first;
+    replica.noteMapped(units, &exact, size);
+    byteRoute.note(o.first, o.second, size);
+  }
+  const auto t = replica.totals(size);
+  const auto b = byteRoute.totals(size);
+  ASSERT_TRUE(t.origKnown && t.uniqueKnown);
+  EXPECT_EQ(t.origBytes, b.origBytes);
+  EXPECT_EQ(t.uniqueBytes, b.uniqueBytes);
+  EXPECT_EQ(t.origBytes, 512 + fx.klNbytes + 4096 + 2 * fx.basketLen);
+  EXPECT_EQ(replica.sig(size), byteRoute.sig(size));
+  EXPECT_EQ(replica.buckets(size), byteRoute.buckets(size));
+
+  // Part of the relocated basket -- verbatim, same length as its original, and
+  // still not the same offsets -- leaves the counts unknown, the signature not.
+  Spans units, exact;
+  EXPECT_FALSE(view->mapToOrigin(basket->virtOff + 8, basket->len - 8, units, exact));
+  replica.noteMapped(units, nullptr, size);
+  byteRoute.note(basket->origOff, basket->origLen, size);
+  EXPECT_FALSE(replica.totals(size).origKnown);
+  EXPECT_FALSE(replica.totals(size).uniqueKnown);
+  EXPECT_EQ(replica.sig(size), byteRoute.sig(size));
 }

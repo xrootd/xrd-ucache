@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <utility>
 
@@ -64,6 +65,28 @@ inline uint64_t readvElemEnd(uint64_t start, uint64_t end, uint64_t pageSize) {
   if (cut <= start)      // page bigger than the ceiling: one page per element
     cut = start + pageSize;
   return std::min(cut, end);
+}
+
+// The spans a vector read's chunks make where they follow one another end to
+// end, in the order given: f(offset, length) once per run. A reader can split
+// one request into consecutive chunks (ROOT cuts a vector-read element larger
+// than the server takes), and the run is the request it split. `chunks` is
+// any sequence of elements with `offset` and `length`. A run never wraps.
+template <typename Chunks, typename F> void forEachEndToEndRun(const Chunks& chunks, F f) {
+  auto it = std::begin(chunks);
+  const auto last = std::end(chunks);
+  while (it != last) {
+    const uint64_t off = it->offset;
+    uint64_t len = it->length;
+    for (++it; it != last; ++it) {
+      const uint64_t end = off + len;
+      if (end < off || it->offset != end ||
+          static_cast<uint64_t>(it->length) > std::numeric_limits<uint64_t>::max() - end)
+        break;
+      len += it->length;
+    }
+    f(off, len);
+  }
 }
 
 } // namespace ucache

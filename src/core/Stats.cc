@@ -140,7 +140,8 @@ std::string Stats::toJsonBody() const {
   os << "\"hist_meta_flush_us\":" << metaFlushUs.toJson() << ',';
   os << "\"hist_req_read_bytes\":" << reqReadBytes.toJson() << ',';
   os << "\"hist_hit_read_bytes\":" << hitReadSize.toJson() << ',';
-  os << "\"hist_replica_read_bytes\":" << replicaReadSize.toJson();
+  os << "\"hist_replica_read_bytes\":" << replicaReadSize.toJson() << ',';
+  os << "\"hist_relay_rt_us\":" << relayRtUs.toJson();
   return os.str();
 }
 

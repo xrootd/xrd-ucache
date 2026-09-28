@@ -384,4 +384,31 @@ bool placeInSlot(const ConvertedBasket& c, const FillSlot& slot, uint8_t* out, s
   return true;
 }
 
+bool exactOriginRanges(const FillLayout& L,
+                       const std::vector<std::pair<uint64_t, uint64_t>>& metaOrigin, uint64_t off,
+                       uint64_t len, std::vector<std::pair<uint64_t, uint64_t>>& out) {
+  const uint64_t end = off + len;
+  if (!len || end < off)
+    return true; // a request with no bytes, or one no layout can hold: nothing read
+  if (off < L.originSize)
+    out.emplace_back(off, std::min(end, L.originSize) - off);
+  const uint64_t metaEnd = L.metaSeek + L.metaRecord.size();
+  if (off < metaEnd && end > L.metaSeek) {
+    if (off > L.metaSeek || end < metaEnd)
+      return false;
+    out.insert(out.end(), metaOrigin.begin(), metaOrigin.end());
+  }
+  if (end <= L.slotsBegin || L.slots.empty())
+    return true;
+  // The first slot that ends past `off`: slots ascend and do not overlap.
+  auto it = std::lower_bound(L.slots.begin(), L.slots.end(), off,
+                             [](const FillSlot& s, uint64_t o) { return s.vSeek + s.vLen <= o; });
+  for (; it != L.slots.end() && it->vSeek < end; ++it) {
+    if (off > it->vSeek || end < it->vSeek + it->vLen)
+      return false;
+    out.emplace_back(it->origSeek, it->origLen);
+  }
+  return true;
+}
+
 } // namespace ucache::transpose

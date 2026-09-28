@@ -118,6 +118,9 @@ struct HandleState {
   // a cached file are directly comparable.
   std::atomic<uint64_t> relayFirstUs{0};
   std::atomic<uint64_t> relayLastUs{0};
+  // Answer times of the reads this handle relayed (RelayHandler), for its own
+  // per-file record: only this handle's, so a file's records sum.
+  Histogram relayRtUs;
 
   std::mutex mu;
   std::shared_ptr<FileEntry> entry;            // null until setup completes

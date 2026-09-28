@@ -673,9 +673,9 @@ TEST(FileEntry, AnEntryGivenARealFootprintStillRecordsNormally) {
   // The control for the leg above: the fallback is poisoned only when the
   // store declines.
   Fixture fx;
+  ucache::ReadFootprint shared; // outlives the entry, as the store's does
   auto e = fx.open();
   ASSERT_TRUE(e);
-  ucache::ReadFootprint shared;
   e->useSharedFootprint(&shared);
   e->noteRead(0, 4096);
   EXPECT_FALSE(e->footprint().poisoned());
