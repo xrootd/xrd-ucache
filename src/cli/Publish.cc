@@ -1444,6 +1444,14 @@ std::string describePayload(const Json& payload) {
     if (m->has("mem_gb"))
       s += ", " + m->get("mem_gb")->s + " GiB RAM";
     s += m->has("id") ? "   (hostname replaced by a salted hash)\n" : "   (no identity: unlinked)\n";
+    if (const Json* c = m->get("calib"); c && c->isObject()) {
+      auto num = [c](const char* k) {
+        const Json* v = c->get(k);
+        return v && v->isNumber() ? v->s : std::string("?");
+      };
+      s += "  cpu       a fixed workload timed here: " + num("t1_wall_s") + " s on one thread, " +
+           num("tn_wall_s") + " s on " + num("tn_threads") + " at once\n";
+    }
   }
   const Json* b = payload.get("bench");
   if (b && b->isArray() && !b->arr.empty()) {

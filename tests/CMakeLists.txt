@@ -36,6 +36,7 @@ add_executable(ucache-unit-tests
   unit/executor_test.cc
   unit/copyguard_test.cc
   unit/runlog_test.cc
+  unit/cpubench_test.cc
   unit/history_json_test.cc
   unit/readfootprint_test.cc
   unit/origin_inflight_test.cc
@@ -48,6 +49,7 @@ add_executable(ucache-unit-tests
   ${CMAKE_SOURCE_DIR}/src/plugin/Executor.cc   # thread pool (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/cli/RunLog.cc        # run reader (pure file parsing)
   ${CMAKE_SOURCE_DIR}/src/cli/HistoryJson.cc   # the history emitter (pure)
+  ${CMAKE_SOURCE_DIR}/src/cli/CpuBench.cc      # the publish CPU workload
   ${CMAKE_SOURCE_DIR}/src/cli/Publish.cc       # redaction + hashes (pure; no network in tests)
 )
 target_link_libraries(ucache-unit-tests PRIVATE ucache-core ucache-core-testing gtest gtest_main
@@ -83,6 +85,8 @@ if (TARGET ucache-transpose) # learner + seek-width + hole-verification contract
                              UCACHE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
   target_link_libraries(ucache-unit-tests PRIVATE ucache-transpose)
   target_include_directories(ucache-unit-tests PRIVATE ${CMAKE_SOURCE_DIR}/src/cli) # CacheSource.h
+  target_compile_definitions(ucache-unit-tests PRIVATE UCACHE_CPUBENCH_CODECS=1)
+  target_include_directories(ucache-unit-tests PRIVATE ${UCACHE_LZMA_INC})
 endif()
 
 add_executable(ucache-crash-harness crash/crash_harness.cc)

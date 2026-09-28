@@ -12,6 +12,7 @@
 #include "PluginFile.h"
 #include "HistoryJson.h"
 #include "RunLog.h"
+#include "CpuBench.h"
 #include "DiskBench.h"
 #include "Publish.h"
 #include "UrlKey.h"
@@ -1666,6 +1667,14 @@ int cmdPublish(const Config& cfg, int argc, char** argv) {
     rememberLabel(host, cacheDir, parts.label);
   parts.machine =
       machineBlock(identity ? &*identity : nullptr, ambientClientVersion(), UCACHE_VERSION);
+  // A fixed CPU workload, timed at every publish (a dry run included, so what
+  // it would send is what it shows): the one measurement that is the same work
+  // on every machine, which the report service needs to put runs from two
+  // machines on one scale. About a second; a build that cannot run it sends
+  // no calibration rather than a different one.
+  std::fputs("publish: timing a fixed CPU workload for the report (about a second)\n", stderr);
+  if (const CpuBenchResult calib = runCpuBench(); calib.ok)
+    parts.machine.set("calib", cpuBenchJson(calib));
   return publishPayload(parts, pf, "publish");
 }
 

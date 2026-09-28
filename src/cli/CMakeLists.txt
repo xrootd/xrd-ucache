@@ -16,7 +16,7 @@ else()
   message(STATUS "ucache: `bench` storage self-test unavailable on ${CMAKE_SYSTEM_NAME}")
 endif()
 
-add_executable(ucache main.cc RunLog.cc HistoryJson.cc Publish.cc ${UCACHE_DISKBENCH_SRC})
+add_executable(ucache main.cc RunLog.cc HistoryJson.cc Publish.cc CpuBench.cc ${UCACHE_DISKBENCH_SRC})
 if (APPLE)
   # Per-device IO counters come from the IO registry here, not from /proc.
   target_link_libraries(ucache PRIVATE "-framework IOKit" "-framework CoreFoundation")
@@ -74,6 +74,10 @@ target_link_libraries(ucache PRIVATE ucache-core ${CMAKE_DL_LIBS}) # dl: doctor 
 if (TARGET ucache-transpose)
   target_compile_definitions(ucache PRIVATE UCACHE_HAVE_TRANSPOSE=1)
   target_link_libraries(ucache PRIVATE ucache-transpose)
+  # The CPU workload `publish` times decodes with the transposer's codecs; a
+  # build without them publishes no calibration.
+  target_compile_definitions(ucache PRIVATE UCACHE_CPUBENCH_CODECS=1)
+  target_include_directories(ucache PRIVATE ${UCACHE_LZMA_INC})
 endif()
 # The recommended configuration: one text for the file the package ships
 # (cmake/Packaging.cmake) and the file `ucache setup` writes.
