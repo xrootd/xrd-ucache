@@ -22,6 +22,7 @@ add_executable(ucache-unit-tests
   unit/urlkey_test.cc
   unit/pagebitmap_test.cc
   unit/stats_test.cc
+  unit/cpucounters_test.cc
   unit/metafile_test.cc
   unit/fileentry_test.cc
   unit/read_rounding_test.cc

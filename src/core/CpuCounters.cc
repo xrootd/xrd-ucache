@@ -15,9 +15,47 @@
 #include <linux/perf_event.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
+#elif defined(__APPLE__)
+#include <libproc.h>
 #endif
 
 namespace ucache {
+
+ScaledCount scaleCounter(const CounterReading* readings, int n) {
+  ScaledCount out;
+  long double value = 0;
+  uint64_t enabled = 0, running = 0;
+  for (int i = 0; i < n; ++i) {
+    const CounterReading& r = readings[i];
+    if (r.enabled == 0)
+      continue; // never enabled: counted nothing, lost nothing
+    enabled += r.enabled;
+    running += r.running < r.enabled ? r.running : r.enabled;
+    if (r.running == 0)
+      continue; // enabled but never given the PMU: nothing to scale
+    if (r.running >= r.enabled)
+      value += static_cast<long double>(r.value);
+    else
+      value += static_cast<long double>(r.value) * static_cast<long double>(r.enabled) /
+               static_cast<long double>(r.running);
+  }
+  const long double top = static_cast<long double>(UINT64_MAX);
+  out.value = value >= top ? UINT64_MAX : static_cast<uint64_t>(value + 0.5L);
+  if (enabled)
+    out.duty = static_cast<double>(static_cast<long double>(running) / enabled);
+  return out;
+}
+
+std::string dutyText(double duty) {
+  if (!(duty > 0)) // also NaN
+    duty = 0;
+  if (duty > 1)
+    duty = 1;
+  const auto t = static_cast<unsigned>(duty * 10000.0 + 0.5); // ten-thousandths
+  char buf[16];
+  ::snprintf(buf, sizeof buf, "%u.%04u", t / 10000u, t % 10000u);
+  return buf;
+}
 
 #if defined(__linux__)
 namespace {
@@ -41,6 +79,9 @@ int openCounter(uint64_t config, bool dropOnExec, int pid) {
   attr.exclude_kernel = 1;
   attr.exclude_hv = 1;
   attr.inherit = 1; // count every thread this process spawns
+  // The kernel's enabled and running times with every value, so a count taken
+  // while the PMU was shared can be scaled (CpuCounters.h).
+  attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
 #if defined(PERF_ATTR_SIZE_VER7)
   if (dropOnExec) {
     attr.remove_on_exec = 1;
@@ -95,13 +136,19 @@ template <typename F> void forOtherThreads(F f) {
   ::close(dir);
 }
 
-uint64_t readCounter(int fd) {
+// A failed read is a reading of nothing: never enabled, so it adds neither
+// to the value nor to the duty cycle.
+CounterReading readCounter(int fd) {
+  CounterReading r;
   if (fd < 0)
-    return 0;
-  uint64_t v = 0;
-  if (::read(fd, &v, sizeof v) != static_cast<ssize_t>(sizeof v))
-    return 0;
-  return v;
+    return r;
+  uint64_t v[3] = {0, 0, 0}; // value, time enabled, time running (read_format)
+  if (::read(fd, v, sizeof v) != static_cast<ssize_t>(sizeof v))
+    return r;
+  r.value = v[0];
+  r.enabled = v[1];
+  r.running = v[2];
+  return r;
 }
 } // namespace
 
@@ -127,17 +174,28 @@ void CpuCounters::closeAll() {
 
 CpuCounters::~CpuCounters() { closeAll(); }
 
-uint64_t CpuCounters::instructions() const {
-  uint64_t v = readCounter(insFd_);
-  for (int i = 0; i < nOther_; ++i)
-    v += readCounter(otherIns_[i]);
-  return v;
-}
-uint64_t CpuCounters::cycles() const {
-  uint64_t v = readCounter(cycFd_);
-  for (int i = 0; i < nOther_; ++i)
-    v += readCounter(otherCyc_[i]);
-  return v;
+bool CpuCounters::available() const { return insFd_ >= 0 && cycFd_ >= 0; }
+
+CpuCounters::Sample CpuCounters::sample() const {
+  Sample s;
+  if (!available())
+    return s;
+  // Each descriptor is scaled on its own: the per-thread ones a forked child
+  // opens are switched in and out independently of the process-wide one.
+  CounterReading ins[1 + kMaxOther], cyc[1 + kMaxOther];
+  ins[0] = readCounter(insFd_);
+  cyc[0] = readCounter(cycFd_);
+  for (int i = 0; i < nOther_; ++i) {
+    ins[1 + i] = readCounter(otherIns_[i]);
+    cyc[1 + i] = readCounter(otherCyc_[i]);
+  }
+  const ScaledCount si = scaleCounter(ins, 1 + nOther_);
+  const ScaledCount sc = scaleCounter(cyc, 1 + nOther_);
+  s.instructions = si.value;
+  s.cycles = sc.value;
+  s.duty = si.duty < sc.duty ? si.duty : sc.duty;
+  s.source = "perf";
+  return s;
 }
 
 void CpuCounters::reopen() {
@@ -158,12 +216,34 @@ void CpuCounters::reopen() {
   });
 }
 
-#else  // not Linux: no perf_event_open, rusage still works
+#elif defined(__APPLE__) // the kernel's own per-process totals
 
 CpuCounters::CpuCounters() = default;
 CpuCounters::~CpuCounters() = default;
-uint64_t CpuCounters::instructions() const { return 0; }
-uint64_t CpuCounters::cycles() const { return 0; }
+// Asked afresh at every read, of the calling process: a forked child reads its
+// own totals with nothing to reopen.
+CpuCounters::Sample CpuCounters::sample() const {
+  Sample s;
+  struct rusage_info_v4 ri;
+  ::memset(&ri, 0, sizeof ri);
+  if (::proc_pid_rusage(::getpid(), RUSAGE_INFO_V4, reinterpret_cast<rusage_info_t*>(&ri)) != 0)
+    return s;
+  if (ri.ri_instructions == 0 || ri.ri_cycles == 0)
+    return s; // the kernel keeps no counts on this machine
+  s.instructions = ri.ri_instructions;
+  s.cycles = ri.ri_cycles;
+  s.source = "rusage";
+  return s;
+}
+bool CpuCounters::available() const { return sample().source != nullptr; }
+void CpuCounters::reopen() {}
+
+#else  // no hardware counters here; rusage still works
+
+CpuCounters::CpuCounters() = default;
+CpuCounters::~CpuCounters() = default;
+CpuCounters::Sample CpuCounters::sample() const { return Sample(); }
+bool CpuCounters::available() const { return false; }
 void CpuCounters::reopen() {}
 
 #endif

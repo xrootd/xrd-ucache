@@ -1014,12 +1014,17 @@ void CacheStore::dumpStats(bool finalDump) {
   if (cfg_.disable)
     line << ",\"disabled\":1"; // a BASELINE run: the cache was out of the loop
   // Work accounting for the run record. cpu_us covers the whole process;
-  // instructions/cycles only since the cache engaged (CpuCounters.h) and are
-  // absent when the kernel does not permit the counters.
+  // instructions/cycles come from the source named beside them (CpuCounters.h)
+  // and are absent when the platform gives no counters. perf counts are scaled
+  // for multiplexing, and pmu_duty says how much of them was measured.
   line << ",\"cpu_us\":" << CpuCounters::processCpuUs()
        << ",\"peak_cores\":" << widthSampler().width();
-  if (cpu_.available())
-    line << ",\"instructions\":" << cpu_.instructions() << ",\"cycles\":" << cpu_.cycles();
+  if (const CpuCounters::Sample cpu = cpu_.sample(); cpu.source) {
+    line << ",\"counter_source\":\"" << cpu.source << '"';
+    if (std::strcmp(cpu.source, "perf") == 0)
+      line << ",\"pmu_duty\":" << dutyText(cpu.duty);
+    line << ",\"instructions\":" << cpu.instructions << ",\"cycles\":" << cpu.cycles;
+  }
   line << ',' << stats_.toJsonBody()
        << ",\"entries\":[";
   {

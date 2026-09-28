@@ -1,4 +1,5 @@
 #include "CacheStore.h"
+#include "CpuCounters.h"
 #include "SlotStore.h"
 #include "testing/FaultIO.h"
 
@@ -1387,4 +1388,59 @@ TEST(CacheStore, AForkedChildThatNeverUsesTheStoreWritesNothing) {
   EXPECT_EQ(r.substr(r.find(' ') + 1), "done");
   // Nothing written anywhere: no file of its own, and no line in the parent's.
   EXPECT_EQ(allStats(td.path() + "/stats"), before);
+}
+
+// ---- Times and counters on the records: raw facts, no interpretation ----
+
+namespace {
+// The text of field `key` in a one-line JSON record: a number, a quoted string
+// with its quotes, or an array with its brackets. "" when the field is absent.
+std::string fieldOf(const std::string& line, const std::string& key) {
+  const std::string k = "\"" + key + "\":";
+  const size_t at = line.find(k);
+  if (at == std::string::npos)
+    return "";
+  const size_t b = at + k.size();
+  size_t e = b;
+  if (e < line.size() && line[e] == '[')
+    e = line.find(']', e) + 1;
+  else if (e < line.size() && line[e] == '"')
+    e = line.find('"', e + 1) + 1;
+  else
+    while (e < line.size() && line[e] != ',' && line[e] != '}')
+      ++e;
+  return line.substr(b, e - b);
+}
+} // namespace
+
+TEST(CacheStore, TheCounterLineNamesWhereItsCountsComeFromAndHowMuchWasMeasured) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  store.disableStatsDump();
+  store.dumpStats(false);
+  const auto lines = completeLines(counterFile(io, td.path()));
+  ASSERT_EQ(lines.size(), 1u);
+  const std::string& l = lines[0];
+  const bool counters = CpuCounters().available();
+  if (!counters) {
+    // Nothing to name and nothing measured: no source, no duty, no counts.
+    EXPECT_EQ(fieldOf(l, "counter_source"), "") << l;
+    EXPECT_EQ(fieldOf(l, "pmu_duty"), "") << l;
+    EXPECT_EQ(fieldOf(l, "instructions"), "") << l;
+    GTEST_SKIP() << "no hardware counters on this machine";
+  }
+  EXPECT_NE(fieldOf(l, "instructions"), "") << l;
+  EXPECT_NE(fieldOf(l, "cycles"), "") << l;
+#if defined(__linux__)
+  EXPECT_EQ(fieldOf(l, "counter_source"), "\"perf\"") << l;
+  const std::string duty = fieldOf(l, "pmu_duty");
+  ASSERT_EQ(duty.size(), 6u) << l; // d.dddd
+  EXPECT_TRUE(duty == "1.0000" || duty.compare(0, 2, "0.") == 0) << duty;
+#elif defined(__APPLE__)
+  EXPECT_EQ(fieldOf(l, "counter_source"), "\"rusage\"") << l;
+  EXPECT_EQ(fieldOf(l, "pmu_duty"), "") << l; // perf only
+#endif
 }
