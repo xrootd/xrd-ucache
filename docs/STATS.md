@@ -21,7 +21,7 @@ how to read the printed summary.
 | What is the cache disk being asked to do? | `hit_disk_reads`, `hit_disk_bytes`, `replica_reads`, `replica_read_bytes`, `hist_*_read_bytes` |
 | Is the cache disk keeping up? | `buffer_stalls`, `buffer_stall_us`, `hist_hit_read_us`, `hist_flush_write_us` |
 | Did the replica tier get used? | `replica_opens`, `replica_published`, `replica_bytes_served` |
-| Were replicas created as files were read? | `cold_replica_files`, `cold_replica_in_bytes`, `cold_replica_baskets_kept`, `cold_replica_declined` |
+| Were replicas created as files were read? | `cold_replica_files`, `cold_replica_in_bytes`, `cold_replica_baskets_kept`, `cold_replica_declined`, `cold_replica_skipped` |
 
 ## Where the numbers are written
 
@@ -66,7 +66,7 @@ the consumers together.
  "replica_bytes_served": 0,
  "cold_replica_files": 0, "cold_replica_in_bytes": 0, "cold_replica_out_bytes": 0,
  "cold_replica_baskets": 0, "cold_replica_baskets_kept": 0, "cold_replica_convert_us": 0,
- "cold_replica_declined": 0,
+ "cold_replica_declined": 0, "cold_replica_skipped": 0,
  "replica_reads": 0, "replica_read_bytes": 0,
  "relay_bytes": 0,
  "readv_chunks": 0, "readv_calls": 0, "readv_mixed": 0,
@@ -183,8 +183,8 @@ With `recompress = on`, a file that has no replica gets a slot store on its
 first open, and every basket a job reads that the store does not hold yet is
 converted as it arrives -- on the first pass, and later for branches read for
 the first time. All zero otherwise. `ucache stats` prints them on one
-`converted on read` line. For an RNTuple file, read "page" wherever these say
-"basket".
+`converted on read` line, and `cold_replica_skipped` on a `not converted` line
+of its own. For an RNTuple file, read "page" wherever these say "basket".
 
 - `cold_replica_files` — slot stores created.
 - `cold_replica_in_bytes` / `cold_replica_out_bytes` — original basket bytes
@@ -203,6 +203,14 @@ the first time. All zero otherwise. `ucache stats` prints them on one
   log says which), the store was removed meanwhile, or the process already held
   its limit of records waiting to be written. They were served to the job that
   read them; a later read converts them again.
+- `cold_replica_skipped` — files whose first pass was declined by what the file
+  itself holds: baskets in a codec `recompress_codecs` does not name, baskets
+  stored uncompressed, or a structure the first pass cannot lay out. Such a
+  file is served as stored. Each file is counted once, by the process that
+  decided it, when that decision is recorded in the cache; later reads of the
+  file do not count it again. The plugin logs the first such file of each
+  process as a warning, with the reason (see TROUBLESHOOTING.md,
+  "`recompress = on` but no replicas ever appear").
 
 Records a job reads from a slot store count in `replica_bytes_served` (and
 their reads from the cache disk in `replica_reads` / `replica_read_bytes`);

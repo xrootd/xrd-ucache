@@ -62,7 +62,13 @@ constexpr uint32_t kSlotFactor100 = 300;
 // differently: a store of another version is replaced, never served.
 // 2: RNTuple slot pages carry their checksum.
 // 3: the tree states its real total size; the slot factor is fixed.
-constexpr uint32_t kLayoutVersion = 3;
+// 4: a compression setting that names no codec takes the codec the file's own
+//    baskets (pages) are stored in, where 3 left those branches as stored.
+//    That changes which files and branches are converted, never how a layout
+//    is laid out: a version 3 layout is still served as it is, while a
+//    version 3 DECLINED store is decided again (see adoptable).
+constexpr uint32_t kLayoutVersion = 4;
+constexpr uint32_t kOldestServedLayout = 3;
 
 // Converted records wait in memory until this many bytes, the periodic
 // checkpoint, or the process's last close of the file, then go to the store in
@@ -666,7 +672,10 @@ bool computeLayout(ColdFill& cf, SetupSource& src, uint64_t size, uint32_t k100,
       return false;
     }
     cf.rnt = true;
-    cf.L = tp::layoutForRNTupleFill(rm, size, header, cf.codecs);
+    std::string unnamed; // the codec of ranges whose setting names none: one page header
+    if (!tp::unnamedRNTupleCodec(rm, src, unnamed))
+      return false; // a failed read: tried again next time, not remembered
+    cf.L = tp::layoutForRNTupleFill(rm, size, header, cf.codecs, unnamed);
     cf.metaOrigin = {{rm.pageListOffset, rm.pageListNbytes},
                      {rm.anchor.seekFooter, rm.anchor.nbytesFooter}};
     if (cf.L.error.empty()) {
@@ -697,17 +706,41 @@ bool computeLayout(ColdFill& cf, SetupSource& src, uint64_t size, uint32_t k100,
     keysList.resize(static_cast<size_t>(kn));
     if (!src.read(keysList.data(), keysList.size(), static_cast<uint64_t>(fm.keyslistSeek)))
       return false;
-    cf.L = tp::layoutForFill(fm, size, header, treeKeyHeader, keysList, cf.codecs, k100);
+    std::string unnamed; // the codec of branches whose setting names none: one basket header
+    if (!tp::unnamedSettingCodec(fm, header, src, unnamed))
+      return false; // a failed read: tried again next time, not remembered
+    cf.L = tp::layoutForFill(fm, size, header, treeKeyHeader, keysList, cf.codecs, k100, unnamed);
     cf.metaOrigin = {{static_cast<uint64_t>(fm.treeKey.seekkey),
                       static_cast<uint64_t>(fm.treeKey.nbytes)}};
   }
   if (!cf.L.error.empty()) {
-    UCACHE_INFO("slot run declined for %s: %s; the file is served as stored", cf.key.key.c_str(),
-                cf.L.error.c_str());
-    declined = true; // decided by the file's own metadata
+    declined = true; // decided by the file's own content: build() says so
     return false;
   }
   return true;
+}
+
+// A first pass the file's own layout declined (L.error): counted, and said
+// once per process at WARN -- recompression that quietly does nothing for a
+// file is the one outcome a user cannot see otherwise. Every other such file
+// is logged at INFO. `recorded` = this process made the store that remembers
+// the decision, so each file counts once. A file with no TTree or RNTuple at
+// all is not a candidate, and says nothing.
+void noteDeclined(const std::shared_ptr<HandleState>& st, const UrlKey& key,
+                  const tp::FillLayout& L, bool recorded) {
+  if (L.error.empty())
+    return;
+  static std::atomic<bool> warned{false};
+  if (recorded && st->store)
+    st->store->stats().coldReplicaSkipped.fetch_add(1, std::memory_order_relaxed);
+  const std::string note = tp::declineNote(L);
+  if (recorded && !warned.exchange(true))
+    UCACHE_WARN("slot run declined for %s: %s; the file is served as stored (`ucache stats` "
+                "counts such files as cold_replica_skipped; later ones are logged at INFO)",
+                key.key.c_str(), note.c_str());
+  else
+    UCACHE_INFO("slot run declined for %s: %s; the file is served as stored", key.key.c_str(),
+                note.c_str());
 }
 
 // The replica tier's adoption rule: size always; mtime or checksum only when
@@ -716,7 +749,8 @@ bool computeLayout(ColdFill& cf, SetupSource& src, uint64_t size, uint32_t k100,
 bool adoptable(const SlotStoreHeader& h, uint64_t size, uint64_t originMtime, uint8_t cksumKind,
                uint32_t originCksum) {
   const Config& cfg = globalConfig();
-  if (h.layoutVersion != kLayoutVersion || h.originSize != size)
+  if (h.layoutVersion > kLayoutVersion || h.originSize != size ||
+      h.layoutVersion < (h.declined ? kLayoutVersion : kOldestServedLayout))
     return false;
   if (cfg.validate == ValidateMode::kSizeMtime && h.originMtime != originMtime)
     return false;
@@ -759,8 +793,12 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   if (store && store->header().layoutVersion > kLayoutVersion)
     return nullptr;
   if (store && !adoptable(store->header(), size, originMtime, cksumKind, originCksum)) {
-    UCACHE_INFO("slot store for %s was made for another version of the file; replaced",
-                key.key.c_str());
+    if (store->header().layoutVersion != kLayoutVersion)
+      UCACHE_INFO("slot store for %s was made by an earlier uCache; decided again",
+                  key.key.c_str());
+    else
+      UCACHE_INFO("slot store for %s was made for another version of the file; replaced",
+                  key.key.c_str());
     store->dropIfCurrent(); // busy: the stale store is found again below, and declined
     store.reset();
   }
@@ -805,8 +843,12 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
     want.originCksum = originCksum;
     std::vector<uint8_t> blob;
     if (!ok) {
-      if (!declined || mode != AttachMode::kCreate)
+      if (!declined)
         return nullptr;
+      if (mode != AttachMode::kCreate) {
+        noteDeclined(st, key, cf->L, /*recorded=*/false);
+        return nullptr;
+      }
       want.declined = true;
     } else {
       want.container = cf->rnt ? 1 : 0;
@@ -831,8 +873,11 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
       UCACHE_INFO("slot run declined for %s: %s", key.key.c_str(), err.c_str());
       return nullptr;
     }
-    if (store->header().declined)
+    if (store->header().declined) {
+      if (created || want.declined) // the decision is this process's: say why
+        noteDeclined(st, key, cf->L, created);
       return nullptr;
+    }
     // A replica published while the layout was computed: one form per file.
     // Every publish checks for a store after its sidecar lands, so of two
     // racing, at least one sees the other.

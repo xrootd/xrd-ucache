@@ -996,13 +996,16 @@ converts it again), and `ucache stats` counts it as not kept.
 file that has one keeps being served from it, and what a job reads of it for
 the first time is still converted.
 
-A file the first pass cannot recompress is served from the byte cache;
-`ucache status` counts such files on its `declined` line and `ucache doctor`
-names why. The commonest reason is the codec: a file stored in a codec that is
-not in `recompress_codecs` is left as it is, and changing the list makes the
-next read decide again. For other reasons (an unusual structure;
-`UCACHE_LOG=info` names it), an explicit `ucache recompress` may still build a
-replica.
+A file the first pass cannot recompress is served from the byte cache. The
+plugin warns about the first such file of each process, naming the reason;
+`ucache stats` counts them as `cold_replica_skipped`, and `ucache status` on
+its `declined` line. The commonest reason is the codec: a file stored in a
+codec that is not in `recompress_codecs` is left as it is, and changing the
+list makes the next read decide again. A file whose compression setting names
+no codec (setting 1, "the global default", from older ROOT versions or
+`hadd -f1`) is judged by the codec its baskets are actually stored in. For
+other reasons (an unusual structure), the warning says so, and an explicit
+`ucache recompress` may still build a replica.
 
 `ucache recompress` runs one foreground sweep, with live progress, over what is
 already in the byte cache: you need it only for data cached before

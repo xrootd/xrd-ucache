@@ -245,12 +245,33 @@ on).
 With `recompress = on`, a file your job reads gets its replica while it is read
 (`ucache ls` shows its size under RECOMP as soon as records are committed:
 every few seconds, and when the job closes the file). If a file stays at 0,
-the INFO log names why its layout was declined (`UCACHE_LOG=info`), and
-`ucache status` counts declined files on its `declined` line. A file declined
-for its codec is decided again at the next read once `recompress_codecs`
-lists that codec; data cached before recompression was switched on and not
-read since gets a replica only from `ucache recompress`. The rest of this
-section covers both.
+the plugin says why: the first such file of each process gets a warning,
+
+```
+[ucache WARN] slot run declined for root://…/f.root: no relocatable branch: its baskets are zstd, which recompress_codecs (lzma,zlib) does not name; the file is served as stored (`ucache stats` counts such files as cold_replica_skipped; later ones are logged at INFO)
+```
+
+every later one an INFO line (`UCACHE_LOG=info`). `ucache stats` counts them
+on its `not converted` line, and `ucache status` on its `declined` line. The
+reasons:
+
+- **its baskets (pages) are in a codec `recompress_codecs` does not name** —
+  see cause 1 below. The file is decided again at the next read once the list
+  names that codec.
+- **its baskets are stored uncompressed**, or **compressed in a codec that is
+  not converted** (the old ROOT algorithm): there is nothing to gain, and a
+  sweep declines such a file as well.
+- anything else is a file structure the first pass's layout cannot hold; the
+  warning then adds that `ucache recompress` can build the file's replica after
+  the run, from what the run cached.
+
+A file whose compression setting names no codec — setting 1, "the global
+default", which files from older ROOT versions and `hadd -f1` carry — is
+judged by the codec its baskets are actually stored in, read from one basket.
+
+Data cached before recompression was switched on and not read since gets a
+replica only from `ucache recompress`. The rest of this section covers these
+causes.
 
 **Ask the tools first — they diagnose this for you:**
 

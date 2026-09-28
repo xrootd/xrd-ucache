@@ -193,7 +193,7 @@ Header:
 |---|---|---|---|
 | 0 | 8 | magic | `"UCSLOTS1"` |
 | 8 | 4 | format_version u32 | = 2. Below 2: not used, and replaced when a new store is made. Above 2 (a newer uCache's store): left in place — never replaced, unlinked or served; the file is served as stored |
-| 12 | 4 | layout_version u32 | the layout algorithm. Lower than this build's: store replaced; higher: left in place, as a newer format is |
+| 12 | 4 | layout_version u32 | the layout algorithm, = 4. Lower: store replaced — except that a version 3 store is served as it is unless it is a DECLINED one (version 4 changed only which files and branches are converted, never how a layout is laid out); higher: left in place, as a newer format is |
 | 16 | 1 | container u8 | 0 = TTree, 1 = RNTuple |
 | 18 | 1 | declined u8 | 1 = the file is not served this way (nothing else follows) |
 | 20 | 4 | n_slots u32 | |

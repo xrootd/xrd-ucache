@@ -124,6 +124,7 @@ struct Stats {
   std::atomic<uint64_t> coldReplicaBasketsKept{0};      // kept as stored (did not fit, unlisted, undecodable)
   std::atomic<uint64_t> coldReplicaConvertUs{0};        // time spent converting, summed over threads
   std::atomic<uint64_t> coldReplicaDeclined{0};  // replicas not published (no room, or failed)
+  std::atomic<uint64_t> coldReplicaSkipped{0};   // files whose own content declined the first pass
   std::atomic<uint64_t> replicaReads{0};      // physical .tdata preads (one per
                                               // coalesced run of overlay pages, so
                                               // re-reads of a page count again — the
@@ -238,7 +239,7 @@ struct StatsTotals {
            hitDiskBytes = 0, hitDiskSeq = 0, replicaBytesServed = 0, replicaReads = 0,
            coldReplicaFiles = 0, coldReplicaInBytes = 0, coldReplicaOutBytes = 0,
            coldReplicaBaskets = 0, coldReplicaBasketsKept = 0, coldReplicaConvertUs = 0,
-           coldReplicaDeclined = 0,
+           coldReplicaDeclined = 0, coldReplicaSkipped = 0,
            replicaReadBytes = 0, relayBytes = 0,
            readvChunks = 0, readvCalls = 0, readvMixed = 0, flushRuns = 0, flushRunBytes = 0,
            bufferStalls = 0, bufferStallUs = 0;

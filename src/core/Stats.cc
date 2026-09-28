@@ -117,6 +117,7 @@ std::string Stats::toJsonBody() const {
   f("cold_replica_baskets_kept", coldReplicaBasketsKept);
   f("cold_replica_convert_us", coldReplicaConvertUs);
   f("cold_replica_declined", coldReplicaDeclined);
+  f("cold_replica_skipped", coldReplicaSkipped);
   f("replica_reads", replicaReads);
   f("replica_read_bytes", replicaReadBytes);
   f("relay_bytes", relayBytes);
@@ -222,6 +223,7 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.coldReplicaBasketsKept += extractU64(last, "cold_replica_baskets_kept");
     t.coldReplicaConvertUs += extractU64(last, "cold_replica_convert_us");
     t.coldReplicaDeclined += extractU64(last, "cold_replica_declined");
+    t.coldReplicaSkipped += extractU64(last, "cold_replica_skipped");
     t.replicaReads += extractU64(last, "replica_reads");
     // Per FILE, not per total: a file written before this counter existed can
     // only offer served bytes, and mixing the two bases silently divides new
