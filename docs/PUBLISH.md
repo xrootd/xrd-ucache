@@ -20,7 +20,8 @@ non-terminal without it is refused), `--label TEXT` (a short name for the disk
 or cache, shown on your pages instead of a path), and `--url URL`
 (`UCACHE_PUBLISH_URL` does the same) for a different service instance.
 `ucache publish --runs N` changes how many of the newest runs go (200 by
-default).
+default). `ucache publish` also times a fixed CPU workload on this machine
+every time it runs, a dry run included (about a second; see `calib` below).
 
 ## What leaves the machine
 
@@ -45,11 +46,15 @@ backstop, not the mechanism.
 | | `host` | your machine's hostname | blank |
 | | `url` | the file you measured against | reduced to `root://<registrable domain>`, e.g. `root://cern.ch` — no host, no path |
 | run history (`ucache history --json`) | bytes per tier, duration, measured gain, faults, instruction counts | numbers | as recorded, newest 200 runs |
+| | `duration_ms`, `orig_read_bytes`, `orig_files`, `unique_bytes`, `unique_files`, `files_bytes`, `pmu_duty`, `relay_rt_us` | the run's wall in milliseconds; the bytes the application asked its files for and how many files that sum is over; the distinct bytes among them and how many files that sum is over; the inputs' total size; the share of the run's time the processor's counters were counting; a histogram of the answer times of requests passed straight to the origin. The byte sums are in the original files' coordinates and take only files whose counts are known exactly: on a replica a read into part of a recompressed basket or page makes that file's counts unknown, and it is left out of both sums (see [STATS.md](STATS.md)) | as recorded. Sizes and times, no names |
+| | `counter_source` | where the instruction counts came from | one of two words, `perf` or `rusage` |
 | | `start` | when the run began | the date only |
 | | `host`, `pid` | hostname, process id | blank, dropped |
-| | per-file records | every file your jobs read | **never sent**; the client derives one list per run of the origin *domains* those files came from (`["root://cern.ch"]`) |
+| | per-file records | every file your jobs read | **never sent**; the client derives one list per run of the origin *domains* those files came from (`["root://cern.ch"]`), and the fields below |
+| | `origins_rt` | the answer times of the run's requests to each origin | one histogram per origin *domain*, `{"origin": "root://cern.ch", "hist": [...]}`, the hosts of one domain summed together — the same reduction as `origins`, never a host |
 | machine block | `os`, `os_release`, `arch`, `kernel`, `cpu_model`, `ncpu`, `mem_gb`, `xrootd_client`, `ucache_version` | hardware and software facts | as gathered |
 | | `id` | | a salted hash of the hostname |
+| | `calib` | a fixed CPU workload timed at this publish: `t1_cpu_s`, `t1_wall_s` on one thread; `tn_cpu_s`, `tn_wall_s` with `tn_threads` threads, one per CPU this process may use -- the CPUs its affinity mask allows, or fewer when a cgroup CPU quota (a container's CPU limit) gives less time than that, rounded up; `t1_instructions`, `tn_instructions` and `counter_source` where the machine gives instruction counts; `version` names the workload | as measured. It shows how fast this machine computes, how many CPUs' worth of time the publishing process was allowed, and — through the gap between the two walls — how busy the machine was in that second |
 | label | `label` | text you typed | as typed, at most 80 characters. The client refuses a label containing `/`, `\`, `@` or `~`; the service refuses one matching its place patterns (`/home/`, `/eos/`, `/data/`, `user@host`, an IP address). Neither can recognise every path: type a name, never a location |
 | all records | everything else that is a NUMBER (`total_gb`, `free_gb`, every count, every rate, arrays of them) | numbers | as recorded |
 | | everything else that is TEXT | anything at all | **not sent.** Only a named list of fields may carry text out — `fs`, `mode`, `error`, `dev`, `dev_name`, `dev_model`, `dev_sched`, `mount_fstype`, `kernel`, `arch`, `cpu_model`, `version`, `build_id`, `time` and the write-shape words. A measurement this tool learns to take tomorrow arrives already published, and a path or a name reaches a record through fields nobody thought of: `cachepath_error` carried the benchmarked directory inside an error message. So the rule is the other way round — text is withheld until it is named here |
@@ -159,7 +164,10 @@ instead of a `bench` one.
     "kernel": "5.14.0-503.el9_5.x86_64",
     "cpu_model": "Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz",
     "ncpu": 32, "mem_gb": 128.0,
-    "xrootd_client": "v5.8.3", "ucache_version": "1.0.0"
+    "xrootd_client": "v5.8.3", "ucache_version": "1.0.0",
+    "calib": { "version": 1, "t1_cpu_s": 0.2981, "t1_wall_s": 0.2990, "tn_threads": 32,
+               "tn_cpu_s": 17.6214, "tn_wall_s": 0.5623, "counter_source": "perf",
+               "t1_instructions": 1426407554, "tn_instructions": 45645034210 }
   },
   "bench": [
     {
@@ -176,6 +184,10 @@ instead of a `bench` one.
   "netbench": [],
   "history": { "schema": 1, "totals": { "runs": 38, "gain": 2.878 },
                "runs": [ { "start": "2026-08-27", "host": "", "kind": "warm", "gain": 4.514,
+                           "duration_ms": 120250, "orig_read_bytes": 48213917696,
+                           "orig_files": 1453,
+                           "files_bytes": 212606238720, "counter_source": "perf",
+                           "origins_rt": [ { "origin": "root://cern.ch", "hist": [0, 0, 3, 17] } ],
                            "origins": ["root://cern.ch"] } ] }
 }
 ```

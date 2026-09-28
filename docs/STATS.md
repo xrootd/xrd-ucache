@@ -45,7 +45,7 @@ the consumers together.
 ## Line schema
 
 ```json
-{"ts": 1783300000, "pid": 12345,
+{"ts": 1783300000, "pid": 12345, "ts_ms": 1783300000123, "start_ms": 1783299400456,
  "opens": 0, "validations_failed": 0,
  "hit_bytes": 0, "miss_bytes": 0, "origin_bytes": 0, "served_bytes": 0,
  "origin_reads": 0, "fetches_joined": 0, "origin_readvs": 0, "page_writes": 0,
@@ -72,8 +72,9 @@ the consumers together.
  "readv_chunks": 0, "readv_calls": 0, "readv_mixed": 0,
  "flush_runs": 0, "flush_run_bytes": 0,
  "buffer_stalls": 0, "buffer_stall_us": 0,
+ "cpu_us": 0, "instructions": 0, "cycles": 0, "counter_source": "perf", "pmu_duty": 1.0000,
  "hist_hit_read_us": [..], "hist_miss_read_us": [..], "hist_origin_rt_us": [..],
- "hist_open_us": [..], "hist_replica_read_us": [..],
+ "hist_relay_rt_us": [..], "hist_open_us": [..], "hist_replica_read_us": [..],
  "hist_flush_write_us": [..], "hist_meta_flush_us": [..],
  "hist_req_read_bytes": [..], "hist_hit_read_bytes": [..],
  "hist_replica_read_bytes": [..],
@@ -284,6 +285,11 @@ reading was re-reading, and what the cache disk was asked to do.
   no-cache baseline by `summary`, whether or not the prediction was used.
   Per file, `prefetch_issued` / `prefetch_served` / `prefetch_dropped` in the
   `.files.jsonl` record.
+- `hist_relay_rt_us` — answer times of the requests the plugin passed straight
+  through to the origin (the ones whose bytes count in `relay_bytes`, a
+  `UCACHE_DISABLE` run's included), process-wide. Kept apart from
+  `hist_origin_rt_us`, which is the cache's own fetches and keeps meaning only
+  that.
 - Histograms are log2 buckets: bucket *i* counts samples with
   `floor(log2(v)) == i` (bucket 0 = ≤1); arrays are trimmed of trailing
   zeros, 40 buckets max. The `_us` ones bucket microseconds; the
@@ -324,6 +330,28 @@ reading was re-reading, and what the cache disk was asked to do.
   same data executes very nearly the same number however the bytes reached it,
   which is what makes two runs comparable at all. Requires performance counters
   to be permitted; absent (zero) where they are not.
+- `counter_source` — where `instructions` and `cycles` came from: `perf`
+  (Linux performance counters: user space only, counted from when the cache
+  engaged in the process) or `rusage` (macOS per-process counters: the whole
+  process from its start, user and kernel). The two do not count the same
+  thing, so compare counts only between runs with the same source. Absent when
+  there are no counters.
+- `pmu_duty` — `perf` only, four decimals: the smaller, over the two counters,
+  of the share of the time a counter was enabled that it was actually counting.
+  Below 1 the processor's counters were shared (with other jobs on the node, or
+  other counters in the process) and the kernel multiplexed them; the
+  `instructions` and `cycles` written are already SCALED by enabled/running
+  time, so they estimate the full count, and a low duty is how much of it was
+  estimated. Like the counts, it covers the process from when the counters
+  opened, so each line's includes the lines before it; `ucache history --json`
+  reports the last line's, which is the whole run's.
+- `ts_ms`, `start_ms` — the same clock as `ts` and the file name's start, in
+  milliseconds: when this line was written, and when this process's store
+  started. Their difference is the run's wall to a millisecond, where the
+  file name and `ts` give it to a second. The final line's time, and its
+  `cpu_us`, `instructions` and `cycles`, are read as the final dump begins,
+  before the dump writes the records of files still open: that work is not the
+  job's, and is in neither.
 - `origin_reads_in_flight_high_water` — the most reads the ORIGIN was being
   asked for at once. Counted where a read is issued to the origin and given
   back at the top of its completion handler, so it spans the READ. This is the
@@ -350,11 +378,76 @@ reading was re-reading, and what the cache disk was asked to do.
   `ucache stats --files`:
 
   ```json
-  {"ts": 0, "key": "root://…", "opens": 0, "served_bytes": 0, "ram_bytes": 0,
+  {"ts": 0, "ts_ms": 0, "key": "root://…", "opens": 0, "served_bytes": 0, "ram_bytes": 0,
    "replica_bytes": 0, "disk_reads": 0, "disk_seq": 0, "disk_bytes": 0,
    "first_touch_bytes": 0, "wire_bytes": 0, "direct_bytes": 0, "span_us": 0,
-   "origin_size": 0, "read_sig": "", "read_buckets": 0, "mode": "cached"}
+   "origin_size": 0, "read_sig": "", "read_buckets": 0, "mode": "cached",
+   "orig_bytes": 0, "unique_bytes": 0, "origin_rt_us": [..]}
   ```
+
+  The fields from `orig_bytes` on are recorded for the report service
+  (`ucache publish`); `summary` and `history` do not interpret them. Recording
+  them never changes what is read, fetched, cached or served: whenever one
+  cannot be had cheaply, it is left out.
+
+  - `orig_bytes` — the bytes the application asked this file for, in the
+    ORIGINAL file's coordinates, re-reads counted, clipped to `origin_size`.
+  - `unique_bytes` — the distinct bytes among them: the union of the same
+    ranges.
+  - `origin_rt_us` — answer times of this file's requests to the origin, a
+    histogram like `hist_origin_rt_us`: the cache's own fetches on the cached
+    route, the relayed requests on the pass-through route. A cached entry's
+    record also holds the requests its handles relayed past the cache (a file
+    read directly under `max_read_fraction`, a fail-open), so its sum is
+    `hist_origin_rt_us` plus that share of `hist_relay_rt_us`. Read-ahead
+    fetches are left out, as they are from `hist_origin_rt_us`. Absent when
+    there were none.
+  - `ts_ms` — when the record was written, in milliseconds; for a record the
+    final dump writes (a file still open at exit), the moment the dump began,
+    like the counter line it goes with.
+
+  **`orig_bytes` and `unique_bytes` are exact or absent**, never estimated:
+  absent means unknown, and a file opened and not read has 0. How each route
+  gets them:
+
+  - Byte cache, pass-through, cache disabled: the application's requests
+    address the original file, and are counted as they are.
+  - A replica (a recompressed copy, or the slot store of `recompress = on`)
+    has its own layout, and a read of it is mapped back through the replica's
+    map of what each piece holds. Bytes still where the original has them count
+    as themselves. A relocated basket or page read WHOLE counts as its whole
+    original record. A read that covers only PART of a relocated basket or page
+    has no place in the original file -- its bytes are recompressed, or
+    decoded -- so from that read on the file records neither field, for the
+    rest of the process. ROOT reads a TTree's baskets and its tree record
+    whole, so a TTree file that ROOT reads through a replica keeps them. Other
+    readers mostly do not: measured, uproot's reads of a TTree through a
+    replica leave neither, and so do ROOT's reads of an RNTuple, whose
+    buffered reads near the footer take part of the pages beside it.
+  - Either is absent too when the footprint was discarded; `orig_bytes` also
+    when the file's size was not known well enough to clip the reads to it;
+    `unique_bytes` also when the file's range set outgrew its cap (100000
+    ranges per file, 128 MiB of ranges per process).
+
+  They count what the reader asked of the layout it was shown, and a reader
+  does not ask a replica for the same bytes as the original: one that reads
+  ahead in blocks counts the extra bytes of the original on the byte route,
+  and on a replica either whole pieces or, once it takes part of one, no
+  count at all. Compare them between runs of one route; `read_sig` (below) is
+  the field made to compare across routes.
+
+  **One key can have several records in a process** (one per relayed handle,
+  or an entry dropped and opened again), and the fields combine differently.
+  `orig_bytes` and `unique_bytes` describe the process's whole footprint on the
+  URL, so later records hold what earlier ones did: take them, as one unit,
+  from the record with the largest `orig_bytes` (on a tie, the later one) —
+  never add them. A record with `ts_ms` and no `orig_bytes` says the footprint
+  became unknown after the records before it (discarded, a replica read that
+  could not be mapped exactly, or asked past the file's end more often than it
+  could follow): the unit is then unknown, until a later record carries
+  `orig_bytes` again.
+  `origin_rt_us` covers only the requests of the record's own handle or
+  entry: add those bucket by bucket, as with `wire_bytes`.
 
   `direct_bytes` are the bytes a file read directly (`max_read_fraction`)
   fetched and did not keep. `mode` is `fill` when the process mostly fetched

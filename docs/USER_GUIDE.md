@@ -562,10 +562,13 @@ rather than a number from too short a wall.
   refused; `ucache summary` says why.
 
 `RATE` is what the job consumed from all sources combined — paced by the
-application, not a cache capability (that is `ucache bench`). Runs under ten
-seconds are left out as noise — of this table and of what `summary` calls the
-last run. `--top N` shows more rows; `--json` on either
-command emits the same figures for scripting.
+application, not a cache capability (that is `ucache bench`). A process that
+opened no file and read nothing is left out — of this table and of what
+`summary` calls the last run: a `ucache` command, or a parent process that only
+started the workers that did the reading. Every process that read is listed,
+however short (one under 30 s gets no gain: it is too short to time), and so is
+a worker that ended without closing its files. `--top N` shows more rows;
+`--json` on either command emits the same figures for scripting.
 
 Records appear when a job that used the cache **exits**; CLI invocations do not
 write them. `ucache stats --reset` starts a fresh counter window but keeps the
@@ -585,10 +588,11 @@ ucache publish --dry-run    # shows the exact payload and sends nothing
 ```
 
 What goes out is the run history, the disk's benchmark records and this
-machine's origin measurements — as numbers. Paths, mount points and the
-hostname are replaced by salted hashes whose salt never leaves the machine;
-file names never leave and origin URLs are reduced to domains; run timestamps
-to dates. Every
+machine's origin measurements — as numbers — and the time this machine takes
+for a fixed CPU workload, measured at every publish (it takes about a second).
+Paths, mount points and the hostname are replaced by salted hashes whose salt
+never leaves the machine; file names never leave and origin URLs are reduced to
+domains; run timestamps to dates. Every
 field is listed in **`docs/PUBLISH.md`**, and the report URLs are unlisted:
 whoever has one can read that page and nobody else can. `ucache bench
 --publish` and `ucache netbench --publish` send a single record the same way.
