@@ -1474,14 +1474,14 @@ std::string describePayload(const Json& payload) {
       if (r.has("cmd"))
         s += " [" + r.str("cmd") + "]";
     }
-    s += "\n            paths and mount points replaced by salted hashes, hostname blanked\n";
+    s += "\n";
   }
   const Json* n = payload.get("netbench");
   if (n && n->isArray() && !n->arr.empty()) {
     s += "  origin    " + std::to_string(n->arr.size()) + " origin benchmark record(s):";
     for (const auto& r : n->arr)
       s += " " + r.str("url") + " (" + r.str("mode") + ")";
-    s += "\n            origin URL reduced to its domain, hostname blanked\n";
+    s += "\n";
   }
   const Json* h = payload.get("history");
   if (h && h->isObject()) {
@@ -1491,8 +1491,7 @@ std::string describePayload(const Json& payload) {
     if (k) {
       s += " from " + runs->arr.front().str("start") + " to " + runs->arr.back().str("start");
     }
-    s += "\n            per-run byte counts and measured gains; times reduced to dates, hostname\n"
-         "            blanked, process ids dropped, origins reduced to domains; no file names\n";
+    s += "\n";
   }
   if (payload.has("label"))
     s += "  label     \"" + payload.str("label") + "\"\n";
