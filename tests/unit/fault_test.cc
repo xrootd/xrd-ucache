@@ -6,7 +6,13 @@
 
 #include "TestUtil.h"
 #include <cerrno>
+#include <chrono>
+#include <cstring>
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <sys/file.h>
+#include <thread>
+#include <unistd.h>
 
 using namespace ucache;
 using test::TempDir;
@@ -269,4 +275,51 @@ TEST(Fault, OpenTruncateFailureClosesTheDataFdOnce) {
   auto e = fx.open();
   EXPECT_FALSE(e);
   EXPECT_EQ(fx.io.calls(IoOp::kClose) - closesBefore, 1);
+}
+
+// A release clears its pages on disk before it punches them. When that commit
+// fails, another process would still find the pages claimed: nothing is
+// punched, and only the reclaim waits.
+TEST(Fault, AReleaseWhoseCommitFailsDoesNotPunch) {
+  Fx fx;
+  const uint64_t n = fx.src.size();
+  auto a = fx.open();
+  ASSERT_TRUE(a);
+  a->writePages(0, n, fx.src.data());
+  a->flushAll();
+  fx.io.failNth(IoOp::kRename, 1, ENOSPC); // the release's sidecar store
+  EXPECT_EQ(a->releaseRanges({{0, n}}), 0u);
+  // Another process, opening now (or after this one was killed).
+  RealIO real2;
+  Stats st2;
+  auto c = FileEntry::open(real2, fx.cfg, st2, fx.key, n, 0, MetaData::kCksumNone, 0);
+  ASSERT_TRUE(c);
+  std::vector<uint8_t> buf(n);
+  EXPECT_TRUE(c->readCached(0, n, buf.data()));
+  EXPECT_EQ(0, memcmp(buf.data(), fx.src.data(), n));
+  EXPECT_EQ(st2.crcFailures.load(), 0u);
+}
+
+// An interval commit that finds another running is not dropped: the running
+// one goes round again. With meta_flush_seconds = 0 there is no checkpoint to
+// pick it up later.
+TEST(Fault, ACommitSkippedWhileAnotherRunsIsNotLost) {
+  Fx fx;
+  fx.cfg.metaFlushSeconds = 0;
+  fx.cfg.fillBufferMb = 0;
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  int ext = ::open(fx.key.dataPath(fx.cfg.cacheDir).c_str(), O_RDWR);
+  ASSERT_GE(ext, 0);
+  ASSERT_EQ(::flock(ext, LOCK_EX), 0); // another process holds the entry lock
+  std::thread t1([&] { e->writePages(0, 4096, fx.src.data()); }); // its commit waits in flock
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  e->writePages(4096, 4096, fx.src.data() + 4096); // its commit finds one running
+  ::flock(ext, LOCK_UN);
+  t1.join();
+  ::close(ext);
+  auto m = MetaFile::load(fx.io, fx.key.metaPath(fx.cfg.cacheDir));
+  ASSERT_TRUE(m);
+  EXPECT_TRUE(m->bitmap.get(0));
+  EXPECT_TRUE(m->bitmap.get(1));
 }

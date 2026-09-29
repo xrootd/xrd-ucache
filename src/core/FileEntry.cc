@@ -1164,41 +1164,66 @@ void FileEntry::touchAtime() {
   }
 }
 
-void FileEntry::flushMeta(bool force) {
-  // One commit at a time. The flock below keeps other processes out, but
-  // every thread of this one shares dataFd_ -- one open file description,
-  // which flock does not divide -- so two commits of this entry used to run
-  // together: both wrote the same sidecar tmp file, one rename won, and the
-  // loser re-armed pages the winner's adoption had just cleared, which the
-  // next commit stored as present with crc 0 over correct bytes. The next
-  // process reported them as CRC mismatches and fetched them again. A commit
-  // that cannot start at once is skipped unless forced: dirty_ stays set and
-  // the next commit carries its changes.
-  std::unique_lock<std::mutex> commit(commitMu_, std::defer_lock);
-  if (force)
-    commit.lock();
-  else if (!commit.try_lock())
-    return;
-  MetaData snapshot;
-  PageBitmap sets, clears;
-  bool pinTouched = false;
-  {
-    std::lock_guard<std::mutex> g(mu_);
+bool FileEntry::flushMeta(bool force) {
+  // One commit at a time. The flock in commitSnapshot keeps other processes
+  // out, but every thread of this one shares dataFd_ -- one open file
+  // description, which flock does not divide -- so two commits of this entry
+  // used to run together: both wrote the same sidecar tmp file, one rename
+  // won, and the loser re-armed pages the winner's adoption had just cleared,
+  // which the next commit stored as present with crc 0 over correct bytes. The
+  // next process reported them as CRC mismatches and fetched them again.
+  //
+  // Commits waiting are merged, not queued: a forced caller that finds one
+  // running waits, and returns once a commit that STARTED after it arrived has
+  // finished -- that commit's snapshot holds its changes. With hundreds of
+  // handles of one file closing around each other, each Close otherwise waited
+  // for every commit ahead of it. A non-forced caller that finds one running
+  // asks it to go round again and returns: dirty_ stays set.
+  std::unique_lock<std::mutex> g(mu_);
+  const uint64_t arrival = commitSeq_;
+  if (committing_) {
+    if (!force) {
+      commitAgain_ = true;
+      return true;
+    }
+    commitCv_.wait(g, [&] { return !committing_ || commitDone_ > arrival; });
+    if (commitDone_ > arrival)
+      return lastCommitOk_;
+  }
+  bool ok = true;
+  for (bool first = true;; first = false) {
     if (!dirty_)
-      return;
-    uint64_t now = nowS();
-    if (!force && now < lastFlushS_ + static_cast<uint64_t>(cfg_.metaFlushSeconds))
-      return;
-    snapshot = meta_; // value copy under lock; store happens outside
-    sets = setSince_;
-    clears = clearedSince_;
-    pinTouched = pinTouched_;
+      break;
+    const uint64_t now = nowS();
+    if (!(first && force) && now < lastFlushS_ + static_cast<uint64_t>(cfg_.metaFlushSeconds))
+      break;
+    committing_ = true;
+    commitAgain_ = false;
+    const uint64_t seq = ++commitSeq_;
+    MetaData snapshot = meta_; // value copy under lock; store happens outside
+    PageBitmap sets = setSince_, clears = clearedSince_;
+    const bool pinTouched = pinTouched_;
     setSince_.clearAll();
     clearedSince_.clearAll();
     pinTouched_ = false;
     dirty_ = false;
     lastFlushS_ = now;
+    g.unlock();
+    ok = commitSnapshot(std::move(snapshot), sets, clears, pinTouched);
+    g.lock();
+    commitDone_ = seq;
+    lastCommitOk_ = ok;
+    if (!commitAgain_)
+      break;
   }
+  committing_ = false;
+  g.unlock();
+  commitCv_.notify_all();
+  return ok;
+}
+
+bool FileEntry::commitSnapshot(MetaData snapshot, const PageBitmap& sets, const PageBitmap& clears,
+                               bool pinTouched) {
   const uint64_t mT0 = nowUsSteady();
   io_.flock(dataFd_, LOCK_EX);
   // Evicted-while-open: never resurrect the sidecar (see FORMAT.md). Checked
@@ -1206,7 +1231,7 @@ void FileEntry::flushMeta(bool force) {
   struct ::stat st;
   if (io_.fstat(dataFd_, &st) == 0 && st.st_nlink == 0) {
     io_.flock(dataFd_, LOCK_UN);
-    return;
+    return true; // nothing to keep
   }
   // The image on disk is shared with every other process holding this entry,
   // and they may have published pages since this handle last looked. Storing
@@ -1268,23 +1293,29 @@ void FileEntry::flushMeta(bool force) {
         clearedSince_.set(i);
     }
     pinTouched_ = pinTouched_ || pinTouched;
-    return;
+    return false;
   }
   if (!merged)
-    return;
+    return true;
   // Adopt the committed image: pages this handle has not touched since the
   // snapshot take the on-disk state, so a sibling's pages are served here too
   // (CRC-verified like any other) and are not fetched a second time, and a
   // sibling's clear is honoured rather than re-published from memory.
+  // A sibling's page claimed with crc 0 (an older release's commit race) is
+  // taken as absent, and the next commit clears it on disk too.
   std::lock_guard<std::mutex> g(mu_);
   const uint64_t n = meta_.npages();
   for (uint64_t i = 0; i < n; ++i) {
     if (setSince_.get(i) || clearedSince_.get(i))
       continue;
-    if (out.bitmap.get(i)) {
+    if (out.bitmap.get(i) && out.pageCrcs[i] != 0) {
       meta_.bitmap.set(i);
       meta_.pageCrcs[i] = out.pageCrcs[i];
     } else {
+      if (out.bitmap.get(i)) {
+        clearedSince_.set(i);
+        dirty_ = true;
+      }
       meta_.bitmap.clear(i);
       meta_.pageCrcs[i] = 0;
     }
@@ -1295,6 +1326,7 @@ void FileEntry::flushMeta(bool force) {
   if (n && meta_.bitmap.count() == n)
     meta_.flags |= MetaData::kFlagComplete;
   meta_.atime = std::max(meta_.atime, out.atime);
+  return true;
 }
 
 bool FileEntry::pinned() {
@@ -1397,7 +1429,9 @@ uint64_t FileEntry::releaseRanges(const std::vector<std::pair<uint64_t, uint64_t
   // Bits durable BEFORE the bytes vanish (D1 ordering): a reader that loads
   // the flushed sidecar refetches from origin; one already holding the old
   // in-memory bitmap is protected by per-page CRC (punched zeros fail it).
-  flushMeta(true);
+  if (!flushMeta(true))
+    return 0; // the clears are not on disk: another process would still find these
+              // pages claimed over a hole. The bytes stay; only the reclaim waits.
   uint64_t punched = 0;
   for (size_t s = 0; s < spans.size(); ++s) {
     const auto [off, len] = spans[s];

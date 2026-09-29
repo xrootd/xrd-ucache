@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -1449,4 +1450,100 @@ TEST(FileEntry, APageClaimedWithCrcZeroIsTreatedAsAbsent) {
   EXPECT_FALSE(after->bitmap.get(2));
   EXPECT_FALSE(after->bitmap.get(7));
   EXPECT_EQ(after->bitmap.count(), 8u);
+}
+
+namespace {
+// RealIO with a slow sidecar rename, counting the stores that reach it.
+class SlowStoreIO : public RealIO {
+ public:
+  std::atomic<int> stores{0};
+  int rename(const std::string& from, const std::string& to) override {
+    if (from.size() > 9 && from.compare(from.size() - 9, 9, ".meta.tmp") == 0) {
+      ++stores;
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return RealIO::rename(from, to);
+  }
+};
+} // namespace
+
+// Handles closing together each force a commit. They are merged: a caller that
+// waited returns once a commit that started after it arrived has finished,
+// instead of every Close waiting for every commit ahead of it.
+TEST(FileEntry, CommitsThatWaitAreMerged) {
+  TempDir td;
+  SlowStoreIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  cfg.fillBufferMb = 0; // fills publish at once: every commit has news
+  Stats stats;
+  auto key = *UrlKey::parse("root://h//merged.root");
+  constexpr uint64_t kPages = 4096;
+  auto src = test::randomBytes(kPages * 4096, 9);
+  auto e = FileEntry::open(io, cfg, stats, key, src.size(), 0, MetaData::kCksumNone, 0);
+  ASSERT_TRUE(e);
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> fills;
+  for (int f = 0; f < 4; ++f)
+    fills.emplace_back([&, f] {
+      for (uint64_t pg = 256 + f; !stop.load() && pg < kPages; pg += 4) {
+        e->writePages(pg * 4096, 4096, src.data() + pg * 4096);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    });
+  const int before = io.stores.load();
+  std::vector<std::thread> ts;
+  constexpr int kClosers = 32, kRounds = 5;
+  for (int t = 0; t < kClosers; ++t)
+    ts.emplace_back([&, t] {
+      std::mt19937 rng(t);
+      for (int r = 0; r < kRounds; ++r) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(rng() % 20));
+        const uint64_t pg = uint64_t(t) * kRounds + r;
+        e->writePages(pg * 4096, 4096, src.data() + pg * 4096);
+        e->flushAll(); // a Close
+      }
+    });
+  for (auto& t : ts)
+    t.join();
+  const int closeStores = io.stores.load() - before;
+  stop = true;
+  for (auto& t : fills)
+    t.join();
+  // Unmerged, every Close stored the sidecar twice (its drain's commit and its
+  // own): 64-95 of them here, and each Close waited for the stores ahead.
+  std::printf("  %d Closes during fills: %d sidecar stores\n", kClosers * kRounds, closeStores);
+  EXPECT_LE(closeStores, kClosers * kRounds / 5) << "commits not merged";
+  e.reset();
+  auto m = MetaFile::load(io, key.metaPath(cfg.cacheDir));
+  ASSERT_TRUE(m);
+  for (uint64_t pg = 0; pg < uint64_t(kClosers) * kRounds; ++pg) // no Close lost a page
+    EXPECT_TRUE(m->bitmap.get(pg)) << pg;
+}
+
+// A sibling that stored a page with crc 0 (an older release) does not hand it
+// over through a commit's adoption either.
+TEST(FileEntry, ASiblingsPageWithCrcZeroIsNotAdopted) {
+  Fixture fx(10 * 4096, 4096);
+  auto a = fx.open();
+  a->writePages(0, 4096, fx.src.data());
+  a->flushAll();
+  {
+    auto b = fx.open();
+    b->writePages(4096, 9 * 4096, fx.src.data() + 4096);
+    b->flushAll();
+  }
+  auto m = MetaFile::load(fx.io, fx.key.metaPath(fx.cfg.cacheDir));
+  ASSERT_TRUE(m);
+  m->pageCrcs[5] = 0;
+  ASSERT_EQ(MetaFile::store(fx.io, fx.key.metaPath(fx.cfg.cacheDir), *m, false), 0);
+  a->writePages(0, 4096, fx.src.data());
+  a->setPinned(true); // something to commit: the commit adopts the sibling's pages
+  EXPECT_TRUE(a->hasRange(4 * 4096, 4096));
+  EXPECT_FALSE(a->hasRange(5 * 4096, 4096));
+  a->flushAll();
+  auto after = MetaFile::load(fx.io, fx.key.metaPath(fx.cfg.cacheDir));
+  ASSERT_TRUE(after);
+  EXPECT_FALSE(after->bitmap.get(5));
+  EXPECT_EQ(after->bitmap.count(), 9u);
 }

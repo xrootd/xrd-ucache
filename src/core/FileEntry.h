@@ -43,9 +43,9 @@
 // CRC failure, a punch, or a commit adopting a sibling's clear). At most one buffer flush runs at a time
 // (flushInProgress_ + condvar); staged pages stay readable during their
 // flush via the flushing_ map. At most one sidecar commit runs at a time
-// (commitMu_, taken before mu_): the flock around a commit keeps other
-// processes out, but every thread here shares one descriptor, which flock
-// does not divide. A range release holds off buffer flushes, and the staging
+// (committing_, under mu_; callers that wait are merged into one commit): the
+// flock around a commit keeps other processes out, but every thread here
+// shares one descriptor, which flock does not divide. A range release holds off buffer flushes, and the staging
 // of the pages it releases, until its punch is done.
 #pragma once
 
@@ -105,7 +105,8 @@ class FileEntry {
   void writePages(uint64_t off, uint64_t len, const void* buf);
 
   // Persist the sidecar if dirty and (force or flush interval elapsed).
-  void flushMeta(bool force);
+  // false: the store failed, and the changes wait for the next commit.
+  bool flushMeta(bool force);
   // Drain the fill buffer to disk. force = unconditional (close,
   // eviction, tests); otherwise honors the cap/interval policy. Waits for a
   // concurrent flush when force so "returned" means "durable".
@@ -333,7 +334,7 @@ class FileEntry {
   bool readVerifyRun(uint64_t firstPage, uint64_t lastPage, const uint32_t* expect,
                      uint8_t* dst);
   // Marks [firstPage, lastPage] absent and the entry incomplete: their
-  // content could not be trusted. Counts ONE crc_failure for the run.
+  // content could not be trusted. Counts one crc_failure per page, logs once.
   void demoteRun(uint64_t firstPage, uint64_t lastPage, const char* why);
   // Re-reads [firstPage, lastPage] one page at a time and demotes only the
   // pages that are genuinely bad (one crc_failure each). Always returns false:
@@ -400,8 +401,17 @@ class FileEntry {
   uint64_t lastBufFlushS_ = 0;
   bool flushInProgress_ = false;
   std::condition_variable flushCv_;
-  // One sidecar commit at a time in this process (see flushMeta).
-  std::mutex commitMu_;
+  // One sidecar commit at a time in this process (see flushMeta), all under mu_.
+  bool committing_ = false;
+  bool commitAgain_ = false; // a caller skipped meanwhile: go round once more
+  uint64_t commitSeq_ = 0;   // commits started
+  uint64_t commitDone_ = 0;  // the last one finished
+  bool lastCommitOk_ = true;
+  std::condition_variable commitCv_;
+  // The store of one snapshot: flock, merge onto the image on disk, store,
+  // adopt. false when the store failed (its changes are re-armed).
+  bool commitSnapshot(MetaData snapshot, const PageBitmap& sets, const PageBitmap& clears,
+                      bool pinTouched);
   // Pages a releaseRanges call is punching: not staged or written until it
   // is done, or the punch would zero a page published after the bit was
   // cleared. releaseGen_ counts releases, for the unbuffered write path.
