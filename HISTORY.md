@@ -11,6 +11,9 @@ Recompression stays off unless you turn it on. Nothing is published unless you
 run `ucache publish`. Any XRootD 5.6 or newer 5.x client works; 6.x from
 v0.21.0.
 
+### v1.3.4 — 2026-09-29
+- The macOS tarball, which 1.3.3 lacks; otherwise the same as 1.3.3.
+
 ### v1.3.3 — 2026-09-29
 - `XRD_LOGLEVEL=Debug` shows uCache's messages in the client's log; a log
   with a warning starts with a line naming the version and cache directory.
