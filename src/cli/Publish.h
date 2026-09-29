@@ -226,7 +226,7 @@ struct PublishOutcome {
 int sendPayload(const Json& payload, const std::string& baseUrl, PublishOutcome& out);
 // The report, the findings and the owner page, for a terminal.
 void printOutcome(const PublishOutcome& out);
-// tty: summary + [y/N]. Not a tty: `yes` decides; without it the refusal names
+// tty: summary + [Y/n], Enter sends. Not a tty: `yes` decides; without it the refusal names
 // the flag. Returns true to proceed.
 bool confirmPublish(const std::string& summary, bool yes);
 

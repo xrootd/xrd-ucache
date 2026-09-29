@@ -1770,10 +1770,10 @@ bool confirmPublish(const std::string& summary, bool yes) {
   // without this, pasting a label followed by a line starting with "y" sent
   // the payload without the user ever seeing the summary above.
   ::tcflush(STDIN_FILENO, TCIFLUSH);
-  std::fputs("Send it? [y/N] ", stdout);
+  std::fputs("Send it? [Y/n] ", stdout);
   std::fflush(stdout);
   char buf[16] = {0};
-  if (!std::fgets(buf, sizeof buf, stdin) || (buf[0] != 'y' && buf[0] != 'Y')) {
+  if (!std::fgets(buf, sizeof buf, stdin) || buf[0] == 'n' || buf[0] == 'N') {
     std::puts("not sent");
     return false;
   }
