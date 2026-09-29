@@ -1476,6 +1476,7 @@ TEST(FileEntry, CommitsThatWaitAreMerged) {
   Config cfg;
   cfg.cacheDir = td.path();
   cfg.fillBufferMb = 0; // fills publish at once: every commit has news
+  cfg.pageSize = 4096;  // the writes below are 4 KiB pages
   Stats stats;
   auto key = *UrlKey::parse("root://h//merged.root");
   constexpr uint64_t kPages = 4096;

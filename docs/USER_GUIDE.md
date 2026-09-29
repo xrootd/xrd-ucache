@@ -698,9 +698,10 @@ to remove. It is off by default because that gain is real but narrow, and
 nobody should acquire a new moving part in their read path without choosing
 it.
 
-- **Page cache, not file cache.** uCache stores the 4 KiB pages your analysis
-  actually reads (typically a small fraction of each file), each protected by a
-  CRC32C. It never stores data it wasn't asked for beyond page rounding.
+- **Page cache, not file cache.** uCache stores the pages your analysis
+  actually reads (4 KiB each, 16 KiB on macOS), typically a small fraction of
+  each file, each protected by a CRC32C. It never stores data it wasn't asked
+  for beyond page rounding.
 - **Validation.** A cached entry is trusted for a freshness window (default
   7 days): inside it, opens don't contact the origin at all — warm passes work
   even when the remote is down or flaky. When the window expires, the next
@@ -747,6 +748,7 @@ overriding your defaults. Common keys:
 | `recompress_keep_originals = off` | `UCACHE_RECOMPRESS_KEEP_ORIGINALS` | `on` = when baskets are converted into a replica, keep their original bytes in the byte cache too (by default they are not kept, and a copy held from before is released: the cache would hold the same data twice) |
 | `recompress_codecs = lzma,zlib` | `UCACHE_RECOMPRESS_CODECS` | which **source** codecs are worth recompressing (comma list); branches in other codecs are served as-is |
 | `recompress_reclaim = superseded` | `UCACHE_RECOMPRESS_RECLAIM` | what to free from the byte cache once a file's replica exists: `superseded` (default) punches only the ranges the replica replaced; `full` drops the **entire** byte copy — replicas become the primary copy, uncovered reads refetch from origin (space-tight disks) |
+| `page_size = 4k` | `UCACHE_PAGE_SIZE` | size of the pages the cache stores: 4 KiB, and 16 KiB on macOS, where a smaller page written into a hole of the cache file takes 16 KiB of disk anyway. Applies to files cached from then on. `ucache doctor` checks it against the cache disk |
 | `log = warn` | `UCACHE_LOG` | `error` / `warn` / `info` / `debug`, optionally `:/path/to/file`. The XRootD client's own switch works too: `XRD_LOGLEVEL=Debug` shows uCache's debug messages, and with `XRD_LOGFILE` they go into the client's log file under the topic `UCache`. `ucache set log debug` turns debug on for every job; `ucache unset log` turns it off |
 | `trace = off` | `UCACHE_TRACE` | `io` = write a sampled per-operation JSON trace next to the process's stats file (deep-dive forensics; zero cost when off). Best set per job: `UCACHE_TRACE=io python3 my_analysis.py` |
 | `trace_sample = 64` | `UCACHE_TRACE_SAMPLE` | record every Nth read-class trace op (`1` = everything; opens/flushes are always recorded) |
@@ -921,7 +923,7 @@ below and the dedicated guide in `docs/CACHE_MANAGEMENT.md`.
 | `ucache identity [--set STRING \| --new \| --path]` | the identity string that groups everything you publish under one owner page: an owner id plus a salt that never leaves the machine. Created by the first publish; `--set` installs it on another machine, `--new` starts over |
 | `ucache evict [--older-than DUR \| --newer-than DUR \| --to-size SIZE] [--dry-run]` | reclaim space: no flags = one pass to the configured budget; `--older-than 30d` drops entries unused that long; `--newer-than 1h` drops entries used within the window (undo a polluting run); `--to-size 20g` LRU-evicts down to a total size; `--dry-run` previews |
 | `ucache rm <url> [url…]` | remove specific entries (byte cache + replica) |
-| `ucache clear [--yes] [--keep-pinned]` | empty the whole cache (prompts unless `--yes`) |
+| `ucache clear [--yes] [--keep-pinned] [--wait]` | empty the whole cache (prompts unless `--yes`). The cache is empty at once; the disk space is freed in the background, or before the command returns with `--wait` |
 | `ucache pin <url>` / `unpin <url>` | protect / unprotect an entry from eviction |
 | `ucache verify <url>` | CRC-scrub an entry; quarantine (not wipe) bad pages |
 | `ucache settings`  | every setting: effective value + where it comes from (default \| conf \| state \| env) |

@@ -16,6 +16,9 @@ $UCACHE_DIR/                         (0700)
   stats/<stem>.files.jsonl           # per-file lifetime records (docs/STATS.md)
   stats/<stem>.trace.jsonl           # sampled IO trace, `trace = io` (docs/STATS.md)
   LOCK                               # cache-wide flock for eviction
+  objects.cleared.<pid>-<ms>/        # an objects/ tree `ucache clear` set aside,
+                                     #  deleted in the background
+  cleared.lock                       # flock held while such a tree is deleted
 ```
 
 `<hh>` = first two hex chars of the sha256. The key is the normalized URL;

@@ -176,4 +176,8 @@ int IOBackend::link(const std::string& from, const std::string& to) {
   return ::link(from.c_str(), to.c_str()) == 0 ? 0 : -errno;
 }
 
+int IOBackend::rmdir(const std::string& path) {
+  return ::rmdir(path.c_str()) == 0 ? 0 : -errno;
+}
+
 } // namespace ucache

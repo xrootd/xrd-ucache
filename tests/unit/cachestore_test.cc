@@ -356,6 +356,7 @@ TEST(CacheStore, VerifyScrub) {
   RealIO io;
   Config cfg;
   cfg.cacheDir = td.path();
+  cfg.pageSize = 4096; // the test's writes are 4 KiB pages
   CacheStore store(io, cfg);
   auto src = test::randomBytes(8 * 4096, 8);
   {
@@ -374,6 +375,7 @@ TEST(CacheStore, VerifyDoesNotWipeUnderMtimeValidation) {
   RealIO io;
   Config cfg;
   cfg.cacheDir = td.path();
+  cfg.pageSize = 4096; // the test's writes are 4 KiB pages
   cfg.validate = ValidateMode::kSizeMtime;
   CacheStore store(io, cfg);
   auto src = test::randomBytes(8 * 4096, 40);
@@ -885,6 +887,7 @@ TEST(CacheStore, OpenEntryNotEvictedMidFillDiskFloor) {
   FaultIO io{real};
   Config cfg;
   cfg.cacheDir = td.path();
+  cfg.pageSize = 4096; // the test's writes are 4 KiB pages
   cfg.maxBytes = 100ull << 30;
   cfg.minFreeBytes = 50ull << 30;
   cfg.evictCheckSeconds = 0;
@@ -1060,8 +1063,10 @@ TEST(CacheStore, CleanupParallelRemovesEntriesAndListedArtifacts) {
   EXPECT_EQ(dry.victims.size(), 120u);
   EXPECT_TRUE(fx.present(0) && fx.present(119));
 
-  auto rep = fx.store->cleanup(CacheStore::CleanupMode::kAll, 0, false, false);
+  // keepPinned with nothing pinned: entry by entry, not the tree set aside.
+  auto rep = fx.store->cleanup(CacheStore::CleanupMode::kAll, 0, /*keepPinned=*/true, false);
   EXPECT_TRUE(rep.locked);
+  EXPECT_TRUE(rep.cleared.empty());
   EXPECT_EQ(rep.victims.size(), 120u);
   EXPECT_EQ(rep.bytes, dry.bytes); // parallel removal credits exactly the scan
   for (int i = 0; i < 120; ++i)
@@ -1076,6 +1081,127 @@ TEST(CacheStore, CleanupParallelRemovesEntriesAndListedArtifacts) {
     EXPECT_LT(fx.io.stat(keyN(i).objectDir(fx.cfg.cacheDir) + "/" + keyN(i).hashHex + ".cost",
                          &st), 0) << i << ".cost";
   EXPECT_EQ(fx.store->listEntries().size(), 0u);
+}
+
+// Clearing everything sets the objects tree aside in one rename: the cache is
+// empty at once, and the files go when removeCleared() runs.
+TEST(CacheStore, ClearingEverythingSetsTheTreeAsideAndFreesItLater) {
+  CleanupFx fx(40, 4);
+  for (int i = 0; i < 40; i += 5)
+    std::ofstream(keyN(i).objectDir(fx.cfg.cacheDir) + "/" + keyN(i).hashHex + ".tdata") << "x";
+  std::vector<std::string> shardsBefore;
+  fx.io.listDir(fx.cfg.cacheDir + "/objects", shardsBefore);
+  auto rep = fx.store->cleanup(CacheStore::CleanupMode::kAll, 0, false, false);
+  ASSERT_TRUE(rep.locked);
+  EXPECT_EQ(rep.victims.size(), 40u);
+  EXPECT_GE(rep.diskBytes, 40u * 4 * 4096); // what the files took, sidecars included
+  ASSERT_FALSE(rep.cleared.empty());
+  EXPECT_EQ(fx.store->listEntries().size(), 0u);
+  for (int i = 0; i < 40; ++i)
+    EXPECT_FALSE(fx.present(i)) << i;
+  // The shard directories stay, empty: a job still running commits its
+  // sidecars there, as after entries were unlinked one by one.
+  std::vector<std::string> shardsAfter;
+  fx.io.listDir(fx.cfg.cacheDir + "/objects", shardsAfter);
+  std::sort(shardsBefore.begin(), shardsBefore.end());
+  std::sort(shardsAfter.begin(), shardsAfter.end());
+  EXPECT_EQ(shardsAfter, shardsBefore);
+  for (const auto& sh : shardsAfter) {
+    std::vector<std::string> files;
+    fx.io.listDir(fx.cfg.cacheDir + "/objects/" + sh, files);
+    EXPECT_TRUE(files.empty()) << sh;
+  }
+  auto st = CacheStore::clearedState(fx.io, fx.cfg.cacheDir);
+  EXPECT_EQ(st.trees, 1u);
+  EXPECT_GE(st.diskBytes, 40u * 4 * 4096);
+  EXPECT_FALSE(st.removing);
+
+  // The cache works while the tree waits to be freed.
+  auto src = test::randomBytes(4 * 4096, 13);
+  {
+    auto e = fx.store->open(keyN(3), src.size());
+    ASSERT_TRUE(e);
+    e->writePages(0, src.size(), src.data());
+    e->flushMeta(true);
+  }
+  CacheStore::removeCleared(fx.io, fx.cfg.cacheDir);
+  st = CacheStore::clearedState(fx.io, fx.cfg.cacheDir);
+  EXPECT_EQ(st.trees, 0u);
+  EXPECT_EQ(st.diskBytes, 0u);
+  struct ::stat sb;
+  EXPECT_LT(fx.io.stat(rep.cleared, &sb), 0);
+  EXPECT_TRUE(fx.present(3));
+  EXPECT_EQ(fx.store->listEntries().size(), 1u);
+}
+
+// A removal that did not finish (the machine rebooted) leaves its tree; the
+// next removal frees it together with any newer one.
+TEST(CacheStore, ARemovalLeftUnfinishedIsCompletedByTheNext) {
+  CleanupFx fx(6, 2);
+  auto first = fx.store->cleanup(CacheStore::CleanupMode::kAll, 0, false, false);
+  ASSERT_FALSE(first.cleared.empty());
+  auto src = test::randomBytes(2 * 4096, 14);
+  {
+    auto e = fx.store->open(keyN(1), src.size());
+    e->writePages(0, src.size(), src.data());
+    e->flushMeta(true);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(2)); // a distinct name
+  auto second = fx.store->cleanup(CacheStore::CleanupMode::kAll, 0, false, false);
+  ASSERT_FALSE(second.cleared.empty());
+  EXPECT_NE(first.cleared, second.cleared);
+  EXPECT_EQ(CacheStore::clearedState(fx.io, fx.cfg.cacheDir).trees, 2u);
+  CacheStore::removeCleared(fx.io, fx.cfg.cacheDir);
+  EXPECT_EQ(CacheStore::clearedState(fx.io, fx.cfg.cacheDir).trees, 0u);
+}
+
+// `status` tells a removal still running from one that stopped: the removal
+// holds the lock for as long as it runs.
+TEST(CacheStore, ClearedStateSeesARemovalThatIsRunning) {
+  CleanupFx fx(3, 2);
+  ASSERT_FALSE(fx.store->cleanup(CacheStore::CleanupMode::kAll, 0, false, false).cleared.empty());
+  int fd = ::open((fx.cfg.cacheDir + "/cleared.lock").c_str(), O_RDWR | O_CREAT, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::flock(fd, LOCK_EX), 0);
+  EXPECT_TRUE(CacheStore::clearedState(fx.io, fx.cfg.cacheDir).removing);
+  ::flock(fd, LOCK_UN);
+  EXPECT_FALSE(CacheStore::clearedState(fx.io, fx.cfg.cacheDir).removing);
+  ::close(fd);
+}
+
+// An entry open in this process is never removed: clearing then goes entry by
+// entry and leaves it, as before.
+TEST(CacheStore, ClearingWithAnEntryOpenHereGoesEntryByEntry) {
+  CleanupFx fx(4, 2);
+  auto held = fx.store->open(keyN(2), 2 * 4096);
+  ASSERT_TRUE(held);
+  auto rep = fx.store->cleanup(CacheStore::CleanupMode::kAll, 0, false, false);
+  EXPECT_TRUE(rep.cleared.empty());
+  EXPECT_EQ(rep.victims.size(), 3u);
+  EXPECT_TRUE(fx.present(2));
+  EXPECT_EQ(CacheStore::clearedState(fx.io, fx.cfg.cacheDir).trees, 0u);
+}
+
+// What the files take on the disk, beside what the sidecars say is cached: a
+// filesystem writing more than a page into a hole makes the first larger.
+TEST(CacheStore, ListingReportsTheSpaceFilesTakeOnDisk) {
+  CleanupFx fx(2, 8);
+  for (const auto& e : fx.store->listEntries()) {
+    EXPECT_EQ(e.dataDisk, 0u); // only on request
+    EXPECT_EQ(e.metaDisk, 0u);
+  }
+  const std::string base = keyN(0).objectDir(fx.cfg.cacheDir) + "/" + keyN(0).hashHex;
+  std::ofstream(base + ".tdata") << std::string(10000, 'r');
+  auto entries = fx.store->listEntries(/*disk=*/true);
+  ASSERT_EQ(entries.size(), 2u);
+  for (const auto& e : entries) {
+    EXPECT_GE(e.dataDisk, e.cachedBytes) << e.key;
+    EXPECT_GT(e.metaDisk, 0u) << e.key;
+  }
+  uint64_t replica = 0;
+  for (const auto& e : entries)
+    replica += e.replicaDisk;
+  EXPECT_GE(replica, 10000u);
 }
 
 // Eviction's victim loop uses the same artifact mask: replica files and the
@@ -1308,6 +1434,7 @@ TEST(CacheStore, CheckpointDrainsCommitsAndRecordsWithoutAClose) {
   RealIO io;
   Config cfg;
   cfg.cacheDir = td.path();
+  cfg.pageSize = 4096; // the test's writes are 4 KiB pages
   cfg.metaFlushSeconds = 1; // 0 would be due inside writePages itself
   auto src = test::randomBytes(64 * 4096, 5);
   CacheStore store(io, cfg);

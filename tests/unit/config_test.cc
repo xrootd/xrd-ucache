@@ -29,7 +29,12 @@ struct EnvGuard {
 TEST(Config, Defaults) {
   EnvGuard g;
   Config c = Config::fromEnv();
-  EXPECT_EQ(c.pageSize, 4096u); // measured default
+  EXPECT_EQ(c.pageSize, Config::kDefaultPageSize); // measured default
+#if defined(__APPLE__)
+  EXPECT_EQ(Config::kDefaultPageSize, 16384u); // what one memory page takes on disk
+#else
+  EXPECT_EQ(Config::kDefaultPageSize, 4096u);
+#endif
   EXPECT_EQ(c.maxBytes, 0u);
   EXPECT_DOUBLE_EQ(c.highWater, 0.90);
   EXPECT_DOUBLE_EQ(c.lowWater, 0.75);
@@ -242,15 +247,15 @@ TEST(Config, RejectsBadValues) {
   ::setenv("UCACHE_HIGH_WATER", "0.5", 1);
   ::setenv("UCACHE_LOW_WATER", "0.9", 1); // low > high
   Config c = Config::fromEnv();
-  EXPECT_EQ(c.pageSize, 4096u);
+  EXPECT_EQ(c.pageSize, Config::kDefaultPageSize);
   EXPECT_DOUBLE_EQ(c.highWater, 0.90);
   EXPECT_DOUBLE_EQ(c.lowWater, 0.75);
   ::setenv("UCACHE_PAGE_SIZE", "2048", 1); // below 4 KiB floor
   c = Config::fromEnv();
-  EXPECT_EQ(c.pageSize, 4096u);
+  EXPECT_EQ(c.pageSize, Config::kDefaultPageSize);
   ::setenv("UCACHE_PAGE_SIZE", "2m", 1); // above 1 MiB ceiling
   c = Config::fromEnv();
-  EXPECT_EQ(c.pageSize, 4096u);
+  EXPECT_EQ(c.pageSize, Config::kDefaultPageSize);
   ::setenv("UCACHE_VALIDATE", "bogus", 1);
   c = Config::fromEnv();
   EXPECT_EQ(c.validate, ValidateMode::kSize);

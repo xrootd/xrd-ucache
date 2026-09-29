@@ -116,10 +116,17 @@ class CacheStore {
     double coverage = 0.0;   // fraction of the file present in cache [0,1]
     bool pinned = false;
     bool complete = false;
+    // Space the entry's files take on disk (allocated blocks), with `disk`
+    // only. It can exceed cachedBytes: a filesystem that writes more than one
+    // page into a hole stores the zeros around it too.
+    uint64_t dataDisk = 0;    // .data
+    uint64_t metaDisk = 0;    // .meta
+    uint64_t replicaDisk = 0; // .tdata + .tmeta + .slots
   };
   // Snapshot of every cached entry (authoritative disk scan; torn sidecars
   // skipped). Cold path — use approxUsageBytes()/stats for hot checks.
-  std::vector<EntryInfo> listEntries();
+  // `disk` also fills the *Disk fields: a stat per file, for `status`.
+  std::vector<EntryInfo> listEntries(bool disk = false);
 
   // CRC scrub of one entry (CLI `verify`). The caller MUST pass the entry's OWN
   // validation metadata (from its sidecar) — size AND mtime/cksum — so the
@@ -152,6 +159,12 @@ class CacheStore {
   // WITHOUT unlinking anything (preview). Serialized cross-process by the same
   // eviction LOCK as evictNow(); report.locked is false (and victims empty) if
   // another process holds it.
+  //
+  // kAll keeping nothing renames the objects directory aside in one step
+  // instead of unlinking entry by entry: every process sees an empty cache at
+  // once, and the files are deleted later by removeCleared() — on a filesystem
+  // that frees a file's blocks inside unlink (APFS), that is where the time
+  // goes. report.cleared names the tree set aside.
   enum class CleanupMode { kAll, kOlderThan, kNewerThan, kToSize };
   struct CleanupVictim {
     std::string key;
@@ -161,9 +174,24 @@ class CacheStore {
   struct CleanupReport {
     bool locked = false; // false => another process holds the eviction lock
     uint64_t bytes = 0;  // total across victims
+    uint64_t diskBytes = 0; // space the victims' files take on disk (kAll only)
+    std::string cleared;    // the tree set aside (kAll keeping nothing); "" = unlinked
     std::vector<CleanupVictim> victims;
   };
   CleanupReport cleanup(CleanupMode mode, uint64_t arg, bool keepPinned, bool dryRun);
+
+  // Trees `cleanup` set aside are named <cacheDir>/<kClearedPrefix><pid>-<ms>.
+  static constexpr const char* kClearedPrefix = "objects.cleared.";
+  // Delete every tree set aside in `cacheDir`, one an interrupted removal left
+  // included. One removal runs at a time: a second waits for the first, then
+  // deletes whatever is left.
+  static void removeCleared(IOBackend& io, const std::string& cacheDir);
+  struct ClearedState {
+    size_t trees = 0;       // trees set aside and not yet deleted
+    uint64_t diskBytes = 0; // space their files still take
+    bool removing = false;  // a removal is running now
+  };
+  static ClearedState clearedState(IOBackend& io, const std::string& cacheDir);
 
   // Drops the entry for `key`: registry detach + unlink of data+sidecar
   // (any write access to a cached URL invalidates its entry).
@@ -276,6 +304,7 @@ class CacheStore {
     uint8_t artifacts = 0;     // kArt* bits present in the shard listing
     bool pinned = false;
     bool complete = false;
+    uint64_t dataDisk = 0, metaDisk = 0, replicaDisk = 0; // see EntryInfo
   };
   // Full-cache sidecar walk (eviction, usage, listEntries): reads
   // sidecar SUMMARIES (MetaFile::loadSummary — header+bitmap, not the page-crc
@@ -284,11 +313,11 @@ class CacheStore {
   // IOBackend to be thread-safe (RealIO: stateless syscalls; FaultIO: internal
   // mutex). Threads are joined before return — none escape the call.
   // `replicated` = also fill MetaScan::replicated (one header read per slot
-  // store): only listings need it.
-  std::vector<MetaScan> scanObjects(bool replicated = false);
+  // store): only listings need it. `disk` = also fill the *Disk fields.
+  std::vector<MetaScan> scanObjects(bool replicated = false, bool disk = false);
   // One shard directory's entries, appended to `out` (worker body of the scan).
   void scanShard(const std::string& objRoot, const std::string& shard,
-                 std::vector<MetaScan>& out, bool replicated = false);
+                 std::vector<MetaScan>& out, bool replicated = false, bool disk = false);
   // Remove replica artifacts (.tdata/.tmeta/*.tmp) whose v1 .meta is gone —
   // debris of a crash mid-publish or of a v1.0.0 process evicting an entry
   // without knowing about replica files (D1 mixed-version caveat). Age-guarded

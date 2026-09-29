@@ -26,7 +26,14 @@ struct Config {
   std::string cacheDir;                   // UCACHE_DIR / `dir =`; NO default:
                                           // empty => plugin passes through (warn),
                                           // doctor FAILs, CLI commands refuse
-  uint32_t pageSize = 4096;               // UCACHE_PAGE_SIZE, new entries only
+  // 4 KiB, and 16 KiB on macOS: Apple silicon writes whole 16 KiB memory
+  // pages, so a 4 KiB page written into a hole takes 16 KiB of disk there.
+#if defined(__APPLE__)
+  static constexpr uint32_t kDefaultPageSize = 16384;
+#else
+  static constexpr uint32_t kDefaultPageSize = 4096;
+#endif
+  uint32_t pageSize = kDefaultPageSize;   // UCACHE_PAGE_SIZE, new entries only
   // Growth is bounded by a free-disk FLOOR by default: the cache uses
   // the disk and LRU-evicts to keep `minFreeBytes` free, so an active session
   // fills most of the disk and reclaims under pressure. maxBytes is an OPTIONAL

@@ -54,8 +54,12 @@ namespace tp = ucache::transpose;
 #include <string>
 #include <utility>
 #include <sys/file.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
 #include <vector>
 
@@ -129,7 +133,10 @@ void usage() {
       "                    (undo a polluting run);\n"
       "                    --to-size 20g: LRU-evict down to that total size\n"
       "  rm <url> [url...] remove specific entries (byte cache + replica)\n"
-      "  clear [--yes] [--keep-pinned]  empty the whole cache (prompts unless --yes)\n"
+      "  clear [--yes] [--keep-pinned] [--wait]\n"
+      "                    empty the whole cache (prompts unless --yes); the\n"
+      "                    space is freed in the background, or before it\n"
+      "                    returns with --wait\n"
       "  pin   <url>       protect an entry from eviction\n"
       "  unpin <url>       remove pin protection\n"
       "  verify <url>      CRC-scrub an entry (detect + invalidate bad pages)\n"
@@ -1783,11 +1790,13 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
   }
   const auto runs =
       withoutTrivial(loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history"));
-  auto entries = store.listEntries();
-  uint64_t used = 0, replicaTotal = 0, replicaN = 0;
+  auto entries = store.listEntries(/*disk=*/true);
+  uint64_t used = 0, replicaTotal = 0, replicaN = 0, byteDisk = 0, replicaDisk = 0;
   for (const auto& e : entries) {
     used += e.cachedBytes;
     replicaTotal += e.replicaBytes;
+    byteDisk += e.dataDisk + e.metaDisk;
+    replicaDisk += e.replicaDisk;
     if (e.replicated)
       ++replicaN;
   }
@@ -1993,8 +2002,8 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
   }
 
   std::printf("cache      : %s — %zu entries, %.1f GB on disk (%.1f byte + %.1f replica)",
-              cfg.cacheDir.c_str(), entries.size(), gb(used + replicaTotal), gb(used),
-              gb(replicaTotal));
+              cfg.cacheDir.c_str(), entries.size(), gb(byteDisk + replicaDisk), gb(byteDisk),
+              gb(replicaDisk));
   if (cfg.minFreeBytes) {
     if (headroom)
       std::printf(", %.1f GB headroom", gb(headroom));
@@ -2120,7 +2129,7 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
 
 int cmdStatus(CacheStore& store, IOBackend& io) {
   const Config& cfg = store.config(); // the EFFECTIVE config (post budget resolution)
-  auto entries = store.listEntries();
+  auto entries = store.listEntries(/*disk=*/true);
   uint64_t used = 0, pinned = 0, protectedN = 0, protectedBytes = 0;
   // Recomputed here from live state rather than read from the plugin's latch:
   // `status` is a separate process, and a state file would be one more thing to
@@ -2188,13 +2197,12 @@ int cmdStatus(CacheStore& store, IOBackend& io) {
   // Footprint summary: what fraction of the original files the
   // cache holds — the at-a-glance answer to "did my analysis read most of
   // the data or a thin slice", aggregated and as a per-file median.
-  uint64_t origTotal = 0, replicaTotal = 0, replicatedBytes = 0;
+  uint64_t origTotal = 0, replicatedBytes = 0;
   size_t replicaN = 0;
   std::vector<double> covs;
   covs.reserve(entries.size());
   for (const auto& e : entries) {
     origTotal += e.fileSize;
-    replicaTotal += e.replicaBytes; // on disk, whatever it holds
     if (e.replicated) {
       replicatedBytes += e.replicaBytes;
       ++replicaN;
@@ -2212,9 +2220,27 @@ int cmdStatus(CacheStore& store, IOBackend& io) {
                 100.0 * med);
   } else
     std::printf("cached    : %s\n", human(used).c_str());
-  std::printf("disk used : %s (%s cached bytes + %s recompressed)\n",
-              human(used + replicaTotal).c_str(), human(used).c_str(),
-              human(replicaTotal).c_str());
+  // What the files take on the disk, which `du` agrees with: the cached bytes
+  // alone understate it where a filesystem writes more than a page into a hole.
+  uint64_t dataDisk = 0, metaDisk = 0, replicaDisk = 0;
+  for (const auto& e : entries) {
+    dataDisk += e.dataDisk;
+    metaDisk += e.metaDisk;
+    replicaDisk += e.replicaDisk;
+  }
+  std::printf("disk used : %s (byte cache %s, sidecars %s, recompressed %s)\n",
+              human(dataDisk + metaDisk + replicaDisk).c_str(), human(dataDisk).c_str(),
+              human(metaDisk).c_str(), human(replicaDisk).c_str());
+  if (dataDisk > used + used / 5 && dataDisk - used > (64ull << 20))
+    std::printf("            the %s cached take %s on disk (%.2fx) — `ucache doctor` "
+                "checks page_size against the disk\n",
+                human(used).c_str(), human(dataDisk).c_str(),
+                static_cast<double>(dataDisk) / static_cast<double>(used ? used : 1));
+  if (const auto left = CacheStore::clearedState(io, cfg.cacheDir); left.trees)
+    std::printf(left.removing ? "clearing  : %s still being freed by `ucache clear`\n"
+                              : "clearing  : %s left by an interrupted `ucache clear`; run it "
+                                "again to free it\n",
+                human(left.diskBytes).c_str());
   if (replicaN)
     std::printf("recompressed: %zu entr%s, %s (recompress %s; codecs:%s%s)\n",
                 replicaN,
@@ -3420,19 +3446,65 @@ int cmdRm(CacheStore& store, const Config& cfg, int argc, char** argv) {
   return missing ? 1 : 0;
 }
 
+// Free what `clear` set aside. In the background by default: on a filesystem
+// that frees a file's blocks inside unlink (APFS) that takes minutes for a big
+// cache, and the cache is already empty. A detached child at low priority does
+// it; false = it could not be started, so the caller frees in the foreground.
+bool freeClearedInBackground(const std::string& cacheDir) {
+  std::fflush(stdout);
+  std::fflush(stderr);
+  const pid_t pid = ::fork();
+  if (pid < 0)
+    return false;
+  if (pid > 0)
+    return true;
+  ::setsid(); // outlives the terminal
+  if (int nul = ::open("/dev/null", O_RDWR); nul >= 0) {
+    ::dup2(nul, STDIN_FILENO);
+    ::dup2(nul, STDOUT_FILENO);
+    ::dup2(nul, STDERR_FILENO);
+    if (nul > STDERR_FILENO)
+      ::close(nul);
+  }
+  [[maybe_unused]] int r = ::setpriority(PRIO_PROCESS, 0, 10);
+#if defined(__APPLE__)
+  ::setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_UTILITY);
+#elif defined(__linux__)
+  // Best effort at its lowest level, not idle: an idle class can wait forever
+  // behind a job that keeps the disk busy, while the space is wanted.
+  ::syscall(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, 0, (2 << 13) | 7);
+#endif
+  CacheStore::removeCleared(RealIO::instance(), cacheDir);
+  ::_exit(0);
+}
+
 int cmdClear(CacheStore& store, int argc, char** argv) {
-  bool yes = false, keepPinned = false;
+  bool yes = false, keepPinned = false, wait = false;
   for (int i = 2; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--yes" || a == "-y")
       yes = true;
     else if (a == "--keep-pinned")
       keepPinned = true;
+    else if (a == "--wait")
+      wait = true;
     else {
       std::fprintf(stderr, "clear: unknown option '%s'\n", a.c_str());
       return 2;
     }
   }
+  const std::string& dir = store.config().cacheDir;
+  IOBackend& io = RealIO::instance();
+  // Free what is set aside. true = in the background, still going.
+  auto freeCleared = [&] {
+    if (!CacheStore::clearedState(io, dir).trees)
+      return false;
+    if (!wait && freeClearedInBackground(dir))
+      return true;
+    CacheStore::removeCleared(io, dir);
+    return false;
+  };
+  const char* kInBackground = "freed in the background: `ucache status` shows it";
   // Preview first, so the confirmation prompt can state exactly what goes.
   auto plan = store.cleanup(CacheStore::CleanupMode::kAll, 0, keepPinned, /*dryRun=*/true);
   if (!plan.locked) {
@@ -3440,7 +3512,13 @@ int cmdClear(CacheStore& store, int argc, char** argv) {
     return 1;
   }
   if (plan.victims.empty()) {
-    std::printf("cache already empty%s\n", keepPinned ? " (all remaining entries pinned)" : "");
+    // An earlier clear may have left its files: freeing them is still wanted.
+    const auto left = CacheStore::clearedState(io, dir);
+    std::printf("cache already empty%s", keepPinned ? " (all remaining entries pinned)" : "");
+    if (left.trees)
+      std::printf("; %s left by an earlier clear, %s", human(left.diskBytes).c_str(),
+                  freeCleared() ? kInBackground : "freed");
+    std::printf("\n");
     return 0;
   }
   const char* plural = plan.victims.size() == 1 ? "y" : "ies";
@@ -3448,18 +3526,18 @@ int cmdClear(CacheStore& store, int argc, char** argv) {
     if (!::isatty(STDIN_FILENO)) {
       std::fprintf(stderr,
                    "clear: would remove %zu entr%s (%s)%s. Re-run with --yes to confirm.\n",
-                   plan.victims.size(), plural, human(plan.bytes).c_str(),
+                   plan.victims.size(), plural, human(plan.diskBytes).c_str(),
                    keepPinned ? "; pinned kept" : "");
       return 1;
     }
-    uint64_t repl = 0, cachedB = 0;
-    for (const auto& e : store.listEntries()) {
-      repl += e.replicaBytes;
-      cachedB += e.cachedBytes;
+    uint64_t repl = 0, byteDisk = 0;
+    for (const auto& e : store.listEntries(/*disk=*/true)) {
+      repl += e.replicaDisk;
+      byteDisk += e.dataDisk + e.metaDisk;
     }
-    std::printf("Remove ALL %zu entr%s (%s: %s cached + %s recompressed)%s? [y/N] ",
-                plan.victims.size(), plural, human(plan.bytes).c_str(),
-                human(cachedB).c_str(), human(repl).c_str(),
+    std::printf("Remove ALL %zu entr%s (%s on disk: %s byte cache + %s recompressed)%s? [y/N] ",
+                plan.victims.size(), plural, human(byteDisk + repl).c_str(),
+                human(byteDisk).c_str(), human(repl).c_str(),
                 keepPinned ? ", keeping pinned" : "");
     std::fflush(stdout);
     char buf[8] = {0};
@@ -3473,9 +3551,10 @@ int cmdClear(CacheStore& store, int argc, char** argv) {
     std::fputs("clear: another process holds the eviction lock; try again\n", stderr);
     return 1;
   }
-  std::printf("cleared %zu entr%s (%s freed)%s\n", rep.victims.size(),
-              rep.victims.size() == 1 ? "y" : "ies", human(rep.bytes).c_str(),
-              keepPinned ? "; pinned kept" : "");
+  const bool background = freeCleared();
+  std::printf("cleared %zu entr%s (%s %s)%s\n", rep.victims.size(),
+              rep.victims.size() == 1 ? "y" : "ies", human(rep.diskBytes).c_str(),
+              background ? kInBackground : "freed", keepPinned ? "; pinned kept" : "");
   return 0;
 }
 
@@ -3891,8 +3970,16 @@ int cmdSetup(int argc, char** argv) {
   return 0;
 }
 
-int fsProbe(const std::string& dir) {
+// A page size as the settings take it: 16k, 1m.
+std::string pageSizeArg(uint64_t b) {
+  return b >= (1u << 20) ? std::to_string(b >> 20) + "m" : std::to_string(b >> 10) + "k";
+}
+
+// `unit` (out): what one page written into a hole of a sparse file takes on
+// this disk; 0 when it could not be measured.
+int fsProbe(const std::string& dir, uint32_t pageSize, uint64_t& unit) {
   int bad = 0;
+  unit = 0;
   mkdirs(dir);
   std::string probe = dir + "/.ucache-doctor-probe";
   int fd = ::open(probe.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
@@ -3901,13 +3988,38 @@ int fsProbe(const std::string& dir) {
     return 1;
   }
   bool sparse = false;
-  if (::ftruncate(fd, 1 << 20) == 0) {
+  if (::ftruncate(fd, 4 << 20) == 0) {
     struct ::stat st;
     if (::fstat(fd, &st) == 0)
-      sparse = static_cast<uint64_t>(st.st_blocks) * 512 < (1u << 20);
+      sparse = static_cast<uint64_t>(st.st_blocks) * 512 < (4u << 20);
   }
   std::printf("  [%s] sparse files (cache stores sparse .data)\n", sparse ? " OK " : "WARN");
   bad += !sparse;
+  // Where the cache puts a page: inside a hole, on a page boundary. A disk
+  // that writes more than that (macOS writes whole 16 KiB memory pages) makes
+  // the cache take more than it holds.
+  if (sparse) {
+    std::vector<char> page(pageSize, 'u');
+    struct ::stat before, after;
+    const off_t at = (1 << 20) + static_cast<off_t>(pageSize);
+    if (::fstat(fd, &before) == 0 &&
+        ::pwrite(fd, page.data(), pageSize, at) == static_cast<ssize_t>(pageSize) &&
+        ::fsync(fd) == 0 && ::fstat(fd, &after) == 0 && after.st_blocks > before.st_blocks)
+      unit = static_cast<uint64_t>(after.st_blocks - before.st_blocks) * 512;
+  }
+  if (unit > pageSize) {
+    uint64_t want = pageSize;
+    while (want < unit && want < (1u << 20))
+      want *= 2;
+    std::printf("  [WARN] one %s page takes %s on this disk, so the cache can take up to %.0fx\n"
+                "         what it holds: set `page_size = %s`\n",
+                human(pageSize).c_str(), human(unit).c_str(),
+                static_cast<double>(unit) / pageSize, pageSizeArg(want).c_str());
+    ++bad;
+  } else if (unit) {
+    std::printf("  [ OK ] one %s page takes %s on disk (page_size)\n", human(pageSize).c_str(),
+                human(unit).c_str());
+  }
   bool flockOk = ::flock(fd, LOCK_EX | LOCK_NB) == 0;
   if (flockOk)
     ::flock(fd, LOCK_UN);
@@ -4218,6 +4330,45 @@ int activationProbe() {
               so.empty() ? "<plugin dir>/libXrdClUCache.so" : so.c_str());
   return 1;
 }
+// What the cache already holds against what the disk takes: entries cached
+// with pages smaller than one write takes (they keep their page size), and
+// space an interrupted `clear` left.
+int cacheSpaceProbe(const std::string& dir, uint64_t unit) {
+  int bad = 0;
+  IOBackend& io = RealIO::instance();
+  if (unit) {
+    size_t small = 0;
+    uint32_t smallest = 0;
+    std::vector<std::string> shards;
+    io.listDir(dir + "/objects", shards);
+    for (const auto& sh : shards) {
+      std::vector<std::string> files;
+      io.listDir(dir + "/objects/" + sh, files);
+      for (const auto& f : files)
+        if (f.size() > 5 && f.compare(f.size() - 5, 5, ".meta") == 0)
+          if (auto m = MetaFile::loadSummary(io, dir + "/objects/" + sh + "/" + f);
+              m && m->pageSize < unit) {
+            ++small;
+            smallest = smallest ? std::min(smallest, m->pageSize) : m->pageSize;
+          }
+    }
+    if (small) {
+      std::printf("  [WARN] %zu cached entr%s use%s %s pages and take%s up to %.0fx what they\n"
+                  "         hold; an entry keeps its page size until it is removed (`ucache clear`)\n",
+                  small, small == 1 ? "y" : "ies", small == 1 ? "s" : "",
+                  human(smallest).c_str(), small == 1 ? "s" : "",
+                  static_cast<double>(unit) / smallest);
+      ++bad;
+    }
+  }
+  if (const auto left = CacheStore::clearedState(io, dir); left.trees && !left.removing) {
+    std::printf("  [WARN] %s left by an interrupted `ucache clear`: run it again to free it\n",
+                human(left.diskBytes).c_str());
+    ++bad;
+  }
+  return bad;
+}
+
 int cmdDoctor(const Config& cfg) {
   std::string conf = findUCacheConf();
   std::printf("ucache doctor\n  cache dir: %s\n  settings : %s\n  freshness: %s\n",
@@ -4247,8 +4398,11 @@ int cmdDoctor(const Config& cfg) {
     std::printf("  [FAIL] cache dir not set — add `dir = /local/disk/path` to ucache.conf "
                 "(USER_GUIDE §2) or set UCACHE_DIR; the plugin runs uncached until then\n");
     ++problems;
-  } else
-    problems += fsProbe(cfg.cacheDir);
+  } else {
+    uint64_t unit = 0;
+    problems += fsProbe(cfg.cacheDir, cfg.pageSize, unit);
+    problems += cacheSpaceProbe(cfg.cacheDir, unit);
+  }
   const PluginPick pick = pickPlugin(conf);
   problems += soProbe(pick) + activationProbe();
   problems += handshakeProbe(pick);

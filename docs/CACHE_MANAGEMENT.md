@@ -43,7 +43,7 @@ freshness : 7d — entries validated within this window are served with no origi
 entries   : 1 (0 pinned)
 original  : 2.5 GiB (total size of the cached files at the origin)
 cached    : 450.3 MiB — 17.6% of the original bytes (median file: 17.6%)
-disk used : 450.3 MiB (450.3 MiB cached bytes + 0 B recompressed)
+disk used : 451.2 MiB (byte cache 450.3 MiB, sidecars 900.0 KiB, recompressed 0 B)
 recompressed: none — `ucache set recompress on` for replicas created as your jobs read files, …
 stats across 1 process file(s):
   opens              1
@@ -67,7 +67,14 @@ stats across 1 process file(s):
   `docs/USER_GUIDE.md`).
 - **entries / original / cached / disk used** — how many files, their total
   size at the origin, the bytes actually cached (with the coverage share),
-  and the physical footprint including recompressed replicas.
+  and the space the cache's files take on the disk, which `du` agrees with.
+  When the byte cache takes clearly more than the bytes cached, a line under
+  it says so: the disk writes more than one page into a hole, and
+  `ucache doctor` names the `page_size` to use (macOS writes 16 KiB for every
+  smaller page, which is why 16 KiB is the default there).
+- **clearing** — only after `ucache clear`: the space its files still take
+  while they are freed in the background, or that an interrupted clear left
+  (run `clear` again to free it).
 - **stats** — cumulative counters aggregated across every process that used
   this cache. `origin_bytes` near 0 on a warm run means you are being served
   from disk; `evicted_*` shows what reclamation has done.
@@ -337,13 +344,20 @@ never touches it.
 ucache clear              # prompts for confirmation, then empties the cache
 ucache clear --yes        # no prompt (for scripts/cron)
 ucache clear --keep-pinned   # wipe everything except pinned entries
+ucache clear --yes --wait    # return only once the disk space is free
 ```
 
-`clear` shows how many entries and how many bytes it will remove and asks before
+`clear` shows how many entries and how much disk it will free and asks before
 doing anything; pass `--yes` to skip the prompt. On a non-interactive stdin
 (a script or cron job) it refuses unless `--yes` is given, so it can never
 surprise you. Wiping is always safe — uCache fails open and re-fetches on the
 next read.
+
+The cache is empty the moment `clear` returns; freeing the disk space it took
+continues in the background, which on some filesystems (APFS on macOS) takes
+minutes for a large cache. `ucache status` shows what is still being freed.
+Use `--wait` when the next step needs the space, or a quiet disk (a
+benchmark, for example).
 
 ### Drop a file's replica (keep the byte cache)
 

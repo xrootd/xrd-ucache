@@ -11,6 +11,7 @@
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
+#include <functional>
 #include <new>
 #include <set>
 #include <sstream>
@@ -349,7 +350,7 @@ void CacheStore::maybeEvict() {
 }
 
 void CacheStore::scanShard(const std::string& objRoot, const std::string& shard,
-                           std::vector<MetaScan>& out, bool replicated) {
+                           std::vector<MetaScan>& out, bool replicated, bool disk) {
   std::vector<std::string> files;
   if (io_.listDir(objRoot + "/" + shard, files) < 0)
     return;
@@ -389,11 +390,26 @@ void CacheStore::scanShard(const std::string& objRoot, const std::string& shard,
       s.artifacts |= kArtCost;
     if (names.count(stem + ".slots"))
       s.artifacts |= kArtSlots;
+    // Allocated blocks, not sizes: what the file takes on the disk.
+    auto allocated = [](const struct ::stat& st) {
+      return static_cast<uint64_t>(st.st_blocks) * 512;
+    };
     struct ::stat tst; // replica overlay counts toward usage
+    if (disk) {
+      if (io_.stat(s.dataPath, &tst) == 0)
+        s.dataDisk = allocated(tst);
+      if (io_.stat(s.metaPath, &tst) == 0)
+        s.metaDisk = allocated(tst);
+      if ((s.artifacts & kArtTmeta) &&
+          io_.stat(objRoot + "/" + shard + "/" + stem + ".tmeta", &tst) == 0)
+        s.replicaDisk += allocated(tst);
+    }
     if ((s.artifacts & kArtTdata) &&
         io_.stat(objRoot + "/" + shard + "/" + stem + ".tdata", &tst) == 0) {
       s.replicaBytes = static_cast<uint64_t>(tst.st_size);
       s.replicated = true;
+      if (disk)
+        s.replicaDisk += allocated(tst);
     }
     // A slot store's size is the space it takes (a store marked DECLINED is
     // one header long and holds nothing). It has recompressed something once
@@ -402,6 +418,8 @@ void CacheStore::scanShard(const std::string& objRoot, const std::string& shard,
                            io_.stat(objRoot + "/" + shard + "/" + stem + ".slots", &tst) == 0;
     if (haveSlots && static_cast<uint64_t>(tst.st_size) == SlotStore::kHeaderBytes)
       s.slotDeclined = true; // a store with a layout is longer than its header
+    if (haveSlots && disk)
+      s.replicaDisk += allocated(tst);
     if (haveSlots && static_cast<uint64_t>(tst.st_size) > SlotStore::kHeaderBytes) {
       const uint64_t size = static_cast<uint64_t>(tst.st_size);
       s.replicaBytes += size;
@@ -412,7 +430,7 @@ void CacheStore::scanShard(const std::string& objRoot, const std::string& shard,
   }
 }
 
-std::vector<CacheStore::MetaScan> CacheStore::scanObjects(bool replicated) {
+std::vector<CacheStore::MetaScan> CacheStore::scanObjects(bool replicated, bool disk) {
   std::vector<MetaScan> out;
   const std::string objRoot = cfg_.cacheDir + "/objects";
   std::vector<std::string> shards;
@@ -423,7 +441,7 @@ std::vector<CacheStore::MetaScan> CacheStore::scanObjects(bool replicated) {
   std::atomic<size_t> next{0};
   auto worker = [&] {
     for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < shards.size();)
-      scanShard(objRoot, shards[i], perShard[i], replicated);
+      scanShard(objRoot, shards[i], perShard[i], replicated, disk);
   };
   size_t hw = std::thread::hardware_concurrency();
   size_t nThreads = std::min({size_t(16), shards.size(), hw ? hw : size_t(1)});
@@ -455,9 +473,9 @@ uint64_t CacheStore::usageBytes() {
   return total;
 }
 
-std::vector<CacheStore::EntryInfo> CacheStore::listEntries() {
+std::vector<CacheStore::EntryInfo> CacheStore::listEntries(bool disk) {
   std::vector<EntryInfo> out;
-  auto scans = scanObjects(/*replicated=*/true); // parallel summary walk
+  auto scans = scanObjects(/*replicated=*/true, disk); // parallel summary walk
   out.reserve(scans.size());
   for (auto& s : scans) {
     EntryInfo e;
@@ -471,6 +489,9 @@ std::vector<CacheStore::EntryInfo> CacheStore::listEntries() {
     e.coverage = s.coverage;
     e.pinned = s.pinned;
     e.complete = s.complete;
+    e.dataDisk = s.dataDisk;
+    e.metaDisk = s.metaDisk;
+    e.replicaDisk = s.replicaDisk;
     out.push_back(std::move(e));
   }
   return out;
@@ -687,7 +708,7 @@ CacheStore::CleanupReport CacheStore::cleanup(CleanupMode mode, uint64_t arg, bo
       e->flushAll();
   }
 
-  auto scans = scanObjects();
+  auto scans = scanObjects(/*replicated=*/false, /*disk=*/mode == CleanupMode::kAll);
 
   // An entry is protected from this pass if it is open in-process, or (when
   // keepPinned) pinned — including a pin that landed AFTER the scan snapshot,
@@ -733,6 +754,41 @@ CacheStore::CleanupReport CacheStore::cleanup(CleanupMode mode, uint64_t arg, bo
         continue; // NOT used within the window — not the recent pollution
       victims.push_back(&s);
     }
+  }
+
+  // Everything goes: set the whole tree aside in one rename. What is left to
+  // do is freeing the space, which removeCleared() does afterwards.
+  if (mode == CleanupMode::kAll && !keepPinned && liveHashes.empty() && !dryRun) {
+    const std::string objRoot = cfg_.cacheDir + "/objects";
+    std::vector<std::string> shards;
+    io_.listDir(objRoot, shards);
+    const std::string aside = cfg_.cacheDir + "/" + kClearedPrefix +
+                              std::to_string(::getpid()) + "-" + std::to_string(nowMs());
+    if (io_.rename(objRoot, aside) == 0) {
+      io_.mkdirs(objRoot, 0700);
+      // A job still running keeps committing its sidecars where its entries
+      // were, as when the files are unlinked one by one: the shards stay.
+      for (const auto& sh : shards)
+        io_.mkdirs(objRoot + "/" + sh, 0700);
+      {
+        std::lock_guard<std::mutex> g(regMu_);
+        registry_.clear(); // nothing is open here (liveHashes is empty)
+      }
+      for (const MetaScan* s : victims) {
+        const uint64_t bytes = s->cachedBytes + s->replicaBytes;
+        rep.victims.push_back({s->key, bytes, s->atime});
+        rep.bytes += bytes;
+        rep.diskBytes += s->dataDisk + s->metaDisk + s->replicaDisk;
+        stats_.evictedEntries.fetch_add(1, std::memory_order_relaxed);
+        stats_.evictedBytes.fetch_add(bytes, std::memory_order_relaxed);
+      }
+      rep.cleared = aside;
+      approxUsage_.store(0, std::memory_order_relaxed);
+      io_.flock(lockFd, LOCK_UN);
+      io_.close(lockFd);
+      return rep;
+    }
+    // Refused (the directory is a mount point, say): entry by entry below.
   }
 
   // Removal fan-out: each victim's unlinks are independent,
@@ -798,6 +854,7 @@ CacheStore::CleanupReport CacheStore::cleanup(CleanupMode mode, uint64_t arg, bo
     const uint64_t bytes = s->cachedBytes + s->replicaBytes;
     rep.victims.push_back({s->key, bytes, s->atime});
     rep.bytes += bytes;
+    rep.diskBytes += s->dataDisk + s->metaDisk + s->replicaDisk;
   }
   if (!dryRun) {
     sweepReplicaOrphans();
@@ -806,6 +863,106 @@ CacheStore::CleanupReport CacheStore::cleanup(CleanupMode mode, uint64_t arg, bo
   io_.flock(lockFd, LOCK_UN);
   io_.close(lockFd);
   return rep;
+}
+
+namespace {
+// Trees `cleanup` set aside in `cacheDir`, as full paths.
+std::vector<std::string> clearedTrees(IOBackend& io, const std::string& cacheDir) {
+  std::vector<std::string> names, trees;
+  io.listDir(cacheDir, names);
+  const std::string prefix = CacheStore::kClearedPrefix;
+  for (const auto& n : names)
+    if (n.compare(0, prefix.size(), prefix) == 0)
+      trees.push_back(cacheDir + "/" + n);
+  std::sort(trees.begin(), trees.end());
+  return trees;
+}
+// Runs body(i) for i in [0, n) on up to 16 threads, joined before return.
+void fanOut(size_t n, const std::function<void(size_t)>& body) {
+  std::atomic<size_t> next{0};
+  auto worker = [&] {
+    for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < n;)
+      body(i);
+  };
+  size_t hw = std::thread::hardware_concurrency();
+  size_t nThreads = std::min({size_t(16), n, hw ? hw : size_t(1)});
+  std::vector<std::thread> pool;
+  for (size_t t = 1; t < nThreads; ++t)
+    pool.emplace_back(worker);
+  worker();
+  for (auto& t : pool)
+    t.join();
+}
+const std::string& clearedLockName() {
+  static const auto* n = new std::string("/cleared.lock"); // leaked: see executor rules
+  return *n;
+}
+} // namespace
+
+void CacheStore::removeCleared(IOBackend& io, const std::string& cacheDir) {
+  int lockFd = io.open(cacheDir + clearedLockName(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (lockFd >= 0)
+    io.flock(lockFd, LOCK_EX); // a removal already running finishes first
+  // Until none is left: a clear may set another tree aside meanwhile. A tree
+  // that cannot be emptied (a file not ours to delete) ends the loop.
+  for (std::vector<std::string> trees, last; !(trees = clearedTrees(io, cacheDir)).empty();
+       last = trees) {
+    if (trees == last)
+      break;
+    for (const auto& tree : trees) {
+      std::vector<std::string> shards;
+      io.listDir(tree, shards);
+      fanOut(shards.size(), [&](size_t i) {
+        const std::string dir = tree + "/" + shards[i];
+        std::vector<std::string> files;
+        if (io.listDir(dir, files) < 0) {
+          io.unlink(dir); // not a directory: a stray file at the top
+          return;
+        }
+        for (const auto& f : files)
+          io.unlink(dir + "/" + f);
+        io.rmdir(dir);
+      });
+      io.rmdir(tree);
+    }
+  }
+  if (lockFd >= 0) {
+    io.flock(lockFd, LOCK_UN);
+    io.close(lockFd);
+  }
+}
+
+CacheStore::ClearedState CacheStore::clearedState(IOBackend& io, const std::string& cacheDir) {
+  ClearedState st;
+  const auto trees = clearedTrees(io, cacheDir);
+  st.trees = trees.size();
+  if (trees.empty())
+    return st;
+  for (const auto& tree : trees) {
+    std::vector<std::string> shards;
+    io.listDir(tree, shards);
+    std::atomic<uint64_t> bytes{0};
+    fanOut(shards.size(), [&](size_t i) {
+      std::vector<std::string> files;
+      io.listDir(tree + "/" + shards[i], files);
+      uint64_t b = 0;
+      struct ::stat fst;
+      for (const auto& f : files)
+        if (io.stat(tree + "/" + shards[i] + "/" + f, &fst) == 0)
+          b += static_cast<uint64_t>(fst.st_blocks) * 512;
+      bytes.fetch_add(b, std::memory_order_relaxed);
+    });
+    st.diskBytes += bytes.load();
+  }
+  // A removal holds the lock exclusively for as long as it runs.
+  if (int fd = io.open(cacheDir + clearedLockName(), O_RDONLY | O_CLOEXEC, 0); fd >= 0) {
+    if (io.flock(fd, LOCK_SH | LOCK_NB) < 0)
+      st.removing = true;
+    else
+      io.flock(fd, LOCK_UN);
+    io.close(fd);
+  }
+  return st;
 }
 
 void CacheStore::sweepReplicaOrphans() {

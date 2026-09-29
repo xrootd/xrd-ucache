@@ -78,6 +78,8 @@ class IOBackend {
   // (write a private file, link it into place) is how a store is made visible
   // with its header already complete. POSIX by default.
   virtual int link(const std::string& from, const std::string& to);
+  // Remove an empty directory; negative -errno on failure. POSIX by default.
+  virtual int rmdir(const std::string& path);
 
   // Complete pwrite loop: retries short writes; negative -errno on failure.
   int64_t pwriteFull(int fd, const void* buf, uint64_t count, uint64_t offset);
