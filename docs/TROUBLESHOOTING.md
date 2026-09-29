@@ -6,6 +6,14 @@ activation (whichever way you configured it), and prints `[ OK ]` / `[WARN]` /
 the whole chain dynamically (cold + warm pass; warm must be origin-free).
 Most issues below map to one of their lines.
 
+To see what uCache does, turn on debug messages the way you would for the
+XRootD client: `XRD_LOGLEVEL=Debug XRD_LOGFILE=/tmp/xrd.log <your job>` puts
+uCache's messages (topic `UCache`) beside the client's. Or
+`ucache set log debug` for every job until `ucache unset log`. A log with a
+warning starts with one line naming the uCache version, the program, the
+thread count and the cache directory with its filesystem: send that line with
+a report.
+
 ## The cache doesn't seem to be used (warm pass still hits the network)
 
 `ucache stats` after two identical runs should show `origin_bytes == 0` on the

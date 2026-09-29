@@ -554,7 +554,7 @@ std::string Config::valueOf(const std::string& key) const {
   if (key == "deny")
     return join(denyHosts);
   if (key == "log")
-    return "-"; // write-only: configures the logger, not stored
+    return Log::spec(); // the logger holds it: one per process
   return "?";
 }
 

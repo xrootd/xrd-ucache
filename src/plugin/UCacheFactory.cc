@@ -23,12 +23,15 @@
 #endif
 
 #include <XrdCl/XrdClDefaultEnv.hh>
+#include <XrdCl/XrdClLog.hh>
 #include <XrdVersion.hh>
 
 #include <atomic>
 #include <dlfcn.h>
 #include <mutex>
 #include <pthread.h>
+#include <sys/vfs.h>
+#include <unistd.h>
 
 namespace ucache {
 
@@ -36,6 +39,96 @@ namespace {
 std::once_flag gInitFlag;
 Config* gConfig = nullptr;
 std::shared_ptr<CacheStore>* gStore = nullptr;
+
+// ---- the XRootD client's log ----------------------------------------------
+// uCache is part of the client a job runs, so it logs where the client does:
+// XRD_LOGLEVEL=Debug shows uCache's debug lines too, and XRD_LOGFILE takes
+// them beside the client's own, under this topic. Far above the client's own
+// topics (5.x and 6.x end below 0x10000).
+constexpr uint64_t kClientLogTopic = 0x0000000100000000ULL;
+
+XrdCl::Log::LogLevel clientLevelOf(LogLevel l) {
+  switch (l) {
+  case LogLevel::kError:
+    return XrdCl::Log::ErrorMsg;
+  case LogLevel::kWarn:
+    return XrdCl::Log::WarningMsg;
+  case LogLevel::kInfo:
+    return XrdCl::Log::InfoMsg;
+  default:
+    return XrdCl::Log::DebugMsg;
+  }
+}
+
+// A message the client's level admits goes through the client's log.
+bool toClientLog(LogLevel lvl, const char* msg) {
+  XrdCl::Log* xl = XrdCl::DefaultEnv::GetLog();
+  if (!xl || xl->GetLevel() < clientLevelOf(lvl))
+    return false;
+  switch (lvl) {
+  case LogLevel::kError:
+    xl->Error(kClientLogTopic, "%s", msg);
+    break;
+  case LogLevel::kWarn:
+    xl->Warning(kClientLogTopic, "%s", msg);
+    break;
+  case LogLevel::kInfo:
+    xl->Info(kClientLogTopic, "%s", msg);
+    break;
+  default:
+    xl->Debug(kClientLogTopic, "%s", msg);
+  }
+  return true;
+}
+
+void followClientLog() {
+  XrdCl::Log* xl = XrdCl::DefaultEnv::GetLog();
+  if (!xl)
+    return;
+  xl->SetTopicName(kClientLogTopic, "UCache");
+  const auto cl = xl->GetLevel();
+  if (cl >= XrdCl::Log::DebugMsg)
+    Log::raiseLevel(LogLevel::kDebug);
+  else if (cl >= XrdCl::Log::InfoMsg)
+    Log::raiseLevel(LogLevel::kInfo);
+  Log::setSink(&toClientLog);
+}
+
+const char* fsNameOf(const std::string& dir) {
+  struct ::statfs sf{};
+  if (dir.empty() || ::statfs(dir.c_str(), &sf) != 0)
+    return "?";
+  switch (static_cast<unsigned long>(sf.f_type)) {
+  case 0x58465342: return "xfs";
+  case 0xEF53: return "ext4";
+  case 0x9123683E: return "btrfs";
+  case 0x01021994: return "tmpfs";
+  case 0x6969: return "nfs";
+  case 0x65735546: return "fuse";
+  case 0x00C36400: return "ceph";
+  case 0x5346414F: return "afs";
+  case 0x0BD00BD0: return "lustre";
+  case 0x47504653: return "gpfs";
+  case 0x2FC12FC1: return "zfs";
+  default: return "other";
+  }
+}
+
+// Printed once, before a process's first warning: what a report from the
+// field needs and a warning line alone does not say.
+std::string runContext() {
+  char line[600];
+  const Config* c = gConfig;
+  ::snprintf(line, sizeof line,
+             "uCache %s in %s (pid %d, %llu threads), cache %s on %s, recompress %s, "
+             "prefetch %s",
+             UCACHE_VERSION, hostExecutable().c_str(), static_cast<int>(::getpid()),
+             static_cast<unsigned long long>(CpuCounters::liveThreads()),
+             c && !c->cacheDir.empty() ? c->cacheDir.c_str() : "(none)",
+             c ? fsNameOf(c->cacheDir) : "?", c && c->recompress ? "on" : "off",
+             c && c->prefetch ? "on" : "off");
+  return line;
+}
 // The plugin conf's key/value map: XrdCl hands it to XrdClGetPlugIn,
 // but only for the duration of the call — copied here (and leaked, like the
 // other globals) before the config is first built. First conf wins if two
@@ -182,6 +275,8 @@ void forkChild() {
 }
 
 void initGlobals() {
+  followClientLog(); // before anything here can log
+  Log::setContext(&runContext);
   pinSelfInMemory(); // before any thread exists that could outlive an unload
   // Before any plugin thread exists, so that no fork can find one unprepared.
   ::pthread_atfork(forkPrepare, forkParent, forkChild);
@@ -209,6 +304,7 @@ void initGlobals() {
   ::atexit([] {
     if (gStore && *gStore)
       (*gStore)->dumpStats(/*finalDump=*/true); // + Layer-2 records of live entries
+    Log::flushHeldBack();
   });
   UCACHE_INFO("xrd-ucache plugin initialized (dir=%s page=%u disable=%d)",
               gConfig->cacheDir.c_str(), gConfig->pageSize, gConfig->disable ? 1 : 0);
@@ -235,17 +331,8 @@ void resumeAfterFork() {
 
 class UCacheFactory : public XrdCl::PlugInFactory {
  public:
-  XrdCl::FilePlugIn* CreateFile(const std::string& url) override {
-    if (::getenv("UCACHE_DEBUG"))
-      fprintf(stderr, "[ucache] CreateFile url=%s\n", url.c_str());
-    auto* p = new UCacheFile();
-    if (::getenv("UCACHE_DEBUG"))
-      fprintf(stderr, "[ucache] CreateFile returning %p\n", static_cast<void*>(p));
-    return p;
-  }
+  XrdCl::FilePlugIn* CreateFile(const std::string& /*url*/) override { return new UCacheFile(); }
   XrdCl::FileSystemPlugIn* CreateFileSystem(const std::string& /*url*/) override {
-    if (::getenv("UCACHE_DEBUG"))
-      fprintf(stderr, "[ucache] CreateFileSystem called (returns null)\n");
     return nullptr; // default FileSystem; see header comment
   }
 };

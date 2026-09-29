@@ -148,6 +148,10 @@ std::shared_ptr<FileEntry> FileEntry::open(IOBackend& io, const Config& cfg, Sta
   }
   e->lastFlushS_ = nowS();
   e->lastBufFlushS_ = nowS();
+  UCACHE_DEBUG("%s: %s, %llu of %llu pages cached", key.key.c_str(),
+               adopt ? "cache entry reused" : "cache entry started",
+               static_cast<unsigned long long>(e->meta_.bitmap.count()),
+               static_cast<unsigned long long>(e->meta_.npages()));
   stats.opens.fetch_add(1, std::memory_order_relaxed);
   // The span starts HERE, not at first read: opening is part of what a file
   // costs, and a file read exactly once would otherwise have no span at all.
@@ -1281,6 +1285,8 @@ bool FileEntry::commitSnapshot(MetaData snapshot, const PageBitmap& sets, const 
     stats_.tracer->rec("meta", key_.key, 0, 0, nowUsSteady() - mT0, /*sampled=*/false);
   if (rc < 0) {
     stats_.failopenEvents.fetch_add(1, std::memory_order_relaxed);
+    UCACHE_WARN("could not store the page index of %s (%s); its changes wait for the next commit",
+                key_.key.c_str(), std::strerror(-rc));
     std::lock_guard<std::mutex> g(mu_);
     dirty_ = true; // retry on a later flush, with the same changes still pending
     // Re-arm the deltas -- except where a newer opposite transition has
@@ -1295,6 +1301,9 @@ bool FileEntry::commitSnapshot(MetaData snapshot, const PageBitmap& sets, const 
     pinTouched_ = pinTouched_ || pinTouched;
     return false;
   }
+  UCACHE_DEBUG("%s: page index stored, %llu pages set and %llu cleared since the last store",
+               key_.key.c_str(), static_cast<unsigned long long>(sets.count()),
+               static_cast<unsigned long long>(clears.count()));
   if (!merged)
     return true;
   // Adopt the committed image: pages this handle has not touched since the
@@ -1443,6 +1452,8 @@ uint64_t FileEntry::releaseRanges(const std::vector<std::pair<uint64_t, uint64_t
                   static_cast<unsigned long long>(off), static_cast<unsigned long long>(len),
                   rc, key_.key.c_str());
   }
+  UCACHE_DEBUG("%s: %zu ranges released, %llu bytes punched", key_.key.c_str(), spans.size(),
+               static_cast<unsigned long long>(punched));
   return punched;
 }
 

@@ -3761,8 +3761,6 @@ int cmdSettings(const Config& cfg) {
   }
   std::printf("\n%-22s %-28s %s\n", "key", "value", "source");
   for (const auto& k : Config::knownKeys()) {
-    if (std::strcmp(k.key, "log") == 0)
-      continue; // write-only: configures the logger
     auto it = cfg.sources.find(k.key);
     std::printf("%-22s %-28s %s\n", k.key, cfg.valueOf(k.key).c_str(),
                 it == cfg.sources.end() ? "default" : it->second.c_str());
