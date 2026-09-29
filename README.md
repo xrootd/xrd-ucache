@@ -251,6 +251,19 @@ Further validation is performed with tools outside this repository.
 - [On-disk format](docs/FORMAT.md) — what a cached entry is made of on disk,
   for anyone inspecting or writing tooling against it
 
+## Support
+
+- **Bugs, and anything worth a public record:** open an
+  [issue](https://github.com/xrootd/xrd-ucache/issues); `CONTRIBUTING.md`
+  says what is most useful to include.
+- **Questions, and reports that carry site paths or dataset names:** write to
+  <ucache-support@cern.ch>. It reaches the maintainer, accepts mail from any
+  address, and is not public.
+
+Either way, attach the output of `ucache doctor`, and the link `ucache publish`
+prints or the output of `ucache summary --detail`: together they describe your
+setup and what the cache did for your jobs, without naming the files they read.
+
 ## Citing uCache
 
 The design and its measurements are described in the paper

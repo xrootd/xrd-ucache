@@ -2,7 +2,9 @@
 
 Pull requests are not being accepted at the moment. Issues are — bug reports,
 questions, and reports from real deployments are all useful, and they are the
-best way to influence what happens next.
+best way to influence what happens next. Anything you would rather not put on a
+public issue — site paths, dataset names — can go to <ucache-support@cern.ch>
+instead; it accepts mail from any address.
 
 ## Most useful to report
 
