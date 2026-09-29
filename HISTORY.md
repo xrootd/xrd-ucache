@@ -11,6 +11,14 @@ Recompression stays off unless you turn it on. Nothing is published unless you
 run `ucache publish`. Any XRootD 5.6 or newer 5.x client works; 6.x from
 v0.21.0.
 
+### v1.3.3 — 2026-09-29
+- `XRD_LOGLEVEL=Debug` shows uCache's messages in the client's log; a log
+  with a warning starts with a line naming the version and cache directory.
+- Bug fixes:
+  - Jobs reading one file with many threads no longer report CRC
+    mismatches; caches that show them heal after the upgrade.
+  - With `recompress = on`, a damaged cached page no longer stops the job.
+
 ### v1.3.2 — 2026-09-29
 - `ucache publish` sends more about each run, so reports can compare jobs
   and machines.
