@@ -1646,6 +1646,26 @@ int cmdPublish(const Config& cfg, int argc, char** argv) {
   parts.identity = identity;
   parts.ucacheVersion = UCACHE_VERSION;
   parts.installId = installId(cacheDir, !pf.dryRun);
+  {
+    // What the cache runs on, for the report: a device, not a folder.
+    const DeviceFacts dev = deviceOf(cacheDir);
+    Json d = Json::object();
+    if (!dev.fs.empty())
+      d.set("fs", Json::string(dev.fs));
+    if (!dev.name.empty())
+      d.set("dev_name", Json::string(dev.name));
+    if (!dev.model.empty())
+      d.set("dev_model", Json::string(dev.model));
+    if (dev.rotational >= 0)
+      d.set("dev_rotational", Json::integer(dev.rotational));
+    if (dev.sizeGb > 0) {
+      char gb[32];
+      std::snprintf(gb, sizeof gb, "%.1f", dev.sizeGb);
+      d.set("dev_size_gb", Json::numberText(gb));
+    }
+    if (d.has("fs"))
+      parts.cacheDevice = d;
+  }
   if (parts.installId.empty()) // only a dry run gets here without one
     parts.installId = "00000000-0000-4000-8000-000000000001";
   if (identity && !host.empty()) {

@@ -194,6 +194,7 @@ struct PayloadParts {
   std::vector<Json> bench; // already redacted
   std::vector<Json> netbench;
   Json history;            // null when none
+  Json cacheDevice;        // the cache directory's device (deviceOf), null when none
   std::string ucacheVersion;
 };
 Json buildPayload(const PayloadParts& parts);

@@ -2024,6 +2024,21 @@ void appendLog(const std::string& path, const std::string& text) {
 
 std::string mountPointOf(const std::string& path) { return mountFor(path).mountPoint; }
 
+DeviceFacts deviceOf(const std::string& path) {
+  const MountInfo m = mountFor(path);
+  DeviceFacts d;
+  if (!m.found)
+    return d;
+  d.fs = m.fsType;
+  if (m.haveBlock) {
+    d.name = m.diskName;
+    d.model = m.model;
+    d.rotational = m.rotational;
+    d.sizeGb = m.sizeGb;
+  }
+  return d;
+}
+
 int runDiskBench(const std::vector<std::string>& paths, const DiskBenchOpts& opts,
                  std::vector<std::string>* records) {
   std::string log;

@@ -1398,6 +1398,8 @@ Json buildPayload(const PayloadParts& parts) {
   p.set("netbench", net);
   if (parts.history.isObject())
     p.set("history", parts.history);
+  if (parts.cacheDevice.isObject())
+    p.set("cache_device", parts.cacheDevice);
   return p;
 }
 
@@ -1452,6 +1454,17 @@ std::string describePayload(const Json& payload) {
       s += "  cpu       a fixed workload timed here: " + num("t1_wall_s") + " s on one thread, " +
            num("tn_wall_s") + " s on " + num("tn_threads") + " at once\n";
     }
+  }
+  if (const Json* d = payload.get("cache_device"); d && d->isObject()) {
+    s += "  device    the cache's:";
+    for (const char* k : {"dev_model", "dev_name", "fs"})
+      if (d->has(k))
+        s += " " + d->str(k);
+    if (const Json* r = d->get("dev_rotational"); r && r->isNumber())
+      s += r->s == "1" ? ", rotating" : ", not rotating";
+    if (const Json* g = d->get("dev_size_gb"); g && g->isNumber())
+      s += ", " + g->s + " GB";
+    s += "   (no mount point, no path)\n";
   }
   const Json* b = payload.get("bench");
   if (b && b->isArray() && !b->arr.empty()) {

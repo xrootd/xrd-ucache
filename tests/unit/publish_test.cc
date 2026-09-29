@@ -529,3 +529,25 @@ TEST(Publish, ServiceUrlPrecedence) {
   EXPECT_EQ(serviceUrl(""), "https://test.example");
   EXPECT_EQ(serviceUrl("http://flag"), "http://flag"); // the flag wins over the environment
 }
+
+// The cache's device goes out as a device -- never a mount point or a path --
+// and the confirmation says so before anything is sent.
+TEST(Publish, PayloadCarriesTheCacheDevice) {
+  PayloadParts parts;
+  parts.cacheDevice = Json::object();
+  parts.cacheDevice.set("fs", Json::string("xfs"));
+  parts.cacheDevice.set("dev_name", Json::string("sdb"));
+  parts.cacheDevice.set("dev_model", Json::string("Samsung SSD 870"));
+  parts.cacheDevice.set("dev_rotational", Json::integer(0));
+  const Json p = buildPayload(parts);
+  const Json* d = p.get("cache_device");
+  ASSERT_TRUE(d && d->isObject());
+  EXPECT_EQ(d->str("fs"), "xfs");
+  EXPECT_EQ(d->str("dev_name"), "sdb");
+  EXPECT_FALSE(d->has("mount"));
+  const std::string text = describePayload(p);
+  EXPECT_NE(text.find("device    the cache's: Samsung SSD 870 sdb xfs, not rotating"), std::string::npos) << text;
+  // none found: no block at all
+  EXPECT_FALSE(buildPayload(PayloadParts{}).has("cache_device"));
+}
+

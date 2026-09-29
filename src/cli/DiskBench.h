@@ -106,4 +106,16 @@ int runDiskBench(const std::vector<std::string>& paths, const DiskBenchOpts& opt
 // cache with the disk benchmarks taken on the same volume.
 std::string mountPointOf(const std::string& path);
 
+// The device a directory lives on, as the benchmark records name it, for
+// `publish` to say what a cache runs on: the filesystem type, the block
+// device's name and model, whether it rotates, and its size. No mount point
+// and no mount source: those are paths, and a network mount's source names
+// its server. Fields that cannot be found stay empty (rotational -1, size 0).
+struct DeviceFacts {
+  std::string fs, name, model;
+  int rotational = -1;
+  double sizeGb = 0;
+};
+DeviceFacts deviceOf(const std::string& path);
+
 } // namespace ucache
