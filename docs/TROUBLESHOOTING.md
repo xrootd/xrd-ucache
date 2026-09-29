@@ -356,6 +356,14 @@ never served. To scrub an entry on demand: `ucache verify <url>` (it reports
 `checked`/`bad`; bad pages are quarantined, not the whole entry). To drop and
 re-fetch an entry entirely, remove it and let the next read repopulate.
 
+Many `CRC mismatch on page N ... marked absent` lines from a job that reads each
+file with several threads at once (say 384 threads over 100 files) came from
+releases 1.1.1 to 1.3.2: two threads saving a file's page index at the same
+moment could store a wrong checksum over correct bytes. Results were not
+affected; each page was fetched again. Later releases do not do this, and they
+treat such a page as absent when they open the entry, so the cache heals
+without `ucache clear`.
+
 ## `replica ... dropped: torn/corrupt sidecar` right after an upgrade
 
 If this appears for many entries at once, and the entries are ones a *newer*

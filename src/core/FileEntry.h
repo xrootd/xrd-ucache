@@ -42,7 +42,11 @@
 // transition absent→present under the lock, and present→absent only on
 // CRC failure, a punch, or a commit adopting a sibling's clear). At most one buffer flush runs at a time
 // (flushInProgress_ + condvar); staged pages stay readable during their
-// flush via the flushing_ map.
+// flush via the flushing_ map. At most one sidecar commit runs at a time
+// (commitMu_, taken before mu_): the flock around a commit keeps other
+// processes out, but every thread here shares one descriptor, which flock
+// does not divide. A range release holds off buffer flushes, and the staging
+// of the pages it releases, until its punch is done.
 #pragma once
 
 #include "Config.h"
@@ -396,6 +400,15 @@ class FileEntry {
   uint64_t lastBufFlushS_ = 0;
   bool flushInProgress_ = false;
   std::condition_variable flushCv_;
+  // One sidecar commit at a time in this process (see flushMeta).
+  std::mutex commitMu_;
+  // Pages a releaseRanges call is punching: not staged or written until it
+  // is done, or the punch would zero a page published after the bit was
+  // cleared. releaseGen_ counts releases, for the unbuffered write path.
+  PageBitmap releasing_;
+  bool releasingAny_ = false;
+  uint64_t releaseGen_ = 0;
+  bool releasingPage(uint64_t pg) const { return releasingAny_ && releasing_.get(pg); }
   // Process-wide staged total across entries (fill_buffer_total_mb ceiling).
   static std::atomic<uint64_t> g_bufTotal_;
   static std::atomic<uint64_t> g_specTotal_;   // process-wide speculative bytes

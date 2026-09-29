@@ -1,11 +1,17 @@
 #include "FileEntry.h"
+#include "MetaFile.h"
+#include "vendor/crc32c.h"
 
 #include "TestUtil.h"
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <memory>
+#include <random>
 #include <thread>
 
 using namespace ucache;
@@ -20,15 +26,19 @@ struct Fixture {
   Stats stats;
   UrlKey key = *UrlKey::parse("root://h//data/file.root");
   std::vector<uint8_t> src;
+  uint64_t size;
 
-  explicit Fixture(uint64_t fileSize = 100000, uint32_t pageSize = 4096) {
+  // content = false: a file too large to hold, its bytes made per page
+  explicit Fixture(uint64_t fileSize = 100000, uint32_t pageSize = 4096, bool content = true)
+      : size(fileSize) {
     cfg.cacheDir = td.path();
     cfg.pageSize = pageSize;
-    src = test::randomBytes(fileSize, 1234);
+    if (content)
+      src = test::randomBytes(fileSize, 1234);
   }
 
   std::shared_ptr<FileEntry> open() {
-    return FileEntry::open(io, cfg, stats, key, src.size(), 0, MetaData::kCksumNone, 0);
+    return FileEntry::open(io, cfg, stats, key, size, 0, MetaData::kCksumNone, 0);
   }
 };
 
@@ -1217,4 +1227,226 @@ TEST(FileEntry, ConcurrentSpeculativeStageServeDrop) {
   EXPECT_EQ(scrub.bad, 0u);
   EXPECT_EQ(scrub.checked * 4096, e->cachedBytes());
   EXPECT_EQ(fx.stats.prefetchDroppedUnread.load() >= specLeft, true);
+}
+
+namespace {
+
+// Bytes of page pg of a large synthetic file, without holding the file.
+void pageBytesOf(uint64_t pg, uint8_t* out, uint32_t n) {
+  uint64_t x = pg * 0x9E3779B97F4A7C15ull + 1;
+  for (uint32_t i = 0; i < n; i += 8) {
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EBull;
+    x ^= x >> 31;
+    std::memcpy(out + i, &x, std::min<uint32_t>(8, n - i));
+  }
+}
+
+// What the next process finds: every page the sidecar on disk claims must
+// hold its own bytes under a matching crc.
+struct Found {
+  uint64_t present = 0, crcWrong = 0, dataWrong = 0;
+};
+Found checkOnDisk(Fixture& fx, uint64_t npages) {
+  Found f;
+  auto m = MetaFile::load(fx.io, fx.key.metaPath(fx.cfg.cacheDir));
+  EXPECT_TRUE(m);
+  if (!m)
+    return f;
+  int fd = ::open(fx.key.dataPath(fx.cfg.cacheDir).c_str(), O_RDONLY);
+  EXPECT_GE(fd, 0);
+  std::vector<uint8_t> got(4096), want(4096);
+  for (uint64_t pg = 0; pg < npages; ++pg) {
+    if (!m->bitmap.get(pg))
+      continue;
+    ++f.present;
+    EXPECT_EQ(::pread(fd, got.data(), 4096, pg * 4096), 4096);
+    pageBytesOf(pg, want.data(), 4096);
+    if (std::memcmp(got.data(), want.data(), 4096) != 0)
+      ++f.dataWrong;
+    if (crc32c(got.data(), 4096) != m->pageCrcs[pg])
+      ++f.crcWrong;
+  }
+  ::close(fd);
+  return f;
+}
+
+} // namespace
+
+// Many handles of one file in one process, closing while others fill: every
+// Close commits the entry's sidecar, and so does the periodic checkpoint. The
+// commits used to run together (the flock is shared by every thread of the
+// process) and left pages claimed with crc 0 over correct bytes, which the
+// next process reported as CRC mismatches. 384 reader threads over 100 files
+// did it; 101 did not.
+TEST(FileEntry, ConcurrentCommitsOfOneEntryKeepEveryCrc) {
+  constexpr uint64_t kPages = 65536;
+  Fixture fx(kPages * 4096, 4096, false);
+  {
+    auto e = fx.open();
+    ASSERT_TRUE(e);
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> ts;
+    for (int w = 0; w < 8; ++w)
+      ts.emplace_back([&, w] { // a fill: a wire span's pages, then the interval commit
+        std::mt19937_64 rng(100 + w);
+        std::vector<uint8_t> buf(32 * 4096);
+        while (!stop.load(std::memory_order_relaxed)) {
+          const uint64_t n = 1 + rng() % 32, pg = rng() % (kPages - n);
+          for (uint64_t i = 0; i < n; ++i)
+            pageBytesOf(pg + i, buf.data() + i * 4096, 4096);
+          e->writePages(pg * 4096, n * 4096, buf.data());
+          e->flushMeta(false);
+        }
+      });
+    for (int c = 0; c < 8; ++c)
+      ts.emplace_back([&, c] { // another handle's Close
+        std::mt19937_64 rng(900 + c);
+        while (!stop.load(std::memory_order_relaxed)) {
+          e->flushAll();
+          std::this_thread::sleep_for(std::chrono::microseconds(rng() % 2000));
+        }
+      });
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    stop = true;
+    for (auto& t : ts)
+      t.join();
+    e->flushAll(); // the last Close
+    EXPECT_EQ(fx.stats.failopenEvents.load(), 0u) << "a sidecar store failed";
+    EXPECT_EQ(e->verifyAll().bad, 0u);
+  }
+  const Found f = checkOnDisk(fx, kPages);
+  EXPECT_GT(f.present, 0u);
+  EXPECT_EQ(f.crcWrong, 0u) << "of " << f.present << " present pages";
+  EXPECT_EQ(f.dataWrong, 0u);
+}
+
+// A release (the cold replica run handing superseded byte ranges back) while
+// the same pages are fetched and flushed again: a page mid-flush, or staged
+// after its bit was cleared, used to be published over the punch, so a
+// present page held zeros.
+TEST(FileEntry, ReleaseDuringFillNeverLeavesAPresentPageOverAHole) {
+  constexpr uint64_t kPages = 4096;
+  Fixture fx(kPages * 4096, 4096, false);
+  fx.cfg.fillBufferMb = 1; // frequent drains: many flushes to meet a release
+  {
+    auto e = fx.open();
+    ASSERT_TRUE(e);
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> ts;
+    for (int w = 0; w < 8; ++w)
+      ts.emplace_back([&, w] {
+        std::mt19937_64 rng(200 + w);
+        std::vector<uint8_t> buf(16 * 4096);
+        while (!stop.load(std::memory_order_relaxed)) {
+          const uint64_t n = 1 + rng() % 16, pg = rng() % (kPages - n);
+          for (uint64_t i = 0; i < n; ++i)
+            pageBytesOf(pg + i, buf.data() + i * 4096, 4096);
+          e->writePages(pg * 4096, n * 4096, buf.data());
+          if (rng() % 4 == 0)
+            e->flushBuffer(true);
+        }
+      });
+    for (int r = 0; r < 2; ++r)
+      ts.emplace_back([&, r] {
+        std::mt19937_64 rng(700 + r);
+        while (!stop.load(std::memory_order_relaxed)) {
+          const uint64_t n = 1 + rng() % 64, pg = rng() % (kPages - n);
+          e->releaseRanges({{pg * 4096, n * 4096}});
+        }
+      });
+    ts.emplace_back([&] { // readers: every byte served is the file's
+      std::vector<uint8_t> got(8 * 4096), want(8 * 4096);
+      std::mt19937_64 rng(5);
+      while (!stop.load(std::memory_order_relaxed)) {
+        const uint64_t pg = rng() % (kPages - 8);
+        if (e->readCached(pg * 4096, got.size(), got.data())) {
+          for (uint64_t i = 0; i < 8; ++i)
+            pageBytesOf(pg + i, want.data() + i * 4096, 4096);
+          ASSERT_EQ(0, std::memcmp(got.data(), want.data(), got.size()));
+        }
+      }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    stop = true;
+    for (auto& t : ts)
+      t.join();
+    e->flushAll();
+    // (a reader that planned a page just before its release can still meet
+    // the punch and demote it: that is caught, and not what is tested here)
+  }
+  const Found f = checkOnDisk(fx, kPages);
+  EXPECT_GT(f.present, 0u);
+  EXPECT_EQ(f.dataWrong, 0u) << "of " << f.present << " present pages";
+  EXPECT_EQ(f.crcWrong, 0u);
+}
+
+// A read that meets bad pages demotes every one of them, not only the first:
+// otherwise a chunk with n bad pages took n reads to heal. Contiguous bad
+// pages count one crc failure each and log once.
+TEST(FileEntry, OneReadDemotesEveryBadPageItMeets) {
+  Fixture fx(400 * 4096, 4096);
+  {
+    auto e = fx.open();
+    e->writePages(0, 400 * 4096, fx.src.data());
+    e->flushAll();
+  }
+  // Damage pages 1-3 (one stretch) and page 300 (a second run: a read is
+  // split at 1 MiB).
+  int fd = ::open(fx.key.dataPath(fx.cfg.cacheDir).c_str(), O_WRONLY);
+  ASSERT_GE(fd, 0);
+  std::vector<uint8_t> junk(3 * 4096, 0xA5);
+  ASSERT_EQ(::pwrite(fd, junk.data(), 3 * 4096, 1 * 4096), 3 * 4096);
+  ASSERT_EQ(::pwrite(fd, junk.data(), 4096, 300 * 4096), 4096);
+  ::close(fd);
+  auto e = fx.open(); // the next process
+  std::vector<uint8_t> buf(400 * 4096);
+  EXPECT_FALSE(e->readCached(0, buf.size(), buf.data()));
+  EXPECT_EQ(fx.stats.crcFailures.load(), 4u);
+  EXPECT_FALSE(e->hasRange(1 * 4096, 4096));
+  EXPECT_FALSE(e->hasRange(3 * 4096, 4096));
+  EXPECT_FALSE(e->hasRange(300 * 4096, 4096));
+  EXPECT_TRUE(e->hasRange(0, 4096));
+  EXPECT_TRUE(e->hasRange(4 * 4096, 296 * 4096));
+  EXPECT_TRUE(e->hasRange(301 * 4096, 99 * 4096));
+  // The refetch lands, and the whole file serves correct bytes again.
+  e->writePages(0, 400 * 4096, fx.src.data());
+  e->flushBuffer(true);
+  ASSERT_TRUE(e->readCached(0, buf.size(), buf.data()));
+  EXPECT_EQ(0, memcmp(buf.data(), fx.src.data(), buf.size()));
+  EXPECT_EQ(fx.stats.crcFailures.load(), 4u);
+}
+
+// A sidecar left by the commit race of older releases claims correct pages
+// with crc 0. Opening the entry treats them as absent, and the next commit
+// says so on disk.
+TEST(FileEntry, APageClaimedWithCrcZeroIsTreatedAsAbsent) {
+  Fixture fx(10 * 4096, 4096);
+  {
+    auto e = fx.open();
+    e->writePages(0, 10 * 4096, fx.src.data());
+    e->flushAll();
+  }
+  auto m = MetaFile::load(fx.io, fx.key.metaPath(fx.cfg.cacheDir));
+  ASSERT_TRUE(m);
+  m->pageCrcs[2] = 0;
+  m->pageCrcs[7] = 0;
+  ASSERT_EQ(MetaFile::store(fx.io, fx.key.metaPath(fx.cfg.cacheDir), *m, false), 0);
+  {
+    auto e = fx.open();
+    EXPECT_FALSE(e->hasRange(2 * 4096, 4096));
+    EXPECT_FALSE(e->hasRange(7 * 4096, 4096));
+    EXPECT_TRUE(e->hasRange(3 * 4096, 4 * 4096));
+    std::vector<uint8_t> buf(4 * 4096);
+    ASSERT_TRUE(e->readCached(3 * 4096, buf.size(), buf.data()));
+    EXPECT_EQ(fx.stats.crcFailures.load(), 0u); // healed, not reported
+    e->flushAll();
+  }
+  auto after = MetaFile::load(fx.io, fx.key.metaPath(fx.cfg.cacheDir));
+  ASSERT_TRUE(after);
+  EXPECT_FALSE(after->bitmap.get(2));
+  EXPECT_FALSE(after->bitmap.get(7));
+  EXPECT_EQ(after->bitmap.count(), 8u);
 }

@@ -127,6 +127,25 @@ std::shared_ptr<FileEntry> FileEntry::open(IOBackend& io, const Config& cfg, Sta
     e->meta_ = std::move(*loaded);
   e->setSince_.reset(e->meta_.npages());
   e->clearedSince_.reset(e->meta_.npages());
+  // A page claimed with crc 0 is what the concurrent-commit race of older
+  // releases left behind: correct bytes under a wrong crc. It is treated as
+  // absent, so an upgraded cache fetches it once more instead of reporting a
+  // CRC mismatch on every read that meets it. (A page whose crc32c really is
+  // 0 is fetched again too: one in four billion.)
+  if (adopt) {
+    uint64_t healed = 0;
+    for (uint64_t i = 0; i < e->meta_.npages(); ++i)
+      if (e->meta_.bitmap.get(i) && e->meta_.pageCrcs[i] == 0) {
+        e->retractPage(i);
+        ++healed;
+      }
+    if (healed) {
+      e->meta_.flags &= ~MetaData::kFlagComplete;
+      e->dirty_ = true;
+      UCACHE_INFO("%s: %llu cached pages carried no checksum; they will be fetched again",
+                  key.key.c_str(), static_cast<unsigned long long>(healed));
+    }
+  }
   e->lastFlushS_ = nowS();
   e->lastBufFlushS_ = nowS();
   stats.opens.fetch_add(1, std::memory_order_relaxed);
@@ -314,7 +333,7 @@ void FileEntry::demoteRun(uint64_t firstPage, uint64_t lastPage, const char* why
     retractPage(i);
   meta_.flags &= ~MetaData::kFlagComplete;
   dirty_ = true;
-  stats_.crcFailures.fetch_add(1, std::memory_order_relaxed);
+  stats_.crcFailures.fetch_add(lastPage - firstPage + 1, std::memory_order_relaxed); // pages
   if (firstPage == lastPage)
     UCACHE_WARN("%s on page %llu of %s; marked absent", why,
                 static_cast<unsigned long long>(firstPage), key_.key.c_str());
@@ -350,18 +369,33 @@ bool FileEntry::readVerifyRun(uint64_t firstPage, uint64_t lastPage, const uint3
   const uint64_t bytes = runBytes(firstPage, lastPage);
   const int64_t r = io_.preadFull(dataFd_, dst, bytes, start);
   const uint64_t got = r > 0 ? static_cast<uint64_t>(r) : 0;
-  uint64_t o = 0;
+  // Every page is checked, not only up to the first bad one: the bytes are in
+  // the buffer already, and a bad page left marked present fails the next
+  // reader in turn -- a chunk with n bad pages took n reads to heal, each
+  // logging one page. Contiguous bad pages are demoted, and logged, as one.
+  constexpr uint64_t kNone = ~0ull;
+  uint64_t o = 0, badFirst = kNone;
+  bool ok = true;
   for (uint64_t i = firstPage; i <= lastPage; ++i) {
     const uint32_t nbytes = meta_.pageBytes(i);
-    if (o + nbytes > got) // short read or IO error: localize it page by page
+    if (o + nbytes > got) { // short read or IO error: localize it page by page
+      if (badFirst != kNone)
+        demoteRun(badFirst, i - 1, "CRC mismatch");
       return demoteBadPages(i, lastPage, expect + (i - firstPage));
-    if (crc32c(dst + o, nbytes) != expect[i - firstPage]) {
-      demoteRun(i, i, "CRC mismatch"); // this one page is provably bad
-      return false;
     }
+    const bool bad = crc32c(dst + o, nbytes) != expect[i - firstPage];
+    if (bad && badFirst == kNone)
+      badFirst = i;
+    if (!bad && badFirst != kNone) {
+      demoteRun(badFirst, i - 1, "CRC mismatch");
+      badFirst = kNone;
+    }
+    ok = ok && !bad;
     o += nbytes;
   }
-  return true;
+  if (badFirst != kNone)
+    demoteRun(badFirst, lastPage, "CRC mismatch");
+  return ok;
 }
 
 bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf, bool account) {
@@ -478,6 +512,7 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf, bool account) 
   }
 
   std::vector<uint8_t> scratch;
+  bool runFailed = false; // the request goes to the origin; its other runs are still checked
   for (const Run& r : runs) {
     const uint64_t rStart = r.firstPage * uint64_t(P);
     const uint64_t rBytes = runBytes(r.firstPage, r.lastPage);
@@ -496,8 +531,8 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf, bool account) 
       dst = scratch.data();
     }
     if (!readVerifyRun(r.firstPage, r.lastPage, &crcs[r.crcBase], dst)) {
-      publish();
-      return false;
+      runFailed = true;
+      continue;
     }
     if (!direct) {
       const uint64_t cStart = std::max(off, rStart);
@@ -510,6 +545,10 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf, bool account) 
     if (rStart == prevEnd)
       ++dSeq;
     stats_.hitReadSize.add(rBytes);
+  }
+  if (runFailed) {
+    publish();
+    return false;
   }
 
   // first_touch for the disk pages, once every run has verified: a request
@@ -567,6 +606,8 @@ void FileEntry::writePages(uint64_t off, uint64_t len, const void* buf) {
       }
       if (meta_.bitmap.get(i) || flushing_.count(i))
         continue; // already present or being written; writes are idempotent
+      if (releasingPage(i))
+        continue; // its range is being punched: kept, it would land on a hole
       BufPage p;
       p.data = std::make_unique<uint8_t[]>(nbytes);
       std::memcpy(p.data.get(), in + (pStart - off), nbytes);
@@ -615,6 +656,8 @@ uint64_t FileEntry::stageSpeculative(uint64_t off, uint64_t len, const void* buf
         break;
       if (meta_.bitmap.get(i) || buf_.count(i) || flushing_.count(i))
         continue; // the demand read got there first: this page is late, not new
+      if (releasingPage(i))
+        continue; // its range is being punched
       BufPage p;
       p.data = std::make_unique<uint8_t[]>(nbytes);
       std::memcpy(p.data.get(), in + (pStart - off), nbytes);
@@ -774,6 +817,11 @@ void FileEntry::writePagesDirect(uint64_t off, uint64_t len, const void* buf) {
   uint64_t i = (off + P - 1) / P;
   uint64_t written = 0;
   std::vector<std::pair<uint64_t, uint32_t>> done; // (page, crc)
+  uint64_t gen = 0;
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    gen = releaseGen_;
+  }
   for (; i * P < end; ++i) {
     uint64_t pStart = i * P;
     uint32_t nbytes = meta_.pageBytes(i);
@@ -781,8 +829,8 @@ void FileEntry::writePagesDirect(uint64_t off, uint64_t len, const void* buf) {
       break; // partial edge page: leave unmarked
     {
       std::lock_guard<std::mutex> g(mu_);
-      if (meta_.bitmap.get(i))
-        continue; // already present; writes are idempotent, skip the IO
+      if (meta_.bitmap.get(i) || releasingPage(i))
+        continue; // already present (writes are idempotent), or being punched
     }
     int64_t w = io_.pwriteFull(dataFd_, in + (pStart - off), nbytes, pStart);
     if (w != static_cast<int64_t>(nbytes)) {
@@ -806,6 +854,10 @@ void FileEntry::writePagesDirect(uint64_t off, uint64_t len, const void* buf) {
   bool complete = false;
   {
     std::lock_guard<std::mutex> g(mu_);
+    // A release that started after these pages were checked may have punched
+    // them after they were written: publishing would set bits over holes.
+    if (releaseGen_ != gen || releasingAny_)
+      return; // bits never published; pages will be refetched
     for (auto [pg, crc] : done)
       publishPage(pg, crc);
     dirty_ = true;
@@ -1113,6 +1165,20 @@ void FileEntry::touchAtime() {
 }
 
 void FileEntry::flushMeta(bool force) {
+  // One commit at a time. The flock below keeps other processes out, but
+  // every thread of this one shares dataFd_ -- one open file description,
+  // which flock does not divide -- so two commits of this entry used to run
+  // together: both wrote the same sidecar tmp file, one rename won, and the
+  // loser re-armed pages the winner's adoption had just cleared, which the
+  // next commit stored as present with crc 0 over correct bytes. The next
+  // process reported them as CRC mismatches and fetched them again. A commit
+  // that cannot start at once is skipped unless forced: dirty_ stays set and
+  // the next commit carries its changes.
+  std::unique_lock<std::mutex> commit(commitMu_, std::defer_lock);
+  if (force)
+    commit.lock();
+  else if (!commit.try_lock())
+    return;
   MetaData snapshot;
   PageBitmap sets, clears;
   bool pinTouched = false;
@@ -1164,7 +1230,9 @@ void FileEntry::flushMeta(bool force) {
       if (clears.get(i)) {
         out.bitmap.clear(i);
         out.pageCrcs[i] = 0;
-      } else if (sets.get(i)) {
+      } else if (sets.get(i) && snapshot.bitmap.get(i)) {
+        // a set is only claimed for a page present in the snapshot: one that
+        // is not has no crc to store, and would be claimed with crc 0
         out.bitmap.set(i);
         out.pageCrcs[i] = snapshot.pageCrcs[i];
       }
@@ -1194,8 +1262,8 @@ void FileEntry::flushMeta(bool force) {
     // happened since, which is the one that must win.
     const uint64_t n = meta_.npages();
     for (uint64_t i = 0; i < n; ++i) {
-      if (sets.get(i) && !clearedSince_.get(i))
-        setSince_.set(i);
+      if (sets.get(i) && !clearedSince_.get(i) && meta_.bitmap.get(i))
+        setSince_.set(i); // only a page still present here: a set has to carry its crc
       if (clears.get(i) && !setSince_.get(i))
         clearedSince_.set(i);
     }
@@ -1260,46 +1328,68 @@ uint64_t FileEntry::releaseRanges(const std::vector<std::pair<uint64_t, uint64_t
   std::vector<uint64_t> resident; // formerly-cached ON-DISK bytes per span
   bool any = false;
   uint64_t specDropped = 0; // speculative pages inside the released span
-  {
-    std::lock_guard<std::mutex> g(mu_);
-    for (const auto& [off, len] : ranges) {
-      if (len == 0 || off + len < off || off + len > meta_.fileSize)
-        continue;
-      uint64_t first = (off + P - 1) / P;          // first fully-covered page
-      uint64_t lastEnd = (off + len) / P;          // one past the last one
-      if (first >= lastEnd)
-        continue;
-      uint64_t res = 0;
-      for (uint64_t i = first; i < lastEnd; ++i) {
-        // Staged-but-unflushed pages in the released range are dropped too
-        // (a page mid-flush in flushing_ republishes and is then simply a
-        // cached page again — punch is reclaim, not correctness).
-        if (auto bit = buf_.find(i); bit != buf_.end()) {
-          uint64_t nb = meta_.pageBytes(i);
-          if (bit->second.spec) { // a speculative page's bytes live in the OTHER pool
-            specBytes_ -= nb;
-            g_specTotal_.fetch_sub(nb, std::memory_order_relaxed);
-            if (!bit->second.touched)
-              specDropped += nb;
-          } else {
-            bufBytes_ -= nb;
-            g_bufTotal_.fetch_sub(nb, std::memory_order_relaxed);
-          }
-          buf_.erase(bit);
-        }
-        if (!meta_.bitmap.get(i))
-          continue;
-        retractPage(i);
-        res += meta_.pageBytes(i);
-        any = true;
-      }
-      meta_.flags &= ~MetaData::kFlagComplete;
-      spans.emplace_back(first * uint64_t(P), (lastEnd - first) * uint64_t(P));
-      resident.push_back(res);
+  // Until the punch is done no buffer flush runs and no page of these ranges
+  // is staged. A page mid-flush, or fetched again after its bit was cleared,
+  // was otherwise published after its bytes were written and then punched to
+  // zeros under a set bit: a CRC mismatch for the next reader.
+  std::unique_lock<std::mutex> lk(mu_);
+  flushCv_.wait(lk, [&] { return !flushInProgress_; });
+  flushInProgress_ = true; // no flush runs, and a second release waits here
+  ++releaseGen_;
+  struct Barrier { // lifted on every exit, with mu_ held or not
+    FileEntry& e;
+    std::unique_lock<std::mutex>& lk;
+    ~Barrier() {
+      if (!lk.owns_lock())
+        lk.lock();
+      if (e.releasingAny_)
+        e.releasing_.clearAll();
+      e.releasingAny_ = false;
+      e.flushInProgress_ = false;
+      lk.unlock();
+      e.flushCv_.notify_all();
     }
-    if (any)
-      dirty_ = true;
+  } barrier{*this, lk};
+  for (const auto& [off, len] : ranges) {
+    if (len == 0 || off + len < off || off + len > meta_.fileSize)
+      continue;
+    uint64_t first = (off + P - 1) / P;          // first fully-covered page
+    uint64_t lastEnd = (off + len) / P;          // one past the last one
+    if (first >= lastEnd)
+      continue;
+    uint64_t res = 0;
+    if (releasing_.npages() != meta_.npages())
+      releasing_.reset(meta_.npages());
+    releasingAny_ = true;
+    for (uint64_t i = first; i < lastEnd; ++i) {
+      releasing_.set(i);
+      // Staged-but-unflushed pages in the released range are dropped too.
+      if (auto bit = buf_.find(i); bit != buf_.end()) {
+        uint64_t nb = meta_.pageBytes(i);
+        if (bit->second.spec) { // a speculative page's bytes live in the OTHER pool
+          specBytes_ -= nb;
+          g_specTotal_.fetch_sub(nb, std::memory_order_relaxed);
+          if (!bit->second.touched)
+            specDropped += nb;
+        } else {
+          bufBytes_ -= nb;
+          g_bufTotal_.fetch_sub(nb, std::memory_order_relaxed);
+        }
+        buf_.erase(bit);
+      }
+      if (!meta_.bitmap.get(i))
+        continue;
+      retractPage(i);
+      res += meta_.pageBytes(i);
+      any = true;
+    }
+    meta_.flags &= ~MetaData::kFlagComplete;
+    spans.emplace_back(first * uint64_t(P), (lastEnd - first) * uint64_t(P));
+    resident.push_back(res);
   }
+  if (any)
+    dirty_ = true;
+  lk.unlock();
   if (specDropped)
     noteSpeculativeDropped(specDropped);
   if (spans.empty())

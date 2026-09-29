@@ -51,6 +51,8 @@ reach disk, in keys or file names.
 - A page is served only if its bitmap bit is set **and** its stored CRC
   matches the bytes read. Any mismatch → page treated as absent (bit
   cleared, CRC zeroed), refetched from origin, `crc_failures` counted.
+- A set bit whose stored CRC is 0 is read as absent when the entry is opened,
+  and the next sidecar commit clears it.
 - Write ordering: page data is written (and optionally fdatasync'd per
   `UCACHE_FSYNC`) **before** its bit is set. The bitmap+CRCs are flushed on
   close and every `UCACHE_META_FLUSH_S` (default 30 s) — by time, not only

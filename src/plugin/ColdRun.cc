@@ -1137,6 +1137,10 @@ void ColdRequest::finish() {
     std::lock_guard<std::mutex> g(emu);
     mine.swap(held);
   }
+  // Every piece is tried, not only up to the first that fails: each failing
+  // slot is forgotten (and a kept original's bad pages demoted), so the retry
+  // fetches them all at once. Stopping at the first let a request with several
+  // damaged slots use up its retries one slot at a time and fail the read.
   if (!lost)
     for (const auto& p : slotPieces) {
       uint64_t rec = 0;
@@ -1144,7 +1148,7 @@ void ColdRequest::finish() {
       if (!copySlot(*cf, p.slot, p.from, p.len, p.dest, rec,
                     h == mine.end() ? nullptr : &h->second)) {
         lost = true; // a record failed its check, or a kept original is gone
-        break;
+        continue;
       }
       (std::binary_search(fetched.begin(), fetched.end(), p.slot) ? fillRec : replicaRec) += rec;
     }
