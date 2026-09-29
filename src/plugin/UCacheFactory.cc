@@ -30,7 +30,12 @@
 #include <dlfcn.h>
 #include <mutex>
 #include <pthread.h>
+#if defined(__APPLE__)
+#include <sys/mount.h> // statfs, and f_fstypename instead of a magic number
+#include <sys/param.h>
+#else
 #include <sys/vfs.h>
+#endif
 #include <unistd.h>
 
 namespace ucache {
@@ -94,10 +99,14 @@ void followClientLog() {
   Log::setSink(&toClientLog);
 }
 
-const char* fsNameOf(const std::string& dir) {
+std::string fsNameOf(const std::string& dir) {
   struct ::statfs sf{};
   if (dir.empty() || ::statfs(dir.c_str(), &sf) != 0)
     return "?";
+#if defined(__APPLE__)
+  // Darwin names the filesystem outright, so no magic-number table is needed.
+  return sf.f_fstypename[0] ? std::string(sf.f_fstypename) : std::string("?");
+#else
   switch (static_cast<unsigned long>(sf.f_type)) {
   case 0x58465342: return "xfs";
   case 0xEF53: return "ext4";
@@ -112,6 +121,7 @@ const char* fsNameOf(const std::string& dir) {
   case 0x2FC12FC1: return "zfs";
   default: return "other";
   }
+#endif
 }
 
 // Printed once, before a process's first warning: what a report from the
@@ -125,7 +135,7 @@ std::string runContext() {
              UCACHE_VERSION, hostExecutable().c_str(), static_cast<int>(::getpid()),
              static_cast<unsigned long long>(CpuCounters::liveThreads()),
              c && !c->cacheDir.empty() ? c->cacheDir.c_str() : "(none)",
-             c ? fsNameOf(c->cacheDir) : "?", c && c->recompress ? "on" : "off",
+             c ? fsNameOf(c->cacheDir).c_str() : "?", c && c->recompress ? "on" : "off",
              c && c->prefetch ? "on" : "off");
   return line;
 }

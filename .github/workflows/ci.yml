@@ -119,7 +119,7 @@ jobs:
           echo "$out" | grep -qE '"mount_source":"[^"]+"' || {
             echo "::error::the record names no device -- statfs resolution failed"; exit 1; }
 
-      - name: plugin, when a 5.x XRootD client is installable
+      - name: plugin, when an XRootD client is installable
         run: |
           # Not a required leg: the point of the job is the compiler, and the core
           # plus CLI above already exercise most of it. If the formula is missing
@@ -129,14 +129,13 @@ jobs:
             echo "::warning::no installable xrootd — plugin compile not checked on macOS"
             exit 0
           fi
-          # The plugin implements the 5.x FilePlugIn interface. Homebrew moved to
-          # XRootD 6, whose signatures differ, so building against whatever the
-          # formula happens to ship tests a combination we do not support and
-          # cannot fix here — that is a client-version fact, not a macOS one.
+          # The plugin builds for XRootD 5 and 6 alike: whichever major the
+          # formula ships is compiled here, so a macOS-only break in the plugin
+          # shows before a release tag, not in the release job.
           ver=$(brew list --versions xrootd | awk '{print $NF}')
           case "$ver" in
-            5.*) ;;
-            *) echo "::warning::Homebrew xrootd is $ver; the plugin targets the 5.x interface — plugin compile skipped"
+            5.*|6.*) ;;
+            *) echo "::warning::Homebrew xrootd is $ver; neither major the plugin builds for — plugin compile skipped"
                exit 0 ;;
           esac
           cmake -S . -B build-plugin -DCMAKE_BUILD_TYPE=Release -DUCACHE_BUILD_BENCH=OFF \
