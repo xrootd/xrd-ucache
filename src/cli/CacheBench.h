@@ -116,4 +116,9 @@ struct CacheBenchResult {
 // `error` set on failure; every phase that ran still carries its numbers.
 CacheBenchResult runCacheBench(const CacheBenchOpts& opts);
 
+// Delete a directory tree the benchmark made. Refuses any path without the
+// benchmark's own `/.ucache-bench.` marker, so it can only ever recurse inside
+// a directory a run created.
+bool removeBenchTree(const std::string& path);
+
 } // namespace ucache

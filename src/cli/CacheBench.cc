@@ -305,6 +305,8 @@ void finish(CachePhase& p, const Dev& d0, const Dev& d1, double elapsed, bool wr
 
 } // namespace
 
+bool removeBenchTree(const std::string& path) { return removeTree(path); }
+
 CacheBenchResult runCacheBench(const CacheBenchOpts& o) {
   CacheBenchResult r;
   const int nEntries = std::max(1, o.entries);

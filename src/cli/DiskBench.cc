@@ -11,9 +11,12 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <csignal>
 #include <cstring>
 #include <ctime>
+#include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <fstream>
 #include <functional>
 #include <mutex>
@@ -1401,8 +1404,127 @@ void evict(int fd) {
 #endif
 }
 
+// The directories this process is measuring in; an interrupt removes them.
+std::mutex gRunningMu;
+std::vector<std::string>& runningDirs() {
+  static auto* v = new std::vector<std::string>; // leaked: the signal thread may outlive teardown
+  return *v;
+}
+struct RunningDir {
+  std::string dir;
+  explicit RunningDir(std::string d) : dir(std::move(d)) {
+    std::lock_guard<std::mutex> g(gRunningMu);
+    runningDirs().push_back(dir);
+  }
+  ~RunningDir() {
+    std::lock_guard<std::mutex> g(gRunningMu);
+    auto& v = runningDirs();
+    v.erase(std::remove(v.begin(), v.end(), dir), v.end());
+  }
+};
+
+// Ctrl-C, a batch system's SIGTERM or a SIGHUP end a run without unwinding, so
+// the destructors that remove the test file never run, and --size bytes stay on
+// the disk being measured: usually a cache disk, where they can push the cache
+// into eviction. The signals go to a thread of their own, where removing a tree
+// is safe, which removes the run's directories and then lets the signal end the
+// process as it would have.
+void guardInterrupts() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGHUP);
+    if (pthread_sigmask(SIG_BLOCK, &set, nullptr) != 0)
+      return; // the default: the run dies, and the next one sweeps
+    std::thread([set] {
+      int sig = 0;
+      if (sigwait(&set, &sig) != 0)
+        return;
+      std::vector<std::string> dirs;
+      {
+        std::lock_guard<std::mutex> g(gRunningMu);
+        dirs = runningDirs();
+      }
+      for (const auto& d : dirs) {
+        // Still being written while it goes: a second pass takes the rest.
+        bool gone = false;
+        for (int i = 0; i < 3 && !gone; ++i)
+          gone = removeBenchTree(d);
+        std::fprintf(stderr, "\nucache bench: interrupted; %s %s\n",
+                     gone ? "removed" : "could not fully remove", d.c_str());
+      }
+      ::signal(sig, SIG_DFL);
+      sigset_t one;
+      sigemptyset(&one);
+      sigaddset(&one, sig);
+      pthread_sigmask(SIG_UNBLOCK, &one, nullptr);
+      ::raise(sig);
+    }).detach();
+  });
+}
+
+// Space a directory tree takes and its newest modification time.
+void treeUsage(const std::string& dir, uint64_t& bytes, time_t& newest) {
+  struct ::stat st;
+  if (::lstat(dir.c_str(), &st) != 0)
+    return;
+  bytes += static_cast<uint64_t>(st.st_blocks) * 512;
+  newest = std::max(newest, st.st_mtime);
+  if (!S_ISDIR(st.st_mode))
+    return;
+  DIR* d = ::opendir(dir.c_str());
+  if (!d)
+    return;
+  while (struct dirent* e = ::readdir(d)) {
+    const std::string n = e->d_name;
+    if (n != "." && n != "..")
+      treeUsage(dir + "/" + n, bytes, newest);
+  }
+  ::closedir(d);
+}
+
+// What an earlier run left where this one is about to measure: killed with
+// SIGKILL, or the machine went down. Removed when its process is gone and
+// nothing in it was written for an hour; the hour covers a run on another
+// machine sharing this directory, whose pid means nothing here, and a
+// benchmark writes all the time. A younger one is named, not touched.
+void sweepLeftovers(const std::string& path) {
+  static const std::string kPrefix = ".ucache-bench.";
+  std::vector<std::string> names;
+  if (DIR* d = ::opendir(path.c_str())) {
+    while (struct dirent* e = ::readdir(d)) {
+      const std::string n = e->d_name;
+      const std::string pid = n.compare(0, kPrefix.size(), kPrefix) == 0 ? n.substr(kPrefix.size()) : "";
+      if (!pid.empty() && pid.find_first_not_of("0123456789") == std::string::npos)
+        names.push_back(n);
+    }
+    ::closedir(d);
+  }
+  for (const auto& n : names) {
+    const long pid = std::strtol(n.c_str() + kPrefix.size(), nullptr, 10);
+    if (pid <= 0 || pid == static_cast<long>(::getpid()) ||
+        ::kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM)
+      continue; // this run, or one still running
+    const std::string dir = path + "/" + n;
+    uint64_t bytes = 0;
+    time_t newest = 0;
+    treeUsage(dir, bytes, newest);
+    const double gb = static_cast<double>(bytes) / (1ull << 30);
+    if (newest > ::time(nullptr) - 3600)
+      std::printf("note: %s (%.1f GiB) is from a run that stopped less than an hour ago; "
+                  "left in place\n", dir.c_str(), gb);
+    else if (removeBenchTree(dir))
+      std::printf("removed %s (%.1f GiB), left by an interrupted run\n", dir.c_str(), gb);
+  }
+  std::fflush(stdout);
+}
+
 Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   Result r;
+  sweepLeftovers(path); // before the free space is read: what it frees counts
   // The record names the directory by its resolved absolute path: a relative
   // argument (`.`) would otherwise identify nothing once the run is over, and
   // the published form hashes exactly this string, so it must be canonical.
@@ -1505,6 +1627,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
     return r;
   }
   std::string tf = std::string(dir) + "/testfile";
+  RunningDir running{dir}; // an interrupt removes it (guardInterrupts)
 
   // Cleanup runs on every exit path of this function.
   struct Cleanup {
@@ -2041,6 +2164,7 @@ DeviceFacts deviceOf(const std::string& path) {
 
 int runDiskBench(const std::vector<std::string>& paths, const DiskBenchOpts& opts,
                  std::vector<std::string>* records) {
+  guardInterrupts(); // before any thread of the run exists: they inherit the mask
   std::string log;
   const std::string plan = planBlock(paths, opts);
   std::fputs(plan.c_str(), stdout);
