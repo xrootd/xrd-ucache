@@ -214,6 +214,19 @@ sidecar). **Your results are unaffected** — fail-open never serves wrong bytes
 it just skips caching for the affected reads. A steadily climbing count points at
 a sick cache filesystem (full, read-only, failing disk).
 
+## A job stops making progress when the storage server goes away
+
+When the server a job reads from dies and stays down, the XRootD client keeps
+trying to reconnect before it reports an error. With its default settings that
+takes about 8 minutes (measured: 480 s), and meanwhile reads neither fail nor
+progress. A job through uCache behaves exactly like one without it, with caching
+on or off: the error arrives at the same moment.
+
+To fail sooner, shorten the client's reconnect policy for the job, for example
+`XRD_CONNECTIONWINDOW=15 XRD_CONNECTIONRETRY=2`: the read error then comes after
+about 15 seconds. Files already in the cache and inside the freshness window
+need no server at all, so a warm pass over them is not affected.
+
 ## The cache is filling my disk
 
 By default uCache uses the disk and evicts LRU to keep a free-space floor
@@ -347,6 +360,12 @@ their own words, because conflating them made healthy runs look broken:
 - **`deferred (no space)`** — no headroom above the eviction floor; the file is
   left for a later `ucache recompress` once there is room. See cause 3 above.
 - **`declined (source codec …)`** — working as configured; see cause 1 above.
+- **`declined (replica past 2 GiB, 32-bit keys)`** — the file is below 2 GiB and
+  its keys are 32-bit, and the replica this sweep would append after its end
+  would reach past 2 GiB, where those keys cannot point. The line names the file
+  and both offsets. It stays in the byte cache and reads correctly; how long the
+  replica is follows from how much of the file is cached, so an analysis reading
+  fewer branches may still get one.
 - **`failed`** — a real build failure: a malformed file, a cache entry whose
   bytes no longer match their checksum (the message then points at
   `ucache verify`), or an entry that has gone missing. The message names the
