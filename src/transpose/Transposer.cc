@@ -58,13 +58,14 @@ std::vector<uint8_t> zstdFrames(const uint8_t* raw, size_t n, int level) {
   return out;
 }
 
-void patchSeek(uint8_t* rec, uint16_t ver, int64_t seek, std::string& err) {
+void patchSeek(uint8_t* rec, uint16_t ver, int64_t seek, Overlay& ov) {
   if (ver > 1000) {
     bePut<int64_t>(rec + 18, seek);
   } else if (seek < (1ll << 31)) {
     bePut<int32_t>(rec + 18, static_cast<int32_t>(seek));
   } else {
-    err = "32-bit key cannot point past 2 GiB";
+    ov.error = "32-bit key cannot point past 2 GiB";
+    ov.narrowKeyEnd = static_cast<uint64_t>(seek);
   }
 }
 
@@ -92,7 +93,7 @@ void finishOverlay(const FileMeta& fm, std::vector<uint8_t> blob, std::vector<ui
   ov.metaStoredBytes = metaPayload.size();
   const int64_t newSeek = extBase + static_cast<int64_t>(ext.size());
   bePut<int32_t>(mkey.data(), static_cast<int32_t>(fm.treeKey.keylen + metaPayload.size()));
-  patchSeek(mkey.data(), fm.treeKey.ver, newSeek, ov.error);
+  patchSeek(mkey.data(), fm.treeKey.ver, newSeek, ov);
   if (!ov.error.empty())
     return;
   ext.insert(ext.end(), mkey.begin(), mkey.end());
@@ -125,7 +126,7 @@ void finishOverlay(const FileMeta& fm, std::vector<uint8_t> blob, std::vector<ui
     if (e->cls == "TTree" && e->name == fm.treeKey.name && e->seekkey == fm.treeKey.seekkey) {
       bePut<int32_t>(klist.data() + at,
                      static_cast<int32_t>(fm.treeKey.keylen + metaPayload.size()));
-      patchSeek(klist.data() + at, e->ver, newSeek, ov.error);
+      patchSeek(klist.data() + at, e->ver, newSeek, ov);
       if (!ov.error.empty())
         return;
       patched = true;
@@ -383,7 +384,7 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
         bePut<int32_t>(rec.data(), static_cast<int32_t>(rec.size())); // fNbytes
       }
       const int64_t newSeek = extBase + static_cast<int64_t>(ext.size());
-      patchSeek(rec.data(), k->ver, newSeek, ov.error);
+      patchSeek(rec.data(), k->ver, newSeek, ov);
       if (!ov.error.empty())
         return ov;
       // Patch the live arrays inside the metadata blob (exact offsets from
@@ -480,7 +481,7 @@ Overlay buildOverlayFromRecords(const FileMeta& fm, const std::vector<uint8_t>& 
     const uint64_t off = static_cast<uint64_t>(b.basketSeek[rb.basket]);
     const uint64_t nb = static_cast<uint64_t>(b.basketBytes[rb.basket]);
     const int64_t newSeek = extBase + static_cast<int64_t>(ext.size());
-    patchSeek(rec.data(), k->ver, newSeek, ov.error);
+    patchSeek(rec.data(), k->ver, newSeek, ov);
     if (!ov.error.empty())
       return ov;
     bePut<int64_t>(blob.data() + b.seekArrayOff + 8 * rb.basket, newSeek);

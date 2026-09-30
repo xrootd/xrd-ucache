@@ -50,6 +50,11 @@ struct Overlay {
   // again; it says nothing about the file being malformed, and callers should
   // not report it as a failure. A parse or codec error leaves this false.
   bool transient = false;
+  // Set with `error` when a record would have had to sit past 2 GiB in a file
+  // whose keys are 32-bit: where it would have gone. Not a fault of the file,
+  // nor retryable: this file cannot take this replica (what it holds decides
+  // how long the replica is, so another analysis's may fit).
+  uint64_t narrowKeyEnd = 0;
 };
 
 // Append `name`'s counter leaves so the hot set is loop-complete — the same

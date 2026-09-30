@@ -2858,7 +2858,7 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   std::atomic<uint64_t> deferBytes{0};
   std::atomic<size_t> next{0};
   std::atomic<int> done{0}, skipped{preSkipped}, failed{0}, incomplete{0};
-  std::atomic<int> declined{0}, already{preAlready};
+  std::atomic<int> declined{0}, already{preAlready}, pastTwoGiB{0};
   std::set<std::string> declinedCodecs; // observed source codecs, under outMu
   std::atomic<uint64_t> totOverlay{0}, totPunched{0};
   std::atomic<uint64_t> decB{0}, decNs{0};
@@ -3088,6 +3088,17 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
         std::lock_guard<std::mutex> g(outMu);
         if (gotStore) {
           ++already; // converted by a job's first pass while this was built
+        } else if (ov.narrowKeyEnd) {
+          // Not a failure: the file's 32-bit keys cannot address what this
+          // replica would append past its end. How long the replica is follows
+          // from what is cached, so the numbers are the explanation.
+          std::fprintf(stderr,
+                       "recompress: declined %s: its keys are 32-bit and cannot address past "
+                       "2 GiB; the file ends at %s and its replica would reach %s. It stays in "
+                       "the byte cache\n",
+                       e.key.c_str(), human(static_cast<uint64_t>(fm.fend)).c_str(),
+                       human(ov.narrowKeyEnd).c_str());
+          ++pastTwoGiB;
         } else if (ov.transient && csrc.sawRot && !released) {
           // Present-but-corrupt bytes: waiting cannot fix this one, so it is a
           // failure with a remedy rather than a retry.
@@ -3097,10 +3108,12 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
                        ov.error.c_str(), e.key.c_str());
           ++failed;
         } else if (ov.transient) {
-          std::fprintf(stderr, "recompress: not built yet, will retry: %s\n", ov.error.c_str());
+          std::fprintf(stderr, "recompress: not built yet, will retry: %s: %s\n", e.key.c_str(),
+                       ov.error.c_str());
           ++incomplete;
         } else {
-          std::fprintf(stderr, "recompress: build failed: %s\n", ov.error.c_str());
+          std::fprintf(stderr, "recompress: build failed: %s: %s\n", e.key.c_str(),
+                       ov.error.c_str());
           ++failed;
         }
         continue;
@@ -3197,12 +3210,16 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   char deferredSeg[96] = {0};
   if (deferred.load())
     std::snprintf(deferredSeg, sizeof deferredSeg, ", %d deferred (no space)", deferred.load());
+  char pastSeg[96] = {0};
+  if (pastTwoGiB.load())
+    std::snprintf(pastSeg, sizeof pastSeg, ", %d declined (replica past 2 GiB, 32-bit keys)",
+                  pastTwoGiB.load());
   char summary[1024];
   std::snprintf(summary, sizeof summary,
-                "recompress: %d recompressed%s%s, %d nothing to do (nothing cached)%s%s, "
+                "recompress: %d recompressed%s%s%s, %d nothing to do (nothing cached)%s%s, "
                 "%d failed",
-                done.load(), declinedSeg, alreadySeg, skipped.load(), incompleteSeg, deferredSeg,
-                failed.load());
+                done.load(), declinedSeg, pastSeg, alreadySeg, skipped.load(), incompleteSeg,
+                deferredSeg, failed.load());
   std::printf("%s\n", summary);
   // Declined everything and built nothing: that is a configuration mismatch,
   // not an optimal cache, and the user cannot act on it without being told

@@ -369,6 +369,13 @@ TEST(TransposeWidth, NarrowKeyCannotBeRelocatedPastTwoGiB) {
   Overlay ov = buildOverlay(fx.fm, fx.src, {"Muon_pt"});
   EXPECT_EQ(ov.error, "32-bit key cannot point past 2 GiB");
   EXPECT_TRUE(ov.meta.extents.empty());
+  // Where the record would have had to go, for the sweep to decline the file
+  // with the arithmetic rather than call it a failed build; not retryable.
+  EXPECT_GE(ov.narrowKeyEnd, 1ull << 31);
+  EXPECT_FALSE(ov.transient);
+  // A wide key takes the same placement: nothing to decline.
+  Fixture wide = mixedWidthFixture(/*wideBasketKey=*/true);
+  EXPECT_EQ(buildOverlay(wide.fm, wide.src, {"Muon_pt"}).narrowKeyEnd, 0u);
 }
 
 // The cold replica run publishes through buildOverlayFromRecords, from baskets
