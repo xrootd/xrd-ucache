@@ -11,6 +11,14 @@ Recompression stays off unless you turn it on. Nothing is published unless you
 run `ucache publish`. Any XRootD 5.6 or newer 5.x client works; 6.x from
 v0.21.0.
 
+### v1.3.5 — 2026-09-30
+- On macOS, cached data takes no more disk space than its size. A cache
+  made by an earlier version is only fixed once you clear it (`ucache clear`);
+  `ucache doctor` tells you whether yours needs it.
+- `ucache clear` empties the cache at once and frees its disk space in the
+  background; `--wait` waits for it.
+- `ucache status` shows the disk space the cache takes, as `du` does.
+
 ### v1.3.4 — 2026-09-29
 - The macOS tarball, which 1.3.3 lacks; otherwise the same as 1.3.3.
 
