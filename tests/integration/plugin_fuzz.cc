@@ -285,11 +285,14 @@ void worker(Ctx* ctx, const Source& src, const Walk* walk, uint64_t seed, uint64
       int n = 1 + rng() % 12;
       XrdCl::ChunkList chunks;
       for (int c = 0; c < n; ++c) {
-        uint32_t len = 1 + rng() % (64 * 1024);
+        // Now and then a zero-length chunk: ROOT sends them, and one must be
+        // served empty, never make the plugin relay a stitched vector (whose
+        // other chunks are offsets the origin does not have).
+        uint32_t len = rng() % 16 == 0 ? 0 : 1 + rng() % (64 * 1024);
         if (len > fsize)
           len = fsize;
         uint64_t off = rng() % (fsize - len + 1);
-        vbufs[c].resize(len);
+        vbufs[c].resize(std::max<uint32_t>(len, 1)); // a real buffer, as ROOT's
         chunks.emplace_back(off, len, vbufs[c].data());
       }
       XrdCl::VectorReadInfo* info = nullptr;

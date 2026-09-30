@@ -419,6 +419,9 @@ shrink). The first sweep also reclaims retroactively: entries recompressed
 earlier give their byte copy back too. Anything the replica does not cover
 (rarely-read header bytes, branches that were only partially cached) is simply
 refetched from the origin on demand and re-cached — reads always stay correct.
+The first pass after a reclaim therefore reads a little from the origin (about
+12 KB per file on NanoAOD), so an origin outage just then would stop it; from
+the second pass on, the cache again needs no origin.
 
 The default (`recompress_reclaim = superseded`) keeps today's behavior:
 only the ranges the replica physically replaced are punched.

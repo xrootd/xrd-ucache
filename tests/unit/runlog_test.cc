@@ -794,6 +794,36 @@ TEST(ReadAgreement, ADifferentAnalysisIsStillRefused) {
   EXPECT_NE(g.reason.find("0%"), std::string::npos) << g.reason;
 }
 
+// `UCACHE_DISABLE=1 xrdcp`, the documented way to copy with the cache out of
+// the way, leaves a disabled run over the same files an analysis reads. A copy
+// reads each file whole, and its records carry that in their signature, so it
+// is refused as the reference of an analysis that reads a part of each file,
+// and a baseline taken before it keeps being the one used.
+TEST(ReadAgreement, ACopyWithTheCacheOffIsNotTheReferenceOfAnAnalysis) {
+  test::TempDir d;
+  std::vector<FileLine> base, copy, warm;
+  for (size_t i = 0; i < 20; ++i) {
+    const std::string key = "root://o//f" + std::to_string(i);
+    base.push_back(FileLine(key, 0, 0, 64 * kMiB, 1200, 0, "relay", kGiB, "part" + std::to_string(i)));
+    copy.push_back(FileLine(key, 0, 0, kGiB, 1900, 0, "relay", kGiB, "whole" + std::to_string(i)));
+    warm.push_back(FileLine(key, 64 * kMiB, 0, 0, 2100, 0, "cached", kGiB, "part" + std::to_string(i)));
+  }
+  const std::string off = "\"opens\":1,\"origin_bytes\":0,\"disabled\":1,\"relay_bytes\":";
+  const std::string on = "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":";
+  // The copy alone: refused, for reading different parts of the files.
+  writeRun(d.path(), "h", 2, 1500, 1900, off + std::to_string(20 * kGiB), copy); // 400 s
+  writeRun(d.path(), "h", 3, 2000, 2100, on + std::to_string(20 * 64 * kMiB), warm);
+  auto g = gainOfWarm(d.path());
+  EXPECT_FALSE(g.valid) << "a whole-file copy measured the analysis: gain " << g.gain;
+  EXPECT_NE(g.reason.find("read the same parts of only"), std::string::npos) << g.reason;
+  // With the analysis's own baseline from before the copy: that one is used.
+  writeRun(d.path(), "h", 1, 1000, 1200, off + std::to_string(20 * 64 * kMiB), base);
+  g = gainOfWarm(d.path());
+  EXPECT_TRUE(g.valid) << g.reason;
+  EXPECT_TRUE(g.workVerified);
+  EXPECT_NEAR(g.gain, 2.0, 0.01) << "the baseline's 200 s over the warm run's 100 s (4.0 = the copy)";
+}
+
 TEST(ReadAgreement, TheThresholdHoldsOnBothSides) {
   {
     test::TempDir d;
