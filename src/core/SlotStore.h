@@ -39,6 +39,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 
 namespace ucache {
@@ -63,7 +64,11 @@ struct SlotStoreHeader {
 };
 
 struct SlotEntry {
-  enum Kind : uint8_t { kZstd = 1, kRaw = 2, kKept = 3 };
+  // kMap: a mixed map (transpose/FillLayout.h), its `slot` = kMapBit | the
+  // map's index. Builds that do not know a kind skip its entries, so a store
+  // with maps is served as map 0 by them.
+  enum Kind : uint8_t { kZstd = 1, kRaw = 2, kKept = 3, kMap = 4 };
+  static constexpr uint32_t kMapBit = 0x80000000u;
   uint32_t slot = 0;
   uint8_t kind = 0;
   uint64_t off = 0; // record offset in the file (0 for kKept: the original is in the byte cache)
@@ -151,9 +156,21 @@ class SlotStore {
                  const std::function<bool(uint32_t)>& taken, bool fsync,
                  std::vector<SlotEntry>& committed);
 
+  // Commit one record made under the exclusive lock (this call may wait for
+  // it): entries others committed meanwhile go to `onOthers` first, then
+  // `build` is asked for the record, from the state they left -- nothing is
+  // written when it returns false. `committed` gets the entry. Returns as
+  // commit() does.
+  int64_t commitBuilt(const std::function<void(const std::vector<SlotEntry>&)>& onOthers,
+                      const std::function<bool(SlotRecord&)>& build, bool fsync,
+                      SlotEntry& committed);
+
   // Bytes of a committed record, CRC-verified. False on I/O error, a short
   // read, or a CRC mismatch (the caller treats the slot as absent).
   bool readRecord(const SlotEntry& e, std::vector<uint8_t>& out);
+  // The first `n` bytes of a committed record, NOT verified (readRecord
+  // verifies the whole). False on I/O error or a short record.
+  bool readHead(const SlotEntry& e, uint8_t* out, size_t n);
 
   // The store's size on disk.
   uint64_t fileBytes();
@@ -164,6 +181,12 @@ class SlotStore {
  private:
   SlotStore(IOBackend& io, int fd, std::string path, SlotStoreHeader hdr, std::vector<uint8_t> blob);
   std::vector<SlotEntry> readBlocks(uint64_t end); // caller holds a lock on fd_
+  // Under mu_ and the exclusive lock: false (rc set) when the path no longer
+  // names this file; else the entries others committed are read.
+  bool lockedCurrent(struct ::stat& st, std::vector<SlotEntry>& others, int64_t& rc);
+  // Under mu_ and the exclusive lock: write `write` as one block at the end.
+  int64_t writeBlock(const std::vector<const SlotRecord*>& write, const struct ::stat& st,
+                     bool fsync, std::vector<SlotEntry>& committed);
 
   IOBackend& io_;
   int fd_ = -1;

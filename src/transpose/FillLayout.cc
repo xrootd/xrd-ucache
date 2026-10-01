@@ -493,29 +493,218 @@ bool placeInSlot(const ConvertedBasket& c, const FillSlot& slot, uint8_t* out, s
 
 bool exactOriginRanges(const FillLayout& L,
                        const std::vector<std::pair<uint64_t, uint64_t>>& metaOrigin, uint64_t off,
-                       uint64_t len, std::vector<std::pair<uint64_t, uint64_t>>& out) {
+                       uint64_t len, std::vector<std::pair<uint64_t, uint64_t>>& out,
+                       const std::function<uint32_t(uint32_t)>* realLen,
+                       std::pair<uint64_t, uint64_t> mapMeta) {
   const uint64_t end = off + len;
   if (!len || end < off)
     return true; // a request with no bytes, or one no layout can hold: nothing read
   if (off < L.originSize)
     out.emplace_back(off, std::min(end, L.originSize) - off);
-  const uint64_t metaEnd = L.metaSeek + L.metaRecord.size();
-  if (off < metaEnd && end > L.metaSeek) {
-    if (off > L.metaSeek || end < metaEnd)
+  // A metadata record -- map 0's, or the handle's own map's -- read whole is
+  // the original tree record; a part of one is no count of anything.
+  auto meta = [&](uint64_t seek, uint64_t n) {
+    const uint64_t e = seek + n;
+    if (!n || off >= e || end <= seek)
+      return true;
+    if (off > seek || end < e)
       return false;
     out.insert(out.end(), metaOrigin.begin(), metaOrigin.end());
-  }
+    return true;
+  };
+  if (!meta(L.metaSeek, L.metaRecord.size()) || !meta(mapMeta.first, mapMeta.second))
+    return false;
   if (end <= L.slotsBegin || L.slots.empty())
     return true;
   // The first slot that ends past `off`: slots ascend and do not overlap.
   auto it = std::lower_bound(L.slots.begin(), L.slots.end(), off,
                              [](const FillSlot& s, uint64_t o) { return s.vSeek + s.vLen <= o; });
   for (; it != L.slots.end() && it->vSeek < end; ++it) {
-    if (off > it->vSeek || end < it->vSeek + it->vLen)
+    if (off > it->vSeek)
       return false;
+    if (end < it->vSeek + it->vLen) {
+      // Short of the slot's end: whole only when it reaches the basket's real
+      // length (a mixed map states that), and this is the last slot it reads.
+      const uint32_t real =
+          realLen ? (*realLen)(static_cast<uint32_t>(it - L.slots.begin())) : 0;
+      if (!real || end < it->vSeek + real)
+        return false;
+    }
     out.emplace_back(it->origSeek, it->origLen);
   }
   return true;
+}
+
+MapTables mapTables(const FillLayout& L) {
+  MapTables t;
+  if (L.metaRecord.empty() || L.slots.empty() || L.slotsBegin <= L.metaSeek)
+    return t;
+  t.first = (L.metaSeek + L.metaRecord.size() + 7) / 8 * 8;
+  t.end = L.slotsBegin;
+  return t;
+}
+
+uint64_t mapSeekLimit(const FillLayout& L) {
+  constexpr uint64_t kNarrow = INT32_MAX;
+  if (L.metaRecord.size() < 6 || beGet<uint16_t>(L.metaRecord.data() + 4) <= 1000)
+    return kNarrow;
+  for (const auto& w : L.windows) {
+    auto kl = parseKey(w.bytes.data(), w.bytes.size(), 0);
+    if (!kl || kl->nbytes <= 0 || static_cast<size_t>(kl->nbytes) != w.bytes.size() ||
+        kl->keylen + 4u > w.bytes.size())
+      continue;
+    const int32_t nkeys = beGet<int32_t>(w.bytes.data() + kl->keylen);
+    size_t pos = kl->keylen + 4;
+    for (int32_t i = 0; i < nkeys; ++i) {
+      auto e = parseKey(w.bytes.data(), w.bytes.size(), pos);
+      if (!e)
+        break;
+      if (e->cls == "TTree" && e->seekkey == static_cast<int64_t>(L.metaSeek))
+        return e->ver > 1000 ? UINT64_MAX : kNarrow;
+      pos += e->keylen;
+    }
+  }
+  return kNarrow;
+}
+
+bool statedRealLengths(const std::vector<uint8_t>& blob, const FileMeta& fields,
+                       const FillLayout& L, std::vector<std::pair<uint32_t, uint32_t>>& real) {
+  real.clear();
+  for (uint32_t i = 0; i < L.slots.size(); ++i) {
+    const FillSlot& s = L.slots[i];
+    if (s.branch >= fields.branches.size())
+      return false;
+    const uint64_t bo = fields.branches[s.branch].bytesArrayOff + 4ull * s.basket;
+    if (bo + 4 > blob.size())
+      return false;
+    const int32_t n = beGet<int32_t>(blob.data() + bo);
+    if (n <= 0 || static_cast<uint32_t>(n) > s.vLen)
+      return false;
+    if (static_cast<uint32_t>(n) != s.vLen)
+      real.emplace_back(i, static_cast<uint32_t>(n));
+  }
+  return true;
+}
+
+bool decodeKeyRecord(const std::vector<uint8_t>& rec, std::vector<uint8_t>& blob, uint16_t& keylen) {
+  auto k = parseKey(rec.data(), rec.size(), 0);
+  if (!k || k->nbytes <= 0 || static_cast<size_t>(k->nbytes) != rec.size() || k->keylen >= rec.size() ||
+      k->objlen <= 0)
+    return false;
+  keylen = k->keylen;
+  const uint8_t* pay = rec.data() + k->keylen;
+  const size_t n = rec.size() - k->keylen;
+  if (n == static_cast<size_t>(k->objlen))
+    blob.assign(pay, pay + n); // stored raw
+  else
+    blob = decompressFrames(pay, n, static_cast<uint64_t>(k->objlen));
+  return blob.size() == static_cast<size_t>(k->objlen);
+}
+
+bool stateRealLengths(std::vector<uint8_t>& blob, const FileMeta& fields, const FillLayout& L,
+                      const std::vector<std::pair<uint32_t, uint32_t>>& real, std::string& err) {
+  std::vector<int64_t> delta(fields.branches.size(), 0);
+  int64_t total = 0;
+  for (const auto& [i, len] : real) {
+    if (i >= L.slots.size()) {
+      err = "slot out of range";
+      return false;
+    }
+    const FillSlot& s = L.slots[i];
+    if (s.branch >= fields.branches.size()) {
+      err = "branch out of range";
+      return false;
+    }
+    const BranchInfo& br = fields.branches[s.branch];
+    const uint64_t so = br.seekArrayOff + 8ull * s.basket, bo = br.bytesArrayOff + 4ull * s.basket;
+    if (static_cast<int32_t>(s.basket) >= br.writeBasket || so + 8 > blob.size() ||
+        bo + 4 > blob.size() || beGet<int64_t>(blob.data() + so) != static_cast<int64_t>(s.vSeek) ||
+        beGet<int32_t>(blob.data() + bo) != static_cast<int32_t>(s.vLen)) {
+      err = "basket not where the layout put it";
+      return false;
+    }
+    if (len == 0 || len > s.vLen) {
+      err = "a real length must be in (0, slot length]";
+      return false;
+    }
+    bePut<int32_t>(blob.data() + bo, static_cast<int32_t>(len));
+    const int64_t d = static_cast<int64_t>(len) - static_cast<int64_t>(s.origLen);
+    delta[s.branch] += d;
+    total += d;
+  }
+  for (size_t b = 0; b < delta.size(); ++b) {
+    if (!delta[b])
+      continue;
+    const uint64_t zo = fields.branches[b].zipBytesOff;
+    if (!zo || zo + 8 > blob.size()) {
+      err = "branch fZipBytes not located";
+      return false;
+    }
+    bePut<int64_t>(blob.data() + zo, beGet<int64_t>(blob.data() + zo) + delta[b]);
+  }
+  if (total) {
+    if (!fields.zipBytesOff || fields.zipBytesOff + 8 > blob.size()) {
+      err = "tree fZipBytes not located";
+      return false;
+    }
+    bePut<int64_t>(blob.data() + fields.zipBytesOff,
+                   beGet<int64_t>(blob.data() + fields.zipBytesOff) + total);
+  }
+  return true;
+}
+
+bool mapMetaRecord(const FillLayout& L, const std::vector<uint8_t>& blob, uint64_t seek,
+                   std::vector<uint8_t>& out, std::string& err) {
+  auto k = parseKey(L.metaRecord.data(), L.metaRecord.size(), 0);
+  if (!k || k->keylen >= L.metaRecord.size()) {
+    err = "map 0's metadata key unreadable";
+    return false;
+  }
+  std::vector<uint8_t> payload = encodeZstdFrames(blob.data(), blob.size(), kFillMetaZstdLevel);
+  if (payload.empty() || payload.size() >= blob.size()) {
+    err = "tree record does not compress";
+    return false;
+  }
+  out.assign(L.metaRecord.begin(), L.metaRecord.begin() + k->keylen);
+  out.insert(out.end(), payload.begin(), payload.end());
+  bePut<int32_t>(out.data(), static_cast<int32_t>(out.size()));
+  if (!putKeySeek(out.data(), k->ver, static_cast<int64_t>(seek))) {
+    err = "tree key is 32-bit and the map lies past 2 GiB";
+    return false;
+  }
+  return true;
+}
+
+bool keysListForMap(const FillLayout& L, uint64_t seek, uint32_t nbytes, FillLayout::Window& out,
+                    std::string& err) {
+  for (const auto& w : L.windows) {
+    auto kl = parseKey(w.bytes.data(), w.bytes.size(), 0);
+    if (!kl || kl->nbytes <= 0 || static_cast<size_t>(kl->nbytes) != w.bytes.size() ||
+        kl->keylen + 4u > w.bytes.size())
+      continue; // not the keys list (the header's window)
+    std::vector<uint8_t> klist = w.bytes;
+    const int32_t nkeys = beGet<int32_t>(klist.data() + kl->keylen);
+    size_t pos = kl->keylen + 4;
+    for (int32_t i = 0; i < nkeys; ++i) {
+      auto e = parseKey(klist.data(), klist.size(), pos);
+      if (!e)
+        break;
+      if (e->cls == "TTree" && e->seekkey == static_cast<int64_t>(L.metaSeek) &&
+          e->nbytes == static_cast<int32_t>(L.metaRecord.size())) {
+        bePut<int32_t>(klist.data() + pos, static_cast<int32_t>(nbytes));
+        if (!putKeySeek(klist.data() + pos, e->ver, static_cast<int64_t>(seek))) {
+          err = "keys-list entry is 32-bit and the map lies past 2 GiB";
+          return false;
+        }
+        out.off = w.off;
+        out.bytes = std::move(klist);
+        return true;
+      }
+      pos += e->keylen;
+    }
+  }
+  err = "live tree entry not found in the keys list";
+  return false;
 }
 
 } // namespace ucache::transpose

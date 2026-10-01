@@ -51,6 +51,7 @@
 namespace ucache {
 
 class ColdFill; // ColdRun.h
+struct ColdMap; // ColdRun.h
 class ReadRule; // ReadRule.h
 
 // The layout a handle a forked child inherited had been set up in: its next
@@ -135,6 +136,10 @@ struct HandleState {
   // Cold replica run (ColdRun.h): the transient layout this handle was shown
   // at setup, likewise HANDLE-STABLE. Never set together with `view`.
   std::shared_ptr<ColdFill> cold;
+  // With `cold`: the mixed map this handle was shown at setup (null: the slot
+  // layout itself). HANDLE-STABLE like the layout.
+  std::shared_ptr<const ColdMap> coldMap;
+  bool coldMapChosen = false; // guarded by mu
   // max_read_fraction (ReadRule.h), set with the entry: null when no rule
   // applies. Shared by every handle of the file in the process.
   std::shared_ptr<ReadRule> rule;

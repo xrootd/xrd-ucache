@@ -118,6 +118,9 @@ std::string Stats::toJsonBody() const {
   f("cold_replica_convert_us", coldReplicaConvertUs);
   f("cold_replica_declined", coldReplicaDeclined);
   f("cold_replica_skipped", coldReplicaSkipped);
+  f("slot_maps_made", slotMapsMade);
+  f("slot_map_opens", slotMapOpens);
+  f("slot_map_full", slotMapFull);
   f("replica_reads", replicaReads);
   f("replica_read_bytes", replicaReadBytes);
   f("relay_bytes", relayBytes);
@@ -224,6 +227,9 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.coldReplicaConvertUs += extractU64(last, "cold_replica_convert_us");
     t.coldReplicaDeclined += extractU64(last, "cold_replica_declined");
     t.coldReplicaSkipped += extractU64(last, "cold_replica_skipped");
+    t.slotMapsMade += extractU64(last, "slot_maps_made");
+    t.slotMapOpens += extractU64(last, "slot_map_opens");
+    t.slotMapFull += extractU64(last, "slot_map_full");
     t.replicaReads += extractU64(last, "replica_reads");
     // Per FILE, not per total: a file written before this counter existed can
     // only offer served bytes, and mixing the two bases silently divides new

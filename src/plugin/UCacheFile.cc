@@ -495,8 +495,8 @@ static void noteAppRead(const std::shared_ptr<HandleState>& st,
     // of a slot (ReadFootprint::noteMapped).
     widthSampler().sample();
     std::vector<std::pair<uint64_t, uint64_t>> units, exact;
-    coldOriginRanges(*cold, off, len, units);
-    const bool known = coldExactOriginRanges(*cold, off, len, exact);
+    coldOriginRanges(*cold, off, len, units, st->coldMap.get());
+    const bool known = coldExactOriginRanges(*cold, off, len, exact, st->coldMap.get());
     entry->noteMappedRead(units, known ? &exact : nullptr);
     return;
   }
@@ -2025,6 +2025,18 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
                 key ? key->key.c_str() : st_->url.c_str());
     entry.reset();
   }
+#ifdef UCACHE_HAVE_COLDRUN
+  // The mixed map the handle is shown, chosen once for its life: a handle a
+  // forked child set up again keeps the one it had (null: the slot layout).
+  std::shared_ptr<const ColdMap> coldMap;
+  bool pickMap = false;
+  if (cold && !lost) {
+    std::lock_guard<std::mutex> g(st_->mu);
+    pickMap = !st_->coldMapChosen;
+  }
+  if (pickMap)
+    coldMap = coldPickMap(cold);
+#endif
   if (st_->store) {
     auto& stats = st_->store->stats();
     stats.openUs.add(nowUs() - setupT0);
@@ -2050,6 +2062,12 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
 #endif
       st_->view = view;
       st_->cold = cold;
+#ifdef UCACHE_HAVE_COLDRUN
+      if (cold && !st_->coldMapChosen) {
+        st_->coldMap = std::move(coldMap);
+        st_->coldMapChosen = true;
+      }
+#endif
       attached = true;
     }
   }

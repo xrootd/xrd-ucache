@@ -746,6 +746,8 @@ overriding your defaults. Common keys:
 | `open_retries = 0`  | `UCACHE_OPEN_RETRIES`   | retry a transient open failure this many times (0 = off); backoff via `open_retry_base_ms`/`open_retry_max_ms` |
 | `recompress = off`  | `UCACHE_RECOMPRESS`     | `on` = the files your jobs read get fast-to-decode replicas **automatically**, created on their first pass (default off — opt-in CPU/disk). Flip it with `ucache set recompress on` |
 | `recompress_keep_originals = off` | `UCACHE_RECOMPRESS_KEEP_ORIGINALS` | `on` = when baskets are converted into a replica, keep their original bytes in the byte cache too (by default they are not kept, and a copy held from before is released: the cache would hold the same data twice) |
+| `mixed_maps = on` | `UCACHE_MIXED_MAPS` | with `recompress = on`: each open of a TTree file is shown its newest map, the baskets converted by then at their real size (see "Recompression"); `off` = every open sees the first-pass layout, every basket at the size of its room — for jobs that hand basket positions to workers on other machines with caches of their own |
+| `map_expiry_seconds = 604800` | `UCACHE_MAP_EXPIRY_S` | how long a replaced map keeps its place, for a reader that still holds it (7 days) |
 | `recompress_codecs = lzma,zlib` | `UCACHE_RECOMPRESS_CODECS` | which **source** codecs are worth recompressing (comma list); branches in other codecs are served as-is |
 | `recompress_reclaim = superseded` | `UCACHE_RECOMPRESS_RECLAIM` | what to free from the byte cache once a file's replica exists: `superseded` (default) punches only the ranges the replica replaced; `full` drops the **entire** byte copy — replicas become the primary copy, uncovered reads refetch from origin (space-tight disks) |
 | `page_size = 4k` | `UCACHE_PAGE_SIZE` | size of the pages the cache stores: 4 KiB, and 16 KiB on macOS, where a smaller page written into a hole of the cache file takes 16 KiB of disk anyway. Applies to files cached from then on. `ucache doctor` checks it against the cache disk |
@@ -982,6 +984,24 @@ it reads them. Two consequences:
 - Do not share a cache directory with uCache 1.2.0 or older. It does not know
   these replicas: it serves such files from the byte cache and the origin
   (correctly, but slowly) and can leave the replicas behind when it evicts.
+
+**From the next pass on, a TTree file is read at its real size.** Each open is
+shown the file's newest *map*: the same layout, with every basket converted by
+then stated at the size of its converted record instead of its room, so ROOT
+reads and holds just the records. A map is made a moment after a process is
+done with a file, once enough has been converted since the last one (a
+twentieth of what the file's replica holds, and after the first map 8 MiB) and
+nobody else is converting the file; after the first, at most one an hour. Baskets converted
+after the newest map are read at the size of their room until the next one.
+A handle keeps the map it was shown for its life, whatever is made after it,
+and a replaced map keeps its place for `map_expiry_seconds` (7 days) for
+readers still holding it; only a few fit, so when none is free the newest
+stays in use (`ucache stats` counts it). `mixed_maps = off` shows every open
+the plain layout: use it when a job hands basket positions to workers on
+other machines, each with a cache of its own (`uproot.dask` with remote
+workers). RNTuple files are always shown the plain layout. The memory figures
+above were measured before maps existed; for TTree they are expected to come
+down, and have not been measured again yet.
 
 Only branches whose source codec is in `recompress_codecs` (default
 `lzma,zlib`) are converted; recompressing already-fast codecs would waste CPU

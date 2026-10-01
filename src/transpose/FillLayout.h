@@ -41,6 +41,7 @@
 #include "TreeMeta.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -174,8 +175,79 @@ bool placeInSlot(const ConvertedBasket& c, const FillSlot& slot, uint8_t* out, s
 // carry nothing. False when the read covers only PART of a slot or of the
 // metadata record: their bytes have no original offset, and `out` is then not
 // to be used.
+//
+// Under a mixed map (below) a reader reads a converted basket at its real
+// length, from its slot's start: `realLen(i)`, when given, is slot i's real
+// length (0 when it has none), and a read of at least that much from the
+// slot's start is its whole basket too. `mapMeta` (offset, length), when not
+// {0, 0}, is another map's metadata record, read whole as `metaOrigin` too.
 bool exactOriginRanges(const FillLayout& L,
                        const std::vector<std::pair<uint64_t, uint64_t>>& metaOrigin, uint64_t off,
-                       uint64_t len, std::vector<std::pair<uint64_t, uint64_t>>& out);
+                       uint64_t len, std::vector<std::pair<uint64_t, uint64_t>>& out,
+                       const std::function<uint32_t(uint32_t)>* realLen = nullptr,
+                       std::pair<uint64_t, uint64_t> mapMeta = {0, 0});
+
+// ---- Mixed maps (TTree)
+//
+// The slot layout above is map 0: every basket in a slot, stated at the
+// slot's length. A MIXED map is the same address space with one difference:
+// the baskets converted when it was made are stated at their REAL length (the
+// record's), so a reader reads just the record and sizes its buffers from it;
+// the rest are stated at their slot's length, as in map 0, and a slot converted
+// later serves its record there, followed by zeros. No basket moves: a slot's
+// bytes are the same whichever map a reader holds, so readers holding
+// different maps -- reopens, other processes, older releases -- all read the
+// same file. A map is its own relocated tree record and keys-list entry; the
+// header and every other byte are map 0's.
+//
+// A map's tree record lies in the reservation layoutForFill makes for map 0's
+// (the raw tree record's length, past map 0's compressed one): below the
+// slots, so a 32-bit keys-list entry that can address map 0's can address
+// them too. A tree record compresses about 5x, so a few maps fit there at once.
+struct MapTables {
+  uint64_t first = 0, end = 0; // [first, end): 8-byte aligned start, the slots' start
+  bool empty() const { return end <= first; }
+};
+MapTables mapTables(const FillLayout& L);
+// The largest place a map's tree record may lie at: past 2 GiB only when the
+// tree key and its keys-list entry are both 64-bit.
+uint64_t mapSeekLimit(const FillLayout& L);
+
+// A key's record (header, then its payload raw or compressed), decompressed,
+// and its header's length. False when the record cannot be decoded.
+bool decodeKeyRecord(const std::vector<uint8_t>& rec, std::vector<uint8_t>& blob, uint16_t& keylen);
+// Map 0's relocated tree record, decoded: what every map is made from.
+inline bool decodeMetaRecord(const FillLayout& L, std::vector<uint8_t>& blob, uint16_t& keylen) {
+  return decodeKeyRecord(L.metaRecord, blob, keylen);
+}
+
+// The lengths a map's decoded tree record `blob` states that differ from the
+// slot's (slot, length), ascending: what the map states at a real length.
+// `fields` as for stateRealLengths. False when `blob` does not fit `fields`.
+bool statedRealLengths(const std::vector<uint8_t>& blob, const FileMeta& fields,
+                       const FillLayout& L, std::vector<std::pair<uint32_t, uint32_t>>& real);
+
+// State the real lengths `real` = (slot, length) in the tree record `blob`:
+// each slot's basket's fBasketBytes, and fZipBytes of its branch and of the
+// tree by the difference from its original length. `fields` carries where in
+// `blob` the arrays and totals are (parseTreeBlob of `blob`, or the metadata
+// the layout was made from). False (err set) when a slot's basket is not where
+// the layout put it, or a length is out of range.
+bool stateRealLengths(std::vector<uint8_t>& blob, const FileMeta& fields, const FillLayout& L,
+                      const std::vector<std::pair<uint32_t, uint32_t>>& real, std::string& err);
+
+// A map's metadata record for the tree record `blob`, placed at `seek`: map
+// 0's key header (same length, fNbytes and fSeekKey set), then `blob`
+// compressed ZSTD-1. Never raw: ROOT tells a raw record from a compressed one
+// by the length the keys list states, so a reader holding another map's
+// entry at that place must find the same form. False when it does not shrink.
+bool mapMetaRecord(const FillLayout& L, const std::vector<uint8_t>& blob, uint64_t seek,
+                   std::vector<uint8_t>& out, std::string& err);
+
+// A map's keys-list window: map 0's, with the live tree entry pointing at the
+// map's metadata record (`seek`, `nbytes`). False when the entry cannot hold
+// `seek` (a 32-bit entry past 2 GiB) or is not found.
+bool keysListForMap(const FillLayout& L, uint64_t seek, uint32_t nbytes, FillLayout::Window& out,
+                    std::string& err);
 
 } // namespace ucache::transpose

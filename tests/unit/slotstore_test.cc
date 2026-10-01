@@ -548,3 +548,79 @@ TEST(SlotStore, ConcurrentProcessesNeitherLoseNorCorruptSlots) {
     EXPECT_EQ(got, rec(slot, 2000 + slot * 10, static_cast<uint8_t>(slot)).bytes);
   }
 }
+
+// A record made under the store's lock (a mixed map): it is built from what the
+// others committed, which is handed over first; nothing is written when the
+// build declines; it is an entry of its own kind, which a build that does not
+// know the kind skips.
+TEST(SlotStore, ARecordBuiltUnderTheLockSeesTheOthersFirst) {
+  TempDir t;
+  RealIO io;
+  auto a = make(io, t.path());
+  auto b = SlotStore::open(io, t.path(), kHash);
+  ASSERT_TRUE(a && b);
+  std::vector<SlotEntry> out;
+  ASSERT_GT(commitAll(*a, {rec(5, 100, 5)}, out), 0);
+  size_t others = 0;
+  bool builtAfter = false;
+  const auto bytes = rec(0, 300, 9).bytes;
+  SlotEntry made;
+  const int64_t n = b->commitBuilt(
+      [&](const std::vector<SlotEntry>& es) { others += es.size(); },
+      [&](SlotRecord& r) {
+        builtAfter = others == 1;
+        r.slot = SlotEntry::kMapBit;
+        r.kind = SlotEntry::kMap;
+        r.bytes = bytes;
+        return true;
+      },
+      false, made);
+  EXPECT_EQ(n, 300);
+  EXPECT_TRUE(builtAfter);
+  EXPECT_EQ(made.kind, SlotEntry::kMap);
+  EXPECT_EQ(made.slot, SlotEntry::kMapBit);
+  std::vector<uint8_t> got;
+  ASSERT_TRUE(b->readRecord(made, got));
+  EXPECT_EQ(got, bytes);
+  uint8_t head[16];
+  ASSERT_TRUE(b->readHead(made, head, sizeof head));
+  EXPECT_EQ(0, std::memcmp(head, bytes.data(), sizeof head));
+  std::vector<uint8_t> big(301);
+  EXPECT_FALSE(b->readHead(made, big.data(), big.size())) << "past the record";
+
+  auto seen = SlotStore::open(io, t.path(), kHash)->refresh(true);
+  ASSERT_EQ(seen.size(), 2u);
+  EXPECT_EQ(seen[1].kind, SlotEntry::kMap);
+  EXPECT_EQ(seen[1].off, made.off);
+
+  SlotEntry none;
+  EXPECT_EQ(b->commitBuilt(nullptr, [](SlotRecord&) { return false; }, false, none), 0);
+  EXPECT_EQ(none.kind, 0);
+  EXPECT_EQ(SlotStore::open(io, t.path(), kHash)->refresh(true).size(), 2u);
+}
+
+// A map entry names no slot, and a slot entry is never a map's: an entry whose
+// kind and slot disagree is not read.
+TEST(SlotStore, AnEntryWhoseKindAndSlotDisagreeIsNotRead) {
+  TempDir t;
+  RealIO io;
+  auto s = make(io, t.path());
+  ASSERT_TRUE(s);
+  auto put = [&](uint32_t slot, uint8_t kind) {
+    SlotEntry e;
+    return s->commitBuilt(nullptr,
+                          [&](SlotRecord& r) {
+                            r.slot = slot;
+                            r.kind = kind;
+                            r.bytes = rec(0, 64, 1).bytes;
+                            return true;
+                          },
+                          false, e);
+  };
+  ASSERT_GT(put(7, SlotEntry::kMap), 0);
+  ASSERT_GT(put(SlotEntry::kMapBit | 7, SlotEntry::kZstd), 0);
+  ASSERT_GT(put(SlotEntry::kMapBit, SlotEntry::kMap), 0);
+  auto seen = SlotStore::open(io, t.path(), kHash)->refresh(true);
+  ASSERT_EQ(seen.size(), 1u);
+  EXPECT_EQ(seen[0].kind, SlotEntry::kMap);
+}

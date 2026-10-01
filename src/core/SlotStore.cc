@@ -59,7 +59,10 @@ bool decodeEntry(const uint8_t* p, SlotEntry& e) {
   e.off = get<uint64_t>(p, 8);
   e.len = get<uint32_t>(p, 16);
   e.crc = get<uint32_t>(p, 20);
-  return e.kind == SlotEntry::kZstd || e.kind == SlotEntry::kRaw || e.kind == SlotEntry::kKept;
+  if (e.kind == SlotEntry::kMap)
+    return (e.slot & SlotEntry::kMapBit) != 0;
+  return (e.kind == SlotEntry::kZstd || e.kind == SlotEntry::kRaw || e.kind == SlotEntry::kKept) &&
+         !(e.slot & SlotEntry::kMapBit);
 }
 
 } // namespace
@@ -394,6 +397,27 @@ std::vector<SlotEntry> SlotStore::refresh(bool wait) {
   return out;
 }
 
+bool SlotStore::lockedCurrent(struct ::stat& st, std::vector<SlotEntry>& others, int64_t& rc) {
+  // The path must still name this file: a dropped or replaced store takes no
+  // more records.
+  struct ::stat sp;
+  if (io_.fstat(fd_, &st) != 0 || st.st_nlink == 0 || io_.stat(path_, &sp) != 0 ||
+      st.st_ino != sp.st_ino || st.st_dev != sp.st_dev) {
+    rc = -ESTALE;
+    return false;
+  }
+  others = readBlocks(static_cast<uint64_t>(st.st_size));
+  return true;
+}
+
+namespace {
+struct Unlock {
+  IOBackend& io;
+  int fd;
+  ~Unlock() { io.flock(fd, LOCK_UN); }
+};
+} // namespace
+
 int64_t SlotStore::commit(std::vector<SlotRecord>& recs,
                           const std::function<void(const std::vector<SlotEntry>&)>& onOthers,
                           const std::function<bool(uint32_t)>& taken, bool fsync,
@@ -404,32 +428,56 @@ int64_t SlotStore::commit(std::vector<SlotRecord>& recs,
   std::lock_guard<std::mutex> g(mu_);
   if (int rc = io_.flock(fd_, LOCK_EX); rc != 0)
     return rc;
-  struct Unlock {
-    IOBackend& io;
-    int fd;
-    ~Unlock() { io.flock(fd, LOCK_UN); }
-  } unlock{io_, fd_};
-
-  // The path must still name this file: a dropped or replaced store takes no
-  // more records.
-  struct ::stat st, sp;
-  if (io_.fstat(fd_, &st) != 0 || st.st_nlink == 0 || io_.stat(path_, &sp) != 0 ||
-      st.st_ino != sp.st_ino || st.st_dev != sp.st_dev)
-    return -ESTALE;
-  const auto others = readBlocks(static_cast<uint64_t>(st.st_size));
+  Unlock unlock{io_, fd_};
+  struct ::stat st;
+  std::vector<SlotEntry> others;
+  int64_t rc = 0;
+  if (!lockedCurrent(st, others, rc))
+    return rc;
   if (onOthers && !others.empty())
     onOthers(others);
 
   std::vector<const SlotRecord*> write;
-  uint64_t dataLen = 0;
   for (const auto& r : recs)
-    if (!taken || !taken(r.slot)) {
+    if (!taken || !taken(r.slot))
       write.push_back(&r);
-      dataLen += r.bytes.size();
-    }
   if (write.empty())
     return 0;
+  return writeBlock(write, st, fsync, committed);
+}
 
+int64_t SlotStore::commitBuilt(const std::function<void(const std::vector<SlotEntry>&)>& onOthers,
+                               const std::function<bool(SlotRecord&)>& build, bool fsync,
+                               SlotEntry& committed) {
+  committed = SlotEntry();
+  if (hdr_.declined)
+    return -EINVAL;
+  std::lock_guard<std::mutex> g(mu_);
+  if (int rc = io_.flock(fd_, LOCK_EX); rc != 0)
+    return rc;
+  Unlock unlock{io_, fd_};
+  struct ::stat st;
+  std::vector<SlotEntry> others;
+  int64_t rc = 0;
+  if (!lockedCurrent(st, others, rc))
+    return rc;
+  if (onOthers && !others.empty())
+    onOthers(others);
+  SlotRecord r;
+  if (!build(r))
+    return 0;
+  std::vector<SlotEntry> out;
+  const int64_t w = writeBlock({&r}, st, fsync, out);
+  if (w >= 0 && out.size() == 1)
+    committed = out[0];
+  return w;
+}
+
+int64_t SlotStore::writeBlock(const std::vector<const SlotRecord*>& write, const struct ::stat& st,
+                              bool fsync, std::vector<SlotEntry>& committed) {
+  uint64_t dataLen = 0;
+  for (const SlotRecord* r : write)
+    dataLen += r->bytes.size();
   // Past everything anyone has written or claimed: the file's end, the blocks
   // read, and the extent of any block cut short (a crash without fsync can
   // leave a header whose records never landed).
@@ -479,6 +527,12 @@ bool SlotStore::readRecord(const SlotEntry& e, std::vector<uint8_t>& out) {
   if (io_.preadFull(fd_, out.data(), e.len, e.off) != static_cast<int64_t>(e.len))
     return false;
   return recordCrc(hdr_.storeId, e.slot, out.data(), out.size()) == e.crc;
+}
+
+bool SlotStore::readHead(const SlotEntry& e, uint8_t* out, size_t n) {
+  if (e.kind == SlotEntry::kKept || n > e.len)
+    return false;
+  return io_.preadFull(fd_, out, n, e.off) == static_cast<int64_t>(n);
 }
 
 uint64_t SlotStore::fileBytes() {

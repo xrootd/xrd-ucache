@@ -418,6 +418,15 @@ void printStats(const StatsTotals& t) {
                 human(t.coldReplicaOutBytes).c_str(), (unsigned long long)t.coldReplicaBaskets,
                 (unsigned long long)t.coldReplicaBasketsKept, static_cast<double>(t.coldReplicaConvertUs) / 1e6,
                 (unsigned long long)t.coldReplicaDeclined);
+  if (t.slotMapsMade || t.slotMapOpens || t.slotMapFull)
+    std::printf("  mixed maps         %llu made, %llu open%s shown one%s\n",
+                (unsigned long long)t.slotMapsMade, (unsigned long long)t.slotMapOpens,
+                t.slotMapOpens == 1 ? "" : "s",
+                t.slotMapFull ? (", " + std::to_string(t.slotMapFull) +
+                                 " not made (no free place: converted baskets read at their "
+                                 "slot's length)")
+                                    .c_str()
+                              : "");
   if (t.coldReplicaSkipped) // recompress = on did nothing for these, by their own content
     std::printf("  not converted      %llu file%s declined on the first pass by what the file "
                 "holds (the plugin's warning names the first reason; served as stored)\n",

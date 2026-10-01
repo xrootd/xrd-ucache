@@ -136,6 +136,38 @@ TEST(Config, MaxReadFraction) {
   }
 }
 
+// mixed_maps: on by default; map_expiry_seconds: 7 days, seconds >= 0 only.
+TEST(Config, MixedMaps) {
+  EnvGuard g;
+  {
+    Config c = Config::fromEnv();
+    EXPECT_TRUE(c.mixedMaps);
+    EXPECT_EQ(c.valueOf("mixed_maps"), "on");
+    EXPECT_EQ(c.mapExpirySeconds, 604800);
+    EXPECT_EQ(c.valueOf("map_expiry_seconds"), "604800");
+  }
+  std::map<std::string, std::string> conf = {{"mixed_maps", "off"},
+                                             {"map_expiry_seconds", "3600"}};
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_FALSE(c.mixedMaps);
+    EXPECT_EQ(c.mapExpirySeconds, 3600);
+    EXPECT_EQ(c.sources.at("mixed_maps"), "conf");
+  }
+  ::setenv("UCACHE_MIXED_MAPS", "on", 1);
+  ::setenv("UCACHE_MAP_EXPIRY_S", "0", 1);
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_TRUE(c.mixedMaps) << "the per-job override wins";
+    EXPECT_EQ(c.mapExpirySeconds, 0);
+  }
+  for (const char* bad : {"-1", "abc", "", "10x"}) {
+    ::setenv("UCACHE_MAP_EXPIRY_S", bad, 1);
+    Config c = Config::fromEnv(&conf);
+    EXPECT_EQ(c.mapExpirySeconds, 3600) << "'" << bad << "' is refused";
+  }
+}
+
 // The slot factor is not a setting: where every slot sits follows from it, so
 // it is fixed. A conf line naming it is an unknown key: ignored, no source.
 TEST(Config, SlotFactorIsNotASetting) {

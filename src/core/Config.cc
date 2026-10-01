@@ -2,6 +2,7 @@
 
 #include "Log.h"
 
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -205,6 +206,19 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.recompress = truthy(v);
   else if (k == "recompress_keep_originals")
     c.recompressKeepOriginals = truthy(v);
+  else if (k == "mixed_maps")
+    c.mixedMaps = !falsy(v); // default on; see Config.h
+  else if (k == "map_expiry_seconds") {
+    char* end = nullptr;
+    const long n = std::strtol(v.c_str(), &end, 10);
+    if (!v.empty() && end && *end == '\0' && n >= 0 && n <= INT_MAX) {
+      c.mapExpirySeconds = static_cast<int>(n);
+    } else {
+      UCACHE_WARN("%s: map_expiry_seconds=%s invalid (seconds, 0 or more); ignored", src,
+                  v.c_str());
+      return false;
+    }
+  }
   else if (k == "recompress_codecs")
     c.recompressCodecs = splitCommas(v);
   else if (k == "recompress_reclaim") {
@@ -409,6 +423,8 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"max_read_fraction", "UCACHE_MAX_READ_FRACTION"},
       {"recompress", "UCACHE_RECOMPRESS"},
       {"recompress_keep_originals", "UCACHE_RECOMPRESS_KEEP_ORIGINALS"},
+      {"mixed_maps", "UCACHE_MIXED_MAPS"},
+      {"map_expiry_seconds", "UCACHE_MAP_EXPIRY_S"},
       {"recompress_codecs", "UCACHE_RECOMPRESS_CODECS"},
       {"recompress_reclaim", "UCACHE_RECOMPRESS_RECLAIM"},
       {"trace", "UCACHE_TRACE"},
@@ -539,6 +555,10 @@ std::string Config::valueOf(const std::string& key) const {
     return onoff(recompress);
   if (key == "recompress_keep_originals")
     return onoff(recompressKeepOriginals);
+  if (key == "mixed_maps")
+    return onoff(mixedMaps);
+  if (key == "map_expiry_seconds")
+    return std::to_string(mapExpirySeconds);
   if (key == "recompress_codecs")
     return join(recompressCodecs);
   if (key == "recompress_reclaim")

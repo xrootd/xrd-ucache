@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <functional>
 #include <gtest/gtest.h>
 #include <string>
 #include <unistd.h>
@@ -953,4 +954,166 @@ TEST(FillLayoutUnnamed, ReadsOnlyWhatItMust) {
     src.failReads = true;
     EXPECT_FALSE(unnamedSettingCodec(fx.fm, fx.header, src, codec)); // nothing decided
   }
+}
+
+// ---- Mixed maps: the same address space, converted baskets stated at their
+// real length. A map is its own tree record (in the reservation past map 0's)
+// and its own keys-list entry; nothing else differs.
+
+namespace {
+// Map 0's tree record with slots 0 and 2 stated at a real length.
+std::vector<uint8_t> mixedBlob(const FillLayout& L, const Fx& fx,
+                               const std::vector<std::pair<uint32_t, uint32_t>>& real) {
+  std::vector<uint8_t> blob;
+  uint16_t keylen = 0;
+  EXPECT_TRUE(decodeMetaRecord(L, blob, keylen));
+  EXPECT_EQ(keylen, fx.fm.treeKey.keylen);
+  std::string err;
+  EXPECT_TRUE(stateRealLengths(blob, fx.fm, L, real, err)) << err;
+  return blob;
+}
+} // namespace
+
+TEST(FillLayoutMaps, TablesLieInTheReservationPastMapZero) {
+  Fx fx = fixture();
+  FillLayout L = layout(fx);
+  ASSERT_TRUE(L.error.empty()) << L.error;
+  MapTables t = mapTables(L);
+  ASSERT_FALSE(t.empty());
+  EXPECT_GE(t.first, L.metaSeek + L.metaRecord.size());
+  EXPECT_LT(t.first, L.metaSeek + L.metaRecord.size() + 8);
+  EXPECT_EQ(t.first % 8, 0u);
+  EXPECT_EQ(t.end, L.slotsBegin);
+  EXPECT_TRUE(mapTables(FillLayout()).empty()) << "a declined layout has no tables";
+}
+
+TEST(FillLayoutMaps, RealLengthsAreStatedWithTheTotals) {
+  Fx fx = fixture();
+  FillLayout L = layout(fx);
+  ASSERT_TRUE(L.error.empty()) << L.error;
+  ASSERT_EQ(L.slots.size(), 3u);
+  const std::vector<std::pair<uint32_t, uint32_t>> real{{0, 1234}, {2, 555}};
+  auto blob = mixedBlob(L, fx, real);
+  EXPECT_EQ(beGet32(&blob[kB0Bytes]), 1234u);
+  EXPECT_EQ(beGet32(&blob[kB0Bytes + 4]), L.slots[1].vLen) << "not converted: the slot's length";
+  EXPECT_EQ(beGet32(&blob[kB2Bytes]), 555u);
+  // Seeks never move.
+  EXPECT_EQ(beGet64(&blob[kB0Seek]), L.slots[0].vSeek);
+  EXPECT_EQ(beGet64(&blob[kB2Seek]), L.slots[2].vSeek);
+  // fZipBytes: what each basket really is -- the record, or the original.
+  EXPECT_EQ(beGet64(&blob[kB0Zip]), 1234u + 2500u);
+  EXPECT_EQ(beGet64(&blob[kB2Zip]), 555u);
+  EXPECT_EQ(beGet64(&blob[kB1Zip]), 800u);
+  EXPECT_EQ(beGet64(&blob[kTreeZipOff]), 10000u - (1500 - 1234) - (900 - 555));
+  // And read back from the record.
+  std::vector<std::pair<uint32_t, uint32_t>> got;
+  ASSERT_TRUE(statedRealLengths(blob, fx.fm, L, got));
+  EXPECT_EQ(got, real);
+  auto zero = mixedBlob(L, fx, {});
+  ASSERT_TRUE(statedRealLengths(zero, fx.fm, L, got));
+  EXPECT_TRUE(got.empty()) << "map 0 states every slot at its length";
+}
+
+TEST(FillLayoutMaps, StatingRefusesWhatTheLayoutDoesNotHold) {
+  Fx fx = fixture();
+  FillLayout L = layout(fx);
+  ASSERT_TRUE(L.error.empty()) << L.error;
+  std::vector<uint8_t> blob;
+  uint16_t keylen = 0;
+  ASSERT_TRUE(decodeMetaRecord(L, blob, keylen));
+  std::string err;
+  for (const auto& bad : std::vector<std::pair<uint32_t, uint32_t>>{
+           {1, 0}, {1, L.slots[1].vLen + 1}, {3, 10}}) {
+    auto b = blob;
+    EXPECT_FALSE(stateRealLengths(b, fx.fm, L, {bad}, err)) << bad.first << " " << bad.second;
+  }
+  // The original record: its baskets are not where the layout put them.
+  auto orig = fx.fm.treeBlob;
+  EXPECT_FALSE(stateRealLengths(orig, fx.fm, L, {{0, 100}}, err));
+  EXPECT_NE(err.find("not where"), std::string::npos) << err;
+}
+
+TEST(FillLayoutMaps, AMapsRecordIsMapZerosKeyAtItsPlace) {
+  Fx fx = fixture();
+  FillLayout L = layout(fx);
+  ASSERT_TRUE(L.error.empty()) << L.error;
+  auto blob = mixedBlob(L, fx, {{0, 1234}});
+  const uint64_t seek = mapTables(L).first;
+  std::vector<uint8_t> rec;
+  std::string err;
+  ASSERT_TRUE(mapMetaRecord(L, blob, seek, rec, err)) << err;
+  const size_t kl = fx.fm.treeKey.keylen;
+  ASSERT_GT(rec.size(), kl);
+  EXPECT_EQ(beGet32(rec.data()), rec.size());                      // fNbytes
+  EXPECT_EQ(beGet64(rec.data() + 18), seek);                       // fSeekKey
+  EXPECT_EQ(beGet32(rec.data() + 6), fx.fm.treeBlob.size());       // fObjlen
+  EXPECT_EQ(0, std::memcmp(rec.data() + 26, L.metaRecord.data() + 26, kl - 26));
+  EXPECT_LT(rec.size() - kl, blob.size()) << "compressed, never raw";
+  std::vector<uint8_t> back;
+  uint16_t k2 = 0;
+  ASSERT_TRUE(decodeKeyRecord(rec, back, k2));
+  EXPECT_EQ(back, blob);
+  // A record that does not compress is not stored raw: ROOT tells the two
+  // apart by the length a keys-list entry states, and a reader holding
+  // another map's entry must find the form it expects.
+  EXPECT_FALSE(mapMetaRecord(L, incompressible(blob.size()), seek, rec, err));
+}
+
+TEST(FillLayoutMaps, AMapsKeysListPointsAtItsRecordAlone) {
+  Fx fx = fixture();
+  FillLayout L = layout(fx);
+  ASSERT_TRUE(L.error.empty()) << L.error;
+  const uint64_t seek = mapTables(L).first;
+  FillLayout::Window w;
+  std::string err;
+  ASSERT_TRUE(keysListForMap(L, seek, 321, w, err)) << err;
+  EXPECT_EQ(w.off, static_cast<uint64_t>(kKeysListSeek));
+  ASSERT_EQ(w.bytes.size(), L.windows[1].bytes.size());
+  EXPECT_EQ(beGet32(&w.bytes[fx.entryOff]), 321u);
+  EXPECT_EQ(beGet64(&w.bytes[fx.entryOff + 18]), seek);
+  std::vector<uint8_t> a = L.windows[1].bytes, b = w.bytes;
+  std::memset(&a[fx.entryOff], 0, 4);
+  std::memset(&b[fx.entryOff], 0, 4);
+  std::memset(&a[fx.entryOff + 18], 0, 8);
+  std::memset(&b[fx.entryOff + 18], 0, 8);
+  EXPECT_EQ(a, b);
+  // A 32-bit entry cannot point past 2 GiB.
+  Fx nx = fixture(70000, false, /*wideEntry=*/false);
+  FillLayout N = layout(nx);
+  ASSERT_TRUE(N.error.empty()) << N.error;
+  EXPECT_TRUE(keysListForMap(N, mapTables(N).first, 321, w, err));
+  EXPECT_FALSE(keysListForMap(N, 3000000000ull, 321, w, err));
+}
+
+TEST(FillLayoutMaps, AReadToTheRecordsEndIsTheWholeBasket) {
+  Fx fx = fixture();
+  FillLayout L = layout(fx);
+  ASSERT_TRUE(L.error.empty()) << L.error;
+  const std::vector<std::pair<uint64_t, uint64_t>> metaOrigin{
+      {static_cast<uint64_t>(kTreeKeySeek), 2000}};
+  const std::function<uint32_t(uint32_t)> real = [](uint32_t i) { return i == 0 ? 1234u : 0u; };
+  const auto& s0 = L.slots[0];
+  const auto& s1 = L.slots[1];
+  std::vector<std::pair<uint64_t, uint64_t>> out;
+  ASSERT_TRUE(exactOriginRanges(L, metaOrigin, s0.vSeek, 1234, out, &real));
+  EXPECT_EQ(out, (std::vector<std::pair<uint64_t, uint64_t>>{{1000, 1500}}));
+  out.clear();
+  EXPECT_FALSE(exactOriginRanges(L, metaOrigin, s0.vSeek, 1233, out, &real)) << "cut short";
+  out.clear();
+  EXPECT_FALSE(exactOriginRanges(L, metaOrigin, s0.vSeek, 1234, out)) << "no map: a part";
+  out.clear();
+  EXPECT_FALSE(exactOriginRanges(L, metaOrigin, s1.vSeek, 1234, out, &real)) << "not converted";
+  // The whole slot is the whole basket either way; and a read over slot 0's
+  // record into slot 1 is a part.
+  out.clear();
+  ASSERT_TRUE(exactOriginRanges(L, metaOrigin, s0.vSeek, s0.vLen, out, &real));
+  out.clear();
+  EXPECT_FALSE(exactOriginRanges(L, metaOrigin, s0.vSeek, s0.vLen + 10, out, &real));
+  // The map's own tree record, whole, is the original tree key.
+  const uint64_t seek = mapTables(L).first;
+  out.clear();
+  ASSERT_TRUE(exactOriginRanges(L, metaOrigin, seek, 300, out, nullptr, {seek, 300}));
+  EXPECT_EQ(out, metaOrigin);
+  out.clear();
+  EXPECT_FALSE(exactOriginRanges(L, metaOrigin, seek, 299, out, nullptr, {seek, 300}));
 }

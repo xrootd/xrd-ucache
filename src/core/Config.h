@@ -188,6 +188,18 @@ struct Config {
   // cache would otherwise hold the same data twice). `on` keeps them too, for
   // comparing the two tiers on one cache.
   bool recompressKeepOriginals = false;          // UCACHE_RECOMPRESS_KEEP_ORIGINALS
+  // `mixed_maps`: a TTree file with a slot store is shown, at each open, the
+  // newest MIXED map -- the baskets converted by then stated at their real
+  // length, the rest at their slot's -- so a later pass reads what the store
+  // holds and no padding. off = every open is shown the slot layout alone,
+  // every basket at its slot's length: the same address space on every machine
+  // with the same settings, for readers that hand basket positions to workers
+  // on other machines with caches of their own (uproot.dask with remote
+  // workers).
+  bool mixedMaps = true;                         // UCACHE_MIXED_MAPS
+  // `map_expiry_seconds`: a mixed map replaced by a newer one keeps its place
+  // this long, for a handle given it at open that reads the tree later.
+  int mapExpirySeconds = 604800;                 // UCACHE_MAP_EXPIRY_S (7 days)
   std::vector<std::string> recompressCodecs{"lzma", "zlib"}; // UCACHE_RECOMPRESS_CODECS
   // `recompress_reclaim`: what to punch from the v1 byte cache once
   // a valid replica exists. kSuperseded (default) frees only the ranges the

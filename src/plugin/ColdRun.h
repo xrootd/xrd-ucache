@@ -55,6 +55,23 @@ enum class AttachMode : uint8_t {
   kMatch,    // only the layout this process already showed (its hash given)
 };
 
+// A mixed map (transpose/FillLayout.h) a handle is given at open: its own
+// keys-list window, and its own relocated tree record. Everything else a
+// handle reads is the same in every map. Immutable once made.
+struct ColdMap {
+  uint64_t seq = 0;              // its entry's place in the store: the order maps were made in
+  uint64_t madeS = 0;            // when it was made (wall clock, seconds)
+  uint64_t metaSeek = 0;         // its tree record, as served
+  std::vector<uint8_t> meta;
+  uint64_t keysListOff = 0;      // its keys-list window
+  std::vector<uint8_t> keysList;
+};
+
+// The map a new handle of the run is shown: the newest mixed map, or null for
+// the slot layout itself (no mixed map yet, `mixed_maps` off, an RNTuple
+// file). May start making a newer one, in the background, for later opens.
+std::shared_ptr<const ColdMap> coldPickMap(const std::shared_ptr<ColdFill>& cf);
+
 // Join (or start) the slot run of `key` for a handle that just set up `entry`.
 // Null when the file is not served this way: no fitting store (and, for
 // kCreate, not a TTree or RNTuple, nothing convertible, a layout the reader
@@ -110,13 +127,16 @@ uint64_t coldLayoutHash(const ColdFill& cf);
 // The ORIGINAL-file ranges a read of [off, off+len) of the layout carries: a
 // slot is its basket, the relocated tree record is the original tree key, the
 // original file's range reads as itself, padding carries nothing.
+// `map`: the handle's mixed map, if it was shown one.
 void coldOriginRanges(const ColdFill& cf, uint64_t off, uint64_t len,
-                      std::vector<std::pair<uint64_t, uint64_t>>& out);
+                      std::vector<std::pair<uint64_t, uint64_t>>& out,
+                      const ColdMap* map = nullptr);
 // The original bytes the same read carried byte for byte, for the byte counts
 // that must be right or absent (transpose::exactOriginRanges): false when it
 // covers only part of a slot or of the relocated metadata.
-bool coldExactOriginRanges(const ColdFill& cf, uint64_t off, uint64_t len,
-                           std::vector<std::pair<uint64_t, uint64_t>>& out);
+bool coldExactOriginRanges(ColdFill& cf, uint64_t off, uint64_t len,
+                           std::vector<std::pair<uint64_t, uint64_t>>& out,
+                           const ColdMap* map = nullptr);
 
 // Serve Read/VectorRead-shaped chunks, each already inside the virtual size.
 // Completes `user` exactly once: with the chunks (VectorReadInfo when isVRead,

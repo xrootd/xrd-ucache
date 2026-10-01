@@ -22,6 +22,7 @@ how to read the printed summary.
 | Is the cache disk keeping up? | `buffer_stalls`, `buffer_stall_us`, `hist_hit_read_us`, `hist_flush_write_us` |
 | Did the replica tier get used? | `replica_opens`, `replica_published`, `replica_bytes_served` |
 | Were replicas created as files were read? | `cold_replica_files`, `cold_replica_in_bytes`, `cold_replica_baskets_kept`, `cold_replica_declined`, `cold_replica_skipped` |
+| Were later passes shown the converted baskets at their real size? | `slot_maps_made`, `slot_map_opens`, `slot_map_full` |
 
 ## Where the numbers are written
 
@@ -67,6 +68,7 @@ the consumers together.
  "cold_replica_files": 0, "cold_replica_in_bytes": 0, "cold_replica_out_bytes": 0,
  "cold_replica_baskets": 0, "cold_replica_baskets_kept": 0, "cold_replica_convert_us": 0,
  "cold_replica_declined": 0, "cold_replica_skipped": 0,
+ "slot_maps_made": 0, "slot_map_opens": 0, "slot_map_full": 0,
  "replica_reads": 0, "replica_read_bytes": 0,
  "relay_bytes": 0,
  "readv_chunks": 0, "readv_calls": 0, "readv_mixed": 0,
@@ -211,6 +213,18 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   file do not count it again. The plugin logs the first such file of each
   process as a warning, with the reason (see TROUBLESHOOTING.md,
   "`recompress = on` but no replicas ever appear").
+- `slot_maps_made` — mixed maps this process made (TTree, `mixed_maps = on`): a
+  later open is shown the baskets converted by then at their real size. One is
+  made a moment after a process is done with a file, when enough has been
+  converted since the newest (a twentieth of what the file's store holds, and
+  after the first map 8 MiB) and nobody else is converting it; after the
+  first, at most one an hour.
+- `slot_map_opens` — opens shown a mixed map. An open of a file with a slot
+  store that is not counted here is shown the slot layout alone: no map yet,
+  `mixed_maps = off`, or an RNTuple file.
+- `slot_map_full` — maps not made because there was no place for one: the
+  baskets converted since the newest map are read at their slot's size until
+  a place frees (`map_expiry_seconds` after the map that replaced the oldest).
 
 Records a job reads from a slot store count in `replica_bytes_served` (and
 their reads from the cache disk in `replica_reads` / `replica_read_bytes`);

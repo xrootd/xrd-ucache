@@ -253,7 +253,7 @@ Commit block, at a 4096-aligned offset:
 | 24 | 4 | n_entries u32 |
 | 28 | 4 | entries_crc u32 (CRC32C of the entries) |
 | 60 | 4 | block_header_crc u32 (CRC32C of bytes [0, 60)) |
-| 64 | 24 × n | entries: slot u32, kind u8 (1 ZSTD, 2 raw, 3 kept as stored), 3 pad, record offset u64, record length u32, record crc u32 |
+| 64 | 24 × n | entries: slot u32, kind u8 (1 ZSTD, 2 raw, 3 kept as stored, 4 map), 3 pad, record offset u64, record length u32, record crc u32 |
 | … | | the records |
 
 A record's CRC32C is seeded with (store_id u64, slot u32, length u32), so it
@@ -261,6 +261,37 @@ validates only as the record it was written as, in the store it was written
 to. A kept-as-stored entry has no record: the slot is served from the byte
 cache's copy of the original basket, with its `fSeekKey` pointing at the slot.
 The last valid entry for a slot wins.
+
+**Maps (TTree).** A kind-4 entry is a *mixed map*, with the slot field
+`0x80000000` (an entry whose kind and slot field disagree is not read). Builds
+that do not know the kind skip the entry and serve the file in the slot layout
+alone, which every map shares. A map is the slot layout with the slots
+committed when it was made stated at their record's length (a kept original
+at its own length; a slot's length is its first record's) instead of the
+slot's, and the tree's and those branches' `fZipBytes` changed by the
+difference. A handle is shown, at its open, the newest map (the one whose
+entry lies furthest into the store) and keeps it for its life; every byte of
+the file but its tree record and its keys list is the same in every map. The
+record:
+
+| offset | size | field |
+|---|---|---|
+| 0 | 8 | magic `"UCSMAP01"` |
+| 8 | 4 | tree record length u32 |
+| 12 | 4 | keys-list window length u32 |
+| 16 | 8 | made u64 (seconds since the epoch) |
+| 24 | 8 | where the tree record is served u64 |
+| 32 | 8 | where the keys-list window is served u64 (the original keys list's offset) |
+| 40 | 8 | covered u64: the bytes of the slots it states at their record's length |
+| 48 | 16 | zero |
+| 64 | | the tree record as served: the slot layout's tree key header, its `fNbytes` and `fSeekKey` set, then the tree record as ROOT-style ZSTD-1 chunks (never stored uncompressed: ROOT tells the two forms apart by the length the keys list states) |
+| … | | the keys-list window: the original keys list, its live tree entry pointing at this map's tree record |
+
+A map's tree record lies between the slot layout's relocated tree record and
+the first slot — the room the slot layout keeps there, the length of the tree
+record uncompressed — in a place no live map holds. A map is live while it is
+the newest, and for `map_expiry_seconds` (default 7 days) after the map that
+replaced it was made; then its place may be taken. A map is never rewritten.
 
 - **Releases sharing a cache:** every format keeps the magic at offset 0 and
   format_version at offset 8, so any build can tell a newer store from debris.
