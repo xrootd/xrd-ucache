@@ -15,6 +15,7 @@
 #include "ReadRule.h"
 #include "ReplicaStore.h"
 #include "SlotStore.h"
+#include "SlotTable.h"
 #include "Transposer.h"
 #include "UCacheFile.h"
 #include "XrdClTimeout.h"
@@ -234,12 +235,20 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   std::atomic<bool> storeGone{false}; // dropped or replaced: nothing more is committed
   std::shared_ptr<FileEntry> entry;
   std::unique_ptr<std::atomic<uint8_t>[]> state; // per slot: kAbsent / kFetching / kReady
-  // Per slot, with mixed maps: the committed record's length (a kept
-  // original's length), 0 until committed. A mixed map states it for the
-  // slots committed when the map was made.
-  std::unique_ptr<std::atomic<uint32_t>[]> recLen;
-  uint32_t committedLen(uint32_t i) const {
-    return recLen ? recLen[i].load(std::memory_order_acquire) : 0;
+  // The slot table (L.slots is empty once the run is set up): for a TTree
+  // file only the branches a request has touched are decoded (SlotTable.h).
+  tp::SlotTable slots;
+  uint32_t nSlots() const { return slots.size(); }
+  const tp::FillSlot& slot(uint32_t i) { return slots.at(i); }
+  // Slot i's first committed record's length (a kept original's own length;
+  // 0 when nothing is committed): what a mixed map states it at.
+  uint32_t committedLenLocked(uint32_t i, const tp::FillSlot& s) const {
+    auto it = firstLens.find(i);
+    return it == firstLens.end() ? 0 : it->second ? it->second : s.origLen;
+  }
+  uint32_t committedLen(uint32_t i, const tp::FillSlot& s) {
+    std::lock_guard<std::mutex> g(mu);
+    return committedLenLocked(i, s);
   }
 
   std::mutex mu; // guards `info` and everything below
@@ -253,11 +262,12 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   std::deque<uint32_t> transient;
   uint64_t transientBytes = 0;
   int handles = 0;
-  // Original ranges of relocated baskets, sorted: bytes the reader never reads
-  // in this layout, so never worth keeping (built on first need).
-  std::vector<std::pair<uint64_t, uint64_t>> relocatedOrig;
-  // Slot indices in the order of their original offsets (built on first need).
-  std::vector<uint32_t> origOrder;
+  // Original ranges of relocated baskets, merged and sorted: bytes the reader
+  // never reads in this layout, so never worth keeping. Built before the first
+  // fetch from the origin (ensureRelocatedOrig), on a thread that may read.
+  std::shared_ptr<const std::vector<std::pair<uint64_t, uint64_t>>> relocatedOrig;
+  bool relocatedTried = false;
+  void ensureRelocatedOrig();
   // Is page `pg` wholly inside baskets that are committed and converted -- so
   // the byte cache's copy of it serves nothing? Caller holds mu.
   bool pageDeadLocked(uint64_t pg, uint64_t ps);
@@ -299,7 +309,7 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
     auto it = info.find(i);
     if (it == info.end() || it->second.kind != tp::ConvertedBasket::kOriginal || it->second.mem)
       return false;
-    const tp::FillSlot& fs = L.slots[i];
+    const tp::FillSlot& fs = slot(i); // decoded: the request found it
     if (entry->hasRange(fs.origSeek, fs.origLen))
       return false;
     forgetLocked(i);
@@ -331,7 +341,7 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
       for (const auto& [e, h] : heads)
         noteMapLocked(*e, h);
       for (const auto& e : es) {
-        if (e.kind == SlotEntry::kMap || e.slot >= L.slots.size())
+        if (e.kind == SlotEntry::kMap || e.slot >= nSlots())
           continue;
         Info& s = info[e.slot];
         if (!s.inStore)
@@ -422,7 +432,10 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   uint64_t seekLimit = 0;       // the largest place a map may lie at
   tp::MapTables tables;
   std::vector<MapPlace> maps;   // every map the store holds, by seq
-  uint64_t convertedBytes = 0;  // real bytes of the committed slots
+  uint64_t convertedBytes = 0;  // real bytes of the committed slots (records, not kept originals)
+  // Per committed slot, its FIRST record's length (0: kept as stored), for
+  // good -- what every mixed map states it at. Never forgotten with the slot.
+  std::unordered_map<uint32_t, uint32_t> firstLens;
   // Wall seconds of the last slot committed after this run was set up: by
   // this process, and by another one (0: none).
   uint64_t lastOwnS = 0, lastForeignS = 0;
@@ -754,17 +767,27 @@ std::vector<uint8_t> encodeLayout(const ColdFill& cf) {
   return out;
 }
 
-bool decodeLayout(const std::vector<uint8_t>& blob, ColdFill& cf) {
+// A stored layout blob's raw bytes (it is stored compressed, or raw when that
+// did not shrink it). False when they are not a layout's.
+bool layoutRaw(const std::vector<uint8_t>& blob, std::vector<uint8_t>& b) {
   if (blob.size() < 8)
     return false;
   uint64_t raw = 0;
   std::memcpy(&raw, blob.data(), 8);
-  std::vector<uint8_t> b;
   if (blob.size() - 8 == raw)
     b.assign(blob.begin() + 8, blob.end());
   else
     b = tp::decompressFrames(blob.data() + 8, blob.size() - 8, raw);
-  if (b.size() != raw || raw < 8 || std::memcmp(b.data(), kLayoutMagic, 8) != 0)
+  return b.size() == raw && raw >= 8 && std::memcmp(b.data(), kLayoutMagic, 8) == 0;
+}
+
+// Decode a stored layout into cf. With `lazy` (a TTree file), the slot table
+// is indexed into cf.slots, its runs decoded from `lazy` when first needed;
+// otherwise every slot lands in cf.L.slots.
+bool decodeLayout(const std::vector<uint8_t>& blob, ColdFill& cf,
+                  tp::SlotTable::Source lazy = nullptr) {
+  std::vector<uint8_t> b;
+  if (!layoutRaw(blob, b))
     return false;
   Reader r{b.data(), b.size(), 8};
   tp::FillLayout& L = cf.L;
@@ -795,6 +818,22 @@ bool decodeLayout(const std::vector<uint8_t>& blob, ColdFill& cf) {
   const uint32_t ns = r.get<uint32_t>();
   if (!r.ok || static_cast<uint64_t>(ns) * 6 > b.size())
     return false;
+  if (lazy && !cf.rnt) {
+    if (L.virtualSize < L.slotsBegin || L.slotsBegin < L.metaSeek)
+      return false;
+    tp::SlotTable::Geometry g;
+    g.slotsBegin = L.slotsBegin;
+    g.virtualSize = L.virtualSize;
+    g.originSize = L.originSize;
+    g.slotFactor100 = cf.slotFactor100;
+    size_t at = r.at;
+    if (!cf.slots.index(b, at, ns, g, std::move(lazy)) || at != b.size())
+      return false;
+    for (const auto& win : L.windows)
+      if (win.off + win.bytes.size() > L.originSize)
+        return false;
+    return true;
+  }
   L.slots.resize(ns);
   uint64_t prevOrig = 0, nextV = L.slotsBegin;
   uint32_t prevBranch = 0, prevBasket = 0;
@@ -1080,13 +1119,26 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
         return nullptr;
     }
   }
-  if (!created) {
-    cf->L = tp::FillLayout(); // the stored layout, in place of anything computed above
+  if (created && cf->rnt) {
+    cf->slots.assign(std::move(cf->L.slots)); // RNTuple: every slot, held
+  } else {
+    // The stored layout, in place of anything computed above -- for a TTree
+    // file also when this process just made the store: what the run holds is
+    // the index of the slot table, each branch's entries decoded from the store
+    // when a read first touches it.
+    const bool rnt = cf->rnt;
+    cf->L = tp::FillLayout();
     cf->slotFactor100 = store->header().slotFactor100;
     cf->metaOrigin.clear();
     cf->pages.clear();
-    if (!decodeLayout(store->layoutBlob(), *cf) ||
-        cf->L.slots.size() != store->header().nSlots ||
+    tp::SlotTable::Source src = [store](std::vector<uint8_t>& raw) {
+      std::vector<uint8_t> blob;
+      return store->readBlob(blob) && layoutRaw(blob, raw);
+    };
+    const bool ok = decodeLayout(store->layoutBlob(), *cf, rnt ? nullptr : std::move(src));
+    if (ok && cf->rnt)
+      cf->slots.assign(std::move(cf->L.slots));
+    if (!ok || cf->nSlots() != store->header().nSlots ||
         cf->L.virtualSize != store->header().virtualSize) {
       UCACHE_WARN("slot store for %s has an unreadable layout; the file is served as stored",
                   key.key.c_str());
@@ -1094,14 +1146,13 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
     }
     cf->codecs = splitCodecs(store->header().codecs);
   }
+  store->releaseBlob(); // read again from the file if the run needs more of it
   cf->store = store;
-  cf->state.reset(new std::atomic<uint8_t>[cf->L.slots.size()]());
+  cf->state.reset(new std::atomic<uint8_t>[cf->nSlots()]());
   if (!cf->rnt && cfg.mixedMaps) { // mixed maps: TTree only
     cf->tables = tp::mapTables(cf->L);
     cf->seekLimit = tp::mapSeekLimit(cf->L);
     cf->mapsOff = cf->tables.empty() || cf->tables.first > cf->seekLimit;
-    if (!cf->mapsOff)
-      cf->recLen.reset(new std::atomic<uint32_t>[cf->L.slots.size()]());
   }
   // Every record anyone has committed so far -- without waiting, so a commit
   // held up in another process never holds up an open (what is missed now is
@@ -1119,7 +1170,7 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
                   cf->slotFactor100 % 100);
   UCACHE_INFO("slot run for %s: %zu %s of %zu %s in slots (%s%s), virtual %llu bytes, "
               "set up in %.1f ms",
-              key.key.c_str(), cf->L.slots.size(), cf->rnt ? "pages" : "baskets",
+              key.key.c_str(), static_cast<size_t>(cf->nSlots()), cf->rnt ? "pages" : "baskets",
               cf->L.relocated.size(), cf->rnt ? "column ranges" : "branches",
               created ? "new store" : "existing store", factor,
               static_cast<unsigned long long>(cf->L.virtualSize), (nowUs() - tSetup) / 1e3);
@@ -1218,7 +1269,7 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
   } else if (!cf.where(i, w)) {
     return false;
   }
-  const tp::FillSlot& fs = cf.L.slots[i];
+  const tp::FillSlot& fs = cf.slot(i);
   if (from + len > fs.vLen)
     return false;
   std::shared_ptr<const std::vector<uint8_t>> rec = w.mem;
@@ -1280,7 +1331,7 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
   // given one that stops short of the slot's end must be served that record.
   // By construction it is (a slot is committed once per store); if not, the
   // read fails rather than hand the reader a basket cut short.
-  if (const uint32_t c = cf.committedLen(i); mapped && c && c != recLen && from + len < fs.vLen) {
+  if (const uint32_t c = mapped ? cf.committedLen(i, fs) : 0; c && c != recLen && from + len < fs.vLen) {
     UCACHE_ERROR("slot %u of %s: a record of %llu bytes where %u are committed", i,
                  cf.key.key.c_str(), static_cast<unsigned long long>(recLen), c);
     fatal = true;
@@ -1418,7 +1469,7 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
                 std::shared_ptr<std::vector<char>> rounded, uint64_t rStart, uint64_t recOff,
                 uint32_t recLen, bool fromCache) try {
   ColdFill& cf = *req->cf;
-  const tp::FillSlot& slot = cf.L.slots[i];
+  const tp::FillSlot& slot = cf.slot(i);
   const auto* rec = reinterpret_cast<const uint8_t*>(rounded->data() + recOff);
   const uint64_t t0 = nowUs();
   if (cf.rnt) {
@@ -1706,6 +1757,7 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
   // The handle's mixed map, if it was shown one: its keys-list window in place
   // of the layout's, its tree record in the tables area.
   const ColdMap* map = req->st->coldMap.get();
+  coldPrepare(cf, req->chunks); // every branch the request touches, in one read
   for (const auto& c : req->chunks) {
     char* base = static_cast<char*>(c.buffer);
     uint64_t pos = c.offset;
@@ -1778,13 +1830,25 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
         }
         pos += n;
       } else {
-        auto it = std::upper_bound(
-            L.slots.begin(), L.slots.end(), pos,
-            [](uint64_t v, const tp::FillSlot& s) { return v < s.vSeek; });
-        const uint32_t i = static_cast<uint32_t>((it - L.slots.begin()) - 1);
-        const tp::FillSlot& s = L.slots[i];
+        uint32_t i = 0;
+        if (!cf.slots.find(pos, i)) {
+          // The slot table cannot be read again (the store file failed its
+          // check): this request cannot be served in the layout it was shown.
+          req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0,
+                                 "slot table unreadable"));
+          std::memset(d, 0, end - pos);
+          pos = end;
+          continue;
+        }
+        const tp::FillSlot& s = cf.slot(i);
         const uint64_t from = pos - s.vSeek;
         const uint64_t n = std::min<uint64_t>(end, s.vSeek + s.vLen) - pos;
+        if (!n) { // past the slot: no layout has a gap here
+          req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, "no slot at offset"));
+          std::memset(d, 0, end - pos);
+          pos = end;
+          continue;
+        }
         req->slotPieces.push_back({i, from, n, d});
         if (cf.state[i].load(std::memory_order_acquire) != ColdFill::kReady ||
             cf.keptOriginalGone(i)) {
@@ -1843,7 +1907,7 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
     // ones in the store would fetch originals nobody needs.
     XrdCl::ChunkList orig;
     for (uint32_t i : need)
-      orig.emplace_back(cf.L.slots[i].origSeek, cf.L.slots[i].origLen, nullptr);
+      orig.emplace_back(cf.slot(i).origSeek, cf.slot(i).origLen, nullptr);
     Prefetcher::instance().onFill(req->st, req->entry, orig, true);
   }
   if (cfg.prefetch && cfg.prefetchJoin && req->mayPark && !need.empty() && !direct) {
@@ -1851,7 +1915,7 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
     // (once) instead of fetching it a second time.
     std::vector<std::pair<uint64_t, uint64_t>> want;
     for (uint32_t i : need) {
-      const tp::FillSlot& s = cf.L.slots[i];
+      const tp::FillSlot& s = cf.slot(i);
       if (!req->entry->hasRange(s.origSeek, s.origLen))
         want.emplace_back(s.origSeek, s.origLen);
     }
@@ -1902,13 +1966,18 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
     }
   }
 
+  // Which original pages are worth keeping needs every relocated basket's
+  // range: known before any of what is fetched arrives, on this thread.
+  if (!req->claimed.empty() || !req->origPieces.empty())
+    cf.ensureRelocatedOrig();
+
   // What to fetch: claimed baskets the byte cache does not hold, and original
   // bytes it did not have. A claimed basket already in the byte cache (a
   // file read before recompression was switched on) converts from there.
   std::vector<PartItem> items;
   const uint64_t ps = req->entry->pageSize(), fs = req->entry->fileSize();
   for (uint32_t i : req->claimed) {
-    const tp::FillSlot& s = cf.L.slots[i];
+    const tp::FillSlot& s = cf.slot(i);
     auto [rs, re] = roundSpan(ps, fs, s.origSeek, s.origLen);
     if (req->entry->hasRange(s.origSeek, s.origLen)) {
       // Its whole pages: a basket kept as stored is written back from them, so
@@ -2029,7 +2098,7 @@ void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool kee
       // A basket kept as stored is served from the byte cache's copy of its
       // original, just written; memory keeps it only if that write did not
       // land.
-      const tp::FillSlot& fs = L.slots[i];
+      const tp::FillSlot& fs = slot(i);
       const bool inCache = !rnt && kind == tp::ConvertedBasket::kOriginal &&
                            entry->hasRange(fs.origSeek, fs.origLen);
       const uint64_t b = inCache ? 0 : rec->size();
@@ -2097,63 +2166,78 @@ void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool kee
 }
 
 bool ColdFill::pageDeadLocked(uint64_t pg, uint64_t ps) {
-  if (origOrder.empty() && !L.slots.empty()) {
-    origOrder.resize(L.slots.size());
-    for (uint32_t k = 0; k < origOrder.size(); ++k)
-      origOrder[k] = k;
-    std::sort(origOrder.begin(), origOrder.end(), [this](uint32_t x, uint32_t y) {
-      return L.slots[x].origSeek < L.slots[y].origSeek;
-    });
-  }
   const uint64_t a = pg * ps, b = std::min(a + ps, L.originSize);
   if (a < kKeepHead || a >= b)
     return false;
-  // The first basket that may reach into the page, then each one in order:
-  // every byte must be covered, with no gap, by committed converted baskets.
-  auto it = std::lower_bound(origOrder.begin(), origOrder.end(), a, [this](uint32_t k, uint64_t v) {
-    return L.slots[k].origSeek + L.slots[k].origLen <= v;
-  });
+  // Every byte must be covered, with no gap, by committed converted baskets.
+  // Only the branches this process has decoded are known: a page also covered
+  // by one it has not is kept, which is never wrong (it only frees less).
+  std::vector<uint32_t> over;
+  slots.decodedOverlappingOrig(a, b, over);
   uint64_t covered = a;
-  for (; it != origOrder.end() && covered < b; ++it) {
-    const tp::FillSlot& fs = L.slots[*it];
+  for (uint32_t k : over) {
+    const tp::FillSlot& fs = slot(k);
     if (fs.origSeek > covered)
-      return false; // bytes in no relocated basket: the file's own records
-    auto in = info.find(*it);
+      return false; // bytes in no relocated basket we know: the file's own records, or unknown
+    auto in = info.find(k);
     if (in == info.end() || !in->second.inStore || in->second.kind == tp::ConvertedBasket::kOriginal)
       return false; // not converted yet, or kept as stored: its original serves
     covered = std::max<uint64_t>(covered, fs.origSeek + fs.origLen);
+    if (covered >= b)
+      return true;
   }
   return covered >= b;
 }
 
-std::vector<std::pair<uint64_t, uint64_t>> ColdFill::storableRuns(uint64_t rs, uint64_t re,
-                                                                  uint64_t ps) {
+void ColdFill::ensureRelocatedOrig() {
   {
     std::lock_guard<std::mutex> g(mu);
-    if (relocatedOrig.empty() && !L.slots.empty()) {
-      std::vector<std::pair<uint64_t, uint64_t>> r;
-      r.reserve(L.slots.size());
-      for (const auto& s : L.slots)
-        r.emplace_back(s.origSeek, s.origSeek + s.origLen);
-      std::sort(r.begin(), r.end());
-      // As merged runs: a page covered by two adjacent baskets is as dead as
-      // one inside a single basket.
-      for (const auto& [a, b] : r) {
-        if (!relocatedOrig.empty() && a <= relocatedOrig.back().second)
-          relocatedOrig.back().second = std::max(relocatedOrig.back().second, b);
-        else
-          relocatedOrig.emplace_back(a, b);
-      }
-    }
+    if (relocatedOrig || relocatedTried)
+      return;
+    relocatedTried = true;
   }
+  // Every relocated basket's original range: one pass over the whole table,
+  // decoded for it and not kept.
+  std::vector<std::pair<uint64_t, uint64_t>> r;
+  r.reserve(nSlots());
+  if (!slots.forEachAll([&r](uint32_t, const tp::FillSlot& s) {
+        r.emplace_back(s.origSeek, s.origSeek + s.origLen);
+      }))
+    return;
+  std::sort(r.begin(), r.end());
+  // As merged runs: a page covered by two adjacent baskets is as dead as one
+  // inside a single basket.
+  auto merged = std::make_shared<std::vector<std::pair<uint64_t, uint64_t>>>();
+  for (const auto& [a, b] : r) {
+    if (!merged->empty() && a <= merged->back().second)
+      merged->back().second = std::max(merged->back().second, b);
+    else
+      merged->emplace_back(a, b);
+  }
+  merged->shrink_to_fit();
+  std::lock_guard<std::mutex> g(mu);
+  relocatedOrig = std::move(merged);
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> ColdFill::storableRuns(uint64_t rs, uint64_t re,
+                                                                  uint64_t ps) {
+  // Built before the fetch was issued (ensureRelocatedOrig: this may be an
+  // XrdCl callback thread, which must not read the disk); if it could not be,
+  // nothing is dead and every page is kept, which is never wrong.
+  std::shared_ptr<const std::vector<std::pair<uint64_t, uint64_t>>> rel;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    rel = relocatedOrig;
+  }
+  static const std::vector<std::pair<uint64_t, uint64_t>> none;
+  const auto& relocated = rel ? *rel : none;
   std::vector<std::pair<uint64_t, uint64_t>> out;
   for (uint64_t p = rs; p < re; p += ps) {
     const uint64_t pe = std::min(re, p + ps);
     // Is [p, pe) inside the relocated baskets? (The head is always kept: ROOT
     // reads it as one block, and a hole there sends every open to the origin.)
-    auto it = std::upper_bound(relocatedOrig.begin(), relocatedOrig.end(),
-                               std::make_pair(p, UINT64_MAX));
-    const bool dead = p >= kKeepHead && it != relocatedOrig.begin() && std::prev(it)->second >= pe;
+    auto it = std::upper_bound(relocated.begin(), relocated.end(), std::make_pair(p, UINT64_MAX));
+    const bool dead = p >= kKeepHead && it != relocated.begin() && std::prev(it)->second >= pe;
     if (dead)
       continue;
     if (!out.empty() && out.back().second == p)
@@ -2339,8 +2423,7 @@ void ColdFill::commit() try {
       s.kind = basketKind(e.kind);
       // A kept basket's original is the only copy: never punched.
       if (s.fromCache && !keepOriginals && e.kind != SlotEntry::kKept)
-        punch.emplace_back(L.slots[e.slot].origSeek,
-                           L.slots[e.slot].origSeek + L.slots[e.slot].origLen);
+        punch.emplace_back(slot(e.slot).origSeek, slot(e.slot).origSeek + slot(e.slot).origLen);
       s.fromCache = false;
       s.persist = false;
       releaseMemLocked(s);
@@ -2409,19 +2492,21 @@ std::vector<std::shared_ptr<ColdFill>>& mapWanted() {
 } // namespace
 
 void ColdFill::noteSlotLocked(const SlotEntry& e, bool foreign) {
-  if (e.slot >= L.slots.size())
+  if (e.slot >= nSlots())
     return;
   if (loaded)
     (foreign ? lastForeignS : lastOwnS) = wallSeconds();
   // A slot's real length is its FIRST record's, for good: what every map
   // states. A slot committed again (its record failed its check and was
   // converted anew) is not counted twice, and serving refuses a record of
-  // another length to a reader holding a map (copySlot).
-  const uint32_t n = e.kind == SlotEntry::kKept ? L.slots[e.slot].origLen : e.len;
-  uint32_t first = 0;
-  if (recLen && !recLen[e.slot].compare_exchange_strong(first, n, std::memory_order_acq_rel))
+  // another length to a reader holding a map (copySlot). A kept original is
+  // its own length (looked up where its slot is at hand) and is not counted
+  // in convertedBytes: nothing here decodes a branch.
+  const bool kept = e.kind == SlotEntry::kKept;
+  if (!firstLens.emplace(e.slot, kept ? 0 : e.len).second)
     return;
-  convertedBytes += n;
+  if (!kept)
+    convertedBytes += e.len;
 }
 
 bool ColdFill::noteMapLocked(const SlotEntry& e, const MapHead& h) {
@@ -2632,14 +2717,24 @@ bool ColdFill::makeMap(bool atExit) try {
     std::lock_guard<std::mutex> g(mu);
     if (mapDueLocked(now, atExit) != 0)
       return false;
-    real.reserve(info.size());
-    for (const auto& [i, s] : info)
-      if (const uint32_t n = s.inStore ? committedLen(i) : 0) {
-        real.emplace_back(i, n);
-        covered += n;
-      }
+    real.assign(firstLens.begin(), firstLens.end());
   }
   std::sort(real.begin(), real.end());
+  {
+    // Every slot it states, decoded here in one read, outside the lock; kept
+    // originals are stated at their own length, from their slots.
+    std::vector<uint32_t> idx;
+    idx.reserve(real.size());
+    for (const auto& [i, n] : real)
+      idx.push_back(i);
+    if (!slots.prepareSlots(idx))
+      return false;
+    for (auto& [i, n] : real)
+      if (!n)
+        n = slot(i).origLen;
+      else
+        covered += n; // as convertedBytes counts: records, not kept originals
+  }
   auto impossible = [&](const std::string& why) {
     std::lock_guard<std::mutex> g(mu);
     mapsImpossible = true;
@@ -2654,7 +2749,9 @@ bool ColdFill::makeMap(bool atExit) try {
     return impossible("the relocated tree record does not decode");
   std::string err;
   std::vector<uint8_t> meta;
-  if (!tp::stateRealLengths(blob, *f, L, real, err) ||
+  if (!tp::stateRealLengths(blob, *f, nSlots(),
+                            [this](uint32_t i) -> const tp::FillSlot& { return slot(i); }, real,
+                            err) ||
       !tp::mapMetaRecord(L, blob, tables.first, meta, err))
     return impossible(err);
   std::vector<uint8_t>().swap(blob);
@@ -3009,7 +3106,19 @@ std::shared_ptr<const ColdMap> coldPickMap(const std::shared_ptr<ColdFill>& cf) 
   return m;
 }
 
-void coldOriginRanges(const ColdFill& cf, uint64_t off, uint64_t len,
+bool coldPrepare(ColdFill& cf, const ChunkList& chunks) {
+  std::vector<std::pair<uint64_t, uint64_t>> r;
+  r.reserve(chunks.size());
+  for (const auto& c : chunks)
+    r.emplace_back(c.offset, c.length);
+  return cf.slots.prepareRanges(r);
+}
+
+bool coldPrepare(ColdFill& cf, uint64_t off, uint64_t len) {
+  return cf.slots.prepareRanges({{off, len}});
+}
+
+void coldOriginRanges(ColdFill& cf, uint64_t off, uint64_t len,
                       std::vector<std::pair<uint64_t, uint64_t>>& out, const ColdMap* map) {
   const tp::FillLayout& L = cf.L;
   const uint64_t end = off + len;
@@ -3020,22 +3129,30 @@ void coldOriginRanges(const ColdFill& cf, uint64_t off, uint64_t len,
   if ((off < metaEnd && end > L.metaSeek) || inMap)
     for (const auto& r : cf.metaOrigin)
       out.push_back(r);
-  if (end > L.slotsBegin && !L.slots.empty()) {
-    auto it = std::upper_bound(L.slots.begin(), L.slots.end(), std::max(off, L.slotsBegin),
-                               [](uint64_t v, const tp::FillSlot& s) { return v < s.vSeek; });
-    for (--it; it != L.slots.end() && it->vSeek < end; ++it)
-      out.emplace_back(it->origSeek, it->origLen);
-  }
+  if (end > L.slotsBegin)
+    cf.slots.forEach(std::max(off, L.slotsBegin), end, [&out](uint32_t, const tp::FillSlot& s) {
+      out.emplace_back(s.origSeek, s.origLen);
+      return true;
+    });
 }
 
 bool coldExactOriginRanges(ColdFill& cf, uint64_t off, uint64_t len,
                            std::vector<std::pair<uint64_t, uint64_t>>& out, const ColdMap* map) {
-  if (!cf.recLen)
-    return tp::exactOriginRanges(cf.L, cf.metaOrigin, off, len, out);
+  const tp::SlotsIn in = [&cf](uint64_t a, uint64_t b,
+                              const std::function<bool(uint32_t, const tp::FillSlot&)>& f) {
+    return cf.slots.forEach(a, b, f);
+  };
+  if (cf.mapsOff)
+    return tp::exactOriginRanges(cf.L, in, cf.metaOrigin, off, len, out);
   // A slot read to its record's end is its whole basket: what a mixed map
   // states, and what a reader given one (here, or in another process) reads.
-  const std::function<uint32_t(uint32_t)> real = [&cf](uint32_t i) { return cf.committedLen(i); };
-  return tp::exactOriginRanges(cf.L, cf.metaOrigin, off, len, out, &real,
+  // Decoded first, so that nothing is read from disk under the lock.
+  cf.slots.prepare(std::max(off, cf.L.slotsBegin), off + len);
+  std::lock_guard<std::mutex> g(cf.mu);
+  const std::function<uint32_t(uint32_t)> real = [&cf](uint32_t i) {
+    return cf.committedLenLocked(i, cf.slot(i));
+  };
+  return tp::exactOriginRanges(cf.L, in, cf.metaOrigin, off, len, out, &real,
                                map ? std::make_pair(map->metaSeek, uint64_t(map->meta.size()))
                                    : std::pair<uint64_t, uint64_t>{0, 0});
 }

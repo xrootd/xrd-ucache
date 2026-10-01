@@ -496,6 +496,24 @@ bool exactOriginRanges(const FillLayout& L,
                        uint64_t len, std::vector<std::pair<uint64_t, uint64_t>>& out,
                        const std::function<uint32_t(uint32_t)>* realLen,
                        std::pair<uint64_t, uint64_t> mapMeta) {
+  const SlotsIn in = [&L](uint64_t a, uint64_t b,
+                          const std::function<bool(uint32_t, const FillSlot&)>& f) {
+    // The first slot that ends past a: slots ascend and do not overlap.
+    auto it = std::lower_bound(L.slots.begin(), L.slots.end(), a,
+                               [](const FillSlot& s, uint64_t o) { return s.vSeek + s.vLen <= o; });
+    for (; it != L.slots.end() && it->vSeek < b; ++it)
+      if (!f(static_cast<uint32_t>(it - L.slots.begin()), *it))
+        break;
+    return true;
+  };
+  return exactOriginRanges(L, in, metaOrigin, off, len, out, realLen, mapMeta);
+}
+
+bool exactOriginRanges(const FillLayout& L, const SlotsIn& slotsIn,
+                       const std::vector<std::pair<uint64_t, uint64_t>>& metaOrigin, uint64_t off,
+                       uint64_t len, std::vector<std::pair<uint64_t, uint64_t>>& out,
+                       const std::function<uint32_t(uint32_t)>* realLen,
+                       std::pair<uint64_t, uint64_t> mapMeta) {
   const uint64_t end = off + len;
   if (!len || end < off)
     return true; // a request with no bytes, or one no layout can hold: nothing read
@@ -514,30 +532,28 @@ bool exactOriginRanges(const FillLayout& L,
   };
   if (!meta(L.metaSeek, L.metaRecord.size()) || !meta(mapMeta.first, mapMeta.second))
     return false;
-  if (end <= L.slotsBegin || L.slots.empty())
+  if (end <= L.slotsBegin)
     return true;
-  // The first slot that ends past `off`: slots ascend and do not overlap.
-  auto it = std::lower_bound(L.slots.begin(), L.slots.end(), off,
-                             [](const FillSlot& s, uint64_t o) { return s.vSeek + s.vLen <= o; });
-  for (; it != L.slots.end() && it->vSeek < end; ++it) {
-    if (off > it->vSeek)
-      return false;
-    if (end < it->vSeek + it->vLen) {
+  bool whole = true;
+  const bool had = slotsIn(off, end, [&](uint32_t i, const FillSlot& s) {
+    if (off > s.vSeek)
+      return whole = false;
+    if (end < s.vSeek + s.vLen) {
       // Short of the slot's end: whole only when it reaches the basket's real
       // length (a mixed map states that), and this is the last slot it reads.
-      const uint32_t real =
-          realLen ? (*realLen)(static_cast<uint32_t>(it - L.slots.begin())) : 0;
-      if (!real || end < it->vSeek + real)
-        return false;
+      const uint32_t real = realLen ? (*realLen)(i) : 0;
+      if (!real || end < s.vSeek + real)
+        return whole = false;
     }
-    out.emplace_back(it->origSeek, it->origLen);
-  }
-  return true;
+    out.emplace_back(s.origSeek, s.origLen);
+    return true;
+  });
+  return had && whole;
 }
 
 MapTables mapTables(const FillLayout& L) {
   MapTables t;
-  if (L.metaRecord.empty() || L.slots.empty() || L.slotsBegin <= L.metaSeek)
+  if (L.metaRecord.empty() || L.slotsBegin <= L.metaSeek)
     return t;
   t.first = (L.metaSeek + L.metaRecord.size() + 7) / 8 * 8;
   t.end = L.slotsBegin;
@@ -603,14 +619,22 @@ bool decodeKeyRecord(const std::vector<uint8_t>& rec, std::vector<uint8_t>& blob
 
 bool stateRealLengths(std::vector<uint8_t>& blob, const FileMeta& fields, const FillLayout& L,
                       const std::vector<std::pair<uint32_t, uint32_t>>& real, std::string& err) {
+  return stateRealLengths(
+      blob, fields, static_cast<uint32_t>(L.slots.size()),
+      [&L](uint32_t i) -> const FillSlot& { return L.slots[i]; }, real, err);
+}
+
+bool stateRealLengths(std::vector<uint8_t>& blob, const FileMeta& fields, uint32_t nSlots,
+                      const std::function<const FillSlot&(uint32_t)>& slot,
+                      const std::vector<std::pair<uint32_t, uint32_t>>& real, std::string& err) {
   std::vector<int64_t> delta(fields.branches.size(), 0);
   int64_t total = 0;
   for (const auto& [i, len] : real) {
-    if (i >= L.slots.size()) {
+    if (i >= nSlots) {
       err = "slot out of range";
       return false;
     }
-    const FillSlot& s = L.slots[i];
+    const FillSlot& s = slot(i);
     if (s.branch >= fields.branches.size()) {
       err = "branch out of range";
       return false;

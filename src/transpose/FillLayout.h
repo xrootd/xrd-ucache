@@ -186,6 +186,17 @@ bool exactOriginRanges(const FillLayout& L,
                        uint64_t len, std::vector<std::pair<uint64_t, uint64_t>>& out,
                        const std::function<uint32_t(uint32_t)>* realLen = nullptr,
                        std::pair<uint64_t, uint64_t> mapMeta = {0, 0});
+// The same over slots held elsewhere (SlotTable.h): `slotsIn(a, b, f)` calls
+// f(index, slot) for the slots overlapping [a, b), in order, until f returns
+// false; it returns false when the slots cannot be had (the read then counts
+// nothing exactly). `L.slots` is not used.
+using SlotsIn = std::function<bool(uint64_t, uint64_t,
+                                   const std::function<bool(uint32_t, const FillSlot&)>&)>;
+bool exactOriginRanges(const FillLayout& L, const SlotsIn& slotsIn,
+                       const std::vector<std::pair<uint64_t, uint64_t>>& metaOrigin, uint64_t off,
+                       uint64_t len, std::vector<std::pair<uint64_t, uint64_t>>& out,
+                       const std::function<uint32_t(uint32_t)>* realLen = nullptr,
+                       std::pair<uint64_t, uint64_t> mapMeta = {0, 0});
 
 // ---- Mixed maps (TTree)
 //
@@ -234,6 +245,10 @@ bool statedRealLengths(const std::vector<uint8_t>& blob, const FileMeta& fields,
 // the layout was made from). False (err set) when a slot's basket is not where
 // the layout put it, or a length is out of range.
 bool stateRealLengths(std::vector<uint8_t>& blob, const FileMeta& fields, const FillLayout& L,
+                      const std::vector<std::pair<uint32_t, uint32_t>>& real, std::string& err);
+// The same with the slots looked up through `slot` (index < `nSlots`).
+bool stateRealLengths(std::vector<uint8_t>& blob, const FileMeta& fields, uint32_t nSlots,
+                      const std::function<const FillSlot&(uint32_t)>& slot,
                       const std::vector<std::pair<uint32_t, uint32_t>>& real, std::string& err);
 
 // A map's metadata record for the tree record `blob`, placed at `seek`: map

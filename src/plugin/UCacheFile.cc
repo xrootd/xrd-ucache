@@ -2255,6 +2255,10 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
   // and a wrong signature is evidence, so it is worse than none.
   auto view = currentView();
   auto cold = currentCold();
+#ifdef UCACHE_HAVE_COLDRUN
+  if (cold && offset + size >= offset) // the branches it touches, decoded in one read
+    coldPrepare(*cold, offset, size);
+#endif
   noteAppRead(st_, entry, view, offset, size, cold);
   if (entry && (view || cold)) {
     // Stitched entry: serve on the executor — overlay + v1
@@ -2442,6 +2446,10 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
   // and a wrong signature is evidence, so it is worse than none.
   auto view = currentView();
   auto cold = currentCold();
+#ifdef UCACHE_HAVE_COLDRUN
+  if (cold && offset + size >= offset) // the branches it touches, decoded in one read
+    coldPrepare(*cold, offset, size);
+#endif
   noteAppRead(st_, entry, view, offset, size, cold);
   if (entry && (view || cold)) {
     if (offset + size < offset) { // overflow
@@ -2670,6 +2678,10 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
     }
     return VectorRead(placed, nullptr, handler, timeout);
   }
+#ifdef UCACHE_HAVE_COLDRUN
+  if (cold) // the branches it touches, decoded in one read
+    coldPrepare(*cold, chunks);
+#endif
   noteAppChunks(st_, entry, view, chunks, cold);
   // The combined-buffer variant is legacy and rare: pass through unchanged.
   if (!entry || buffer || chunks.empty()) {

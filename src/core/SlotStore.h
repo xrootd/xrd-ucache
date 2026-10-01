@@ -136,6 +136,13 @@ class SlotStore {
   ~SlotStore();
   const SlotStoreHeader& header() const { return hdr_; }
   const std::vector<uint8_t>& layoutBlob() const { return blob_; }
+  // The layout blob again, from the file (CRC-checked): for a caller that let
+  // go of it (releaseBlob) and needs more of the layout later. Safe from any
+  // thread. False on I/O error or a CRC mismatch.
+  bool readBlob(std::vector<uint8_t>& out);
+  // Free the blob held since open; layoutBlob() is empty afterwards. Call
+  // before the store is shared between threads.
+  void releaseBlob() { std::vector<uint8_t>().swap(blob_); }
 
   // Entries committed (by anyone) since the last refresh or commit, in commit
   // order. `wait` = wait for a commit in progress (in this process or

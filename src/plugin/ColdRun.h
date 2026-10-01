@@ -124,11 +124,17 @@ uint64_t coldVirtualSize(const ColdFill& cf);
 // The hash of the layout the run serves.
 uint64_t coldLayoutHash(const ColdFill& cf);
 
+// Decode, in one read of the stored layout, every branch of the slot table a
+// request's ranges touch (a TTree run holds only the branches read so far).
+// False when the layout cannot be read again; the request then fails.
+bool coldPrepare(ColdFill& cf, const XrdCl::ChunkList& chunks);
+bool coldPrepare(ColdFill& cf, uint64_t off, uint64_t len);
+
 // The ORIGINAL-file ranges a read of [off, off+len) of the layout carries: a
 // slot is its basket, the relocated tree record is the original tree key, the
 // original file's range reads as itself, padding carries nothing.
 // `map`: the handle's mixed map, if it was shown one.
-void coldOriginRanges(const ColdFill& cf, uint64_t off, uint64_t len,
+void coldOriginRanges(ColdFill& cf, uint64_t off, uint64_t len,
                       std::vector<std::pair<uint64_t, uint64_t>>& out,
                       const ColdMap* map = nullptr);
 // The original bytes the same read carried byte for byte, for the byte counts

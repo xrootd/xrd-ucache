@@ -80,7 +80,8 @@ target_include_directories(ucache-unit-tests PRIVATE ${CMAKE_SOURCE_DIR}/src/plu
 if (TARGET ucache-transpose) # learner + seek-width + hole-verification contracts
   target_sources(ucache-unit-tests PRIVATE unit/learner_test.cc unit/transpose_width_test.cc
                  unit/transpose_hole_test.cc unit/rntuple_meta_test.cc
-                 unit/rntuple_rewrite_test.cc unit/fill_layout_test.cc unit/readmap_test.cc)
+                 unit/rntuple_rewrite_test.cc unit/fill_layout_test.cc unit/readmap_test.cc
+                 unit/slot_table_test.cc)
   target_compile_definitions(ucache-unit-tests PRIVATE
                              UCACHE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
   target_link_libraries(ucache-unit-tests PRIVATE ucache-transpose)

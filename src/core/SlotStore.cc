@@ -529,6 +529,13 @@ bool SlotStore::readRecord(const SlotEntry& e, std::vector<uint8_t>& out) {
   return recordCrc(hdr_.storeId, e.slot, out.data(), out.size()) == e.crc;
 }
 
+bool SlotStore::readBlob(std::vector<uint8_t>& out) {
+  out.resize(hdr_.blobLen);
+  return io_.preadFull(fd_, out.data(), out.size(), kHeaderBytes) ==
+             static_cast<int64_t>(out.size()) &&
+         crc32c(out.data(), out.size()) == hdr_.blobCrc;
+}
+
 bool SlotStore::readHead(const SlotEntry& e, uint8_t* out, size_t n) {
   if (e.kind == SlotEntry::kKept || n > e.len)
     return false;
