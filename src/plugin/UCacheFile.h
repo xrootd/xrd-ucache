@@ -166,7 +166,9 @@ struct HandleState {
   // (fail-open). Opt-in; when the knob is 0 these stay false and the path is
   // unchanged. innerOpenMu serializes the one-shot lazy open off the fast path.
   bool cacheOnly = false;
-  bool innerOpened = false;
+  // Read without innerOpenMu on the fast path (acquireInner): set under it, and
+  // atomic so a reader that sees it set also sees the open that preceded it.
+  std::atomic<bool> innerOpened{false};
   bool innerOpenOk = false;
   std::mutex innerOpenMu;
   // Failed lazy opens do NOT latch (a user's cmsRun died to one transient

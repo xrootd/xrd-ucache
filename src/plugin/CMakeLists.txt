@@ -108,6 +108,15 @@ function(ucache_add_plugin target include_dir library suffix)
   if (NOT APPLE)
     target_link_options(${target} PRIVATE "-Wl,-z,nodelete")
     target_compile_definitions(${target} PRIVATE UCACHE_LINK_NODELETE=1)
+    # A sanitized plugin binds its own (instrumented) copies of the library code
+    # it shares with libXrdCl. Otherwise the dynamic linker resolves inline
+    # templates such as std::shared_ptr's reference release to libXrdCl's
+    # uninstrumented copy; ThreadSanitizer then never sees the synchronisation
+    # that orders a destructor after the last use, and reports every object
+    # released from an XrdCl callback thread as a race.
+    if (UCACHE_SANITIZE)
+      target_link_options(${target} PRIVATE "-Wl,-Bsymbolic-functions")
+    endif()
   endif()
 
   # Relocatable install: drop the baked LCG build RPATH in favour of
