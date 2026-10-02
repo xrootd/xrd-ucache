@@ -55,9 +55,16 @@ enum class AttachMode : uint8_t {
   kMatch,    // only the layout this process already showed (its hash given)
 };
 
-// A mixed map (transpose/FillLayout.h) a handle is given at open: its own
-// keys-list window, and its own relocated tree record. Everything else a
-// handle reads is the same in every map. Immutable once made.
+// A map a handle is given at open: its own keys-list window, and its own
+// relocated tree record (transpose/FillLayout.h).
+// * A MIXED map states the converted baskets at their real length, at their
+//   slots: every other byte a handle reads is map 1's.
+// * A COMPACT map states them back to back in a range of its own, past map 1's
+//   slots: [rangeLo, rangeLo + rangeLen), each address translated to the exact
+//   record it names (`recs`). It has its own header window too (fEND = its
+//   end); the baskets not converted when it was made stay at their slots, and
+//   those kept as stored at their original place.
+// Immutable once made.
 struct ColdMap {
   uint64_t seq = 0;              // its entry's place in the store: the order maps were made in
   uint64_t madeS = 0;            // when it was made (wall clock, seconds)
@@ -65,6 +72,19 @@ struct ColdMap {
   std::vector<uint8_t> meta;
   uint64_t keysListOff = 0;      // its keys-list window
   std::vector<uint8_t> keysList;
+  uint64_t rangeLo = 0, rangeLen = 0; // a compact map's range (0: a mixed map)
+  uint64_t headerOff = 0;             // a compact map's header window
+  std::vector<uint8_t> header;
+  struct Rec {
+    uint64_t off = 0;      // from rangeLo
+    uint32_t slot = 0;
+    uint32_t len = 0, crc = 0; // the record it names (store offset `storeOff`)
+    uint8_t kind = 0;
+    uint64_t storeOff = 0;
+  };
+  std::vector<Rec> recs; // ascending, back to back from 0 to rangeLen
+  bool compact() const { return rangeLen != 0; }
+  uint64_t end() const { return rangeLo + rangeLen; }
 };
 
 // The map a new handle of the run is shown: the newest mixed map, or null for
@@ -121,6 +141,14 @@ void coldAfterForkChild();
 
 // The file size the reader is shown.
 uint64_t coldVirtualSize(const ColdFill& cf);
+// The size a handle shown `map` (null: the slot layout itself) is shown: a
+// compact map's end, else the slot layout's. Its header's fEND says the same.
+uint64_t coldShownSize(const ColdFill& cf, const ColdMap* map);
+// The end of every address this process may serve the file at: the slot
+// layout's, or the last compact map's. A position read by one handle may have
+// been learned by another, so reads are bounded by this, not by the size the
+// handle was shown.
+uint64_t coldAddressEnd(ColdFill& cf);
 // The hash of the layout the run serves.
 uint64_t coldLayoutHash(const ColdFill& cf);
 

@@ -1033,6 +1033,33 @@ TEST(FillLayoutMaps, StatingRefusesWhatTheLayoutDoesNotHold) {
   EXPECT_NE(err.find("not where"), std::string::npos) << err;
 }
 
+TEST(FillLayoutMaps, CompactAddressesAreStatedAfterTheLengths) {
+  // A compact map: a converted basket at its address in the map's own range,
+  // at its record's length; one kept as stored at its original place; the
+  // rest where map 1 has them.
+  Fx fx = fixture();
+  FillLayout L = layout(fx);
+  ASSERT_TRUE(L.error.empty()) << L.error;
+  auto blob = mixedBlob(L, fx, {{0, 1234}, {2, 900}});
+  std::string err;
+  const uint64_t R = L.virtualSize + (1ull << 30);
+  const std::function<const FillSlot&(uint32_t)> slot = [&L](uint32_t i) -> const FillSlot& {
+    return L.slots[i];
+  };
+  ASSERT_TRUE(stateSeeks(blob, fx.fm, static_cast<uint32_t>(L.slots.size()), slot,
+                         {{0, R}, {2, L.slots[2].origSeek}}, err))
+      << err;
+  EXPECT_EQ(beGet64(&blob[kB0Seek]), R);
+  EXPECT_EQ(beGet32(&blob[kB0Bytes]), 1234u);
+  EXPECT_EQ(beGet64(&blob[kB0Seek + 8]), L.slots[1].vSeek) << "not converted: map 1's address";
+  EXPECT_EQ(beGet64(&blob[kB2Seek]), L.slots[2].origSeek) << "kept: its original place";
+  // A second statement finds the basket moved: refused, as for the lengths.
+  auto again = blob;
+  EXPECT_FALSE(stateSeeks(again, fx.fm, static_cast<uint32_t>(L.slots.size()), slot, {{0, R}}, err));
+  EXPECT_NE(err.find("not where"), std::string::npos) << err;
+  EXPECT_FALSE(stateSeeks(again, fx.fm, static_cast<uint32_t>(L.slots.size()), slot, {{9, R}}, err));
+}
+
 TEST(FillLayoutMaps, AMapsRecordIsMapZerosKeyAtItsPlace) {
   Fx fx = fixture();
   FillLayout L = layout(fx);

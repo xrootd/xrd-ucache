@@ -122,6 +122,7 @@ std::string Stats::toJsonBody() const {
   f("slot_maps_made", slotMapsMade);
   f("slot_map_opens", slotMapOpens);
   f("slot_map_full", slotMapFull);
+  f("slot_map_refused", slotMapRefused);
   f("slot_crc_failures", slotCrcFailures);
   f("slot_read_fallbacks", slotReadFallbacks);
   f("slot_pages_decoded", slotPagesDecoded);

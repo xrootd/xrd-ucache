@@ -746,7 +746,7 @@ overriding your defaults. Common keys:
 | `open_retries = 0`  | `UCACHE_OPEN_RETRIES`   | retry a transient open failure this many times (0 = off); backoff via `open_retry_base_ms`/`open_retry_max_ms` |
 | `recompress = off`  | `UCACHE_RECOMPRESS`     | `on` = the files your jobs read get fast-to-decode replicas **automatically**, created on their first pass (default off — opt-in CPU/disk). Flip it with `ucache set recompress on` |
 | `recompress_keep_originals = off` | `UCACHE_RECOMPRESS_KEEP_ORIGINALS` | `on` = when baskets are converted into a replica, keep their original bytes in the byte cache too (by default they are not kept, and a copy held from before is released: the cache would hold the same data twice) |
-| `mixed_maps = on` | `UCACHE_MIXED_MAPS` | with `recompress = on`: each open of a TTree file is shown its newest map, the baskets converted by then at their real size (see "Recompression"); `off` = every open sees the first-pass layout, every basket at the size of its room — for jobs that hand basket positions to workers on other machines with caches of their own |
+| `mixed_maps = on` | `UCACHE_MIXED_MAPS` | with `recompress = on`: each open of a TTree file is shown its newest map, the baskets converted by then back to back at their real size (see "Recompression"); `off` = every open sees the first-pass layout, every basket at the size of its room — for jobs that hand basket positions to workers on other machines with caches of their own |
 | `recompress_codecs = lzma,zlib` | `UCACHE_RECOMPRESS_CODECS` | which **source** codecs are worth recompressing (comma list); branches in other codecs are served as-is |
 | `recompress_reclaim = superseded` | `UCACHE_RECOMPRESS_RECLAIM` | what to free from the byte cache once a file's replica exists: `superseded` (default) punches only the ranges the replica replaced; `full` drops the **entire** byte copy — replicas become the primary copy, uncovered reads refetch from origin (space-tight disks) |
 | `page_size = 4k` | `UCACHE_PAGE_SIZE` | size of the pages the cache stores: 4 KiB, and 16 KiB on macOS, where a smaller page written into a hole of the cache file takes 16 KiB of disk anyway. Applies to files cached from then on. `ucache doctor` checks it against the cache disk |
@@ -985,18 +985,21 @@ it reads them. Two consequences:
   (correctly, but slowly) and can leave the replicas behind when it evicts.
 
 **From the next pass on, a TTree file is read at its real size.** Each open is
-shown the file's newest *map*: the same layout, with every basket converted by
-then stated at the size of its converted record instead of its room, so ROOT
-reads and holds just the records. A map is made a moment after a process is
+shown the file's newest *map*: every basket converted by then stated back to
+back at the size of its converted record, in an address range of the map's
+own past the first-pass layout, so ROOT reads and holds just the records; the
+rest stay where the first-pass layout has them. A map is made a moment after a process is
 done with a file, once enough has been converted since the last one (a
 twentieth of what the file's replica holds, and after the first map 8 MiB) and
 nobody else is converting the file; after the first, at most one an hour. Baskets converted
 after the newest map are read at the size of their room until the next one.
 A handle keeps the map it was shown for its life, whatever is made after it,
-and a replaced map keeps its place while any process's handle holds it and for
+and a replaced map keeps its range while any process's handle holds it and for
 `in_use_seconds` (1 day) after it was last used, for readers still holding its
-positions; only a few fit, so when none is free the newest stays in use
-(`ucache stats` counts it). `mixed_maps = off` shows every open
+positions. After that a read in its range fails, with an error that says so:
+reopening the file shows the current map. At most four maps are in use at once;
+when a fifth would be due, new opens are shown the first-pass layout, which
+states everything converted (`ucache stats` counts it). `mixed_maps = off` shows every open
 the plain layout: use it when a job hands basket positions to workers on
 other machines, each with a cache of its own (`uproot.dask` with remote
 workers). RNTuple files are always shown the plain layout. The memory figures

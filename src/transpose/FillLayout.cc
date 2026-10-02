@@ -677,6 +677,35 @@ bool stateRealLengths(std::vector<uint8_t>& blob, const FileMeta& fields, uint32
   return true;
 }
 
+bool stateSeeks(std::vector<uint8_t>& blob, const FileMeta& fields, uint32_t nSlots,
+                const std::function<const FillSlot&(uint32_t)>& slot,
+                const std::vector<std::pair<uint32_t, uint64_t>>& seeks, std::string& err) {
+  for (const auto& [i, seek] : seeks) {
+    if (i >= nSlots) {
+      err = "slot out of range";
+      return false;
+    }
+    const FillSlot& s = slot(i);
+    if (s.branch >= fields.branches.size()) {
+      err = "branch out of range";
+      return false;
+    }
+    const BranchInfo& br = fields.branches[s.branch];
+    const uint64_t so = br.seekArrayOff + 8ull * s.basket;
+    if (static_cast<int32_t>(s.basket) >= br.writeBasket || so + 8 > blob.size() ||
+        beGet<int64_t>(blob.data() + so) != static_cast<int64_t>(s.vSeek)) {
+      err = "basket not where the layout put it";
+      return false;
+    }
+    if (seek > static_cast<uint64_t>(INT64_MAX)) {
+      err = "address out of range";
+      return false;
+    }
+    bePut<int64_t>(blob.data() + so, static_cast<int64_t>(seek));
+  }
+  return true;
+}
+
 bool mapMetaRecord(const FillLayout& L, const std::vector<uint8_t>& blob, uint64_t seek,
                    std::vector<uint8_t>& out, std::string& err) {
   auto k = parseKey(L.metaRecord.data(), L.metaRecord.size(), 0);

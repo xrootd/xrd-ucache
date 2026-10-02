@@ -110,6 +110,12 @@ int g_cmtPending = 0;
 // 8 MiB too (on a smaller file, as much again as the newest map states).
 constexpr uint64_t kMapMinBytes = 8ull << 20;
 constexpr uint64_t kMapShare = 20;
+// A compact map's range lies past map 1's slots and past every range handed
+// out, behind a guard longer than any read a reader merges (RNTuple's
+// fMaxKeySize is 1 GiB), so no read spans two maps. At most this many are in
+// use at once; then the next open is shown map 1.
+constexpr uint64_t kCompactGuard = 1ull << 30;
+constexpr size_t kMaxCompactMaps = 4;
 // Only a few maps fit the space the layout keeps for them (about four for a
 // NanoAOD file), and a map another may still use keeps its place while a
 // handle holds it and for `in_use_seconds` after its last use (InUse.h). So
@@ -154,34 +160,68 @@ bool commitFaultFire() {
 }
 
 // A map's record in the store: this head, then its tree record as served,
-// then its keys-list window. Made once, never rebuilt: another build could
-// compress the tree record into other bytes.
+// then its keys-list window -- and, for a compact map, its header window and
+// the records its range names (kMapRecBytes each: slot, length, CRC, kind,
+// store offset), in address order. Made once, never rebuilt: another build
+// could compress the tree record into other bytes. A build that knows only
+// mixed maps passes over a compact one (another magic), and shows map 1.
 constexpr char kMapMagic[8] = {'U', 'C', 'S', 'M', 'A', 'P', '0', '1'};
-constexpr size_t kMapHead = 64;
+constexpr char kMapMagic2[8] = {'U', 'C', 'S', 'M', 'A', 'P', '0', '2'};
+constexpr size_t kMapHead = 64, kMapHead2 = 96, kMapRecBytes = 24;
 struct MapHead {
   uint32_t metaLen = 0, keysListLen = 0;
   uint64_t madeS = 0;    // wall clock, seconds
   uint64_t metaSeek = 0; // where its tree record is served
   uint64_t keysListOff = 0;
   uint64_t covered = 0;  // real bytes of the slots it states at their real length
+  // A compact map:
+  uint64_t rangeLo = 0, rangeLen = 0;
+  uint64_t headerOff = 0;
+  uint32_t headerLen = 0, nRecs = 0;
+  bool compact() const { return rangeLen != 0; }
+  uint64_t recordLen() const {
+    return (compact() ? kMapHead2 : kMapHead) + uint64_t(metaLen) + keysListLen + headerLen +
+           uint64_t(nRecs) * kMapRecBytes;
+  }
 };
 std::vector<uint8_t> encodeMapRecord(const MapHead& h, const std::vector<uint8_t>& meta,
-                                     const std::vector<uint8_t>& keysList) {
-  std::vector<uint8_t> b(kMapHead, 0);
+                                     const std::vector<uint8_t>& keysList,
+                                     const ColdMap* compact = nullptr) {
+  std::vector<uint8_t> b(compact ? kMapHead2 : kMapHead, 0);
   auto put = [&](size_t off, auto v) { std::memcpy(b.data() + off, &v, sizeof v); };
-  std::memcpy(b.data(), kMapMagic, 8);
+  std::memcpy(b.data(), compact ? kMapMagic2 : kMapMagic, 8);
   put(8, static_cast<uint32_t>(meta.size()));
   put(12, static_cast<uint32_t>(keysList.size()));
   put(16, h.madeS);
   put(24, h.metaSeek);
   put(32, h.keysListOff);
   put(40, h.covered);
+  if (compact) {
+    put(48, compact->rangeLo);
+    put(56, compact->rangeLen);
+    put(64, compact->headerOff);
+    put(72, static_cast<uint32_t>(compact->header.size()));
+    put(76, static_cast<uint32_t>(compact->recs.size()));
+  }
   b.insert(b.end(), meta.begin(), meta.end());
   b.insert(b.end(), keysList.begin(), keysList.end());
+  if (compact) {
+    b.insert(b.end(), compact->header.begin(), compact->header.end());
+    for (const auto& r : compact->recs) {
+      uint8_t e[kMapRecBytes] = {};
+      std::memcpy(e, &r.slot, 4);
+      std::memcpy(e + 4, &r.len, 4);
+      std::memcpy(e + 8, &r.crc, 4);
+      e[12] = r.kind;
+      std::memcpy(e + 16, &r.storeOff, 8);
+      b.insert(b.end(), e, e + kMapRecBytes);
+    }
+  }
   return b;
 }
 bool decodeMapHead(const uint8_t* p, size_t n, MapHead& h) {
-  if (n < kMapHead || std::memcmp(p, kMapMagic, 8) != 0)
+  const bool v2 = n >= kMapHead2 && std::memcmp(p, kMapMagic2, 8) == 0;
+  if (!v2 && (n < kMapHead || std::memcmp(p, kMapMagic, 8) != 0))
     return false;
   auto get = [&](size_t off, auto& v) { std::memcpy(&v, p + off, sizeof v); };
   get(8, h.metaLen);
@@ -190,6 +230,15 @@ bool decodeMapHead(const uint8_t* p, size_t n, MapHead& h) {
   get(24, h.metaSeek);
   get(32, h.keysListOff);
   get(40, h.covered);
+  if (v2) {
+    get(48, h.rangeLo);
+    get(56, h.rangeLen);
+    get(64, h.headerOff);
+    get(72, h.headerLen);
+    get(76, h.nRecs);
+    if (!h.rangeLen) // a compact map states something
+      return false;
+  }
   return true;
 }
 uint64_t wallSeconds() {
@@ -361,10 +410,11 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
     // A map's head is read before taking the lock: no I/O under it.
     std::vector<std::pair<const SlotEntry*, MapHead>> heads;
     for (const auto& e : es) {
-      uint8_t b[kMapHead];
+      uint8_t b[kMapHead2];
       MapHead h;
-      if (e.kind == SlotEntry::kMap && store && store->readHead(e, b, kMapHead) &&
-          decodeMapHead(b, kMapHead, h))
+      const size_t n = std::min<size_t>(kMapHead2, e.len);
+      if (e.kind == SlotEntry::kMap && store && store->readHead(e, b, n) &&
+          decodeMapHead(b, n, h))
         heads.emplace_back(&e, h); // an unreadable one is not a map anyone can be given
     }
     {
@@ -501,6 +551,28 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   // together with the room next to it.
   uint64_t freePlaceLocked(uint64_t len, uint64_t now, const InUseRecord& inUse,
                            uint64_t& retryS) const;
+  // The compact map to make of the slots `real` states: its range, header and
+  // records in `m`, the addresses its tree record states in `seeks`. Null when
+  // one is made; else why not ("full": as many compact maps are in use as may
+  // be -- the caller shows map 1 instead; anything else: a mixed map is made).
+  const char* compactPlan(const std::vector<std::pair<uint32_t, uint32_t>>& real,
+                          const InUseRecord& inUse, uint64_t now, ColdMap& m,
+                          std::vector<std::pair<uint32_t, uint64_t>>& seeks);
+  // Is the compact map at maps[k] still to be served: the newest, held by a
+  // handle of this process, or in use in the in-use record?
+  bool compactValidLocked(size_t k, const InUseRecord& inUse, uint64_t now) const;
+  // What a read at `pos`, past map 1's slots, reads -- by address, whichever
+  // map the handle was shown: the compact map whose range holds it, when it
+  // may still be read; else `refused`, when pos lies in a range readers may
+  // hold that is no longer valid (a map replaced and out of use, or a range of
+  // a store this one replaced); else neither: unassigned, zeros up to `upto`.
+  std::shared_ptr<const ColdMap> compactAt(uint64_t pos, bool& refused, uint64_t& upto);
+  // The in-use record as last read, again at most every few seconds.
+  InUseRecord inUseSnapshot(uint64_t now);
+  std::mutex inUseMu;
+  InUseRecord inUseCache;
+  uint64_t inUseCacheS = 0;
+  std::atomic<uint64_t> refusedLogS{0};
   // The map whose entry lies at `seq`, read once. Null when it cannot be read.
   std::shared_ptr<const ColdMap> mapBySeq(uint64_t seq);
   // The tables area as any handle reads it: the newest map lying at `pos`,
@@ -570,7 +642,8 @@ struct Shown {
   // position a reader learned from one is served from it by every handle --
   // also after the store was replaced -- and fails once no handle holds it.
   struct Map {
-    uint64_t seek = 0, len = 0;
+    uint64_t seek = 0, len = 0;   // its tree record
+    uint64_t lo = 0, hi = 0;      // what identifies it in the in-use record
     std::weak_ptr<const ColdMap> map;
   };
   std::vector<Map> maps;
@@ -600,7 +673,8 @@ void noteShownMap(const std::string& key, const std::shared_ptr<const ColdMap>& 
   for (const auto& x : v)
     have = have || x.map.lock() == m;
   if (!have)
-    v.push_back({m->metaSeek, m->meta.size(), m});
+    v.push_back({m->metaSeek, m->meta.size(), m->compact() ? m->rangeLo : m->metaSeek,
+                 m->compact() ? m->end() : m->metaSeek + m->meta.size(), m});
   g_shownVersion.fetch_add(1, std::memory_order_acq_rel); // even: whole again
 }
 // The map this process showed `key` in whose tree record lies at `pos`, while a
@@ -620,19 +694,19 @@ std::shared_ptr<const ColdMap> shownMapAt(const std::string& key, uint64_t pos, 
     }
   return nullptr;
 }
-// Does a handle of this process hold a map of `key` whose tree record overlaps
-// [a, b)?
+// Does a handle of this process hold a map of `key` whose identifying range
+// (a compact map's addresses, a mixed map's tree record) overlaps [a, b)?
 bool shownMapHeld(const std::string& key, uint64_t a, uint64_t b) {
   std::lock_guard<std::mutex> g(g_shownMu);
   auto it = shownMap().find(key);
   if (it == shownMap().end())
     return false;
   for (const auto& m : it->second.maps)
-    if (m.seek < b && a < m.seek + m.len && !m.map.expired())
+    if (m.lo < b && a < m.hi && !m.map.expired())
       return true;
   return false;
 }
-// The tree-record ranges of the maps this process showed `key` in; `held`:
+// The identifying ranges of the maps this process showed `key` in; `held`:
 // only those a handle still holds.
 std::vector<std::pair<uint64_t, uint64_t>> shownMapRanges(const std::string& key, bool held) {
   std::vector<std::pair<uint64_t, uint64_t>> out;
@@ -641,7 +715,7 @@ std::vector<std::pair<uint64_t, uint64_t>> shownMapRanges(const std::string& key
   if (it != shownMap().end())
     for (const auto& m : it->second.maps)
       if (!held || !m.map.expired())
-        out.emplace_back(m.seek, m.seek + m.len);
+        out.emplace_back(m.lo, m.hi);
   return out;
 }
 // The parameters of the slot layout this process showed `key` in, if any.
@@ -1286,6 +1360,10 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
     // finish() does not decode the record again. Written before the
     // conversion's done(), read in finish() after the last one.
     bool served = false;
+    // Read at a compact map's address: the record there starts at `seekAs`
+    // (its fSeekKey, as served), and must be the one the map names.
+    uint64_t seekAs = 0;
+    uint32_t expectLen = 0, expectCrc = 0;
   };
   std::vector<SlotPiece> slotPieces;
   struct OrigPiece {
@@ -1326,6 +1404,7 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   std::atomic<int> outstanding{1}; // the issuing stage holds one
   std::atomic<bool> failed{false};
   std::atomic<bool> retry{false}; // a slot someone else was fetching fell through
+  std::atomic<bool> refused{false}; // read in an invalid map's range: asking again cannot help
   std::mutex emu;
   XRootDStatus err;
 
@@ -1370,7 +1449,8 @@ void servePage(const uint8_t* page, uint32_t pageLen, uint64_t from, uint64_t le
 // absent again, and serving the request again fetches it -- unless `fatal`
 // is set, and the request fails.
 bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
-              uint64_t& recBytes, const ColdFill::Where* held, bool mapped, bool& fatal) {
+              uint64_t& recBytes, const ColdFill::Where* held, bool mapped, bool& fatal, uint64_t seekAs = 0, uint32_t expectLen = 0,
+              uint32_t expectCrc = 0) {
   recBytes = 0;
   ColdFill::Where w;
   if (held) {
@@ -1420,6 +1500,41 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
       stats.replicaReadSize.add(buf->size());
     }
     rec = buf;
+  }
+  if (seekAs) {
+    // At a compact map's address: exactly the record the map names, with its
+    // fSeekKey stating the address read, and nothing after it. A record
+    // converted again since (this one failed its check) serves only if it is
+    // the same record; otherwise the read fails rather than serve another.
+    const uint64_t recLen = rec->size();
+    const bool same =
+        recLen == expectLen &&
+        (w.inStore && !w.mem ? w.e.crc == expectCrc
+                             : SlotStore::recordCrc(cf.store->header().storeId, i, rec->data(),
+                                                    recLen) == expectCrc);
+    if (!same || from + len > recLen) {
+      UCACHE_ERROR("slot %u of %s: a compact map names a record of %u bytes; the slot's is %llu "
+                   "bytes, another record",
+                   i, cf.key.key.c_str(), expectLen, static_cast<unsigned long long>(recLen));
+      fatal = true;
+      return false;
+    }
+    std::memcpy(dest, rec->data() + from, len);
+    uint8_t head[64];
+    const size_t hn = static_cast<size_t>(std::min<uint64_t>(recLen, sizeof head));
+    if (from < hn) {
+      std::memcpy(head, rec->data(), hn);
+      if (!tp::patchKeySeek(head, hn, seekAs)) {
+        UCACHE_ERROR("slot %u of %s: its basket key cannot state the address %llu", i,
+                     cf.key.key.c_str(), static_cast<unsigned long long>(seekAs));
+        fatal = true;
+        return false;
+      }
+      const uint64_t b = std::min<uint64_t>(from + len, hn);
+      std::memcpy(dest, head + from, b - from);
+    }
+    recBytes = len;
+    return true;
   }
   if (cf.rnt) {
     // The store keeps the block; the reader is served the page decoded, then
@@ -1564,7 +1679,7 @@ void ColdRequest::finish() {
     // Served again from the start, as a request whose slot fell through is
     // (requests that waited on this fetch do the same): a read the origin
     // failed once is asked for once more, as the plain miss path relays it.
-    if (attempt < 2) {
+    if (attempt < 2 && !refused.load()) {
       again(false);
       return;
     }
@@ -1605,7 +1720,8 @@ void ColdRequest::finish() {
       }
       auto h = mine.find(p.slot);
       if (!copySlot(*cf, p.slot, p.from, p.len, p.dest, rec,
-                    h == mine.end() ? nullptr : &h->second, st->coldMap != nullptr, fatal)) {
+                    h == mine.end() ? nullptr : &h->second, st->coldMap != nullptr, fatal,
+                    p.seekAs, p.expectLen, p.expectCrc)) {
         lost = true; // a record failed its check, or a kept original is gone
         continue;
       }
@@ -1977,12 +2093,15 @@ void issuePart(const std::shared_ptr<ColdRequest>& req, std::vector<PartItem> it
 }
 
 // A range of the file's addresses noted in its in-use record (InUse.h), off
-// the reader's path: a map's metadata handed out to a reader (`kHandOut`, which
-// the handle then holds), a map an open handle of this process still holds
-// (`kHold`), or this process's last close of the file (`kRelease`: the window
-// counts from it). Hand-outs and holds are rate-limited per range; nothing
-// here can fail a read.
-enum class Use { kHandOut, kHold, kRelease };
+// the reader's path: a map's metadata handed out to the handle shown it
+// (`kHandOut`, which the handle then holds); a read of a map's addresses or
+// metadata by a handle not shown it (`kUse`: positions learned elsewhere,
+// counted from now but not held, since only the maps a process shows are
+// released at its close); a map an open handle of this process still holds
+// (`kHold`); or this process's last close of the file (`kRelease`: the window
+// counts from it). Hand-outs, uses and holds are rate-limited per range;
+// nothing here can fail a read.
+enum class Use { kHandOut, kUse, kHold, kRelease };
 constexpr uint64_t kHandOutNoteS = 60;
 void noteUse(ColdFill& cf, uint64_t lo, uint64_t hi, Use u) {
   auto cs = globalStore();
@@ -1992,7 +2111,7 @@ void noteUse(ColdFill& cf, uint64_t lo, uint64_t hi, Use u) {
   {
     std::lock_guard<std::mutex> g(cf.mu);
     auto& t = cf.inUseNoted[lo];
-    if (u == Use::kHandOut) {
+    if (u == Use::kHandOut || u == Use::kUse) {
       if (t.first && now < t.first + kHandOutNoteS)
         return;
       t.first = now;
@@ -2011,7 +2130,7 @@ void noteUse(ColdFill& cf, uint64_t lo, uint64_t hi, Use u) {
   // has the map now, and other processes must see that before the first
   // refresh. A release removes this process's hold.
   r.pid = static_cast<uint64_t>(::getpid());
-  if (u != Use::kRelease)
+  if (u == Use::kHandOut || u == Use::kHold)
     r.holdS = now;
   if (u != Use::kHold)
     r.lastS = now;
@@ -2041,6 +2160,8 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
   // (map 1), or a mixed map's tree record (its range)? Noted after the walk.
   bool layoutMeta = false;
   uint64_t mapLo = 0, mapHi = 0;
+  bool mapOwn = false; // the map read is the one the handle was shown
+  std::vector<size_t> compactIdx; // pieces read at a compact map's address
   for (const auto& c : req->chunks) {
     char* base = static_cast<char*>(c.buffer);
     uint64_t pos = c.offset;
@@ -2056,8 +2177,12 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
           const uint64_t we = w.off + w.bytes.size();
           if (pos >= w.off && pos < we) {
             const uint64_t n = std::min(segEnd, we) - pos;
+            // The handle's map has its own keys-list window, and a compact
+            // map its own header (its end); same offsets and sizes as map 1's.
             const uint8_t* src = map && w.off == map->keysListOff ? map->keysList.data()
-                                                                  : w.bytes.data();
+                                 : map && map->compact() && w.off == map->headerOff
+                                     ? map->header.data()
+                                     : w.bytes.data();
             std::memcpy(d, src + (pos - w.off), n);
             pos += n;
             inWindow = true;
@@ -2107,8 +2232,9 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
         if (at) {
           n = std::min<uint64_t>(n, at->metaSeek + at->meta.size() - pos);
           std::memcpy(d, at->meta.data() + (pos - at->metaSeek), n);
-          mapLo = at->metaSeek;
-          mapHi = at->metaSeek + at->meta.size();
+          mapLo = at->compact() ? at->rangeLo : at->metaSeek;
+          mapHi = at->compact() ? at->end() : at->metaSeek + at->meta.size();
+          mapOwn = at == map;
         } else {
           if (map && pos < map->metaSeek)
             n = std::min<uint64_t>(n, map->metaSeek - pos);
@@ -2116,6 +2242,49 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
           std::memset(d, 0, n);
         }
         pos += n;
+      } else if (pos >= L.virtualSize) {
+        // Past map 1's slots: a compact map's range (any handle's, by
+        // address), or a guard -- zeros.
+        bool refused = false;
+        uint64_t upto = UINT64_MAX;
+        auto cm = cf.compactAt(pos, refused, upto);
+        if (cm) {
+          const auto& R = cm->recs;
+          auto it = std::upper_bound(R.begin(), R.end(), pos - cm->rangeLo,
+                                     [](uint64_t v, const ColdMap::Rec& r) { return v < r.off; });
+          const ColdMap::Rec& r = *(it - 1); // recs[0].off is 0
+          const uint64_t base = cm->rangeLo + r.off;
+          const uint64_t n = std::min<uint64_t>(end, base + r.len) - pos;
+          req->slotPieces.push_back({r.slot, pos - base, n, d});
+          auto& p = req->slotPieces.back();
+          p.seekAs = base;
+          p.expectLen = r.len;
+          p.expectCrc = r.crc;
+          compactIdx.push_back(req->slotPieces.size() - 1);
+          mapLo = cm->rangeLo; // a use of the map: its positions are being read
+          mapHi = cm->end();
+          mapOwn = cm.get() == map;
+          pos += n;
+        } else if (refused) {
+          req->refused.store(true);
+          req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0,
+                                 "a read in the range of a map that is no longer valid"));
+          if (auto cs = globalStore())
+            cs->stats().slotMapRefused.fetch_add(1, std::memory_order_relaxed);
+          const uint64_t nowS = wallSeconds();
+          if (uint64_t last = cf.refusedLogS.load(); nowS != last &&
+                                                     cf.refusedLogS.compare_exchange_strong(last, nowS))
+            UCACHE_ERROR("%s: a read at %llu, in the range of a map that is no longer valid "
+                         "(replaced and unused for in_use_seconds, or its store was replaced), "
+                         "fails; open the file again",
+                         cf.key.key.c_str(), static_cast<unsigned long long>(pos));
+          std::memset(d, 0, end - pos);
+          pos = end;
+        } else {
+          const uint64_t n = std::min(end, upto) - pos;
+          std::memset(d, 0, n);
+          pos += n;
+        }
       } else {
         uint32_t i = 0;
         if (!cf.slots.find(pos, i)) {
@@ -2147,10 +2316,27 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
       }
     }
   }
+  if (!compactIdx.empty()) {
+    // Their slots, decoded in one read; then as any slot read: ready, or to
+    // be fetched and converted again (its record failed its check).
+    std::vector<uint32_t> idx;
+    idx.reserve(compactIdx.size());
+    for (size_t k : compactIdx)
+      idx.push_back(req->slotPieces[k].slot);
+    if (!cf.slots.prepareSlots(idx)) {
+      req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, "slot table unreadable"));
+    } else {
+      for (uint32_t i : idx)
+        if (cf.state[i].load(std::memory_order_acquire) != ColdFill::kReady)
+          need.push_back(i);
+        else
+          req->holdReady(i);
+    }
+  }
   if (layoutMeta)
     noteSlotLayout(cf, Use::kHandOut);
   if (mapHi)
-    noteUse(cf, mapLo, mapHi, Use::kHandOut);
+    noteUse(cf, mapLo, mapHi, mapOwn ? Use::kHandOut : Use::kUse);
 }
 
 void serveRequest(const std::shared_ptr<ColdRequest>& req) {
@@ -2903,13 +3089,16 @@ void ColdFill::noteSlotLocked(const SlotEntry& e, bool foreign) {
 
 bool ColdFill::noteMapLocked(const SlotEntry& e, const MapHead& h) {
   if (mapsOff || h.metaLen < 26 || h.metaSeek < tables.first ||
-      h.metaSeek + h.metaLen > tables.end ||
-      kMapHead + uint64_t(h.metaLen) + h.keysListLen != e.len)
+      h.metaSeek + h.metaLen > tables.end || h.recordLen() != e.len)
     return false;
-  bool window = false;
-  for (const auto& w : L.windows)
+  bool window = false, header = !h.compact();
+  for (const auto& w : L.windows) {
     window = window || (w.off && w.off == h.keysListOff && w.bytes.size() == h.keysListLen);
-  if (!window)
+    header = header || (w.off == h.headerOff && w.bytes.size() == h.headerLen);
+  }
+  // A compact map's range lies past map 1's slots; its header replaces map 1's.
+  if (!window || !header || (h.compact() && (h.rangeLo < L.virtualSize || !h.nRecs ||
+                                             h.rangeLo + h.rangeLen < h.rangeLo)))
     return false;
   auto it = std::lower_bound(maps.begin(), maps.end(), e.off,
                              [](const MapPlace& m, uint64_t v) { return m.seq < v; });
@@ -2954,12 +3143,14 @@ uint64_t ColdFill::freePlaceLocked(uint64_t len, uint64_t now, const InUseRecord
   for (size_t k = maps.size(); k-- > 0;) {
     const MapHead& h = maps[k].head;
     const uint64_t a = h.metaSeek, b = h.metaSeek + h.metaLen;
+    // What identifies the map in the in-use record: a compact map's addresses.
+    const uint64_t ia = h.compact() ? h.rangeLo : a, ib = h.compact() ? h.rangeLo + h.rangeLen : b;
     bool gone = false;
     if (k + 1 < maps.size()) { // replaced
-      const bool held = shownMapHeld(key.key, a, b);
-      gone = !held && !inUse.inUse(id, a, b, now, window);
+      const bool held = shownMapHeld(key.key, ia, ib);
+      gone = !held && !inUse.inUse(id, ia, ib, now, window);
       if (!gone) {
-        const uint64_t at = inUse.freeAtS(id, a, b, window);
+        const uint64_t at = inUse.freeAtS(id, ia, ib, window);
         retryS = std::min(retryS, held || at <= now ? now + InUseRecord::kHoldRefreshS : at);
       }
     }
@@ -3003,9 +3194,8 @@ std::shared_ptr<const ColdMap> ColdFill::mapBySeq(uint64_t seq) {
     h = it->head;
   }
   std::vector<uint8_t> rec;
-  if (!store || !store->readRecord(e, rec) ||
-      rec.size() != kMapHead + uint64_t(h.metaLen) + h.keysListLen) {
-    UCACHE_WARN("mixed map for %s failed its check; its handles are shown the slot layout",
+  if (!store || !store->readRecord(e, rec) || rec.size() != h.recordLen()) {
+    UCACHE_WARN("map for %s failed its check; its handles are shown the slot layout",
                 key.key.c_str());
     return nullptr;
   }
@@ -3013,9 +3203,37 @@ std::shared_ptr<const ColdMap> ColdFill::mapBySeq(uint64_t seq) {
   m->seq = seq;
   m->madeS = h.madeS;
   m->metaSeek = h.metaSeek;
-  m->meta.assign(rec.begin() + kMapHead, rec.begin() + kMapHead + h.metaLen);
+  size_t at = h.compact() ? kMapHead2 : kMapHead;
+  m->meta.assign(rec.begin() + at, rec.begin() + at + h.metaLen);
+  at += h.metaLen;
   m->keysListOff = h.keysListOff;
-  m->keysList.assign(rec.begin() + kMapHead + h.metaLen, rec.end());
+  m->keysList.assign(rec.begin() + at, rec.begin() + at + h.keysListLen);
+  at += h.keysListLen;
+  if (h.compact()) {
+    m->rangeLo = h.rangeLo;
+    m->rangeLen = h.rangeLen;
+    m->headerOff = h.headerOff;
+    m->header.assign(rec.begin() + at, rec.begin() + at + h.headerLen);
+    at += h.headerLen;
+    m->recs.resize(h.nRecs);
+    uint64_t off = 0;
+    for (auto& r : m->recs) {
+      const uint8_t* p = rec.data() + at;
+      std::memcpy(&r.slot, p, 4);
+      std::memcpy(&r.len, p + 4, 4);
+      std::memcpy(&r.crc, p + 8, 4);
+      r.kind = p[12];
+      std::memcpy(&r.storeOff, p + 16, 8);
+      r.off = off;
+      off += r.len;
+      at += kMapRecBytes;
+    }
+    if (off != h.rangeLen) {
+      UCACHE_WARN("compact map for %s does not add up; its handles are shown the slot layout",
+                  key.key.c_str());
+      return nullptr;
+    }
+  }
   std::lock_guard<std::mutex> g(mu);
   auto it = std::lower_bound(maps.begin(), maps.end(), seq,
                              [](const MapPlace& p, uint64_t v) { return p.seq < v; });
@@ -3093,6 +3311,148 @@ void ColdFill::queueMap(uint64_t delayMs) {
     commitPool().post(std::move(task));
 }
 
+bool ColdFill::compactValidLocked(size_t k, const InUseRecord& inUse, uint64_t now) const {
+  const MapHead& h = maps[k].head;
+  if (!h.compact())
+    return false;
+  if (k + 1 == maps.size())
+    return true; // the newest map is what new opens are shown
+  const uint64_t lo = h.rangeLo, hi = h.rangeLo + h.rangeLen;
+  return shownMapHeld(key.key, lo, hi) ||
+         inUse.inUse(store ? store->header().storeId : 0, lo, hi, now,
+                     globalConfig().inUseSeconds);
+}
+
+InUseRecord ColdFill::inUseSnapshot(uint64_t now) {
+  std::lock_guard<std::mutex> g(inUseMu);
+  if (!inUseCacheS || now >= inUseCacheS + 5) {
+    InUseRecord r;
+    if (auto cs = globalStore())
+      if (InUseRecord::load(RealIO::instance(),
+                            InUseRecord::path(cs->config().cacheDir, key.hashHex), r))
+        inUseCache = std::move(r);
+    inUseCacheS = now;
+  }
+  return inUseCache;
+}
+
+std::shared_ptr<const ColdMap> ColdFill::compactAt(uint64_t pos, bool& refused, uint64_t& upto) {
+  refused = false;
+  upto = UINT64_MAX;
+  const uint64_t now = wallSeconds();
+  const InUseRecord rec = inUseSnapshot(now);
+  uint64_t seq = 0;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    for (size_t k = 0; k < maps.size() && !seq && !refused; ++k) {
+      const MapHead& h = maps[k].head;
+      if (!h.compact())
+        continue;
+      if (pos >= h.rangeLo && pos < h.rangeLo + h.rangeLen) {
+        if (compactValidLocked(k, rec, now))
+          seq = maps[k].seq;
+        else
+          refused = true;
+      } else if (h.rangeLo > pos) {
+        upto = std::min(upto, h.rangeLo);
+      }
+    }
+  }
+  if (seq) {
+    auto m = mapBySeq(seq);
+    refused = !m; // valid, and its record unreadable: no other bytes are its
+    return m;
+  }
+  if (!refused)
+    for (const auto& r : rec.ranges) {
+      if (r.lo < L.virtualSize)
+        continue; // map 1's, or a mixed map's tree record
+      if (pos >= r.lo && pos < r.hi)
+        refused = true; // handed out, of a store or a map this process does not know
+      else if (r.lo > pos)
+        upto = std::min(upto, r.lo);
+    }
+  return nullptr;
+}
+
+const char* ColdFill::compactPlan(const std::vector<std::pair<uint32_t, uint32_t>>& real,
+                                  const InUseRecord& inUse, uint64_t now, ColdMap& m,
+                                  std::vector<std::pair<uint32_t, uint64_t>>& seeks) {
+  if (rnt || !store || !entry)
+    return "not a TTree run";
+  uint64_t base = std::max(L.virtualSize, inUse.highWater);
+  size_t valid = 0;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    for (size_t k = 0; k < maps.size(); ++k) {
+      const MapHead& h = maps[k].head;
+      if (!h.compact())
+        continue;
+      base = std::max(base, h.rangeLo + h.rangeLen);
+      valid += compactValidLocked(k, inUse, now) ? 1 : 0;
+    }
+    for (const auto& [i, n] : real) {
+      auto it = info.find(i);
+      if (it == info.end() || !it->second.inStore)
+        continue; // stated at its real length at its slot, as a mixed map does
+      const SlotEntry& e = it->second.e;
+      if (e.kind == SlotEntry::kKept) {
+        seeks.emplace_back(i, slot(i).origSeek); // the original, where the file has it
+        continue;
+      }
+      if ((e.kind != SlotEntry::kZstd && e.kind != SlotEntry::kRaw) || e.len != n)
+        continue;
+      ColdMap::Rec r;
+      r.slot = i;
+      r.len = e.len;
+      r.crc = e.crc;
+      r.kind = e.kind;
+      r.storeOff = e.off;
+      m.recs.push_back(r);
+    }
+  }
+  if (valid >= kMaxCompactMaps)
+    return "full";
+  if (m.recs.empty())
+    return "nothing converted";
+  { // Basket keys are 64-bit in every file ROOT writes today; a 32-bit one
+    // cannot state an address past 2 GiB, where the range lies.
+    SlotEntry e;
+    e.slot = m.recs[0].slot;
+    e.kind = m.recs[0].kind;
+    e.off = m.recs[0].storeOff;
+    e.len = m.recs[0].len;
+    e.crc = m.recs[0].crc;
+    uint8_t h[6];
+    if (!store->readHead(e, h, sizeof h) || ((h[4] << 8) | h[5]) <= 1000)
+      return "32-bit basket keys";
+  }
+  const uint64_t lo = (base + kCompactGuard + 4095) / 4096 * 4096;
+  uint64_t off = 0;
+  for (auto& r : m.recs) {
+    r.off = off;
+    seeks.emplace_back(r.slot, lo + off);
+    off += r.len;
+  }
+  std::sort(seeks.begin(), seeks.end());
+  m.rangeLo = lo;
+  m.rangeLen = off;
+  // Its header states its end, in the window map 1's header has.
+  std::vector<uint8_t> hdr(static_cast<size_t>(std::min<uint64_t>(L.originSize, 4096)));
+  if (!entry->hasRange(0, hdr.size()) ||
+      !entry->readCached(0, hdr.size(), reinterpret_cast<char*>(hdr.data()), /*account=*/false))
+    return "the file header is not cached";
+  std::string err;
+  if (!tp::headerWindowForEnd(hdr, m.end(), m.headerOff, m.header, err))
+    return "the file header is unreadable";
+  bool same = false;
+  for (const auto& w : L.windows)
+    same = same || (w.off == m.headerOff && w.bytes.size() == m.header.size());
+  if (!same)
+    return "the header cannot state the map's end where map 1's states its own";
+  return nullptr;
+}
+
 bool ColdFill::makeMap(bool atExit) try {
   std::lock_guard<std::mutex> mg(mapMu);
   // This process's records first, so the map covers them.
@@ -3148,14 +3508,37 @@ bool ColdFill::makeMap(bool atExit) try {
     return impossible("the relocated tree record does not decode");
   std::string err;
   std::vector<uint8_t> meta;
-  if (!tp::stateRealLengths(blob, *f, nSlots(),
-                            [this](uint32_t i) -> const tp::FillSlot& { return slot(i); }, real,
-                            err) ||
+  const std::function<const tp::FillSlot&(uint32_t)> slotOf =
+      [this](uint32_t i) -> const tp::FillSlot& { return slot(i); };
+  // A compact map when the file allows one: the converted baskets back to back
+  // in a range of its own, each the exact record committed now; the baskets
+  // kept as stored at their original place; the rest where map 1 has them.
+  auto m = std::make_shared<ColdMap>();
+  std::vector<std::pair<uint32_t, uint64_t>> seeks;
+  InUseRecord inUseNow;
+  if (auto cs = globalStore())
+    InUseRecord::load(RealIO::instance(), InUseRecord::path(cs->config().cacheDir, key.hashHex),
+                      inUseNow);
+  if (const char* why = compactPlan(real, inUseNow, now, *m, seeks)) {
+    m = std::make_shared<ColdMap>(); // a mixed map instead
+    seeks.clear();
+    if (std::strcmp(why, "full") == 0) {
+      std::lock_guard<std::mutex> g(mu);
+      mapsFullUntilS = now + InUseRecord::kHoldRefreshS;
+      if (auto cs = globalStore())
+        cs->stats().slotMapFull.fetch_add(1, std::memory_order_relaxed);
+      UCACHE_INFO("no room for another compact map of %s: %zu in use; new opens are shown the "
+                  "slot layout",
+                  key.key.c_str(), kMaxCompactMaps);
+      return false;
+    }
+  }
+  if (!tp::stateRealLengths(blob, *f, nSlots(), slotOf, real, err) ||
+      (!seeks.empty() && !tp::stateSeeks(blob, *f, nSlots(), slotOf, seeks, err)) ||
       !tp::mapMetaRecord(L, blob, tables.first, meta, err))
     return impossible(err);
   std::vector<uint8_t>().swap(blob);
 
-  auto m = std::make_shared<ColdMap>();
   MapHead head;
   bool busy = false, full = false;
   SlotEntry made;
@@ -3181,6 +3564,16 @@ bool ColdFill::makeMap(bool atExit) try {
         std::lock_guard<std::mutex> g(mu);
         if (!maps.empty() && maps.back().head.covered >= covered)
           return false;
+        // The range was chosen before this lock: still past every range
+        // handed out, and every map's (another process may have made one)?
+        if (m->compact()) {
+          bool clear = inUse.highWater + kCompactGuard <= m->rangeLo;
+          for (const auto& p : maps)
+            clear = clear && (!p.head.compact() ||
+                              p.head.rangeLo + p.head.rangeLen + kCompactGuard <= m->rangeLo);
+          if (!clear)
+            return false;
+        }
         uint64_t retryS = 0;
         const uint64_t seek = freePlaceLocked(meta.size(), now, inUse, retryS);
         if (!seek) {
@@ -3203,6 +3596,13 @@ bool ColdFill::makeMap(bool atExit) try {
         head.metaSeek = seek;
         head.keysListOff = kl.off;
         head.covered = covered;
+        if (m->compact()) {
+          head.rangeLo = m->rangeLo;
+          head.rangeLen = m->rangeLen;
+          head.headerOff = m->headerOff;
+          head.headerLen = static_cast<uint32_t>(m->header.size());
+          head.nRecs = static_cast<uint32_t>(m->recs.size());
+        }
         m->madeS = now;
         m->metaSeek = seek;
         m->meta = std::move(meta);
@@ -3210,7 +3610,7 @@ bool ColdFill::makeMap(bool atExit) try {
         m->keysList = std::move(kl.bytes);
         r.slot = SlotEntry::kMapBit;
         r.kind = SlotEntry::kMap;
-        r.bytes = encodeMapRecord(head, m->meta, m->keysList);
+        r.bytes = encodeMapRecord(head, m->meta, m->keysList, m->compact() ? m.get() : nullptr);
         return true;
       },
       globalConfig().fsync != FsyncMode::kOff, made);
@@ -3248,8 +3648,13 @@ bool ColdFill::makeMap(bool atExit) try {
     cs->stats().slotMapsMade.fetch_add(1, std::memory_order_relaxed);
     cs->noteStoredBytes(static_cast<uint64_t>(n));
   }
-  UCACHE_INFO("mixed map for %s: %zu baskets at their real length (%.1f MiB)", key.key.c_str(),
-              real.size(), covered / 1048576.0);
+  if (m->compact())
+    UCACHE_INFO("compact map for %s: %zu baskets in [%llu, %llu) (%.1f MiB)", key.key.c_str(),
+                m->recs.size(), static_cast<unsigned long long>(m->rangeLo),
+                static_cast<unsigned long long>(m->end()), m->rangeLen / 1048576.0);
+  else
+    UCACHE_INFO("mixed map for %s: %zu baskets at their real length (%.1f MiB)", key.key.c_str(),
+                real.size(), covered / 1048576.0);
   return true;
 } catch (const std::exception& e) {
   UCACHE_WARN("mixed map for %s not made (%s)", key.key.c_str(), e.what());
@@ -3508,6 +3913,17 @@ void coldAfterForkChild() {
 }
 
 uint64_t coldVirtualSize(const ColdFill& cf) { return cf.L.virtualSize; }
+uint64_t coldShownSize(const ColdFill& cf, const ColdMap* map) {
+  return map && map->compact() ? map->end() : cf.L.virtualSize;
+}
+uint64_t coldAddressEnd(ColdFill& cf) {
+  uint64_t end = cf.L.virtualSize;
+  std::lock_guard<std::mutex> g(cf.mu);
+  for (const auto& m : cf.maps)
+    if (m.head.compact())
+      end = std::max(end, m.head.rangeLo + m.head.rangeLen);
+  return end;
+}
 uint64_t coldLayoutHash(const ColdFill& cf) { return cf.store->header().layoutHash; }
 
 std::shared_ptr<const ColdMap> coldPickMap(const std::shared_ptr<ColdFill>& cf) {
@@ -3515,15 +3931,24 @@ std::shared_ptr<const ColdMap> coldPickMap(const std::shared_ptr<ColdFill>& cf) 
     return nullptr;
   cf->sync(); // maps made since the run was set up (never waits)
   uint64_t seq = 0;
-  bool due;
+  bool due, outOfMaps;
   {
     std::lock_guard<std::mutex> g(cf->mu);
     if (!cf->maps.empty())
       seq = cf->maps.back().seq;
-    due = cf->mapDueLocked(wallSeconds(), false) == 0;
+    const uint64_t now = wallSeconds();
+    const int64_t at = cf->mapDueLocked(now, false);
+    due = at == 0;
+    // What was converted since the newest map is worth a map, and none can
+    // be made (as many compact maps are in use as may be): the slot layout,
+    // which states everything converted, rather than an outdated map.
+    outOfMaps = at > 0 && cf->mapsFullUntilS > now && !cf->maps.empty() &&
+                cf->maps.back().head.compact();
   }
   if (due) // for later opens: this one is shown what exists now
     cf->queueMap(0);
+  if (outOfMaps)
+    return nullptr;
   auto m = seq ? cf->mapBySeq(seq) : nullptr;
   if (m) {
     noteShownMap(cf->key.key, m);
@@ -3545,10 +3970,55 @@ bool coldPrepare(ColdFill& cf, uint64_t off, uint64_t len) {
   return cf.slots.prepareRanges({{off, len}});
 }
 
+namespace {
+// The records compact maps state in [a, b), in address order: f(record's
+// address, record, its slot) until f returns false. False when a map there
+// cannot be read or its slots decoded.
+bool forCompactRecords(ColdFill& cf, uint64_t a, uint64_t b,
+                       const std::function<bool(uint64_t, const ColdMap::Rec&,
+                                                const tp::FillSlot&)>& f) {
+  std::vector<uint64_t> seqs;
+  {
+    std::lock_guard<std::mutex> g(cf.mu);
+    for (const auto& m : cf.maps)
+      if (m.head.compact() && m.head.rangeLo < b && a < m.head.rangeLo + m.head.rangeLen)
+        seqs.push_back(m.seq);
+  }
+  for (uint64_t seq : seqs) {
+    auto m = cf.mapBySeq(seq);
+    if (!m)
+      return false;
+    const auto& R = m->recs;
+    auto it = std::upper_bound(R.begin(), R.end(), a > m->rangeLo ? a - m->rangeLo : 0,
+                               [](uint64_t v, const ColdMap::Rec& r) { return v < r.off; });
+    if (it != R.begin())
+      --it;
+    std::vector<uint32_t> idx;
+    for (auto j = it; j != R.end() && m->rangeLo + j->off < b; ++j)
+      idx.push_back(j->slot);
+    if (!cf.slots.prepareSlots(idx))
+      return false;
+    for (; it != R.end() && m->rangeLo + it->off < b; ++it)
+      if (m->rangeLo + it->off + it->len > a && !f(m->rangeLo + it->off, *it, cf.slot(it->slot)))
+        return true;
+  }
+  return true;
+}
+} // namespace
+
 void coldOriginRanges(ColdFill& cf, uint64_t off, uint64_t len,
                       std::vector<std::pair<uint64_t, uint64_t>>& out, const ColdMap* map) {
   const tp::FillLayout& L = cf.L;
   const uint64_t end = off + len;
+  if (end > L.virtualSize) { // a compact map's records are their baskets
+    forCompactRecords(cf, std::max(off, L.virtualSize), end,
+                      [&out](uint64_t, const ColdMap::Rec&, const tp::FillSlot& s) {
+                        out.emplace_back(s.origSeek, s.origLen);
+                        return true;
+                      });
+    if (off >= L.virtualSize)
+      return;
+  }
   if (off < L.originSize)
     out.emplace_back(off, std::min(end, L.originSize) - off);
   const uint64_t metaEnd = L.metaSeek + L.metaRecord.size();
@@ -3565,6 +4035,24 @@ void coldOriginRanges(ColdFill& cf, uint64_t off, uint64_t len,
 
 bool coldExactOriginRanges(ColdFill& cf, uint64_t off, uint64_t len,
                            std::vector<std::pair<uint64_t, uint64_t>>& out, const ColdMap* map) {
+  if (off + len > cf.L.virtualSize) {
+    // Past map 1's slots: a compact map's record read whole is its basket; a
+    // guard carries nothing; part of a record has no original offset.
+    const uint64_t a = std::max(off, cf.L.virtualSize), b = off + len;
+    bool whole = true;
+    if (!forCompactRecords(cf, a, b,
+                           [&](uint64_t at, const ColdMap::Rec& r, const tp::FillSlot& s) {
+                             if (at < a || at + r.len > b)
+                               return whole = false;
+                             out.emplace_back(s.origSeek, s.origLen);
+                             return true;
+                           }) ||
+        !whole)
+      return false;
+    if (off >= cf.L.virtualSize)
+      return true;
+    len = cf.L.virtualSize - off;
+  }
   const tp::SlotsIn in = [&cf](uint64_t a, uint64_t b,
                               const std::function<bool(uint32_t, const tp::FillSlot&)>& f) {
     return cf.slots.forEach(a, b, f);

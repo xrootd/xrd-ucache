@@ -287,6 +287,35 @@ record:
 | 64 | | the tree record as served: the slot layout's tree key header, its `fNbytes` and `fSeekKey` set, then the tree record as ROOT-style ZSTD-1 chunks (never stored uncompressed: ROOT tells the two forms apart by the length the keys list states) |
 | … | | the keys-list window: the original keys list, its live tree entry pointing at this map's tree record |
 
+**Compact maps (magic `"UCSMAP02"`).** A map made by this release states the
+baskets converted when it was made back to back, at their record's length, in
+a range of its own, `[rangeLo, rangeLo + rangeLen)`. The range lies past the
+slot layout's end and past every range the file's in-use record has seen,
+behind a guard of 1 GiB that nothing is served at but zeros. A basket kept as
+stored is stated at its original place; one not converted when the map was
+made stays at its slot. Its header window states its end (`fEND`), the size a
+handle shown it is given. A read in the range is translated to the record the
+map names and served with that basket's `fSeekKey` set to the address read. A
+read in the range of a map no longer live is refused, logged and counted
+(`slot_map_refused`). Builds that know only `"UCSMAP01"` skip the entry. At
+most four are live at once; then new opens are shown the slot layout. A
+compact map is made only when the file's header can state its end where the
+slot layout's header states its own: on a small file whose header is 32-bit,
+only maps that end below 2 GiB are compact, and the rest are mixed. Its record
+is the same as above to offset 48, then:
+
+| offset | size | field |
+|---|---|---|
+| 48 | 8 | rangeLo u64 |
+| 56 | 8 | rangeLen u64 |
+| 64 | 8 | where the header window is served u64 |
+| 72 | 4 | header window length u32 |
+| 76 | 4 | records u32 |
+| 80 | 16 | zero |
+| 96 | | the tree record, then the keys-list window, as above |
+| … | | the header window |
+| … | 24 each | the records its range names, in address order: slot u32, length u32, CRC u32, kind u8, 3 zero bytes, store offset u64 |
+
 A map's tree record lies between the slot layout's relocated tree record and
 the first slot — the room the slot layout keeps there, the length of the tree
 record uncompressed — in a place no live map holds. A map is live while it is

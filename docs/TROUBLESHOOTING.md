@@ -375,6 +375,19 @@ their own words, because conflating them made healthy runs look broken:
   If failures persist for the same file and coverage never completes, report it
   with the branch name from the sweep's output.
 
+## `a read ... in the range of a map that is no longer valid ... fails`
+
+With `recompress = on`, a TTree file read again is shown a *map* that states
+its converted baskets in an address range of its own. A map replaced by a
+newer one stays readable while any process's handle holds it (an open handle
+keeps it, however long it is idle) and for `in_use_seconds` (default 1 day)
+after it was last used. A reader that comes back later with positions it
+learned from it -- kept after every handle that held the map was closed, or
+handed to another process -- gets this error instead of another basket's
+bytes. Open the file again: the new handle is shown the current map. If your
+jobs reuse positions longer than a day after closing the file, raise
+`in_use_seconds`; `ucache stats` counts these reads as `slot_map_refused`.
+
 ## Corruption / CRC
 
 Every cached page carries a CRC32C, verified on read; a mismatch quarantines that

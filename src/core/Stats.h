@@ -129,6 +129,7 @@ struct Stats {
   std::atomic<uint64_t> slotMapsMade{0};      // mixed maps this process made
   std::atomic<uint64_t> slotMapOpens{0};      // handles given a mixed map at open
   std::atomic<uint64_t> slotMapFull{0};       // maps not made: no free place for one
+  std::atomic<uint64_t> slotMapRefused{0};    // reads refused: in a map's range no longer valid
   std::atomic<uint64_t> slotCrcFailures{0};   // stored slot records that failed their check
   std::atomic<uint64_t> slotReadFallbacks{0}; // merged record reads that failed, read again one by one
   std::atomic<uint64_t> slotPagesDecoded{0};  // RNTuple pages decoded from their stored record to serve them

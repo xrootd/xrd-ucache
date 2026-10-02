@@ -251,6 +251,14 @@ bool stateRealLengths(std::vector<uint8_t>& blob, const FileMeta& fields, uint32
                       const std::function<const FillSlot&(uint32_t)>& slot,
                       const std::vector<std::pair<uint32_t, uint32_t>>& real, std::string& err);
 
+// State the addresses `seeks` = (slot, address) in the tree record `blob`:
+// each slot's basket's fBasketSeek. Lengths are stated by stateRealLengths;
+// call that first. `fields`, `nSlots`, `slot` as there. False (err set) when a
+// slot's basket is not where the layout put it.
+bool stateSeeks(std::vector<uint8_t>& blob, const FileMeta& fields, uint32_t nSlots,
+                const std::function<const FillSlot&(uint32_t)>& slot,
+                const std::vector<std::pair<uint32_t, uint64_t>>& seeks, std::string& err);
+
 // A map's metadata record for the tree record `blob`, placed at `seek`: map
 // 0's key header (same length, fNbytes and fSeekKey set), then `blob`
 // compressed ZSTD-1. Never raw: ROOT tells a raw record from a compressed one

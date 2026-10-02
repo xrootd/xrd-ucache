@@ -2112,8 +2112,13 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
     std::lock_guard<std::mutex> g(st_->mu);
     pickMap = !st_->coldMapChosen;
   }
-  if (pickMap)
+  if (pickMap) {
     coldMap = coldPickMap(cold);
+    // The size it is shown is its map's: ROOT takes a header whose fEND is
+    // past the file's size for a truncated file.
+    if (coldMap && coldMap->compact() && statClone)
+      statClone->SetSize(coldShownSize(*cold, coldMap.get()));
+  }
 #endif
   if (st_->store) {
     auto& stats = st_->store->stats();
@@ -2175,7 +2180,7 @@ uint64_t UCacheFile::shownSize() const {
     return st_->view->virtualSize();
 #ifdef UCACHE_HAVE_COLDRUN
   if (st_->cold)
-    return coldVirtualSize(*st_->cold);
+    return coldShownSize(*st_->cold, st_->coldMap.get());
 #endif
   return 0;
 }
@@ -2363,14 +2368,21 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
     // the origin cannot give that answer — a stitched file is LARGER than the
     // file the origin has, so the origin returns nothing and the caller sees
     // nread == 0. Clamp to the virtual size and serve what exists.
-    const uint64_t vsize = shownSize();
+    uint64_t vsize = shownSize();
+#ifdef UCACHE_HAVE_COLDRUN
+    // A read that starts past the handle's own end reads a position another
+    // handle was shown (a compact map's range): bounded by every address
+    // served. One that starts inside it ends at its end, as above.
+    if (cold && offset >= vsize)
+      vsize = std::max(vsize, coldAddressEnd(*cold));
+#endif
     const uint32_t served =
         offset >= vsize ? 0u : static_cast<uint32_t>(std::min<uint64_t>(size, vsize - offset));
     if (served == 0) { // at or past EOF, or a zero-length request: 0 bytes, not an error
       complete(handler, okStatus(), chunkResponse(offset, 0, buffer));
       return XRootDStatus();
     }
-    if (!st_->copyGuard.allow(entry->fileSize(), vsize, offset, size))
+    if (!st_->copyGuard.allow(entry->fileSize(), shownSize(), offset, size))
       return refuseCopy(st_);
     auto st = st_;
     ChunkList one;
@@ -2798,11 +2810,11 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
   if (cold) {
     // Cold-run entry: whole vector served on the executor. A chunk outside the
     // layout cannot be relayed -- the origin does not have this layout.
-    const uint64_t vsize = coldVirtualSize(*cold);
+    const uint64_t vsize = coldAddressEnd(*cold);
     for (const auto& c : chunks)
       if (c.offset + c.length < c.offset || c.offset + c.length > vsize)
         return XRootDStatus(XrdCl::stError, XrdCl::errInvalidArgs);
-    if (!guardAllowsChunks(st_, entry->fileSize(), vsize, chunks))
+    if (!guardAllowsChunks(st_, entry->fileSize(), shownSize(), chunks))
       return refuseCopy(st_);
     auto st = st_;
     noteVectorRequest(st_, chunks);
