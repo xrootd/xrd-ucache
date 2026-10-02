@@ -61,6 +61,9 @@ TEST(Stats, JsonBodyHasAllCounters) {
   s.reqReadBytes.add(4096);
   s.hitReadSize.add(4096);
   s.slotCrcFailures = 2;
+  s.coldOriginFailures = 6;
+  s.slotReadFallbacks = 4;
+  s.slotPagesDecoded = 5;
   s.keptReads = 3;
   s.poolTasks = 11;
   s.poolQueueHighWater = 7;
@@ -80,6 +83,9 @@ TEST(Stats, JsonBodyHasAllCounters) {
   EXPECT_NE(j.find("\"slot_map_opens\":6"), std::string::npos);
   EXPECT_NE(j.find("\"slot_map_full\":0"), std::string::npos);
   EXPECT_NE(j.find("\"slot_crc_failures\":2"), std::string::npos);
+  EXPECT_NE(j.find("\"slot_read_fallbacks\":4"), std::string::npos);
+  EXPECT_NE(j.find("\"cold_origin_failures\":6"), std::string::npos);
+  EXPECT_NE(j.find("\"slot_pages_decoded\":5"), std::string::npos);
   EXPECT_NE(j.find("\"kept_reads\":3"), std::string::npos);
   EXPECT_NE(j.find("\"kept_read_bytes\":0"), std::string::npos);
   EXPECT_NE(j.find("\"pool_tasks\":11"), std::string::npos);

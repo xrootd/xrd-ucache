@@ -17,4 +17,10 @@ XrdCl::XRootDStatus* okStatus();
 XrdCl::AnyObject* chunkResponse(uint64_t off, uint32_t len, void* buf);
 XrdCl::AnyObject* vreadResponse(const XrdCl::ChunkList& chunks);
 
+// Test-only wire-read fault (UCACHE_TEST_READ_FAIL_N, inert unless set): true
+// for the process's first N origin reads the cache issues -- byte-cache misses
+// and first-pass fetches alike -- which then complete with errConnectionError
+// instead of being sent. One relaxed load when unset.
+bool readFaultFire();
+
 } // namespace ucache

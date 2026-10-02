@@ -530,10 +530,10 @@ bool SlotStore::readRecord(const SlotEntry& e, std::vector<uint8_t>& out) {
   return recordCrc(hdr_.storeId, e.slot, out.data(), out.size()) == e.crc;
 }
 
-void SlotStore::readRecords(const std::vector<SlotEntry>& es,
-                            std::vector<std::vector<uint8_t>>& out, std::vector<char>& ok,
-                            uint64_t maxRun, uint64_t maxGap,
-                            const std::function<void(uint64_t, uint64_t)>& onRead) {
+uint64_t SlotStore::readRecords(const std::vector<SlotEntry>& es,
+                                std::vector<std::vector<uint8_t>>& out, std::vector<char>& ok,
+                                uint64_t maxRun, uint64_t maxGap,
+                                const std::function<void(uint64_t, uint64_t)>& onRead) {
   const size_t n = es.size();
   out.assign(n, {});
   ok.assign(n, 0);
@@ -558,6 +558,7 @@ void SlotStore::readRecords(const std::vector<SlotEntry>& es,
   };
   std::unique_ptr<uint8_t[]> buf; // not zero-filled: every byte used is read first
   uint64_t bufLen = 0;
+  uint64_t fellBack = 0;
   for (size_t k = 0; k < ord.size();) {
     const SlotEntry& first = es[ord[k]];
     const uint64_t start = first.off;
@@ -584,6 +585,8 @@ void SlotStore::readRecords(const std::vector<SlotEntry>& es,
     const bool got = timed(len, [&] {
       return io_.preadFull(fd_, buf.get(), len, start) == static_cast<int64_t>(len);
     });
+    if (!got)
+      ++fellBack;
     for (size_t m = k; m < j; ++m) {
       const size_t i = ord[m];
       const SlotEntry& e = es[i];
@@ -599,6 +602,7 @@ void SlotStore::readRecords(const std::vector<SlotEntry>& es,
     }
     k = j;
   }
+  return fellBack;
 }
 
 bool SlotStore::readBlob(std::vector<uint8_t>& out) {

@@ -125,10 +125,13 @@ struct Stats {
   std::atomic<uint64_t> coldReplicaConvertUs{0};        // time spent converting, summed over threads
   std::atomic<uint64_t> coldReplicaDeclined{0};  // replicas not published (no room, or failed)
   std::atomic<uint64_t> coldReplicaSkipped{0};   // files whose own content declined the first pass
+  std::atomic<uint64_t> coldOriginFailures{0};   // first-pass origin reads that failed (each asked again)
   std::atomic<uint64_t> slotMapsMade{0};      // mixed maps this process made
   std::atomic<uint64_t> slotMapOpens{0};      // handles given a mixed map at open
   std::atomic<uint64_t> slotMapFull{0};       // maps not made: no free place for one
   std::atomic<uint64_t> slotCrcFailures{0};   // stored slot records that failed their check
+  std::atomic<uint64_t> slotReadFallbacks{0}; // merged record reads that failed, read again one by one
+  std::atomic<uint64_t> slotPagesDecoded{0};  // RNTuple pages decoded from their stored record to serve them
   std::atomic<uint64_t> keptReads{0};         // kept-as-stored baskets read from the byte cache
   std::atomic<uint64_t> keptReadBytes{0};     //   ... and their bytes
   // The serving pool (the executor every read is posted to): tasks run, time

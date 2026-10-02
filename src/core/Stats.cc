@@ -118,10 +118,13 @@ std::string Stats::toJsonBody() const {
   f("cold_replica_convert_us", coldReplicaConvertUs);
   f("cold_replica_declined", coldReplicaDeclined);
   f("cold_replica_skipped", coldReplicaSkipped);
+  f("cold_origin_failures", coldOriginFailures);
   f("slot_maps_made", slotMapsMade);
   f("slot_map_opens", slotMapOpens);
   f("slot_map_full", slotMapFull);
   f("slot_crc_failures", slotCrcFailures);
+  f("slot_read_fallbacks", slotReadFallbacks);
+  f("slot_pages_decoded", slotPagesDecoded);
   f("kept_reads", keptReads);
   f("kept_read_bytes", keptReadBytes);
   f("pool_tasks", poolTasks);

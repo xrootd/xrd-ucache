@@ -655,7 +655,7 @@ TEST(SlotStoreReads, NeighboursAreReadInOneGoEachAsItself) {
   Reads r;
   // Asked in a different order from the store's: the answer follows the asking.
   std::vector<SlotEntry> ask = {out[3], out[0], out[4], out[1], out[2]};
-  s->readRecords(ask, got, ok, 1 << 20, 0, r.fn());
+  EXPECT_EQ(s->readRecords(ask, got, ok, 1 << 20, 0, r.fn()), 0u);
   EXPECT_EQ(r.n, 1);
   for (size_t i = 0; i < ask.size(); ++i) {
     ASSERT_TRUE(ok[i]) << i;
@@ -701,7 +701,7 @@ TEST(SlotStoreReads, AFailedRunIsReadAgainOneRecordAtATime) {
   std::vector<std::vector<uint8_t>> got;
   std::vector<char> ok;
   Reads r;
-  s->readRecords(out, got, ok, 1 << 20, 0, r.fn());
+  EXPECT_EQ(s->readRecords(out, got, ok, 1 << 20, 0, r.fn()), 1u); // one run fell back
   EXPECT_EQ(r.n, 4); // the failed run, then one read per record
   for (int i = 0; i < 3; ++i)
     EXPECT_TRUE(ok[i]) << i;

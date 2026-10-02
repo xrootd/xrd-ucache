@@ -67,9 +67,10 @@ the consumers together.
  "replica_bytes_served": 0,
  "cold_replica_files": 0, "cold_replica_in_bytes": 0, "cold_replica_out_bytes": 0,
  "cold_replica_baskets": 0, "cold_replica_baskets_kept": 0, "cold_replica_convert_us": 0,
- "cold_replica_declined": 0, "cold_replica_skipped": 0,
+ "cold_replica_declined": 0, "cold_replica_skipped": 0, "cold_origin_failures": 0,
  "slot_maps_made": 0, "slot_map_opens": 0, "slot_map_full": 0,
- "slot_crc_failures": 0, "kept_reads": 0, "kept_read_bytes": 0,
+ "slot_crc_failures": 0, "slot_read_fallbacks": 0, "slot_pages_decoded": 0,
+ "kept_reads": 0, "kept_read_bytes": 0,
  "pool_tasks": 0, "pool_busy_us": 0, "pool_queue_high_water": 0,
  "replica_reads": 0, "replica_read_bytes": 0,
  "relay_bytes": 0,
@@ -208,6 +209,10 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   log says which), the store was removed meanwhile, or the process already held
   its limit of records waiting to be written. They were served to the job that
   read them; a later read converts them again.
+- `cold_origin_failures` — origin reads sent on the first pass that failed. The
+  request is served again from the start, twice at most, so a read the origin
+  fails once or twice is answered; a third failure in a row reaches the reader,
+  as it would without the cache. Nonzero means origin trouble during the pass.
 - `cold_replica_skipped` — files whose first pass was declined by what the file
   itself holds: baskets in a codec `recompress_codecs` does not name, baskets
   stored uncompressed, or a structure the first pass cannot lay out. Such a
@@ -231,6 +236,13 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
 - `slot_crc_failures` — records read from a slot store that failed their check
   (damage on the cache disk, or a torn write): each is dropped and converted
   again from the origin, and the read that met it is served again.
+- `slot_read_fallbacks` — reads of neighbouring stored records (joined into one
+  read of at most 1 MiB) that failed or came back short, and were read again one
+  record at a time. Nonzero means a cache disk returning errors.
+- `slot_pages_decoded` — RNTuple pages decoded from their stored record to be
+  served. A page converted for the request that asked for it is served from the
+  conversion's own decoded copy and is not counted, so a first pass counts here
+  only pages it finds already stored; a later pass counts every page it serves.
 - `kept_reads` / `kept_read_bytes` — reads of baskets a slot store keeps as
   stored, served from the byte cache's copy of the original. They are not in
   `hit_disk_reads` (that counts the byte tier's own serving).

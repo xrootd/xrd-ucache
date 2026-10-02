@@ -136,6 +136,20 @@ const MapTiming& mapTiming() {
   return t;
 }
 
+// UCACHE_TEST_COMMIT_FAIL_N=N (inert unless set): the process's first N
+// slot-store commits fail with EIO, as a write the cache disk refused, so a
+// gate can show what a failed commit costs: nothing a reader sees, and the
+// records are converted again by a later pass.
+bool commitFaultFire() {
+  static std::atomic<int> budget{[] {
+    const char* v = std::getenv("UCACHE_TEST_COMMIT_FAIL_N");
+    return v ? std::atoi(v) : 0;
+  }()};
+  if (budget.load(std::memory_order_relaxed) <= 0)
+    return false;
+  return budget.fetch_sub(1, std::memory_order_relaxed) > 0;
+}
+
 // A map's record in the store: this head, then its tree record as served,
 // then its keys-list window. Made once, never rebuilt: another build could
 // compress the tree record into other bytes.
@@ -1374,6 +1388,8 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
     std::vector<uint8_t> raw;
     const uint8_t* page = rec->data();
     if (rec->size() != pageLen) {
+      if (auto cs = globalStore())
+        cs->stats().slotPagesDecoded.fetch_add(1, std::memory_order_relaxed);
       raw = tp::decompressFrames(rec->data(), rec->size(), pageLen);
       if (raw.size() != pageLen) {
         cf.forget(i);
@@ -1452,7 +1468,7 @@ void ColdRequest::readStoredTogether(std::unordered_map<uint32_t, ColdFill::Wher
   Stats* stats = st->store ? &st->store->stats() : nullptr;
   std::vector<std::vector<uint8_t>> got;
   std::vector<char> ok;
-  cf->store->readRecords(es, got, ok, kStoredRunBytes, kStoredRunGap,
+  const uint64_t fellBack = cf->store->readRecords(es, got, ok, kStoredRunBytes, kStoredRunGap,
                          [stats](uint64_t us, uint64_t bytes) {
                            if (!stats)
                              return;
@@ -1461,6 +1477,8 @@ void ColdRequest::readStoredTogether(std::unordered_map<uint32_t, ColdFill::Wher
                            stats->replicaReadSize.add(bytes);
                            stats->slotReadUs.add(us);
                          });
+  if (stats && fellBack)
+    stats->slotReadFallbacks.fetch_add(fellBack, std::memory_order_relaxed);
   for (size_t i = 0; i < es.size(); ++i) {
     if (!ok[i])
       continue; // copySlot reads it alone, and drops it if it fails again
@@ -1503,6 +1521,13 @@ void ColdRequest::finish() {
     for (uint32_t i : claimed)
       if (!std::binary_search(done.begin(), done.end(), i))
         cf->abandon(i);
+    // Served again from the start, as a request whose slot fell through is
+    // (requests that waited on this fetch do the same): a read the origin
+    // failed once is asked for once more, as the plain miss path relays it.
+    if (attempt < 2) {
+      again(false);
+      return;
+    }
     XRootDStatus s;
     {
       std::lock_guard<std::mutex> g(emu);
@@ -1776,6 +1801,8 @@ class PartHandler : public ResponseHandler {
     std::unique_ptr<AnyObject> r(response);
     std::unique_ptr<HostList> h(hostList);
     if (!s || !s->IsOK()) {
+      if (req_->st->store)
+        req_->st->store->stats().coldOriginFailures.fetch_add(1, std::memory_order_relaxed);
       req_->fail(s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal));
       req_->done();
       delete this;
@@ -1891,10 +1918,19 @@ void issuePart(const std::shared_ptr<ColdRequest>& req, std::vector<PartItem> it
     return;
   }
   auto* h = new PartHandler(req, std::move(items), std::move(wire));
-  XRootDStatus s = f->VectorRead(chunks, nullptr, h, 0);
+  XRootDStatus s;
+  if (readFaultFire()) // test hook: the origin's vector read dies mid-stream
+    Executor::instance().post([h] {
+      h->HandleResponseWithHosts(new XRootDStatus(XrdCl::stError, XrdCl::errConnectionError),
+                                 nullptr, nullptr);
+    });
+  else
+    s = f->VectorRead(chunks, nullptr, h, 0);
   if (!s.IsOK()) {
     delete h;
     req->st->releaseInner();
+    if (req->st->store)
+      req->st->store->stats().coldOriginFailures.fetch_add(1, std::memory_order_relaxed);
     req->fail(s);
     req->done();
   }
@@ -2632,14 +2668,16 @@ void ColdFill::commit() try {
     }
   }
   std::vector<SlotEntry> committed;
-  const int64_t n = store->commit(
-      recs, [this](const std::vector<SlotEntry>& es) { apply(es); },
-      [this](uint32_t slot) {
-        std::lock_guard<std::mutex> g(mu);
-        auto it = info.find(slot);
-        return it != info.end() && it->second.inStore;
-      },
-      globalConfig().fsync != FsyncMode::kOff, committed);
+  int64_t n = -EIO; // test hook: the commit's write refused
+  if (!commitFaultFire())
+    n = store->commit(
+        recs, [this](const std::vector<SlotEntry>& es) { apply(es); },
+        [this](uint32_t slot) {
+          std::lock_guard<std::mutex> g(mu);
+          auto it = info.find(slot);
+          return it != info.end() && it->second.inStore;
+        },
+        globalConfig().fsync != FsyncMode::kOff, committed);
   if (n == -ESTALE) {
     // Dropped or replaced (evicted, removed, another build's): this process
     // keeps serving what it holds, and commits nothing more to it.

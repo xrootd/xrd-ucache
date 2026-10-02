@@ -55,6 +55,20 @@ static_assert(XrdCl::errConnectionError == 108 && XrdCl::errErrorResponse == 400
 static_assert(kXR_ItExists == 3018 && kXR_Overloaded == 3024,
               "kXR wire codes drifted from OpenRetry.cc");
 
+// Test-only wire-read fault (PluginSupport.h): the origin dying mid-stream
+// after a healthy open, so the fail-open contract -- the reader still gets the
+// exact bytes -- can be tested deterministically. The relay pass-through and
+// every other inner operation are untouched. Sibling of UCACHE_TEST_OPEN_FAIL_N.
+bool readFaultFire() {
+  static std::atomic<int> budget{[] {
+    const char* v = ::getenv("UCACHE_TEST_READ_FAIL_N");
+    return v ? ::atoi(v) : 0;
+  }()};
+  if (budget.load(std::memory_order_relaxed) <= 0)
+    return false; // production fast path: one relaxed load
+  return budget.fetch_sub(1, std::memory_order_relaxed) > 0;
+}
+
 namespace {
 
 // ---- Test-only open fault injection (inert unless armed) -------------------
@@ -90,23 +104,6 @@ std::string rewritePortTo1(const std::string& url) {
 std::string faultOpenUrl(const std::string& url, int attempt) {
   int n = openFaultFirstN();
   return (n > 0 && attempt <= n) ? rewritePortTo1(url) : url;
-}
-
-// ---- Test-only wire-read fault injection (inert unless armed) --------------
-// UCACHE_TEST_READ_FAIL_N=N: the process's first N rounded wire reads (the
-// miss machinery's inner Read/VectorRead) complete with errConnectionError
-// instead of being issued — the origin dying mid-stream AFTER a healthy open.
-// The relay pass-through and every other inner op are untouched, so the §5.2
-// step-5 fail-open contract (the user still gets the exact bytes) is testable
-// deterministically. Sibling of UCACHE_TEST_OPEN_FAIL_N above.
-bool readFaultFire() {
-  static std::atomic<int> budget{[] {
-    const char* v = ::getenv("UCACHE_TEST_READ_FAIL_N");
-    return v ? ::atoi(v) : 0;
-  }()};
-  if (budget.load(std::memory_order_relaxed) <= 0)
-    return false; // production fast path: one relaxed load
-  return budget.fetch_sub(1, std::memory_order_relaxed) > 0;
 }
 
 // ---- Case A: retrying open handler -----------------------------------------

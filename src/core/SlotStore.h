@@ -187,8 +187,9 @@ class SlotStore {
   // short is read again one record at a time, so only the records that fail on
   // their own are lost. `out[i]` / `ok[i]` answer `es[i]`; a kept entry
   // (no bytes here) is never read. `onRead(us, bytes)` is called once per
-  // pread made, for the caller's counters.
-  void readRecords(const std::vector<SlotEntry>& es, std::vector<std::vector<uint8_t>>& out,
+  // pread made, for the caller's counters. Returns the number of runs read
+  // again one record at a time.
+  uint64_t readRecords(const std::vector<SlotEntry>& es, std::vector<std::vector<uint8_t>>& out,
                    std::vector<char>& ok, uint64_t maxRun, uint64_t maxGap,
                    const std::function<void(uint64_t us, uint64_t bytes)>& onRead = {});
 
