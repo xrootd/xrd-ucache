@@ -69,6 +69,8 @@ the consumers together.
  "cold_replica_baskets": 0, "cold_replica_baskets_kept": 0, "cold_replica_convert_us": 0,
  "cold_replica_declined": 0, "cold_replica_skipped": 0,
  "slot_maps_made": 0, "slot_map_opens": 0, "slot_map_full": 0,
+ "slot_crc_failures": 0, "kept_reads": 0, "kept_read_bytes": 0,
+ "pool_tasks": 0, "pool_busy_us": 0, "pool_queue_high_water": 0,
  "replica_reads": 0, "replica_read_bytes": 0,
  "relay_bytes": 0,
  "readv_chunks": 0, "readv_calls": 0, "readv_mixed": 0,
@@ -80,6 +82,7 @@ the consumers together.
  "hist_flush_write_us": [..], "hist_meta_flush_us": [..],
  "hist_req_read_bytes": [..], "hist_hit_read_bytes": [..],
  "hist_replica_read_bytes": [..],
+ "hist_slot_read_us": [..], "hist_cold_request_us": [..], "hist_pool_queue_us": [..],
  "entries": [{"key": "root://host:1094/path", "file_size": 0,
               "cached_bytes": 0, "page_size": 4096}]}
 ```
@@ -225,6 +228,21 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
 - `slot_map_full` — maps not made because there was no place for one: the
   baskets converted since the newest map are read at their slot's size until
   a place frees (`map_expiry_seconds` after the map that replaced the oldest).
+- `slot_crc_failures` — records read from a slot store that failed their check
+  (damage on the cache disk, or a torn write): each is dropped and converted
+  again from the origin, and the read that met it is served again.
+- `kept_reads` / `kept_read_bytes` — reads of baskets a slot store keeps as
+  stored, served from the byte cache's copy of the original. They are not in
+  `hit_disk_reads` (that counts the byte tier's own serving).
+- `hist_slot_read_us` — time to read and check one stored slot record.
+- `hist_cold_request_us` — a request served in the first-pass layout, from its
+  arrival to the answer handed to the reader, retries included: what a reader
+  waits for on the first pass.
+- `pool_tasks`, `pool_busy_us`, `pool_queue_high_water`, `hist_pool_queue_us` —
+  the serving pool, the threads every read is posted to: tasks it ran, time
+  its threads spent running them, the most tasks waiting at once, and how long
+  each waited before a thread took it. A long queue wait with the threads busy
+  the whole time means the pool, not the disk or the origin, sets the pace.
 
 Records a job reads from a slot store count in `replica_bytes_served` (and
 their reads from the cache disk in `replica_reads` / `replica_read_bytes`);

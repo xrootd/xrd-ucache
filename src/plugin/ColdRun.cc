@@ -1284,10 +1284,22 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
       cf.forget(i);
       return false;
     }
+    if (auto cs = globalStore()) { // not counted by readCached (account=false)
+      cs->stats().keptReads.fetch_add(1, std::memory_order_relaxed);
+      cs->stats().keptReadBytes.fetch_add(fs.origLen, std::memory_order_relaxed);
+    }
     rec = buf;
   } else if (!rec) {
     auto buf = std::make_shared<std::vector<uint8_t>>();
-    if (!w.inStore || !cf.store->readRecord(w.e, *buf)) {
+    const uint64_t t0 = nowUs();
+    const bool ok = w.inStore && cf.store->readRecord(w.e, *buf);
+    if (auto cs = globalStore()) {
+      if (w.inStore)
+        cs->stats().slotReadUs.add(nowUs() - t0);
+      if (!ok)
+        cs->stats().slotCrcFailures.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!ok) {
       UCACHE_WARN("slot record for %s (slot %u) failed its check; converting it again",
                   cf.key.key.c_str(), i);
       cf.forget(i);
@@ -1364,6 +1376,11 @@ void ColdRequest::again(bool mayParkAgain) {
 }
 
 void ColdRequest::finish() {
+  // Arrival (t0, kept across retries) to the answer handed to the reader.
+  auto answered = [this] {
+    if (st->store && t0)
+      st->store->stats().coldRequestUs.add(nowUs() - t0);
+  };
   if (failed.load()) {
     // Give back the claims this request still holds -- those it never staged.
     // A slot it staged may have been dropped and claimed by another request
@@ -1386,6 +1403,7 @@ void ColdRequest::finish() {
     // errors, and a pass-through handle would send the origin offsets that
     // exist only in the layout this reader was shown. The origin's error goes
     // to the reader, as it would have without the cache.
+    answered();
     complete(user, new XRootDStatus(s), nullptr);
     return;
   }
@@ -1418,6 +1436,7 @@ void ColdRequest::finish() {
       again(false);
       return;
     }
+    answered();
     complete(user, new XRootDStatus(XrdCl::stError, XrdCl::errDataError), nullptr);
     return;
   }
@@ -1456,6 +1475,7 @@ void ColdRequest::finish() {
   }
   entry->noteActivity();
   st->noteCacheOk();
+  answered();
   if (isVRead)
     complete(user, okStatus(), vreadResponse(chunks));
   else

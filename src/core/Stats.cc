@@ -121,6 +121,12 @@ std::string Stats::toJsonBody() const {
   f("slot_maps_made", slotMapsMade);
   f("slot_map_opens", slotMapOpens);
   f("slot_map_full", slotMapFull);
+  f("slot_crc_failures", slotCrcFailures);
+  f("kept_reads", keptReads);
+  f("kept_read_bytes", keptReadBytes);
+  f("pool_tasks", poolTasks);
+  f("pool_busy_us", poolBusyUs);
+  f("pool_queue_high_water", poolQueueHighWater);
   f("replica_reads", replicaReads);
   f("replica_read_bytes", replicaReadBytes);
   f("relay_bytes", relayBytes);
@@ -145,6 +151,9 @@ std::string Stats::toJsonBody() const {
   os << "\"hist_req_read_bytes\":" << reqReadBytes.toJson() << ',';
   os << "\"hist_hit_read_bytes\":" << hitReadSize.toJson() << ',';
   os << "\"hist_replica_read_bytes\":" << replicaReadSize.toJson() << ',';
+  os << "\"hist_slot_read_us\":" << slotReadUs.toJson() << ',';
+  os << "\"hist_cold_request_us\":" << coldRequestUs.toJson() << ',';
+  os << "\"hist_pool_queue_us\":" << poolQueueUs.toJson() << ',';
   os << "\"hist_relay_rt_us\":" << relayRtUs.toJson();
   return os.str();
 }

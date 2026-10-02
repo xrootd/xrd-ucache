@@ -128,6 +128,14 @@ struct Stats {
   std::atomic<uint64_t> slotMapsMade{0};      // mixed maps this process made
   std::atomic<uint64_t> slotMapOpens{0};      // handles given a mixed map at open
   std::atomic<uint64_t> slotMapFull{0};       // maps not made: no free place for one
+  std::atomic<uint64_t> slotCrcFailures{0};   // stored slot records that failed their check
+  std::atomic<uint64_t> keptReads{0};         // kept-as-stored baskets read from the byte cache
+  std::atomic<uint64_t> keptReadBytes{0};     //   ... and their bytes
+  // The serving pool (the executor every read is posted to): tasks run, time
+  // its threads spent running them, and the most tasks waiting at once.
+  std::atomic<uint64_t> poolTasks{0};
+  std::atomic<uint64_t> poolBusyUs{0};
+  std::atomic<uint64_t> poolQueueHighWater{0};
   std::atomic<uint64_t> replicaReads{0};      // physical .tdata preads (one per
                                               // coalesced run of overlay pages, so
                                               // re-reads of a page count again — the
@@ -208,6 +216,9 @@ struct Stats {
   Histogram reqReadBytes;     // per request arriving at the plugin (Read, readv chunk)
   Histogram hitReadSize;      // per byte-tier pread
   Histogram replicaReadSize;  // per replica-tier pread
+  Histogram slotReadUs;       // per stored slot record read (pread and check)
+  Histogram coldRequestUs;    // per first-pass request, arrival to answer
+  Histogram poolQueueUs;      // per serving-pool task, time waiting in the queue
 
   // Set once at store init when `trace = io`; null = off.
   // Not dumped; carried here so every path that has Stats& can trace.

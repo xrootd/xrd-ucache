@@ -26,6 +26,8 @@
 
 namespace ucache {
 
+struct Stats;
+
 class Executor {
  public:
   explicit Executor(unsigned threads);
@@ -44,6 +46,10 @@ class Executor {
   static Executor& instance(unsigned threads = 0);
   // The number of worker threads this executor runs.
   unsigned threads() const { return threads_; }
+  // Account the tasks this executor runs in `s` (its pool_* counters and the
+  // queue-wait histogram) from now on; null stops. `s` must outlive the
+  // executor (the store's counters are leaked with it).
+  void setStats(Stats* s) { stats_.store(s, std::memory_order_release); }
 
   // The current fork generation: 0 in the process that loaded the plugin, one
   // more in each forked child. Other process-wide state keyed on it rebuilds
@@ -59,6 +65,7 @@ class Executor {
 
   const unsigned threads_;
   std::atomic<Core*> core_{nullptr};
+  std::atomic<Stats*> stats_{nullptr};
 };
 
 } // namespace ucache

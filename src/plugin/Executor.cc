@@ -1,5 +1,6 @@
 #include "Executor.h"
 
+#include "Stats.h"
 #include "UsableCpus.h"
 
 #include <algorithm>
@@ -36,16 +37,24 @@ std::mutex& buildMu() {
 // One fork generation's pool. Its threads capture the core, never the
 // Executor, so a core outlives nothing it depends on.
 struct Executor::Core {
-  Core(unsigned threads, uint64_t gen) : gen(gen) {
+  Core(unsigned threads, uint64_t gen, const std::atomic<Stats*>* stats)
+      : gen(gen), stats(stats) {
     for (unsigned i = 0; i < threads; ++i)
       std::thread([this] { loop(); }).detach(); // leaked with the core; see header
     std::thread([this] { timerLoop(); }).detach(); // one dedicated timer thread
   }
 
   void post(std::function<void()> task) {
+    Stats* s = stats->load(std::memory_order_acquire);
     {
       std::lock_guard<std::mutex> g(mu);
-      queue.push_back(std::move(task));
+      queue.push_back(Task{std::move(task), s ? nowNs() : 0});
+      if (s) {
+        const uint64_t n = queue.size();
+        uint64_t hw = s->poolQueueHighWater.load(std::memory_order_relaxed);
+        while (n > hw && !s->poolQueueHighWater.compare_exchange_weak(hw, n, std::memory_order_relaxed)) {
+        }
+      }
     }
     cv.notify_one();
   }
@@ -61,14 +70,21 @@ struct Executor::Core {
 
   void loop() {
     for (;;) {
-      std::function<void()> task;
+      Task task;
       {
         std::unique_lock<std::mutex> lk(mu);
         cv.wait(lk, [this] { return !queue.empty(); });
         task = std::move(queue.front());
         queue.pop_front();
       }
-      task(); // tasks must not throw (no exceptions cross the ABI)
+      Stats* s = task.postedNs ? stats->load(std::memory_order_acquire) : nullptr;
+      const uint64_t start = s ? nowNs() : 0;
+      task.fn(); // tasks must not throw (no exceptions cross the ABI)
+      if (s) {
+        s->poolQueueUs.add((start - task.postedNs) / 1000);
+        s->poolBusyUs.fetch_add((nowNs() - start) / 1000, std::memory_order_relaxed);
+        s->poolTasks.fetch_add(1, std::memory_order_relaxed);
+      }
     }
   }
 
@@ -94,10 +110,15 @@ struct Executor::Core {
     }
   }
 
+  struct Task {
+    std::function<void()> fn;
+    uint64_t postedNs = 0; // 0: not accounted (no stats when it was posted)
+  };
   const uint64_t gen;
+  const std::atomic<Stats*>* const stats; // the Executor's; it is never destroyed
   std::mutex mu;
   std::condition_variable cv;
-  std::deque<std::function<void()>> queue;
+  std::deque<Task> queue;
 
   // Delayed dispatch: one timer thread drains a min-deadline queue and forwards
   // due tasks to post(). Separate lock so scheduling never contends the work
@@ -129,7 +150,7 @@ Executor::Core* Executor::core() {
     return c;
   // The previous generation's core is left as it is: in a child, nothing
   // runs it and nothing may destroy it (its tasks capture the parent's state).
-  c = new Core(threads_, gen);
+  c = new Core(threads_, gen, &stats_);
   core_.store(c, std::memory_order_release);
   return c;
 }

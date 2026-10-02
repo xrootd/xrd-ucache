@@ -309,6 +309,8 @@ void initGlobals() {
           : std::make_shared<CacheStore>(RealIO::instance(), *gConfig));
   Executor::instance(static_cast<unsigned>(
       gConfig->threads > 0 ? gConfig->threads : 0));
+  if (*gStore)
+    Executor::instance().setStats(&(*gStore)->stats());
   if (*gStore && gConfig->metaFlushSeconds > 0)
     scheduleCheckpoint();
   ::atexit([] {

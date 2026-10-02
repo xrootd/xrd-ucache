@@ -60,6 +60,11 @@ TEST(Stats, JsonBodyHasAllCounters) {
   s.slotMapOpens = 6;
   s.reqReadBytes.add(4096);
   s.hitReadSize.add(4096);
+  s.slotCrcFailures = 2;
+  s.keptReads = 3;
+  s.poolTasks = 11;
+  s.poolQueueHighWater = 7;
+  s.coldRequestUs.add(1000); // bucket 9
   std::string j = "{" + s.toJsonBody() + "}";
   // Spot-check names and values (schema is docs/STATS.md, and is relied on).
   EXPECT_NE(j.find("\"opens\":3"), std::string::npos);
@@ -74,6 +79,15 @@ TEST(Stats, JsonBodyHasAllCounters) {
   EXPECT_NE(j.find("\"slot_maps_made\":5"), std::string::npos);
   EXPECT_NE(j.find("\"slot_map_opens\":6"), std::string::npos);
   EXPECT_NE(j.find("\"slot_map_full\":0"), std::string::npos);
+  EXPECT_NE(j.find("\"slot_crc_failures\":2"), std::string::npos);
+  EXPECT_NE(j.find("\"kept_reads\":3"), std::string::npos);
+  EXPECT_NE(j.find("\"kept_read_bytes\":0"), std::string::npos);
+  EXPECT_NE(j.find("\"pool_tasks\":11"), std::string::npos);
+  EXPECT_NE(j.find("\"pool_busy_us\":0"), std::string::npos);
+  EXPECT_NE(j.find("\"pool_queue_high_water\":7"), std::string::npos);
+  EXPECT_NE(j.find("\"hist_cold_request_us\":[0,0,0,0,0,0,0,0,0,1]"), std::string::npos);
+  EXPECT_NE(j.find("\"hist_slot_read_us\":[]"), std::string::npos);
+  EXPECT_NE(j.find("\"hist_pool_queue_us\":[]"), std::string::npos);
   EXPECT_NE(j.find("\"hist_hit_read_us\":[0,0,1]"), std::string::npos);
   // Read-shape surface: sizes are histogrammed in log2 BYTES (4096 => bucket 12).
   EXPECT_NE(j.find("\"replica_read_bytes\":65536"), std::string::npos);
