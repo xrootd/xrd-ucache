@@ -136,35 +136,36 @@ TEST(Config, MaxReadFraction) {
   }
 }
 
-// mixed_maps: on by default; map_expiry_seconds: 7 days, seconds >= 0 only.
-TEST(Config, MixedMaps) {
+// mixed_maps: on by default. in_use_seconds: 1 day, seconds >= 0 only (0 = no
+// protection); it replaces evict_protect_seconds and map_expiry_seconds.
+TEST(Config, MixedMapsAndTheInUseWindow) {
   EnvGuard g;
   {
     Config c = Config::fromEnv();
     EXPECT_TRUE(c.mixedMaps);
     EXPECT_EQ(c.valueOf("mixed_maps"), "on");
-    EXPECT_EQ(c.mapExpirySeconds, 604800);
-    EXPECT_EQ(c.valueOf("map_expiry_seconds"), "604800");
+    EXPECT_EQ(c.inUseSeconds, 86400u);
+    EXPECT_EQ(c.valueOf("in_use_seconds"), "86400");
   }
-  std::map<std::string, std::string> conf = {{"mixed_maps", "off"},
-                                             {"map_expiry_seconds", "3600"}};
+  std::map<std::string, std::string> conf = {{"mixed_maps", "off"}, {"in_use_seconds", "3600"}};
   {
     Config c = Config::fromEnv(&conf);
     EXPECT_FALSE(c.mixedMaps);
-    EXPECT_EQ(c.mapExpirySeconds, 3600);
+    EXPECT_EQ(c.inUseSeconds, 3600u);
     EXPECT_EQ(c.sources.at("mixed_maps"), "conf");
+    EXPECT_EQ(c.sources.at("in_use_seconds"), "conf");
   }
   ::setenv("UCACHE_MIXED_MAPS", "on", 1);
-  ::setenv("UCACHE_MAP_EXPIRY_S", "0", 1);
+  ::setenv("UCACHE_IN_USE_S", "0", 1);
   {
     Config c = Config::fromEnv(&conf);
     EXPECT_TRUE(c.mixedMaps) << "the per-job override wins";
-    EXPECT_EQ(c.mapExpirySeconds, 0);
+    EXPECT_EQ(c.inUseSeconds, 0u);
   }
-  for (const char* bad : {"-1", "abc", "", "10x"}) {
-    ::setenv("UCACHE_MAP_EXPIRY_S", bad, 1);
+  for (const char* bad : {"-1", "abc", "", "10x", "99999999999"}) {
+    ::setenv("UCACHE_IN_USE_S", bad, 1);
     Config c = Config::fromEnv(&conf);
-    EXPECT_EQ(c.mapExpirySeconds, 3600) << "'" << bad << "' is refused";
+    EXPECT_EQ(c.inUseSeconds, 3600u) << "'" << bad << "' is refused";
   }
 }
 
@@ -382,6 +383,33 @@ size_t countOf(const std::string& hay, const std::string& needle) {
   return n;
 }
 } // namespace
+
+// The two settings the window replaced are named, with the new one, wherever
+// they are still set -- and never applied.
+TEST(Config, TheOldWindowKeysAreNamed) {
+  EnvGuard g;
+  test::TempDir td;
+  const std::string log = td.path() + "/log.txt";
+  Log::configure("warn:" + log);
+  std::map<std::string, std::string> conf = {{"evict_protect_seconds", "60"},
+                                             {"map_expiry_seconds", "60"}};
+  ::setenv("UCACHE_EVICT_PROTECT_S", "60", 1);
+  ::setenv("UCACHE_MAP_EXPIRY_S", "60", 1);
+  Config c = Config::fromEnv(&conf);
+  Log::configure("warn");
+  const std::string all = slurp(log);
+  for (const char* k : {"evict_protect_seconds", "map_expiry_seconds"}) {
+    EXPECT_NE(all.find(std::string("'") + k + "' is no longer a setting"), std::string::npos) << all;
+    EXPECT_NE(Config::retiredReason(k), nullptr);
+    EXPECT_EQ(c.sources.count(k), 0u);
+    for (const auto& known : Config::knownKeys())
+      EXPECT_STRNE(known.key, k);
+  }
+  EXPECT_EQ(countOf(all, "UCACHE_EVICT_PROTECT_S is no longer used"), 1u);
+  EXPECT_EQ(countOf(all, "UCACHE_MAP_EXPIRY_S is no longer used"), 1u);
+  EXPECT_NE(all.find("in_use_seconds"), std::string::npos); // the reason names the new one
+  EXPECT_EQ(c.inUseSeconds, 86400u);                        // neither was applied
+}
 
 // A setting that no longer exists is named, with its reason, wherever it is
 // still set — never reported as a typo, never recorded as a source, never

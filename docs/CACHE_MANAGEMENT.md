@@ -187,8 +187,11 @@ not have to schedule anything. There are two ways to bound growth:
 ### A running job will not evict its own data
 
 Whichever limit is in force, an entry is **not** an eviction candidate while it
-was read within `evict_protect_seconds` (default **1 day**). Data untouched for
-longer — an earlier, finished piece of work — is what gets given up first.
+is in use: read within `in_use_seconds` (default **1 day**), or its replica's
+maps handed to a reader within that time (serving a replica does not move the
+byte cache's read time, so each file's in-use record under `<dir>/inuse/` says
+when). Data untouched for longer — an earlier, finished piece of work — is what
+gets given up first.
 
 This matters when the cache is smaller than what a job reads. Plain LRU is at its
 worst on a repeated sequential pass: the entry it picks to evict is precisely the
@@ -203,15 +206,17 @@ Reads keep working — they just go to the origin, uncached. `ucache status` say
 in its `protected` line, and `ucache stats` counts it as `admissions_bypassed`:
 
 ```
-protected : 1204 entries (118.2 GiB) read within the last 1d — ALL of them, and the
+protected : 1204 entries (118.2 GiB) used within the last 1d — ALL of them, and the
             disk is at the floor, so NEW FILES ARE NOT BEING CACHED.
-            `ucache evict --older-than <dur>`, or lower evict_protect_seconds
+            `ucache evict --older-than <dur>`, or lower in_use_seconds
 ```
 
 Three ways out, in the order usually worth trying: give the cache a bigger disk;
 free space explicitly with `ucache evict --older-than 2h`; or shorten the window
-with `ucache set evict_protect_seconds 3600`. Setting it to `0` restores plain
-LRU, including its behaviour on the pass above.
+with `ucache set in_use_seconds 3600`. Setting it to `0` restores plain LRU,
+including its behaviour on the pass above. The same window governs how long a
+replaced replica map keeps its place for readers that still hold it, so a
+shorter window also lets those places be reused sooner.
 
 The window is a *duration*, so size it to how often the work repeats rather than
 to how long one job runs. A day suits work rerun daily. Two cautions: a single

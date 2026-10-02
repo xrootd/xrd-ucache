@@ -12,6 +12,7 @@
 #include "UsableCpus.h"
 #endif
 #include "PluginSupport.h"
+#include "InUse.h"
 #include "ReaderWait.h"
 #include "ReadRounding.h"
 #include "ReadRule.h"
@@ -110,8 +111,9 @@ int g_cmtPending = 0;
 constexpr uint64_t kMapMinBytes = 8ull << 20;
 constexpr uint64_t kMapShare = 20;
 // Only a few maps fit the space the layout keeps for them (about four for a
-// NanoAOD file), and a map another may still use is kept for
-// `map_expiry_seconds` after a newer one is made. So maps are made rarely: not
+// NanoAOD file), and a map another may still use keeps its place while a
+// handle holds it and for `in_use_seconds` after its last use (InUse.h). So
+// maps are made rarely: not
 // while anyone is still converting the file (nothing committed for this long),
 // and after the first, at most one an hour.
 // The last handle of a file closed: its map is made a moment after (2 s),
@@ -477,6 +479,9 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   // Wall seconds of the last slot committed after this run was set up: by
   // this process, and by another one (0: none).
   uint64_t lastOwnS = 0, lastForeignS = 0;
+  // When this process last noted a range of this file in its in-use record
+  // (InUse.h): first address -> (hand-out, hold), wall seconds.
+  std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> inUseNoted;
   bool loaded = false;          // the entries found at set-up are in
   std::atomic<bool> mapQueued{false};
   std::mutex mapMu;             // one map made at a time in this process; guards mapFields
@@ -494,7 +499,8 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   // hold. Before them all, else after them all, else between: a newer map
   // states more and is a little longer, so it fits where an older one lay only
   // together with the room next to it.
-  uint64_t freePlaceLocked(uint64_t len, uint64_t now, uint64_t& retryS) const;
+  uint64_t freePlaceLocked(uint64_t len, uint64_t now, const InUseRecord& inUse,
+                           uint64_t& retryS) const;
   // The map whose entry lies at `seq`, read once. Null when it cannot be read.
   std::shared_ptr<const ColdMap> mapBySeq(uint64_t seq);
   // The tables area as any handle reads it: the newest map lying at `pos`,
@@ -613,6 +619,30 @@ std::shared_ptr<const ColdMap> shownMapAt(const std::string& key, uint64_t pos, 
       gone = true;
     }
   return nullptr;
+}
+// Does a handle of this process hold a map of `key` whose tree record overlaps
+// [a, b)?
+bool shownMapHeld(const std::string& key, uint64_t a, uint64_t b) {
+  std::lock_guard<std::mutex> g(g_shownMu);
+  auto it = shownMap().find(key);
+  if (it == shownMap().end())
+    return false;
+  for (const auto& m : it->second.maps)
+    if (m.seek < b && a < m.seek + m.len && !m.map.expired())
+      return true;
+  return false;
+}
+// The tree-record ranges of the maps this process showed `key` in; `held`:
+// only those a handle still holds.
+std::vector<std::pair<uint64_t, uint64_t>> shownMapRanges(const std::string& key, bool held) {
+  std::vector<std::pair<uint64_t, uint64_t>> out;
+  std::lock_guard<std::mutex> g(g_shownMu);
+  auto it = shownMap().find(key);
+  if (it != shownMap().end())
+    for (const auto& m : it->second.maps)
+      if (!held || !m.map.expired())
+        out.emplace_back(m.seek, m.seek + m.len);
+  return out;
 }
 // The parameters of the slot layout this process showed `key` in, if any.
 bool shownSlotParams(const std::string& key, uint32_t& slotFactor100, std::string& codecs) {
@@ -1097,10 +1127,19 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
     cf->codecs = cfg.recompressCodecs;
     cf->slotFactor100 = kSlotFactor100;
     // Rebuilding the layout this process already showed (its store is gone):
-    // with what it was computed with, not with today's settings.
+    // with what it was computed with, not with today's settings. Likewise a
+    // layout another process showed readers within `in_use_seconds` (its
+    // in-use record says how), so the positions they hold stay right.
+    InUseRecord rec;
     if (std::string shownCodecs; mode == AttachMode::kMatch &&
                                  shownSlotParams(key.key, cf->slotFactor100, shownCodecs))
       cf->codecs = splitCodecs(shownCodecs);
+    else if (InUseRecord::load(io, InUseRecord::path(cfg.cacheDir, key.hashHex), rec) &&
+             rec.hasSettings && rec.settings.layoutVersion == kLayoutVersion &&
+             !rec.expired(wallSeconds(), cfg.inUseSeconds)) {
+      cf->codecs = splitCodecs(rec.settings.codecs);
+      cf->slotFactor100 = rec.settings.slotFactor100;
+    }
     bool declined = false;
     const bool ok = computeLayout(*cf, src, size, cf->slotFactor100, declined);
     SlotStoreHeader want;
@@ -1937,6 +1976,58 @@ void issuePart(const std::shared_ptr<ColdRequest>& req, std::vector<PartItem> it
   }
 }
 
+// A range of the file's addresses noted in its in-use record (InUse.h), off
+// the reader's path: a map's metadata handed out to a reader (`kHandOut`, which
+// the handle then holds), a map an open handle of this process still holds
+// (`kHold`), or this process's last close of the file (`kRelease`: the window
+// counts from it). Hand-outs and holds are rate-limited per range; nothing
+// here can fail a read.
+enum class Use { kHandOut, kHold, kRelease };
+constexpr uint64_t kHandOutNoteS = 60;
+void noteUse(ColdFill& cf, uint64_t lo, uint64_t hi, Use u) {
+  auto cs = globalStore();
+  if (!cs || !cf.store || cf.store->header().declined)
+    return;
+  const uint64_t now = wallSeconds();
+  {
+    std::lock_guard<std::mutex> g(cf.mu);
+    auto& t = cf.inUseNoted[lo];
+    if (u == Use::kHandOut) {
+      if (t.first && now < t.first + kHandOutNoteS)
+        return;
+      t.first = now;
+    } else if (u == Use::kHold) {
+      if (t.second && now < t.second + InUseRecord::kHoldRefreshS)
+        return;
+      t.second = now;
+    }
+  }
+  const SlotStoreHeader& h = cf.store->header();
+  InUseRange r;
+  r.storeId = h.storeId;
+  r.lo = lo;
+  r.hi = hi;
+  // A hand-out is also this process's hold: the handle that read the metadata
+  // has the map now, and other processes must see that before the first
+  // refresh. A release removes this process's hold.
+  r.pid = static_cast<uint64_t>(::getpid());
+  if (u != Use::kRelease)
+    r.holdS = now;
+  if (u != Use::kHold)
+    r.lastS = now;
+  InUseSettings s{h.layoutVersion, h.slotFactor100, h.codecs};
+  const std::string path = InUseRecord::path(cs->config().cacheDir, cf.key.hashHex);
+  const uint64_t window = globalConfig().inUseSeconds;
+  if (u == Use::kRelease) { // at once: a map made right after (at exit) must see it
+    InUseRecord::note(RealIO::instance(), path, r, &s, window, /*release=*/true);
+    return;
+  }
+  Executor::instance().post(
+      [path, r, s, window] { InUseRecord::note(RealIO::instance(), path, r, &s, window); });
+}
+// Map 1, the slot layout itself: its slots.
+void noteSlotLayout(ColdFill& cf, Use u) { noteUse(cf, cf.L.slotsBegin, cf.L.virtualSize, u); }
+
 // Walk every chunk: answer what is here now, note what must be fetched.
 void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& need) {
   ColdFill& cf = *req->cf;
@@ -1946,6 +2037,10 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
   // of the layout's, its tree record in the tables area.
   const ColdMap* map = req->st->coldMap.get();
   coldPrepare(cf, req->chunks); // every branch the request touches, in one read
+  // Did the reader learn positions here: the layout's windows or tree record
+  // (map 1), or a mixed map's tree record (its range)? Noted after the walk.
+  bool layoutMeta = false;
+  uint64_t mapLo = 0, mapHi = 0;
   for (const auto& c : req->chunks) {
     char* base = static_cast<char*>(c.buffer);
     uint64_t pos = c.offset;
@@ -1966,6 +2061,7 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
             std::memcpy(d, src + (pos - w.off), n);
             pos += n;
             inWindow = true;
+            layoutMeta = true;
             break;
           }
           if (w.off > pos)
@@ -1985,6 +2081,7 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
         const uint64_t n = std::min(end, metaEnd) - pos;
         std::memcpy(d, L.metaRecord.data() + (pos - L.metaSeek), n);
         pos += n;
+        layoutMeta = true;
       } else if (pos < L.slotsBegin) {
         // The tables area: a map's tree record where one lies -- the handle's
         // own; else one this process showed, while a handle holds it (a read
@@ -2010,6 +2107,8 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
         if (at) {
           n = std::min<uint64_t>(n, at->metaSeek + at->meta.size() - pos);
           std::memcpy(d, at->meta.data() + (pos - at->metaSeek), n);
+          mapLo = at->metaSeek;
+          mapHi = at->metaSeek + at->meta.size();
         } else {
           if (map && pos < map->metaSeek)
             n = std::min<uint64_t>(n, map->metaSeek - pos);
@@ -2048,6 +2147,10 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
       }
     }
   }
+  if (layoutMeta)
+    noteSlotLayout(cf, Use::kHandOut);
+  if (mapHi)
+    noteUse(cf, mapLo, mapHi, Use::kHandOut);
 }
 
 void serveRequest(const std::shared_ptr<ColdRequest>& req) {
@@ -2838,26 +2941,33 @@ int64_t ColdFill::mapDueLocked(uint64_t now, bool atExit) const {
   return static_cast<int64_t>(at - now);
 }
 
-uint64_t ColdFill::freePlaceLocked(uint64_t len, uint64_t now, uint64_t& retryS) const {
-  // A map may still be read while no newer one has replaced it for longer
-  // than the expiry; a place a newer map took over went with it.
-  const uint64_t expiry = static_cast<uint64_t>(std::max(0, globalConfig().mapExpirySeconds));
+uint64_t ColdFill::freePlaceLocked(uint64_t len, uint64_t now, const InUseRecord& inUse,
+                                   uint64_t& retryS) const {
+  // A map replaced by a newer one keeps its place while it is in use: handed
+  // out or released within `in_use_seconds` by any process (the in-use
+  // record), or held by a handle of this one. A map nobody was handed frees
+  // at once; a place a newer map took over went with it.
+  const uint64_t window = globalConfig().inUseSeconds;
+  const uint64_t id = store ? store->header().storeId : 0;
   std::vector<std::pair<uint64_t, uint64_t>> live, newer;
-  uint64_t firstNewer = UINT64_MAX; // when the earliest newer map was made
   retryS = UINT64_MAX;
   for (size_t k = maps.size(); k-- > 0;) {
     const MapHead& h = maps[k].head;
     const uint64_t a = h.metaSeek, b = h.metaSeek + h.metaLen;
-    bool gone = firstNewer != UINT64_MAX && firstNewer + expiry <= now;
+    bool gone = false;
+    if (k + 1 < maps.size()) { // replaced
+      const bool held = shownMapHeld(key.key, a, b);
+      gone = !held && !inUse.inUse(id, a, b, now, window);
+      if (!gone) {
+        const uint64_t at = inUse.freeAtS(id, a, b, window);
+        retryS = std::min(retryS, held || at <= now ? now + InUseRecord::kHoldRefreshS : at);
+      }
+    }
     for (const auto& [x, y] : newer)
       gone = gone || (a < y && x < b);
-    if (!gone) {
+    if (!gone)
       live.emplace_back(a, b);
-      if (firstNewer != UINT64_MAX)
-        retryS = std::min(retryS, firstNewer + expiry);
-    }
     newer.emplace_back(a, b);
-    firstNewer = std::min(firstNewer, h.madeS);
   }
   const uint64_t end = std::min(tables.end, seekLimit == UINT64_MAX ? UINT64_MAX : seekLimit + len);
   if (end <= tables.first || end - tables.first < len)
@@ -3060,11 +3170,19 @@ bool ColdFill::makeMap(bool atExit) try {
         // would come too soon. Or someone made one already.
         if (busy && mapTiming().quietS > 0)
           return false;
+        // Which places readers may still use: read under the store's exclusive
+        // lock, which every placement holds (the store's lock, then the
+        // record's). A record that cannot be read leaves only this process's
+        // own knowledge.
+        InUseRecord inUse;
+        if (auto cs = globalStore())
+          InUseRecord::load(RealIO::instance(),
+                            InUseRecord::path(cs->config().cacheDir, key.hashHex), inUse);
         std::lock_guard<std::mutex> g(mu);
         if (!maps.empty() && maps.back().head.covered >= covered)
           return false;
         uint64_t retryS = 0;
-        const uint64_t seek = freePlaceLocked(meta.size(), now, retryS);
+        const uint64_t seek = freePlaceLocked(meta.size(), now, inUse, retryS);
         if (!seek) {
           full = true;
           // Nothing may free before then; if nothing ever will (the newest
@@ -3305,6 +3423,10 @@ void coldDetach(const std::shared_ptr<ColdFill>& cf) {
     }
   }
   if (last) {
+    // The window of what this process used counts from its last close.
+    noteSlotLayout(*cf, Use::kRelease);
+    for (const auto& [a, b] : shownMapRanges(cf->key.key, /*held=*/false))
+      noteUse(*cf, a, b, Use::kRelease);
     cf->queueCommit(); // what this process converted goes to the store now
     bool maps;
     {
@@ -3327,6 +3449,10 @@ void coldCheckpoint() {
   const uint64_t stalledUs = static_cast<uint64_t>(std::max(1, globalConfig().metaFlushSeconds)) * 1000000;
   for (const auto& cf : all) {
     cf->appendHeldOlderThan(stalledUs); // a request stalled this long gives up its records
+    // Still open here: the layout, and the maps a handle holds, are in use.
+    noteSlotLayout(*cf, Use::kHold);
+    for (const auto& [a, b] : shownMapRanges(cf->key.key, /*held=*/true))
+      noteUse(*cf, a, b, Use::kHold);
     cf->queueCommit();
     bool due;
     {

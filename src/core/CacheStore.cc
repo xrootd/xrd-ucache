@@ -1,4 +1,5 @@
 #include "CacheStore.h"
+#include "InUse.h"
 #include "SlotStore.h"
 
 #include "Log.h"
@@ -260,11 +261,11 @@ std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSi
       *declinedForSpace = true;
     stats_.admissionsBypassed.fetch_add(1, std::memory_order_relaxed);
     if (!blockedWarned_.exchange(true, std::memory_order_relaxed))
-      UCACHE_WARN("cache is full of entries read within the last %us, so new files are "
+      UCACHE_WARN("cache is full of entries used within the last %us, so new files are "
                   "no longer being cached (reads still work, uncached). Free space with "
-                  "`ucache evict --older-than <dur>`, lower `evict_protect_seconds`, or "
+                  "`ucache evict --older-than <dur>`, lower `in_use_seconds`, or "
                   "use a bigger cache disk",
-                  cfg_.evictProtectSeconds);
+                  cfg_.inUseSeconds);
     return nullptr; // NOT a fail-open: the caller must not count it as one
   }
 
@@ -480,6 +481,7 @@ std::vector<CacheStore::EntryInfo> CacheStore::listEntries(bool disk) {
   for (auto& s : scans) {
     EntryInfo e;
     e.key = std::move(s.key);
+    e.hashHex = s.hashHex;
     e.fileSize = s.fileSize;
     e.cachedBytes = s.cachedBytes;
     e.replicaBytes = s.replicaBytes;
@@ -495,6 +497,14 @@ std::vector<CacheStore::EntryInfo> CacheStore::listEntries(bool disk) {
     out.push_back(std::move(e));
   }
   return out;
+}
+
+bool CacheStore::mapsInUse(const std::string& hashHex, uint64_t nowS) const {
+  if (!cfg_.inUseSeconds)
+    return false;
+  InUseRecord r;
+  return InUseRecord::load(io_, InUseRecord::path(cfg_.cacheDir, hashHex), r) &&
+         !r.expired(nowS, cfg_.inUseSeconds);
 }
 
 int CacheStore::evictNow() {
@@ -558,14 +568,15 @@ int CacheStore::evictNow() {
     return false;
   };
 
-  // Entries read within this window are not candidates, so a running analysis
-  // cannot evict its own working set. The cutoff is computed ONCE per pass: a
-  // per-entry `now` would let entries read during the pass drift across the
-  // boundary and make the decision depend on how long the scan took.
+  // Entries read within this window, or whose maps were handed to a reader
+  // within it, are not candidates, so a running analysis cannot evict its own
+  // working set. The cutoff is computed ONCE per pass: a per-entry `now` would
+  // let entries read during the pass drift across the boundary and make the
+  // decision depend on how long the scan took.
   const uint64_t passNow = nowS(); // file-local helper; one reading for the pass
   const uint64_t protectCutoff =
-      cfg_.evictProtectSeconds && passNow > cfg_.evictProtectSeconds
-          ? passNow - cfg_.evictProtectSeconds
+      cfg_.inUseSeconds && passNow > cfg_.inUseSeconds
+          ? passNow - cfg_.inUseSeconds
           : 0; // 0 => protect nothing (window off, or the clock is absurdly early)
   bool sawProtected = false;
 
@@ -582,6 +593,12 @@ int CacheStore::evictNow() {
         // Sorted oldest-first, so everything after this is protected too — but
         // keep scanning rather than breaking: a later entry may be unprotected if
         // atime resolution ties, and the loop is over an in-memory vector.
+        sawProtected = true;
+        continue;
+      }
+      // Read long ago, but its maps may be in use: serving a replica does not
+      // move the byte cache's read time.
+      if (protectCutoff && mapsInUse(s.hashHex, passNow)) {
         sawProtected = true;
         continue;
       }
@@ -620,6 +637,12 @@ int CacheStore::evictNow() {
                 static_cast<unsigned long long>(usage));
   }
   sweepReplicaOrphans();
+  // In-use records of files nobody used within the window (at most hourly per
+  // process: it lists a directory).
+  static std::atomic<uint64_t> lastInUseSweepS{0};
+  if (uint64_t last = lastInUseSweepS.load(std::memory_order_relaxed);
+      passNow >= last + 3600 && lastInUseSweepS.compare_exchange_strong(last, passNow))
+    InUseRecord::sweep(io_, cfg_.cacheDir, passNow, cfg_.inUseSeconds);
   // Growth stops when the budget is still exceeded AND the only thing standing in
   // the way is the protection window. Deliberately NOT latched when the blocker is
   // the pinned/open set: that case predates this window, is handled by the
@@ -630,7 +653,7 @@ int CacheStore::evictNow() {
   if (needEvict() && sawProtected)
     UCACHE_INFO("eviction: over budget with every candidate inside the %us protection "
                 "window — new entries will not be admitted until one ages out",
-                cfg_.evictProtectSeconds);
+                cfg_.inUseSeconds);
   // Reconcile the per-process running estimate to the authoritative scan total,
   // and record whether this pass made progress (drives the over-budget bypass).
   approxUsage_.store(usage, std::memory_order_relaxed);

@@ -86,6 +86,9 @@ class CacheStore {
   // so it has stopped growing. Latched by evictNow() and cleared there as soon as
   // a victim becomes eligible again. Reported by `status` and `doctor`.
   bool admissionBlocked() const { return admissionBlocked_.load(std::memory_order_relaxed); }
+  // Were the entry's maps handed to a reader within `in_use_seconds` before
+  // nowS (InUse.h)? Always false with a window of 0 (no protection).
+  bool mapsInUse(const std::string& hashHex, uint64_t nowS) const;
 
   // Rate-limited high-water check; runs eviction when above.
   void maybeEvict();
@@ -102,6 +105,7 @@ class CacheStore {
   // One cached object as seen on disk, for the CLI `ls`/`status` (cold path).
   struct EntryInfo {
     std::string key;         // full normalized key
+    std::string hashHex;     // its object name
     uint64_t fileSize = 0;   // origin size
     uint64_t cachedBytes = 0;
     uint64_t replicaBytes = 0; // .tdata overlay + .slots size; 0 = none

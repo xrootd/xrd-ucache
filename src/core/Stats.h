@@ -75,7 +75,7 @@ struct Stats {
   std::atomic<uint64_t> evictedBytes{0};
   std::atomic<uint64_t> failopenEvents{0};
   // Entries NOT admitted because every resident entry was still inside the
-  // protection window (Config::evictProtectSeconds). Deliberately separate from
+  // protection window (Config::inUseSeconds). Deliberately separate from
   // failopenEvents: that counter means something went wrong, and the benchmark
   // acceptance triple requires it to be zero. This is a capacity decision, and
   // the reads it declines to cache still succeed.

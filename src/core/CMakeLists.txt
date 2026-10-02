@@ -7,6 +7,7 @@ add_library(ucache-core STATIC
   ReaderWait.cc
   Config.cc
   FileEntry.cc
+  InUse.cc
   IOBackend.cc
   Log.cc
   MetaFile.cc

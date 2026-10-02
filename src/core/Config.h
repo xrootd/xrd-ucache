@@ -48,16 +48,22 @@ struct Config {
                              // 0 = auto (min(50 GiB, 10% of total), clamped to
                              // <= half of free-at-init) when budgetAuto, else off.
   int evictCheckSeconds = 10; // UCACHE_EVICT_CHECK_S; eviction-check rate limit (0 = always)
-  // UCACHE_EVICT_PROTECT_S. An entry is not an eviction candidate while its last
-  // read is this recent, so a running analysis cannot evict its own working set
-  // — LRU is pessimal for a cyclic scan: with a cache smaller than the set, the
-  // victim it picks is exactly the entry wanted next, and the hit rate collapses
-  // toward zero instead of the C/W a policy that simply held still would get.
-  // Data untouched for longer than this — an earlier, finished study — stays the
-  // first thing given up, which is the point.
-  // When nothing is eligible, growth stops by DECLINING NEW ENTRIES rather than
-  // evicting a peer (see CacheStore::admissionBlocked). 0 = off, i.e. plain LRU.
-  uint32_t evictProtectSeconds = 86400;
+  // `in_use_seconds` (UCACHE_IN_USE_S): one window for what readers may still be
+  // using. An entry read within it, or whose maps were handed to a reader
+  // within it (InUse.h: serving a replica does not move the byte cache's read
+  // time), is not an eviction candidate, so a running analysis cannot evict
+  // its own working set -- LRU is pessimal for a cyclic scan: with a cache
+  // smaller than the set, the victim it picks is exactly the entry wanted
+  // next, and the hit rate collapses toward zero instead of the C/W a policy
+  // that simply held still would get. Data untouched for longer than this -- an
+  // earlier, finished study -- stays the first thing given up, which is the
+  // point. When nothing is eligible, growth stops by DECLINING NEW ENTRIES
+  // rather than evicting a peer (see CacheStore::admissionBlocked). A map
+  // replaced by a newer one keeps its place for the window after it was last
+  // used, for a reader that still holds its positions. 0 = no eviction
+  // protection (plain LRU), and a replaced map stays valid only while an open
+  // handle holds it.
+  uint32_t inUseSeconds = 86400;
   double highWater = 0.90;                // UCACHE_HIGH_WATER (fraction of maxBytes)
   double lowWater = 0.75;                 // UCACHE_LOW_WATER
   ValidateMode validate = ValidateMode::kSize; // UCACHE_VALIDATE
@@ -197,9 +203,6 @@ struct Config {
   // on other machines with caches of their own (uproot.dask with remote
   // workers).
   bool mixedMaps = true;                         // UCACHE_MIXED_MAPS
-  // `map_expiry_seconds`: a mixed map replaced by a newer one keeps its place
-  // this long, for a handle given it at open that reads the tree later.
-  int mapExpirySeconds = 604800;                 // UCACHE_MAP_EXPIRY_S (7 days)
   std::vector<std::string> recompressCodecs{"lzma", "zlib"}; // UCACHE_RECOMPRESS_CODECS
   // `recompress_reclaim`: what to punch from the v1 byte cache once
   // a valid replica exists. kSuperseded (default) frees only the ranges the

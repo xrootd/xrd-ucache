@@ -126,7 +126,7 @@ These are the counters to read first when something looks off. `crc_failures`,
 not to cache, and says the cache is under pressure rather than broken.
 
 - `admissions_bypassed` — files NOT cached because every resident entry was
-  still inside the eviction protection window (`evict_protect_seconds`), so the
+  still inside the eviction protection window (`in_use_seconds`), so the
   cache had stopped growing rather than evict data a running job still needs.
   These reads SUCCEED, uncached. Deliberately separate from `failopen_events`:
   that counter means something went wrong, while this is a capacity decision. A
@@ -234,7 +234,8 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   `mixed_maps = off`, or an RNTuple file.
 - `slot_map_full` — maps not made because there was no place for one: the
   baskets converted since the newest map are read at their slot's size until
-  a place frees (`map_expiry_seconds` after the map that replaced the oldest).
+  a place frees: when no handle holds a replaced map and it has not been used
+  for `in_use_seconds`.
 - `slot_crc_failures` — records read from a slot store that failed their check
   (damage on the cache disk, or a torn write): each is dropped and converted
   again from the origin, and the read that met it is served again.

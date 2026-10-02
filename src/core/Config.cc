@@ -146,8 +146,16 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.lowWater = ::atof(v.c_str());
   else if (k == "evict_check_seconds")
     c.evictCheckSeconds = ::atoi(v.c_str());
-  else if (k == "evict_protect_seconds")
-    c.evictProtectSeconds = static_cast<uint32_t>(::atol(v.c_str()));
+  else if (k == "in_use_seconds") {
+    char* end = nullptr;
+    const long long n = std::strtoll(v.c_str(), &end, 10);
+    if (!v.empty() && end && *end == '\0' && n >= 0 && n <= UINT32_MAX) {
+      c.inUseSeconds = static_cast<uint32_t>(n);
+    } else {
+      UCACHE_WARN("%s: in_use_seconds=%s invalid (seconds, 0 or more); ignored", src, v.c_str());
+      return false;
+    }
+  }
   else if (k == "validate")
     setValidate(c, v);
   else if (k == "fsync")
@@ -208,17 +216,6 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.recompressKeepOriginals = truthy(v);
   else if (k == "mixed_maps")
     c.mixedMaps = !falsy(v); // default on; see Config.h
-  else if (k == "map_expiry_seconds") {
-    char* end = nullptr;
-    const long n = std::strtol(v.c_str(), &end, 10);
-    if (!v.empty() && end && *end == '\0' && n >= 0 && n <= INT_MAX) {
-      c.mapExpirySeconds = static_cast<int>(n);
-    } else {
-      UCACHE_WARN("%s: map_expiry_seconds=%s invalid (seconds, 0 or more); ignored", src,
-                  v.c_str());
-      return false;
-    }
-  }
   else if (k == "recompress_codecs")
     c.recompressCodecs = splitCommas(v);
   else if (k == "recompress_reclaim") {
@@ -394,7 +391,7 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"max_bytes", "UCACHE_MAX_BYTES"},
       {"min_free_bytes", "UCACHE_MIN_FREE_BYTES"},
       {"evict_check_seconds", "UCACHE_EVICT_CHECK_S"},
-      {"evict_protect_seconds", "UCACHE_EVICT_PROTECT_S"},
+      {"in_use_seconds", "UCACHE_IN_USE_S"},
       {"high_water", "UCACHE_HIGH_WATER"},
       {"low_water", "UCACHE_LOW_WATER"},
       {"validate", "UCACHE_VALIDATE"},
@@ -424,7 +421,6 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"recompress", "UCACHE_RECOMPRESS"},
       {"recompress_keep_originals", "UCACHE_RECOMPRESS_KEEP_ORIGINALS"},
       {"mixed_maps", "UCACHE_MIXED_MAPS"},
-      {"map_expiry_seconds", "UCACHE_MAP_EXPIRY_S"},
       {"recompress_codecs", "UCACHE_RECOMPRESS_CODECS"},
       {"recompress_reclaim", "UCACHE_RECOMPRESS_RECLAIM"},
       {"trace", "UCACHE_TRACE"},
@@ -439,6 +435,12 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
 
 const std::vector<Config::RetiredKey>& Config::retiredKeys() {
   static const std::vector<RetiredKey> kRetired = {
+      {"evict_protect_seconds", "UCACHE_EVICT_PROTECT_S",
+       "is now `in_use_seconds`: one window for how long after a reader last used a file it "
+       "stays protected from eviction and its replaced maps stay valid"},
+      {"map_expiry_seconds", "UCACHE_MAP_EXPIRY_S",
+       "is now `in_use_seconds`: one window for how long after a reader last used a file it "
+       "stays protected from eviction and its replaced maps stay valid"},
       {"recompress_drain_jobs", "UCACHE_RECOMPRESS_DRAIN_JOBS",
        "sized the background recompression worker, which no longer exists (a file's replica is "
        "created as a job first reads it, and `ucache recompress` builds what is already cached)"},
@@ -487,8 +489,8 @@ std::string Config::valueOf(const std::string& key) const {
     return minFreeBytes ? std::to_string(minFreeBytes) : std::string(budgetAuto ? "0 (auto)" : "0");
   if (key == "evict_check_seconds")
     return std::to_string(evictCheckSeconds);
-  if (key == "evict_protect_seconds")
-    return std::to_string(evictProtectSeconds);
+  if (key == "in_use_seconds")
+    return std::to_string(inUseSeconds);
   if (key == "high_water" || key == "low_water") {
     char buf[32];
     std::snprintf(buf, sizeof buf, "%.2f", key == "high_water" ? highWater : lowWater);
@@ -557,8 +559,6 @@ std::string Config::valueOf(const std::string& key) const {
     return onoff(recompressKeepOriginals);
   if (key == "mixed_maps")
     return onoff(mixedMaps);
-  if (key == "map_expiry_seconds")
-    return std::to_string(mapExpirySeconds);
   if (key == "recompress_codecs")
     return join(recompressCodecs);
   if (key == "recompress_reclaim")

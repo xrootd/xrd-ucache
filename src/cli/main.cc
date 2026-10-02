@@ -2144,14 +2144,15 @@ int cmdStatus(CacheStore& store, IOBackend& io) {
   // `status` is a separate process, and a state file would be one more thing to
   // keep in sync or expire.
   const uint64_t nowS = static_cast<uint64_t>(::time(nullptr));
-  const uint64_t protectCutoff = cfg.evictProtectSeconds && nowS > cfg.evictProtectSeconds
-                                     ? nowS - cfg.evictProtectSeconds
+  const uint64_t protectCutoff = cfg.inUseSeconds && nowS > cfg.inUseSeconds
+                                     ? nowS - cfg.inUseSeconds
                                      : 0;
   for (const auto& e : entries) {
     used += e.cachedBytes;
     if (e.pinned)
       ++pinned;
-    if (protectCutoff && e.atime >= protectCutoff && !e.pinned) {
+    if (protectCutoff && !e.pinned &&
+        (e.atime >= protectCutoff || store.mapsInUse(e.hashHex, nowS))) {
       ++protectedN;
       protectedBytes += e.cachedBytes + e.replicaBytes;
     }
@@ -2180,7 +2181,7 @@ int cmdStatus(CacheStore& store, IOBackend& io) {
                     human(cfg.minFreeBytes).c_str());
     }
   }
-  if (cfg.evictProtectSeconds) {
+  if (cfg.inUseSeconds) {
     uint64_t avail = 0, total = 0;
     const bool haveSpace =
         RealIO::instance().spaceInfo(cfg.cacheDir, avail, total) == 0 && total;
@@ -2189,17 +2190,17 @@ int cmdStatus(CacheStore& store, IOBackend& io) {
     // up, so the cache has stopped growing. Say what it means and how to undo it,
     // because a cache that has quietly stopped caching looks like a slow cache.
     if (atFloor && protectedN == entries.size() - pinned && !entries.empty())
-      std::printf("protected : %llu entries (%s) read within the last %s — ALL of them, "
+      std::printf("protected : %llu entries (%s) used within the last %s — ALL of them, "
                   "and the disk is at the floor, so NEW FILES ARE NOT BEING CACHED. "
-                  "`ucache evict --older-than <dur>`, or lower evict_protect_seconds\n",
+                  "`ucache evict --older-than <dur>`, or lower in_use_seconds\n",
                   static_cast<unsigned long long>(protectedN), human(protectedBytes).c_str(),
-                  humanAge(1, 1 + cfg.evictProtectSeconds).c_str());
+                  humanAge(1, 1 + cfg.inUseSeconds).c_str());
     else
-      std::printf("protected : %llu of %zu entries (%s) read within the last %s — not "
+      std::printf("protected : %llu of %zu entries (%s) used within the last %s — not "
                   "evictable, so a running job cannot evict its own working set\n",
                   static_cast<unsigned long long>(protectedN), entries.size(),
                   human(protectedBytes).c_str(),
-                  humanAge(1, 1 + cfg.evictProtectSeconds).c_str());
+                  humanAge(1, 1 + cfg.inUseSeconds).c_str());
   }
   std::printf("freshness : %s\n", freshnessSummary(cfg).c_str());
   std::printf("entries   : %zu (%llu pinned)\n", entries.size(), (unsigned long long)pinned);

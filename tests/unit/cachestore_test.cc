@@ -1,4 +1,5 @@
 #include "CacheStore.h"
+#include "InUse.h"
 #include "CpuCounters.h"
 #include "SlotStore.h"
 #include "testing/FaultIO.h"
@@ -86,7 +87,7 @@ TEST(CacheStore, UsageAndEviction) {
   // of them would be immune and nothing would be evicted. Turn the window off so
   // the test measures what it means to measure; the window has its own cases
   // below.
-  cfg.evictProtectSeconds = 0;
+  cfg.inUseSeconds = 0;
   CacheStore store(io, cfg);
 
   auto src = test::randomBytes(200 * 4096, 5); // 800 KB source
@@ -129,7 +130,7 @@ TEST(CacheStore, EvictNowFailsCleanlyWhenAnotherProcessHoldsLock) {
   // Orthogonal to the protection window: this case writes entries and evicts them
   // immediately, which the shipped 1-day window forbids by design. Turn it off so
   // the case still measures the budget/floor mechanics it was written for.
-  cfg.evictProtectSeconds = 0;
+  cfg.inUseSeconds = 0;
   cfg.maxBytes = 100000;
   CacheStore store(io, cfg);
   auto src = test::randomBytes(50 * 4096, 7);
@@ -160,7 +161,7 @@ TEST(CacheStore, EvictionSkipsPinned) {
   // Orthogonal to the protection window: this case writes entries and evicts them
   // immediately, which the shipped 1-day window forbids by design. Turn it off so
   // the case still measures the budget/floor mechanics it was written for.
-  cfg.evictProtectSeconds = 0;
+  cfg.inUseSeconds = 0;
   cfg.maxBytes = 100000;
   cfg.highWater = 0.5;
   cfg.lowWater = 0.1; // target 10 KB: below one entry -> wants to evict all
@@ -760,7 +761,7 @@ TEST(CacheStore, StatvfsFloorTriggersEvictionRespectingPins) {
   // Orthogonal to the protection window: this case writes entries and evicts them
   // immediately, which the shipped 1-day window forbids by design. Turn it off so
   // the case still measures the budget/floor mechanics it was written for.
-  cfg.evictProtectSeconds = 0;
+  cfg.inUseSeconds = 0;
   cfg.maxBytes = 100ull << 30; // huge: the byte trigger never fires
   cfg.minFreeBytes = 50ull << 30;
   cfg.evictCheckSeconds = 0;
@@ -915,7 +916,7 @@ TEST(CacheStore, DiskFloorEvictsWithByteBudgetDisabled) {
   // Orthogonal to the protection window: this case writes entries and evicts them
   // immediately, which the shipped 1-day window forbids by design. Turn it off so
   // the case still measures the budget/floor mechanics it was written for.
-  cfg.evictProtectSeconds = 0;
+  cfg.inUseSeconds = 0;
   cfg.maxBytes = 0;               // byte budget OFF
   cfg.minFreeBytes = 50ull << 30; // disk floor ON
   cfg.evictCheckSeconds = 0;
@@ -981,7 +982,7 @@ TEST(CacheStore, DiskFloorEvictsOnlyEnoughToClearFloor) {
   // Orthogonal to the protection window: this case writes entries and evicts them
   // immediately, which the shipped 1-day window forbids by design. Turn it off so
   // the case still measures the budget/floor mechanics it was written for.
-  cfg.evictProtectSeconds = 0;
+  cfg.inUseSeconds = 0;
   cfg.maxBytes = 100ull << 30; // byte trigger off (usage tiny)
   cfg.minFreeBytes = 1000000;  // resumeFree = 1,100,000
   cfg.evictCheckSeconds = 0;
@@ -1015,7 +1016,7 @@ TEST(CacheStore, BudgetEnforcedDespiteLazySidecarFlush) {
   // Orthogonal to the protection window: this case writes entries and evicts them
   // immediately, which the shipped 1-day window forbids by design. Turn it off so
   // the case still measures the budget/floor mechanics it was written for.
-  cfg.evictProtectSeconds = 0;
+  cfg.inUseSeconds = 0;
   cfg.maxBytes = 1000000; // 1 MB
   cfg.highWater = 0.5;    // 500 KB
   cfg.lowWater = 0.25;    // 250 KB
@@ -1214,7 +1215,7 @@ TEST(CacheStore, EvictNowDropsListedArtifactsWithEntry) {
   // Orthogonal to the protection window: this case writes entries and evicts them
   // immediately, which the shipped 1-day window forbids by design. Turn it off so
   // the case still measures the budget/floor mechanics it was written for.
-  cfg.evictProtectSeconds = 0;
+  cfg.inUseSeconds = 0;
   cfg.maxBytes = 100 * 4096; // force everything over budget
   cfg.highWater = 0.5;
   cfg.lowWater = 0.25;
@@ -1280,7 +1281,7 @@ TEST(CacheStoreBudget, EffectiveFloorIsAnswerableBeforeResolution) {
   EXPECT_EQ(ucache::CacheStore::effectiveMinFree(offCfg, io), 0u);
 }
 
-// --- Eviction protection window (Config::evictProtectSeconds) --------------
+// --- Eviction protection window (Config::inUseSeconds) --------------
 //
 // LRU is pessimal for a cyclic scan: with a cache smaller than the working set
 // the victim it picks is exactly the entry wanted next, so the hit rate
@@ -1305,7 +1306,7 @@ struct EvictFixture {
     cfg.maxBytes = 1000000;
     cfg.highWater = 0.5;
     cfg.lowWater = 0.25;
-    cfg.evictProtectSeconds = protectSeconds;
+    cfg.inUseSeconds = protectSeconds;
     store = std::make_unique<CacheStore>(io, cfg);
     auto src = test::randomBytes(40 * 4096, 7);
     for (int n = 0; n < 3; ++n) {
@@ -1389,12 +1390,52 @@ TEST(CacheStore, BlockedDeclinesNewEntriesButNotResidentOnes) {
   EXPECT_FALSE(declined2);
 }
 
+TEST(CacheStore, AnEntryWhoseMapsAreInUseIsNotEvicted) {
+  // Read long ago, but its maps were handed to a reader an hour ago: serving a
+  // replica does not move the byte cache's read time, so the in-use record is
+  // what tells. Window 1 day: kept; the other two (no record) are evicted.
+  EvictFixture f(86400, 1000);
+  ASSERT_TRUE(f.store);
+  const UrlKey k = keyN(1);
+  InUseRange r;
+  r.storeId = 1;
+  r.lo = 0;
+  r.hi = 100;
+  r.lastS = nowSecs() - 3600;
+  ASSERT_TRUE(InUseRecord::note(f.io, InUseRecord::path(f.cfg.cacheDir, k.hashHex), r, nullptr,
+                                86400));
+  EXPECT_TRUE(f.store->mapsInUse(k.hashHex, nowSecs()));
+  // LRU order is 0, 1, 2: the second victim it would take is skipped, and the
+  // third goes instead; the budget is then met.
+  EXPECT_EQ(f.store->evictNow(), 2);
+  EXPECT_FALSE(f.store->admissionBlocked());
+  auto entries = f.store->listEntries();
+  ASSERT_EQ(entries.size(), 1u);
+  EXPECT_EQ(entries[0].hashHex, k.hashHex);
+}
+
+TEST(CacheStore, MapsUsedBeforeTheWindowOrWithNoWindowProtectNothing) {
+  for (const auto& [window, ago] : {std::pair<uint32_t, uint64_t>{3600, 7200}, {0, 10}}) {
+    EvictFixture f(window, 1000);
+    ASSERT_TRUE(f.store);
+    const UrlKey k = keyN(1);
+    InUseRange r;
+    r.storeId = 1;
+    r.hi = 100;
+    r.lastS = nowSecs() - ago;
+    ASSERT_TRUE(InUseRecord::note(f.io, InUseRecord::path(f.cfg.cacheDir, k.hashHex), r,
+                                  nullptr, window));
+    EXPECT_FALSE(f.store->mapsInUse(k.hashHex, nowSecs())) << window;
+    EXPECT_EQ(f.store->evictNow(), 2) << window; // plain LRU by read time
+  }
+}
+
 TEST(CacheStore, ProtectWindowDefaultIsOneDay) {
   // Pinned WITHOUT setting the knob: a test that sets the value under test
   // cannot tell you what ships, and a default that no case asserts is a default
   // nothing defends.
   Config cfg;
-  EXPECT_EQ(cfg.evictProtectSeconds, 86400u);
+  EXPECT_EQ(cfg.inUseSeconds, 86400u);
 }
 
 // ---- Periodic checkpoint: what a process that never runs its destructors leaves ----

@@ -740,14 +740,13 @@ overriding your defaults. Common keys:
 | `dir = …`           | `UCACHE_DIR`            | cache location — **required** (no default; use a local disk). Unset ⇒ doctor FAILs, plugin runs uncached |
 | `max_bytes = 50g`   | `UCACHE_MAX_BYTES`      | hard cache-size cap; unset ⇒ no cap (use the disk, evict at the floor) |
 | `min_free_bytes = …`| `UCACHE_MIN_FREE_BYTES` | keep this much disk free (the default limit) |
-| `evict_protect_seconds = …`| `UCACHE_EVICT_PROTECT_S` | do not evict an entry read this recently (default 86400 = 1 day; 0 = plain LRU) |
+| `in_use_seconds = 86400` | `UCACHE_IN_USE_S` | how long after a reader last used a file it stays in use: not evicted (read, or its maps handed out, this recently), and a replaced map keeps its place for readers that still hold it (default 1 day; 0 = plain LRU, and a replaced map stays valid only while an open handle holds it). Replaces `evict_protect_seconds` and `map_expiry_seconds` |
 | `validate = size`   | `UCACHE_VALIDATE`       | `none` / `size` / `size+mtime` / `cksum`. **Caveat:** the plugin has no origin-checksum source yet, so `cksum` currently degrades to size-only (weaker than `size+mtime`) — prefer `size+mtime` until a checksum query lands |
 | `revalidate_seconds = 604800` | `UCACHE_REVALIDATE_S` | freshness window (TTL): an entry validated against the origin within this many seconds is served with **no remote contact at all**. Default 7 days — right for write-once physics data. `0` = re-check on every open; `ucache rm <url>` forces a re-check anytime |
 | `open_retries = 0`  | `UCACHE_OPEN_RETRIES`   | retry a transient open failure this many times (0 = off); backoff via `open_retry_base_ms`/`open_retry_max_ms` |
 | `recompress = off`  | `UCACHE_RECOMPRESS`     | `on` = the files your jobs read get fast-to-decode replicas **automatically**, created on their first pass (default off — opt-in CPU/disk). Flip it with `ucache set recompress on` |
 | `recompress_keep_originals = off` | `UCACHE_RECOMPRESS_KEEP_ORIGINALS` | `on` = when baskets are converted into a replica, keep their original bytes in the byte cache too (by default they are not kept, and a copy held from before is released: the cache would hold the same data twice) |
 | `mixed_maps = on` | `UCACHE_MIXED_MAPS` | with `recompress = on`: each open of a TTree file is shown its newest map, the baskets converted by then at their real size (see "Recompression"); `off` = every open sees the first-pass layout, every basket at the size of its room — for jobs that hand basket positions to workers on other machines with caches of their own |
-| `map_expiry_seconds = 604800` | `UCACHE_MAP_EXPIRY_S` | how long a replaced map keeps its place, for a reader that still holds it (7 days) |
 | `recompress_codecs = lzma,zlib` | `UCACHE_RECOMPRESS_CODECS` | which **source** codecs are worth recompressing (comma list); branches in other codecs are served as-is |
 | `recompress_reclaim = superseded` | `UCACHE_RECOMPRESS_RECLAIM` | what to free from the byte cache once a file's replica exists: `superseded` (default) punches only the ranges the replica replaced; `full` drops the **entire** byte copy — replicas become the primary copy, uncovered reads refetch from origin (space-tight disks) |
 | `page_size = 4k` | `UCACHE_PAGE_SIZE` | size of the pages the cache stores: 4 KiB, and 16 KiB on macOS, where a smaller page written into a hole of the cache file takes 16 KiB of disk anyway. Applies to files cached from then on. `ucache doctor` checks it against the cache disk |
@@ -994,9 +993,10 @@ twentieth of what the file's replica holds, and after the first map 8 MiB) and
 nobody else is converting the file; after the first, at most one an hour. Baskets converted
 after the newest map are read at the size of their room until the next one.
 A handle keeps the map it was shown for its life, whatever is made after it,
-and a replaced map keeps its place for `map_expiry_seconds` (7 days) for
-readers still holding it; only a few fit, so when none is free the newest
-stays in use (`ucache stats` counts it). `mixed_maps = off` shows every open
+and a replaced map keeps its place while any process's handle holds it and for
+`in_use_seconds` (1 day) after it was last used, for readers still holding its
+positions; only a few fit, so when none is free the newest stays in use
+(`ucache stats` counts it). `mixed_maps = off` shows every open
 the plain layout: use it when a job hands basket positions to workers on
 other machines, each with a cache of its own (`uproot.dask` with remote
 workers). RNTuple files are always shown the plain layout. The memory figures

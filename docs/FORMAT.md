@@ -290,8 +290,10 @@ record:
 A map's tree record lies between the slot layout's relocated tree record and
 the first slot — the room the slot layout keeps there, the length of the tree
 record uncompressed — in a place no live map holds. A map is live while it is
-the newest, and for `map_expiry_seconds` (default 7 days) after the map that
-replaced it was made; then its place may be taken. A map is never rewritten.
+the newest, while a handle in any process holds it, and for `in_use_seconds`
+(default 1 day) after it was last handed out or released (the file's in-use
+record, below); then its place may be taken. A map nobody was handed frees at
+once. A map is never rewritten.
 
 - **Releases sharing a cache:** every format keeps the magic at offset 0 and
   format_version at offset 8, so any build can tell a newer store from debris.
@@ -313,6 +315,35 @@ replaced it was made; then its place may be taken. A map is never rewritten.
   dropped or replaced) writes nothing.
 - **Reading new blocks** takes the shared lock without waiting. A block that
   fails its checks is debris of a commit that died, and is stepped over.
+
+## In-use record: `<dir>/inuse/<hh>/<hash>`
+
+Which of a file's maps were handed to readers, and when: one small text file
+per entry, beside `objects/` rather than in it, so removing a file's cached
+data (`ucache rm`, `clear`, an invalidation, eviction) leaves it. It expires on
+its own: removed once nothing in it has been in use for `in_use_seconds`.
+
+```
+ucache-inuse 1
+settings <layout version> <slot factor x100> <codecs, or ->
+high <highest address handed out>
+range <store id, 16 hex digits> <first address> <end address> <last use> <last held> <pid>
+```
+
+- A `range` line with pid `0` is a use: the newest time a map's metadata was
+  handed out, or a process that held the map closed the file. The window
+  counts from it.
+- A line with a pid is that process's hold: noted when one of its handles is
+  handed the map, refreshed while one holds it, removed at its last close. A
+  held map stays in use whatever the window; a process that ends without
+  closing lets go 20 minutes after its last refresh.
+- `settings`: what the slot layout readers were shown was computed with. A
+  store rebuilt while the record is in use is laid out with them, whatever the
+  rebuilding process's `recompress_codecs`, so the positions readers hold stay
+  right.
+- Written in place under an exclusive `flock`, never fsynced; a line that does
+  not parse is skipped, and a first line other than `ucache-inuse 1` makes the
+  file read as no record.
 
 ## Cache-freshness marker (optional): `<hash>.val`
 
