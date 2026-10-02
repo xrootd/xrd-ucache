@@ -9,6 +9,7 @@
 #include "OriginSource.h"
 #ifdef UCACHE_HAVE_PREFETCH
 #include "Prefetch.h"
+#include "UsableCpus.h"
 #endif
 #include "PluginSupport.h"
 #include "ReadRounding.h"
@@ -87,7 +88,7 @@ constexpr size_t kPartItems = 512;
 // CPU-bound and as many as the reader has threads, and a hit must not queue
 // behind them. Leaked like the executor (threads end with the process).
 Executor& convertPool() {
-  static Executor* pool = new Executor(std::max(2u, std::thread::hardware_concurrency()));
+  static Executor* pool = new Executor(std::max(2u, usableCpus()));
   return *pool;
 }
 

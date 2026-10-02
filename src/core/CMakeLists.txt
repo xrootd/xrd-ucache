@@ -15,6 +15,7 @@ add_library(ucache-core STATIC
   Stats.cc
   Trace.cc
   UrlKey.cc
+  UsableCpus.cc
   vendor/crc32c.cc
   vendor/xxh3.cc
   vendor/sha256.cc

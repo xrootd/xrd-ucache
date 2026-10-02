@@ -1,5 +1,7 @@
 #include "Executor.h"
 
+#include "UsableCpus.h"
+
 #include <algorithm>
 #include <chrono>
 #include <utility>
@@ -143,9 +145,11 @@ void Executor::postAfter(uint64_t delayMs, std::function<void()> task) {
 }
 
 Executor& Executor::instance(unsigned threads) {
-  static Executor* exec = new Executor(
-      threads ? threads
-              : std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
+  // One thread per read in flight, up to the CPUs this process may use: a
+  // reader thread waits for its read, so these threads take no CPU from one
+  // that is working, and the work posted here (slot-store reads and decodes,
+  // first-pass requests) blocks.
+  static Executor* exec = new Executor(threads ? threads : std::max(1u, usableCpus()));
   return *exec;
 }
 

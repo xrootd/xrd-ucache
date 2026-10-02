@@ -62,7 +62,7 @@ struct Config {
   double lowWater = 0.75;                 // UCACHE_LOW_WATER
   ValidateMode validate = ValidateMode::kSize; // UCACHE_VALIDATE
   FsyncMode fsync = FsyncMode::kOff;      // UCACHE_FSYNC
-  int threads = 0;                        // UCACHE_THREADS; 0 = min(8, hw)
+  int threads = 0;                        // UCACHE_THREADS; 0 = the CPUs this process may use
   int maxErrors = 5;                      // UCACHE_MAX_ERRORS per handle
   // UCACHE_META_FLUSH_S: the sidecar commit interval, the fill-buffer drain
   // interval, and the period of the plugin's checkpoint that drives both by

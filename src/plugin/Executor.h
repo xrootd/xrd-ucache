@@ -39,8 +39,11 @@ class Executor {
   // open failures, exactly the scenario retry targets. delayMs == 0 posts now.
   void postAfter(uint64_t delayMs, std::function<void()> task);
 
-  // Process-wide instance, sized per UCACHE_THREADS (0 = min(8, hw)).
+  // Process-wide instance, sized per UCACHE_THREADS (0 = the CPUs this process
+  // may use: usableCpus()).
   static Executor& instance(unsigned threads = 0);
+  // The number of worker threads this executor runs.
+  unsigned threads() const { return threads_; }
 
   // The current fork generation: 0 in the process that loaded the plugin, one
   // more in each forked child. Other process-wide state keyed on it rebuilds

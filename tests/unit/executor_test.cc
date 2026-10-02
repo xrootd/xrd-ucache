@@ -11,7 +11,9 @@
 // false-races under TSan across tests — a test artifact, since production tasks
 // capture st_, a shared_ptr, never stack locals.)
 #include "Executor.h"
+#include "UsableCpus.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -51,6 +53,13 @@ struct Latch {
   }
 };
 } // namespace
+
+// The serving pool runs one thread per CPU this process may use (its affinity
+// mask, capped by a cgroup quota), not a fixed handful: the slot store's reads
+// and decodes block on it. Under `taskset -c 0-1` this is 2.
+TEST(Executor, TheInstanceRunsOneThreadPerUsableCpu) {
+  EXPECT_EQ(Executor::instance().threads(), std::max(1u, usableCpus()));
+}
 
 TEST(Executor, PostAfterRunsEveryTaskOnce) {
   auto& ex = Executor::instance();
