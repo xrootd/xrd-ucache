@@ -580,6 +580,122 @@ FillLayout layoutForRNTupleFill(const RNTupleMeta& m, uint64_t fileSize,
   return L;
 }
 
+RNTupleCompactMap rnTupleCompactMap(const RNTupleMeta& m, const FillLayout& L, uint64_t base,
+                                    const std::function<uint32_t(uint32_t slot)>& recLen) {
+  RNTupleCompactMap out;
+  if (!L.error.empty() || m.pageList.empty() || m.footer.empty()) {
+    out.error = "no layout";
+    return out;
+  }
+  // Slots by (range, page): what L made of each page record it relocated.
+  std::map<std::pair<uint32_t, uint32_t>, uint32_t> slotOf;
+  std::map<uint64_t, uint32_t> slotAtOrig; // a shared page's one slot
+  for (uint32_t i = 0; i < L.slots.size(); ++i) {
+    slotOf[{L.slots[i].branch, L.slots[i].basket}] = i;
+    slotAtOrig.emplace(L.slots[i].origSeek, i);
+  }
+  out.metaReserve = (2 * kRBlobKeyLen + m.pageList.size() + m.footer.size() + 4095) / 4096 * 4096;
+  std::vector<uint8_t> pl = m.pageList;
+  std::map<uint32_t, uint64_t> placed; // slot -> address
+  uint64_t at = base + out.metaReserve;
+  for (uint32_t ri : L.relocated) {
+    const auto& r = m.ranges[ri];
+    // A range is compact when every page of it has a record: it has one
+    // compression setting, so it is stated whole one way or the other.
+    std::vector<uint32_t> slots(r.pages.size());
+    bool all = !r.pages.empty();
+    for (uint32_t pi = 0; pi < r.pages.size() && all; ++pi) {
+      auto it = slotOf.find({ri, pi});
+      if (it == slotOf.end()) {
+        auto s = slotAtOrig.find(r.pages[pi].offset); // shared with a page L met first
+        if (s == slotAtOrig.end()) {
+          all = false;
+          break;
+        }
+        slots[pi] = s->second;
+      } else {
+        slots[pi] = it->second;
+      }
+      all = recLen(slots[pi]) > 0;
+    }
+    if (!all)
+      continue; // as L states it: its slots, decoded
+    for (uint32_t pi = 0; pi < r.pages.size(); ++pi) {
+      const auto& pg = r.pages[pi];
+      const uint32_t s = slots[pi];
+      const uint32_t n = recLen(s);
+      uint64_t v;
+      auto p = placed.find(s);
+      if (p != placed.end()) {
+        v = p->second;
+      } else {
+        v = at;
+        placed.emplace(s, at);
+        out.pieces.emplace_back(s, at);
+        at += n + kSlotChecksumBytes;
+      }
+      // Negative: the page carries a checksum (its record's, served after it).
+      putLE(pl.data() + pg.recordOffset, static_cast<uint32_t>(-static_cast<int64_t>(pg.nElements)),
+            4);
+      putLE(pl.data() + pg.recordOffset + 4, n, 4);
+      putLE(pl.data() + pg.recordOffset + 8, v, 8);
+    }
+    putLE(pl.data() + r.compressionOffset, 501, 4);
+    ++out.rangesCompact;
+  }
+  if (out.pieces.empty()) {
+    out.error = "no column range wholly converted";
+    return out;
+  }
+  // The other relocated ranges: at their slots, decoded, as L states them.
+  {
+    std::set<uint32_t> compactRanges;
+    for (const auto& [s, a] : out.pieces)
+      compactRanges.insert(L.slots[s].branch);
+    for (uint32_t ri : L.relocated) {
+      const auto& r = m.ranges[ri];
+      bool whole = true;
+      for (uint32_t pi = 0; pi < r.pages.size() && whole; ++pi) {
+        auto it = slotOf.find({ri, pi});
+        uint32_t s = it != slotOf.end() ? it->second : slotAtOrig.at(r.pages[pi].offset);
+        whole = placed.count(s) > 0;
+      }
+      if (whole)
+        continue;
+      for (uint32_t pi = 0; pi < r.pages.size(); ++pi) {
+        const auto& pg = r.pages[pi];
+        auto it = slotOf.find({ri, pi});
+        const uint32_t s = it != slotOf.end() ? it->second : slotAtOrig.at(pg.offset);
+        putLE(pl.data() + pg.recordOffset,
+              static_cast<uint32_t>(-static_cast<int64_t>(pg.nElements)), 4);
+        putLE(pl.data() + pg.recordOffset + 4, pg.uncompressedBytes, 4);
+        putLE(pl.data() + pg.recordOffset + 8, L.slots[s].vSeek, 8);
+      }
+      putLE(pl.data() + r.compressionOffset, 0, 4);
+    }
+  }
+  out.end = at;
+  sealEnvelope(pl.data(), pl.size());
+  const auto plStored = storeEnvelope(pl, 1);
+  const uint64_t plAt = appendBlob(out.meta, base, plStored, pl.size());
+  std::vector<uint8_t> ftr = m.footer;
+  if (!patchFooterLink(m, ftr, pl.size(), plStored.size(), plAt)) {
+    out.error = "footer page-list locator out of bounds";
+    return out;
+  }
+  sealEnvelope(ftr.data(), ftr.size());
+  const auto ftrStored = storeEnvelope(ftr, 1);
+  const uint64_t ftrAt = appendBlob(out.meta, base, ftrStored, ftr.size());
+  if (out.meta.size() > out.metaReserve) {
+    out.error = "metadata outgrew its reservation";
+    return out;
+  }
+  RNTuplePatch ap = anchorPatch(m, ftrAt, ftrStored.size(), ftr.size());
+  out.anchor.off = ap.offset;
+  out.anchor.bytes = std::move(ap.bytes);
+  return out;
+}
+
 void sealDecodedPage(const uint8_t* page, size_t n, uint8_t out[kSlotChecksumBytes]) {
   const uint64_t h = xxh3_64(page, n);
   for (uint32_t i = 0; i < kSlotChecksumBytes; ++i) out[i] = static_cast<uint8_t>(h >> (8 * i));

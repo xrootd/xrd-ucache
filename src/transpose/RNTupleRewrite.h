@@ -120,6 +120,28 @@ FillLayout layoutForRNTupleFill(const RNTupleMeta& m, uint64_t fileSize,
                                 const std::vector<std::string>& codecs,
                                 const std::string& unnamedCodec = "");
 
+// A compact map of the first-pass layout `L` (layoutForRNTupleFill of `m`): a
+// range of addresses from `base` holding, first, the map's own page list and
+// footer (an RBlob key each, in a reservation of their raw size), then every
+// page of each column range whose pages ALL have records (`recLen(slot)` > 0)
+// back to back, each as its record -- ZSTD-1, or the page uncompressed when that
+// did not shrink it -- followed by the record's checksum (XXH3-64,
+// little-endian). Those ranges state ZSTD-1 (501); ROOT decides per page from
+// its stored and uncompressed sizes. Every other range L relocates stays at its
+// slots, decoded, as L states it; the rest as the original. The RNTuple header
+// is not rewritten. A page several records share has one slot, and one place.
+struct RNTupleCompactMap {
+  std::vector<uint8_t> meta;          // the bytes at `base`: the page list's and footer's keys
+  uint64_t metaReserve = 0;           // the pages start at base + this
+  FillLayout::Window anchor;          // the anchor, pointing at this map's footer
+  std::vector<std::pair<uint32_t, uint64_t>> pieces; // (slot, address), ascending addresses
+  uint64_t end = 0;                   // past the last page's checksum
+  size_t rangesCompact = 0;
+  std::string error;
+};
+RNTupleCompactMap rnTupleCompactMap(const RNTupleMeta& m, const FillLayout& L, uint64_t base,
+                                    const std::function<uint32_t(uint32_t slot)>& recLen);
+
 // One page prepared for a cold run from its ORIGINAL on-disk bytes (block, plus
 // the 8-byte checksum when it carries one): `raw` = the decoded page, what the
 // reader is served; `enc` = the block the replica keeps (ZSTD-1, or `raw` when

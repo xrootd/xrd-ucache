@@ -89,6 +89,8 @@ struct FillLayout {
 // fBEGIN bytes. False (err set) when the header cannot be read.
 bool headerWindowForEnd(const std::vector<uint8_t>& header, uint64_t newEnd, uint64_t& windowOff,
                         std::vector<uint8_t>& window, std::string& err);
+// The length of the 64-bit file header headerWindowForEnd writes at offset 0.
+constexpr size_t kLargeHeaderBytes = 75;
 
 // The codec a compression SETTING names: "zlib", "lzma", "lz4" or "zstd";
 // "" for no compression, an inherited setting that is itself unset, or an

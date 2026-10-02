@@ -22,6 +22,7 @@
 #include "TreeMeta.h"
 
 #include <gtest/gtest.h>
+#include <set>
 
 #include <algorithm>
 #include <cstdio>
@@ -354,6 +355,88 @@ TEST(RNTupleFill, LayoutParsesBackAndServesTheSamePages) {
 
   FileSource src(::open(fixture().c_str(), O_RDONLY), m.fileSize);
   EXPECT_EQ(decodeAllPages(t, v), decodeAllPages(m, src));
+}
+
+// A compact map of the first-pass layout: its own page list and footer first
+// in a range of its own, then every page of a wholly converted range as its
+// record (ZSTD-1, or uncompressed) with the record's checksum; a range not
+// wholly converted stays at its slots, decoded. The file it describes parses
+// back -- anchor and envelope checksums included -- and every page decodes to
+// the original's bytes.
+TEST(RNTupleFill, ACompactMapParsesBackAndServesTheSamePages) {
+  RNTupleMeta m = parseRNTuple(fixture(), "");
+  ASSERT_TRUE(m.error.empty()) << m.error;
+  const auto orig = slurp(fixture());
+  const std::vector<uint8_t> header(orig.begin(), orig.begin() + 100);
+  const std::string codec = rnTupleCodecName(m.ranges[0].compressionSettings);
+  FillLayout L = layoutForRNTupleFill(m, m.fileSize, header, {codec});
+  ASSERT_TRUE(L.error.empty()) << L.error;
+  ASSERT_GE(L.relocated.size(), 2u) << "the fixture needs two relocated ranges";
+  std::vector<std::vector<uint8_t>> enc(L.slots.size()), raw(L.slots.size());
+  for (uint32_t i = 0; i < L.slots.size(); ++i) {
+    const auto& s = L.slots[i];
+    const auto& pg = m.ranges[s.branch].pages[s.basket];
+    ConvertedPage c = convertPage(orig.data() + s.origSeek, s.origLen, pg.nbytes, pg.hasChecksum,
+                                  pg.uncompressedBytes);
+    ASSERT_TRUE(c.error.empty()) << c.error;
+    enc[i] = c.enc;
+    raw[i] = c.raw;
+  }
+  for (const bool partial : {false, true}) {
+    // partial: the first relocated range has a page with no record yet.
+    const uint32_t held = L.relocated[0];
+    auto recLen = [&](uint32_t i) -> uint32_t {
+      return partial && L.slots[i].branch == held && L.slots[i].basket == 0
+                 ? 0
+                 : static_cast<uint32_t>(enc[i].size());
+    };
+    const uint64_t base = (L.virtualSize + 8191) / 4096 * 4096; // a guard of a page here
+    RNTupleCompactMap cm = rnTupleCompactMap(m, L, base, recLen);
+    ASSERT_TRUE(cm.error.empty()) << cm.error;
+    ASSERT_LE(cm.meta.size(), cm.metaReserve);
+    // The file a handle shown it reads: windows (its anchor, a header for its
+    // end), map 1's slots decoded, its range.
+    BytesSource v;
+    v.b = orig;
+    std::vector<uint8_t> hw;
+    uint64_t hwOff = 0;
+    std::string err;
+    ASSERT_TRUE(headerWindowForEnd(header, cm.end, hwOff, hw, err)) << err;
+    for (const auto& w : L.windows)
+      std::memcpy(v.b.data() + w.off, w.bytes.data(), w.bytes.size());
+    std::memcpy(v.b.data() + hwOff, hw.data(), hw.size());
+    std::memcpy(v.b.data() + cm.anchor.off, cm.anchor.bytes.data(), cm.anchor.bytes.size());
+    v.b.resize(cm.end, 0);
+    for (uint32_t i = 0; i < L.slots.size(); ++i) {
+      std::memcpy(v.b.data() + L.slots[i].vSeek, raw[i].data(), raw[i].size());
+      sealDecodedPage(raw[i].data(), raw[i].size(), v.b.data() + L.slots[i].vSeek + raw[i].size());
+    }
+    std::memcpy(v.b.data() + base, cm.meta.data(), cm.meta.size());
+    std::set<uint32_t> compactRanges;
+    for (const auto& [i, at] : cm.pieces) {
+      std::memcpy(v.b.data() + at, enc[i].data(), enc[i].size());
+      sealDecodedPage(enc[i].data(), enc[i].size(), v.b.data() + at + enc[i].size());
+      compactRanges.insert(L.slots[i].branch);
+    }
+    EXPECT_EQ(compactRanges.count(held), partial ? 0u : 1u);
+    EXPECT_EQ(cm.rangesCompact, compactRanges.size());
+    RNTupleMeta t = parseRNTuple(v, static_cast<int64_t>(v.b.size()), "");
+    ASSERT_TRUE(t.error.empty()) << t.error;
+    for (uint32_t ri : L.relocated) {
+      const bool compact = compactRanges.count(ri) > 0;
+      EXPECT_EQ(t.ranges[ri].compressionSettings, compact ? 501 : 0) << ri;
+      for (const auto& pg : t.ranges[ri].pages) {
+        EXPECT_TRUE(pg.hasChecksum);
+        if (compact)
+          EXPECT_GE(pg.offset, base + cm.metaReserve);
+        else
+          EXPECT_LT(pg.offset, L.virtualSize); // its slot
+        EXPECT_LE(pg.offset + pg.nbytes + kSlotChecksumBytes, cm.end);
+      }
+    }
+    FileSource src(::open(fixture().c_str(), O_RDONLY), m.fileSize);
+    EXPECT_EQ(decodeAllPages(t, v), decodeAllPages(m, src)) << (partial ? "partial" : "whole");
+  }
 }
 
 TEST(RNTupleFill, PublishFromConvertedPagesMatchesTheRewrite) {

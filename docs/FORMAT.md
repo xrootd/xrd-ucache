@@ -294,15 +294,26 @@ slot layout's end and past every range the file's in-use record has seen,
 behind a guard of 1 GiB that nothing is served at but zeros. A basket kept as
 stored is stated at its original place; one not converted when the map was
 made stays at its slot. Its header window states its end (`fEND`), the size a
-handle shown it is given. A read in the range is translated to the record the
-map names and served with that basket's `fSeekKey` set to the address read. A
-read in the range of a map no longer live is refused, logged and counted
-(`slot_map_refused`). Builds that know only `"UCSMAP01"` skip the entry. At
-most four are live at once; then new opens are shown the slot layout. A
-compact map is made only when the file's header can state its end where the
-slot layout's header states its own: on a small file whose header is 32-bit,
-only maps that end below 2 GiB are compact, and the rest are mixed. Its record
-is the same as above to offset 48, then:
+handle shown it is given: in the slot layout's header window, or -- when the
+file's header is 32-bit and the map ends past 2 GiB -- as the whole header
+rewritten in the 64-bit layout at offset 0, as ROOT does when a file passes
+2 GB. A read in the range is translated to the record the map names and served
+with that basket's `fSeekKey` set to the address read. A read in the range of a
+map no longer live is refused, logged and counted (`slot_map_refused`). Builds
+that know only `"UCSMAP01"` skip the entry. At most four are live at once; then
+new opens are shown the slot layout.
+
+An RNTuple file's compact map starts its range with its own page list and
+footer, an RBlob key each, in a reservation of their raw size; its records
+start `firstOff` into the range. Each column range whose pages all have records
+is stated there page by page as its record -- ZSTD-1, or the page uncompressed
+where that is no smaller -- followed by the record's 8-byte checksum (XXH3-64,
+little-endian), with compression setting 501; ROOT decodes them. A page several
+column ranges share (same-page merging) is stated once. Every other range stays
+at its slots, decoded. The anchor window, where a TTree map has its keys-list
+window, points at the map's footer; the RNTuple header is not rewritten.
+
+Its record is the same as above to offset 48, then:
 
 | offset | size | field |
 |---|---|---|
@@ -311,8 +322,10 @@ is the same as above to offset 48, then:
 | 64 | 8 | where the header window is served u64 |
 | 72 | 4 | header window length u32 |
 | 76 | 4 | records u32 |
-| 80 | 16 | zero |
-| 96 | | the tree record, then the keys-list window, as above |
+| 80 | 8 | where its records start, from rangeLo u64 (RNTuple: past its page list and footer; TTree: 0) |
+| 88 | 1 | flags u8: 1 = each record is followed by its 8-byte checksum (RNTuple) |
+| 89 | 7 | zero |
+| 96 | | the tree record (RNTuple: the page list and footer served at rangeLo), then the keys-list window (RNTuple: the anchor window), as above |
 | … | | the header window |
 | … | 24 each | the records its range names, in address order: slot u32, length u32, CRC u32, kind u8, 3 zero bytes, store offset u64 |
 

@@ -178,6 +178,8 @@ struct MapHead {
   uint64_t rangeLo = 0, rangeLen = 0;
   uint64_t headerOff = 0;
   uint32_t headerLen = 0, nRecs = 0;
+  uint64_t firstOff = 0; // where its records start, from rangeLo
+  uint8_t flags = 0;     // 1: each record followed by its 8-byte checksum
   bool compact() const { return rangeLen != 0; }
   uint64_t recordLen() const {
     return (compact() ? kMapHead2 : kMapHead) + uint64_t(metaLen) + keysListLen + headerLen +
@@ -187,7 +189,12 @@ struct MapHead {
 std::vector<uint8_t> encodeMapRecord(const MapHead& h, const std::vector<uint8_t>& meta,
                                      const std::vector<uint8_t>& keysList,
                                      const ColdMap* compact = nullptr) {
-  std::vector<uint8_t> b(compact ? kMapHead2 : kMapHead, 0);
+  const size_t head = compact ? kMapHead2 : kMapHead;
+  const size_t total = head + meta.size() + keysList.size() +
+                       (compact ? compact->header.size() + compact->recs.size() * kMapRecBytes : 0);
+  // Sized once and filled in place (growing it piece by piece trips a false
+  // -Wstringop-overread in gcc 11).
+  std::vector<uint8_t> b(total, 0);
   auto put = [&](size_t off, auto v) { std::memcpy(b.data() + off, &v, sizeof v); };
   std::memcpy(b.data(), compact ? kMapMagic2 : kMapMagic, 8);
   put(8, static_cast<uint32_t>(meta.size()));
@@ -202,19 +209,27 @@ std::vector<uint8_t> encodeMapRecord(const MapHead& h, const std::vector<uint8_t
     put(64, compact->headerOff);
     put(72, static_cast<uint32_t>(compact->header.size()));
     put(76, static_cast<uint32_t>(compact->recs.size()));
+    put(80, compact->firstOff);
+    put(88, static_cast<uint8_t>(compact->sums ? 1 : 0));
   }
-  b.insert(b.end(), meta.begin(), meta.end());
-  b.insert(b.end(), keysList.begin(), keysList.end());
+  size_t at = head;
+  auto append = [&](const uint8_t* p, size_t n) {
+    if (n)
+      std::memcpy(b.data() + at, p, n);
+    at += n;
+  };
+  append(meta.data(), meta.size());
+  append(keysList.data(), keysList.size());
   if (compact) {
-    b.insert(b.end(), compact->header.begin(), compact->header.end());
+    append(compact->header.data(), compact->header.size());
     for (const auto& r : compact->recs) {
-      uint8_t e[kMapRecBytes] = {};
+      uint8_t* e = b.data() + at;
       std::memcpy(e, &r.slot, 4);
       std::memcpy(e + 4, &r.len, 4);
       std::memcpy(e + 8, &r.crc, 4);
       e[12] = r.kind;
       std::memcpy(e + 16, &r.storeOff, 8);
-      b.insert(b.end(), e, e + kMapRecBytes);
+      at += kMapRecBytes;
     }
   }
   return b;
@@ -236,6 +251,8 @@ bool decodeMapHead(const uint8_t* p, size_t n, MapHead& h) {
     get(64, h.headerOff);
     get(72, h.headerLen);
     get(76, h.nRecs);
+    get(80, h.firstOff);
+    get(88, h.flags);
     if (!h.rangeLen) // a compact map states something
       return false;
   }
@@ -561,6 +578,9 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   // Is the compact map at maps[k] still to be served: the newest, held by a
   // handle of this process, or in use in the in-use record?
   bool compactValidLocked(size_t k, const InUseRecord& inUse, uint64_t now) const;
+  // makeMap for an RNTuple file (called with its locks held): a compact map of
+  // every column range whose pages are all converted, or nothing.
+  bool makeRNTupleMap(uint64_t now, uint64_t covered);
   // What a read at `pos`, past map 1's slots, reads -- by address, whichever
   // map the handle was shown: the compact map whose range holds it, when it
   // may still be read; else `refused`, when pos lies in a range readers may
@@ -1307,10 +1327,14 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   store->releaseBlob(); // read again from the file if the run needs more of it
   cf->store = store;
   cf->state.reset(new std::atomic<uint8_t>[cf->nSlots()]());
-  if (!cf->rnt && cfg.mixedMaps) { // mixed maps: TTree only
-    cf->tables = tp::mapTables(cf->L);
-    cf->seekLimit = tp::mapSeekLimit(cf->L);
-    cf->mapsOff = cf->tables.empty() || cf->tables.first > cf->seekLimit;
+  if (cfg.mixedMaps) {
+    if (!cf->rnt) {
+      cf->tables = tp::mapTables(cf->L);
+      cf->seekLimit = tp::mapSeekLimit(cf->L);
+      cf->mapsOff = cf->tables.empty() || cf->tables.first > cf->seekLimit;
+    } else {
+      cf->mapsOff = false; // compact maps only: their metadata in their own range
+    }
   }
   // Every record anyone has committed so far -- without waiting, so a commit
   // held up in another process never holds up an open (what is missed now is
@@ -1512,12 +1536,25 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
         (w.inStore && !w.mem ? w.e.crc == expectCrc
                              : SlotStore::recordCrc(cf.store->header().storeId, i, rec->data(),
                                                     recLen) == expectCrc);
-    if (!same || from + len > recLen) {
+    const uint64_t extent = recLen + (cf.rnt ? tp::kSlotChecksumBytes : 0);
+    if (!same || from + len > extent) {
       UCACHE_ERROR("slot %u of %s: a compact map names a record of %u bytes; the slot's is %llu "
                    "bytes, another record",
                    i, cf.key.key.c_str(), expectLen, static_cast<unsigned long long>(recLen));
       fatal = true;
       return false;
+    }
+    if (cf.rnt) { // the page as stored (ROOT decodes it), then its checksum
+      if (from < recLen)
+        std::memcpy(dest, rec->data() + from, std::min<uint64_t>(len, recLen - from));
+      if (from + len > recLen) {
+        uint8_t sum[tp::kSlotChecksumBytes];
+        tp::sealDecodedPage(rec->data(), recLen, sum); // XXH3-64 of the bytes, as the format seals
+        for (uint64_t q = std::max<uint64_t>(from, recLen); q < from + len; ++q)
+          dest[q - from] = static_cast<char>(sum[q - recLen]);
+      }
+      recBytes = len;
+      return true;
     }
     std::memcpy(dest, rec->data() + from, len);
     uint8_t head[64];
@@ -2170,6 +2207,16 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
       char* d = base + (pos - c.offset);
       if (pos < L.originSize) {
         const uint64_t segEnd = std::min(end, L.originSize);
+        // A compact map's header, stating its end: the handle's own, in a
+        // window of map 1's or as the whole 64-bit header at offset 0.
+        if (map && map->compact() && pos >= map->headerOff &&
+            pos < map->headerOff + map->header.size()) {
+          const uint64_t n = std::min(segEnd, map->headerOff + map->header.size()) - pos;
+          std::memcpy(d, map->header.data() + (pos - map->headerOff), n);
+          pos += n;
+          layoutMeta = true;
+          continue;
+        }
         // A window, if one covers pos; else the original bytes up to the next one.
         uint64_t next = segEnd;
         bool inWindow = false;
@@ -2177,12 +2224,10 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
           const uint64_t we = w.off + w.bytes.size();
           if (pos >= w.off && pos < we) {
             const uint64_t n = std::min(segEnd, we) - pos;
-            // The handle's map has its own keys-list window, and a compact
-            // map its own header (its end); same offsets and sizes as map 1's.
-            const uint8_t* src = map && w.off == map->keysListOff ? map->keysList.data()
-                                 : map && map->compact() && w.off == map->headerOff
-                                     ? map->header.data()
-                                     : w.bytes.data();
+            // The handle's map has its own keys-list window, at the offset
+            // and size of map 1's.
+            const uint8_t* src =
+                map && w.off == map->keysListOff ? map->keysList.data() : w.bytes.data();
             std::memcpy(d, src + (pos - w.off), n);
             pos += n;
             inWindow = true;
@@ -2248,13 +2293,27 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
         bool refused = false;
         uint64_t upto = UINT64_MAX;
         auto cm = cf.compactAt(pos, refused, upto);
-        if (cm) {
+        if (cm && pos < cm->rangeLo + cm->firstOff) {
+          // An RNTuple map's own page list and footer, then zeros to its records.
+          const uint64_t rel = pos - cm->rangeLo;
+          uint64_t n = std::min<uint64_t>(end, cm->rangeLo + cm->firstOff) - pos;
+          if (rel < cm->meta.size()) {
+            n = std::min<uint64_t>(n, cm->meta.size() - rel);
+            std::memcpy(d, cm->meta.data() + rel, n);
+          } else {
+            std::memset(d, 0, n);
+          }
+          mapLo = cm->rangeLo;
+          mapHi = cm->end();
+          mapOwn = cm.get() == map;
+          pos += n;
+        } else if (cm) {
           const auto& R = cm->recs;
           auto it = std::upper_bound(R.begin(), R.end(), pos - cm->rangeLo,
                                      [](uint64_t v, const ColdMap::Rec& r) { return v < r.off; });
-          const ColdMap::Rec& r = *(it - 1); // recs[0].off is 0
+          const ColdMap::Rec& r = *(it - 1); // recs[0].off is firstOff
           const uint64_t base = cm->rangeLo + r.off;
-          const uint64_t n = std::min<uint64_t>(end, base + r.len) - pos;
+          const uint64_t n = std::min<uint64_t>(end, base + cm->extent(r)) - pos;
           req->slotPieces.push_back({r.slot, pos - base, n, d});
           auto& p = req->slotPieces.back();
           p.seekAs = base;
@@ -3087,15 +3146,29 @@ void ColdFill::noteSlotLocked(const SlotEntry& e, bool foreign) {
     convertedBytes += e.len;
 }
 
+namespace {
+// Where a compact map's header may state its end: in one of map 1's windows,
+// or -- when map 1's header is 32-bit and the map ends past 2 GiB -- the whole
+// header in the 64-bit form at offset 0, as ROOT rewrites it once a file
+// passes 2 GB. Each handle is served its own map's header there.
+bool headerWindowFits(const tp::FillLayout& L, uint64_t off, size_t len) {
+  for (const auto& w : L.windows)
+    if (w.off == off && w.bytes.size() == len)
+      return true;
+  return off == 0 && len == tp::kLargeHeaderBytes;
+}
+} // namespace
+
 bool ColdFill::noteMapLocked(const SlotEntry& e, const MapHead& h) {
-  if (mapsOff || h.metaLen < 26 || h.metaSeek < tables.first ||
-      h.metaSeek + h.metaLen > tables.end || h.recordLen() != e.len)
+  const bool metaInRange = h.compact() && h.metaSeek == h.rangeLo;
+  if (mapsOff || h.metaLen < 26 || h.recordLen() != e.len ||
+      (metaInRange ? h.metaLen > h.firstOff || h.firstOff > h.rangeLen
+                   : h.metaSeek < tables.first || h.metaSeek + h.metaLen > tables.end))
     return false;
-  bool window = false, header = !h.compact();
-  for (const auto& w : L.windows) {
+  bool window = false;
+  const bool header = !h.compact() || headerWindowFits(L, h.headerOff, h.headerLen);
+  for (const auto& w : L.windows)
     window = window || (w.off && w.off == h.keysListOff && w.bytes.size() == h.keysListLen);
-    header = header || (w.off == h.headerOff && w.bytes.size() == h.headerLen);
-  }
   // A compact map's range lies past map 1's slots; its header replaces map 1's.
   if (!window || !header || (h.compact() && (h.rangeLo < L.virtualSize || !h.nRecs ||
                                              h.rangeLo + h.rangeLen < h.rangeLo)))
@@ -3215,8 +3288,10 @@ std::shared_ptr<const ColdMap> ColdFill::mapBySeq(uint64_t seq) {
     m->headerOff = h.headerOff;
     m->header.assign(rec.begin() + at, rec.begin() + at + h.headerLen);
     at += h.headerLen;
+    m->firstOff = h.firstOff;
+    m->sums = (h.flags & 1) != 0;
     m->recs.resize(h.nRecs);
-    uint64_t off = 0;
+    uint64_t off = h.firstOff;
     for (auto& r : m->recs) {
       const uint8_t* p = rec.data() + at;
       std::memcpy(&r.slot, p, 4);
@@ -3225,7 +3300,7 @@ std::shared_ptr<const ColdMap> ColdFill::mapBySeq(uint64_t seq) {
       r.kind = p[12];
       std::memcpy(&r.storeOff, p + 16, 8);
       r.off = off;
-      off += r.len;
+      off += m->extent(r);
       at += kMapRecBytes;
     }
     if (off != h.rangeLen) {
@@ -3445,12 +3520,185 @@ const char* ColdFill::compactPlan(const std::vector<std::pair<uint32_t, uint32_t
   std::string err;
   if (!tp::headerWindowForEnd(hdr, m.end(), m.headerOff, m.header, err))
     return "the file header is unreadable";
-  bool same = false;
-  for (const auto& w : L.windows)
-    same = same || (w.off == m.headerOff && w.bytes.size() == m.header.size());
-  if (!same)
-    return "the header cannot state the map's end where map 1's states its own";
+  if (!headerWindowFits(L, m.headerOff, m.header.size()))
+    return "the header cannot state the map's end";
   return nullptr;
+}
+
+namespace {
+// The file's bytes the byte cache holds, for parsing its metadata again.
+struct CachedSource : tp::Source {
+  FileEntry& e;
+  explicit CachedSource(FileEntry& f) : e(f) {}
+  bool has(uint64_t off, uint64_t n) override { return e.hasRange(off, n); }
+  bool read(void* dst, uint64_t n, uint64_t off) override {
+    return e.readCached(off, n, dst, /*account=*/false);
+  }
+};
+} // namespace
+
+bool ColdFill::makeRNTupleMap(uint64_t now, uint64_t covered) {
+  auto cs = globalStore();
+  if (!cs || !entry || !store)
+    return false;
+  auto impossible = [&](const std::string& why) {
+    std::lock_guard<std::mutex> g(mu);
+    mapsImpossible = true;
+    UCACHE_INFO("no compact map for %s (%s); it is read in the slot layout", key.key.c_str(),
+                why.c_str());
+    return false;
+  };
+  // The original metadata: the file's own records, which the byte cache keeps.
+  CachedSource src(*entry);
+  tp::RNTupleMeta rm = tp::parseRNTuple(src, static_cast<int64_t>(L.originSize), "");
+  if (!rm.error.empty()) {
+    UCACHE_INFO("no compact map for %s yet: its metadata is not all cached (%s)", key.key.c_str(),
+                rm.error.c_str());
+    return false;
+  }
+  // The layout's slots and relocated ranges, as the map is computed from them.
+  // The ranges are the layout's own: one whose pages all repeat a page another
+  // range has (RNTuple's same-page merging) has no slot of its own.
+  tp::FillLayout Lc;
+  Lc.slots.reserve(nSlots());
+  for (uint32_t i = 0; i < nSlots(); ++i)
+    Lc.slots.push_back(slot(i));
+  Lc.relocated = L.relocated;
+  Lc.virtualSize = L.virtualSize;
+  InUseRecord inUseNow;
+  InUseRecord::load(RealIO::instance(), InUseRecord::path(cs->config().cacheDir, key.hashHex),
+                    inUseNow);
+  std::vector<uint32_t> lens(nSlots(), 0);
+  std::vector<SlotEntry> ents(nSlots());
+  uint64_t base = std::max(L.virtualSize, inUseNow.highWater);
+  size_t valid = 0;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    for (size_t k = 0; k < maps.size(); ++k)
+      if (maps[k].head.compact()) {
+        base = std::max(base, maps[k].head.rangeLo + maps[k].head.rangeLen);
+        valid += compactValidLocked(k, inUseNow, now) ? 1 : 0;
+      }
+    for (const auto& [i, s] : info)
+      if (i < nSlots() && s.inStore && (s.e.kind == SlotEntry::kZstd || s.e.kind == SlotEntry::kRaw)) {
+        lens[i] = s.e.len;
+        ents[i] = s.e;
+      }
+    if (valid >= kMaxCompactMaps) {
+      mapsFullUntilS = now + InUseRecord::kHoldRefreshS;
+      cs->stats().slotMapFull.fetch_add(1, std::memory_order_relaxed);
+      UCACHE_INFO("no room for another compact map of %s: %zu in use; new opens are shown the "
+                  "slot layout",
+                  key.key.c_str(), kMaxCompactMaps);
+      return false;
+    }
+  }
+  const uint64_t lo = (base + kCompactGuard + 4095) / 4096 * 4096;
+  tp::RNTupleCompactMap cmap =
+      tp::rnTupleCompactMap(rm, Lc, lo, [&lens](uint32_t i) { return i < lens.size() ? lens[i] : 0u; });
+  if (!cmap.error.empty())
+    return false; // nothing wholly converted yet
+  auto m = std::make_shared<ColdMap>();
+  m->rangeLo = lo;
+  m->rangeLen = cmap.end - lo;
+  m->firstOff = cmap.metaReserve;
+  m->sums = true;
+  m->metaSeek = lo;
+  m->meta = std::move(cmap.meta);
+  m->keysListOff = cmap.anchor.off; // an RNTuple map's anchor, where the keys list is a TTree's
+  m->keysList = std::move(cmap.anchor.bytes);
+  for (const auto& [i, at] : cmap.pieces) {
+    ColdMap::Rec r;
+    r.off = at - lo;
+    r.slot = i;
+    r.len = lens[i];
+    r.crc = ents[i].crc;
+    r.kind = ents[i].kind;
+    r.storeOff = ents[i].off;
+    m->recs.push_back(r);
+  }
+  // Its header states its end, in the window the slot layout's header uses.
+  std::vector<uint8_t> hdr(static_cast<size_t>(std::min<uint64_t>(L.originSize, 4096)));
+  std::string err;
+  if (!entry->hasRange(0, hdr.size()) ||
+      !entry->readCached(0, hdr.size(), reinterpret_cast<char*>(hdr.data()), /*account=*/false))
+    return false;
+  if (!tp::headerWindowForEnd(hdr, m->end(), m->headerOff, m->header, err))
+    return impossible("the file header is unreadable");
+  if (!headerWindowFits(L, m->headerOff, m->header.size()))
+    return impossible("the header cannot state a map's end");
+  MapHead head;
+  bool busy = false;
+  SlotEntry made;
+  const int64_t n = store->commitBuilt(
+      [this, &busy](const std::vector<SlotEntry>& es) {
+        for (const auto& e : es)
+          busy = busy || e.kind != SlotEntry::kMap;
+        apply(es);
+      },
+      [&](SlotRecord& r) {
+        if (busy && mapTiming().quietS > 0)
+          return false;
+        InUseRecord inUse;
+        InUseRecord::load(RealIO::instance(),
+                          InUseRecord::path(cs->config().cacheDir, key.hashHex), inUse);
+        std::lock_guard<std::mutex> g(mu);
+        if (!maps.empty() && maps.back().head.covered >= covered)
+          return false;
+        bool clear = inUse.highWater + kCompactGuard <= m->rangeLo;
+        for (const auto& p : maps)
+          clear = clear && (!p.head.compact() ||
+                            p.head.rangeLo + p.head.rangeLen + kCompactGuard <= m->rangeLo);
+        if (!clear)
+          return false;
+        head.metaLen = static_cast<uint32_t>(m->meta.size());
+        head.keysListLen = static_cast<uint32_t>(m->keysList.size());
+        head.madeS = now;
+        head.metaSeek = m->metaSeek;
+        head.keysListOff = m->keysListOff;
+        head.covered = covered;
+        head.rangeLo = m->rangeLo;
+        head.rangeLen = m->rangeLen;
+        head.headerOff = m->headerOff;
+        head.headerLen = static_cast<uint32_t>(m->header.size());
+        head.nRecs = static_cast<uint32_t>(m->recs.size());
+        head.firstOff = m->firstOff;
+        head.flags = 1;
+        m->madeS = now;
+        r.slot = SlotEntry::kMapBit;
+        r.kind = SlotEntry::kMap;
+        r.bytes = encodeMapRecord(head, m->meta, m->keysList, m.get());
+        return true;
+      },
+      globalConfig().fsync != FsyncMode::kOff, made);
+  if (n == -ESTALE) {
+    storeGone.store(true);
+    return false;
+  }
+  if (n < 0) {
+    UCACHE_WARN("compact map for %s not stored (%s)", key.key.c_str(),
+                std::strerror(static_cast<int>(-n)));
+    return false;
+  }
+  if (made.kind != SlotEntry::kMap)
+    return false;
+  m->seq = made.off;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    if (noteMapLocked(made, head)) {
+      auto it = std::lower_bound(maps.begin(), maps.end(), made.off,
+                                 [](const MapPlace& p, uint64_t v) { return p.seq < v; });
+      if (it != maps.end() && it->seq == made.off)
+        it->map = m;
+    }
+  }
+  cs->stats().slotMapsMade.fetch_add(1, std::memory_order_relaxed);
+  cs->noteStoredBytes(static_cast<uint64_t>(n));
+  UCACHE_INFO("compact map for %s: %zu pages of %zu column ranges in [%llu, %llu) (%.1f MiB)",
+              key.key.c_str(), m->recs.size(), cmap.rangesCompact,
+              static_cast<unsigned long long>(m->rangeLo),
+              static_cast<unsigned long long>(m->end()), m->rangeLen / 1048576.0);
+  return true;
 }
 
 bool ColdFill::makeMap(bool atExit) try {
@@ -3494,6 +3742,8 @@ bool ColdFill::makeMap(bool atExit) try {
       else
         covered += n; // as convertedBytes counts: records, not kept originals
   }
+  if (rnt)
+    return makeRNTupleMap(now, covered);
   auto impossible = [&](const std::string& why) {
     std::lock_guard<std::mutex> g(mu);
     mapsImpossible = true;
@@ -3927,7 +4177,7 @@ uint64_t coldAddressEnd(ColdFill& cf) {
 uint64_t coldLayoutHash(const ColdFill& cf) { return cf.store->header().layoutHash; }
 
 std::shared_ptr<const ColdMap> coldPickMap(const std::shared_ptr<ColdFill>& cf) {
-  if (!cf || cf->rnt || cf->mapsOff)
+  if (!cf || cf->mapsOff)
     return nullptr;
   cf->sync(); // maps made since the run was set up (never waits)
   uint64_t seq = 0;
@@ -3975,8 +4225,9 @@ namespace {
 // address, record, its slot) until f returns false. False when a map there
 // cannot be read or its slots decoded.
 bool forCompactRecords(ColdFill& cf, uint64_t a, uint64_t b,
-                       const std::function<bool(uint64_t, const ColdMap::Rec&,
-                                                const tp::FillSlot&)>& f) {
+                       const std::function<bool(uint64_t, uint64_t, const ColdMap::Rec&,
+                                                const tp::FillSlot&)>& f,
+                       bool* metaWhole = nullptr, bool* metaTouched = nullptr) {
   std::vector<uint64_t> seqs;
   {
     std::lock_guard<std::mutex> g(cf.mu);
@@ -3988,6 +4239,13 @@ bool forCompactRecords(ColdFill& cf, uint64_t a, uint64_t b,
     auto m = cf.mapBySeq(seq);
     if (!m)
       return false;
+    if (m->metaInRange() && a < m->rangeLo + m->meta.size() && m->rangeLo < b) {
+      // its own page list and footer: they stand for the original's
+      if (metaTouched)
+        *metaTouched = true;
+      if (metaWhole && (a > m->rangeLo || b < m->rangeLo + m->meta.size()))
+        *metaWhole = false;
+    }
     const auto& R = m->recs;
     auto it = std::upper_bound(R.begin(), R.end(), a > m->rangeLo ? a - m->rangeLo : 0,
                                [](uint64_t v, const ColdMap::Rec& r) { return v < r.off; });
@@ -3999,7 +4257,8 @@ bool forCompactRecords(ColdFill& cf, uint64_t a, uint64_t b,
     if (!cf.slots.prepareSlots(idx))
       return false;
     for (; it != R.end() && m->rangeLo + it->off < b; ++it)
-      if (m->rangeLo + it->off + it->len > a && !f(m->rangeLo + it->off, *it, cf.slot(it->slot)))
+      if (m->rangeLo + it->off + m->extent(*it) > a &&
+          !f(m->rangeLo + it->off, m->extent(*it), *it, cf.slot(it->slot)))
         return true;
   }
   return true;
@@ -4011,11 +4270,17 @@ void coldOriginRanges(ColdFill& cf, uint64_t off, uint64_t len,
   const tp::FillLayout& L = cf.L;
   const uint64_t end = off + len;
   if (end > L.virtualSize) { // a compact map's records are their baskets
-    forCompactRecords(cf, std::max(off, L.virtualSize), end,
-                      [&out](uint64_t, const ColdMap::Rec&, const tp::FillSlot& s) {
-                        out.emplace_back(s.origSeek, s.origLen);
-                        return true;
-                      });
+    bool meta = false;
+    forCompactRecords(
+        cf, std::max(off, L.virtualSize), end,
+        [&out](uint64_t, uint64_t, const ColdMap::Rec&, const tp::FillSlot& s) {
+          out.emplace_back(s.origSeek, s.origLen);
+          return true;
+        },
+        nullptr, &meta);
+    if (meta)
+      for (const auto& r : cf.metaOrigin)
+        out.push_back(r);
     if (off >= L.virtualSize)
       return;
   }
@@ -4039,16 +4304,21 @@ bool coldExactOriginRanges(ColdFill& cf, uint64_t off, uint64_t len,
     // Past map 1's slots: a compact map's record read whole is its basket; a
     // guard carries nothing; part of a record has no original offset.
     const uint64_t a = std::max(off, cf.L.virtualSize), b = off + len;
-    bool whole = true;
-    if (!forCompactRecords(cf, a, b,
-                           [&](uint64_t at, const ColdMap::Rec& r, const tp::FillSlot& s) {
-                             if (at < a || at + r.len > b)
-                               return whole = false;
-                             out.emplace_back(s.origSeek, s.origLen);
-                             return true;
-                           }) ||
-        !whole)
+    bool whole = true, metaWhole = true, meta = false;
+    if (!forCompactRecords(
+            cf, a, b,
+            [&](uint64_t at, uint64_t ext, const ColdMap::Rec&, const tp::FillSlot& s) {
+              if (at < a || at + ext > b)
+                return whole = false;
+              out.emplace_back(s.origSeek, s.origLen);
+              return true;
+            },
+            &metaWhole, &meta) ||
+        !whole || (meta && !metaWhole))
       return false;
+    if (meta)
+      for (const auto& r : cf.metaOrigin)
+        out.push_back(r);
     if (off >= cf.L.virtualSize)
       return true;
     len = cf.L.virtualSize - off;

@@ -73,6 +73,11 @@ struct ColdMap {
   uint64_t keysListOff = 0;      // its keys-list window
   std::vector<uint8_t> keysList;
   uint64_t rangeLo = 0, rangeLen = 0; // a compact map's range (0: a mixed map)
+  // Where its records start, from rangeLo: an RNTuple map's own page list and
+  // footer come first (served from `meta`, metaSeek = rangeLo); a TTree map's
+  // tree record lies in the tables area instead (0 here).
+  uint64_t firstOff = 0;
+  bool sums = false; // an RNTuple map: each record followed by its checksum
   uint64_t headerOff = 0;             // a compact map's header window
   std::vector<uint8_t> header;
   struct Rec {
@@ -85,6 +90,8 @@ struct ColdMap {
   std::vector<Rec> recs; // ascending, back to back from 0 to rangeLen
   bool compact() const { return rangeLen != 0; }
   uint64_t end() const { return rangeLo + rangeLen; }
+  bool metaInRange() const { return compact() && metaSeek == rangeLo; }
+  uint64_t extent(const Rec& r) const { return r.len + (sums ? 8u : 0u); }
 };
 
 // The map a new handle of the run is shown: the newest mixed map, or null for

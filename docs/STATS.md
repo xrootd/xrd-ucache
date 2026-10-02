@@ -223,15 +223,15 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   file do not count it again. The plugin logs the first such file of each
   process as a warning, with the reason (see TROUBLESHOOTING.md,
   "`recompress = on` but no replicas ever appear").
-- `slot_maps_made` — mixed maps this process made (TTree, `mixed_maps = on`): a
-  later open is shown the baskets converted by then at their real size. One is
+- `slot_maps_made` — maps this process made (`mixed_maps = on`): a later open
+  is shown the baskets or RNTuple pages converted by then at their real size. One is
   made a moment after a process is done with a file, when enough has been
   converted since the newest (a twentieth of what the file's store holds, and
   after the first map 8 MiB) and nobody else is converting it; after the
   first, at most one an hour.
-- `slot_map_opens` — opens shown a mixed map. An open of a file with a slot
-  store that is not counted here is shown the slot layout alone: no map yet,
-  `mixed_maps = off`, or an RNTuple file.
+- `slot_map_opens` — opens shown a map. An open of a file with a slot store
+  that is not counted here is shown the slot layout alone: no map yet, or
+  `mixed_maps = off`.
 - `slot_map_refused` — reads refused because they lay in the range of a compact
   map no longer live: replaced and, for `in_use_seconds`, neither held nor
   used; or a range of a store that was replaced since. The reader gets an
@@ -249,7 +249,10 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
 - `slot_pages_decoded` — RNTuple pages decoded from their stored record to be
   served. A page converted for the request that asked for it is served from the
   conversion's own decoded copy and is not counted, so a first pass counts here
-  only pages it finds already stored; a later pass counts every page it serves.
+  only pages it finds already stored. A later pass shown a map counts only the
+  pages it reads in the slot layout -- column ranges not yet wholly converted,
+  and the few an open reads past the file's original end; the pages of the
+  map's range are served as stored and ROOT decodes them.
 - `kept_reads` / `kept_read_bytes` — reads of baskets a slot store keeps as
   stored, served from the byte cache's copy of the original. They are not in
   `hit_disk_reads` (that counts the byte tier's own serving).

@@ -126,7 +126,7 @@ bool parseHeader(const std::vector<uint8_t>& h, Header& out) {
 // (TFile::WriteHeader) — for a header that was written 32-bit. 75 bytes,
 // which fit before fBEGIN in any file ROOT writes.
 std::vector<uint8_t> largeHeader(const Header& h, int64_t newEnd) {
-  std::vector<uint8_t> w(75, 0);
+  std::vector<uint8_t> w(kLargeHeaderBytes, 0);
   std::memcpy(&w[0], "root", 4);
   bePut<int32_t>(&w[4], h.large ? h.version : h.version + 1000000);
   bePut<int32_t>(&w[8], h.begin);
