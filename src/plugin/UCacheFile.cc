@@ -16,6 +16,7 @@
 #endif
 #include "OriginInFlight.h"
 #include "PluginSupport.h"
+#include "ReaderWait.h"
 #include "ReadRounding.h"
 #include "ReplicaFile.h"
 #include "Trace.h"
@@ -67,6 +68,80 @@ bool readFaultFire() {
   if (budget.load(std::memory_order_relaxed) <= 0)
     return false; // production fast path: one relaxed load
   return budget.fetch_sub(1, std::memory_order_relaxed) > 0;
+}
+
+namespace {
+// The reader's handler, wrapped by the read's entry point: the reading
+// thread's wait (ReaderWait.h) is closed just before the reader is answered,
+// charged to the costliest tier the request needed. Forwards exactly the one
+// completion it receives, through the same call, then deletes itself.
+class WaitHandler : public ResponseHandler {
+ public:
+  WaitHandler(ResponseHandler* real, std::shared_ptr<ReaderWait::Thread> t, Stats* s)
+      : real_(real), t_(std::move(t)), stats_(s) {
+    ReaderWait::begin(*t_, nowUs());
+  }
+  void note(uint8_t tier) {
+    uint8_t cur = tier_.load(std::memory_order_relaxed);
+    while (cur < tier && !tier_.compare_exchange_weak(cur, tier, std::memory_order_relaxed)) {
+    }
+  }
+  void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
+                               HostList* hostList) override {
+    ResponseHandler* real = finish(false);
+    real->HandleResponseWithHosts(status, response, hostList);
+  }
+  void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    ResponseHandler* real = finish(false);
+    real->HandleResponse(status, response);
+  }
+  // The read was refused at once: no answer will come through this handler.
+  void cancel() { finish(true); }
+
+ private:
+  ResponseHandler* finish(bool refused) {
+    ReaderWait::Tier tier = ReaderWait::kByte;
+    const uint64_t now = nowUs();
+    const uint64_t us =
+        refused ? ReaderWait::cancel(*t_, now, tier)
+                : ReaderWait::end(*t_, now,
+                                  static_cast<ReaderWait::Tier>(tier_.load(std::memory_order_relaxed)),
+                                  tier);
+    if (us)
+      stats_->readerWaitUs[tier].fetch_add(us, std::memory_order_relaxed);
+    ResponseHandler* real = real_;
+    delete this;
+    return real;
+  }
+  ResponseHandler* real_;
+  std::shared_ptr<ReaderWait::Thread> t_;
+  Stats* stats_;
+  std::atomic<uint8_t> tier_{ReaderWait::kByte};
+};
+
+// Serve one read with the reader's handler wrapped, when this handle caches
+// (a pass-through handle, and so a switched-off run, is left as it is).
+template <class Serve>
+XRootDStatus waited(const std::shared_ptr<HandleState>& st, bool passthrough,
+                    ResponseHandler* handler, Serve serve) {
+  if (passthrough || !st->store || !handler)
+    return serve(handler);
+  bool created = false;
+  auto t = ReaderWait::current(Executor::forkGeneration(), created);
+  Stats& stats = st->store->stats();
+  if (created)
+    stats.readerThreads.fetch_add(1, std::memory_order_relaxed);
+  auto* w = new WaitHandler(handler, std::move(t), &stats);
+  XRootDStatus s = serve(w);
+  if (!s.IsOK())
+    w->cancel();
+  return s;
+}
+} // namespace
+
+void noteWaitTier(ResponseHandler* h, uint8_t tier) {
+  if (auto* w = dynamic_cast<WaitHandler*>(h))
+    w->note(tier);
 }
 
 namespace {
@@ -742,6 +817,7 @@ template <typename Issue>
 static XrdCl::XRootDStatus relayToInner(const std::shared_ptr<HandleState>& st,
                                         XrdCl::ResponseHandler* user, Issue issue,
                                         uint64_t readLen = 0) {
+  noteWaitTier(user, ReaderWait::kOrigin);
   if (XrdCl::File* f = st->acquireInner()) {
     auto* relay = newRelay(st, user);
     relay->readLen = readLen;
@@ -930,7 +1006,9 @@ class MissReadHandler : public ResponseHandler {
       : st_(std::move(st)), entry_(std::move(entry)), userOff_(userOff), userLen_(userLen),
         userBuf_(userBuf), user_(user), wireOff_(wireOff), wireBuf_(std::move(wireBuf)),
         t0_(t0), gateLen_(gateLen),
-        inflight_(st_->store ? &st_->store->stats() : nullptr) {}
+        inflight_(st_->store ? &st_->store->stats() : nullptr) {
+    noteWaitTier(user_, ReaderWait::kOrigin);
+  }
 
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
@@ -1103,7 +1181,9 @@ class MissVReadHandler : public ResponseHandler {
                    std::shared_ptr<ReadRule> direct = nullptr)
       : st_(std::move(st)), entry_(std::move(entry)), userChunks_(std::move(userChunks)),
         missIdx_(std::move(missIdx)), wire_(std::move(wire)), user_(user), t0_(t0),
-        direct_(std::move(direct)), inflight_(st_->store ? &st_->store->stats() : nullptr) {}
+        direct_(std::move(direct)), inflight_(st_->store ? &st_->store->stats() : nullptr) {
+    noteWaitTier(user_, ReaderWait::kOrigin);
+  }
 
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
@@ -1435,6 +1515,7 @@ bool stitchChunk(const std::shared_ptr<HandleState>& st,
 void stitchedServe(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
                    std::shared_ptr<ReplicaView> view, ChunkList userChunks,
                    bool isVRead, ResponseHandler* user) {
+  noteWaitTier(user, ReaderWait::kReplica);
   ChunkList resid;
   uint64_t localBytes = 0, overlayBytes = 0;
   const uint64_t t0 = nowUs();
@@ -2238,6 +2319,13 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
 
 XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffer,
                                      ResponseHandler* handler, ucache::XrdTimeout timeout) {
+  return waited(st_, passthroughOnly_, handler, [&](ResponseHandler* h) {
+    return readServe(offset, size, buffer, h, timeout);
+  });
+}
+
+XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* buffer,
+                                          ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
   const std::pair<uint64_t, uint64_t> req{offset, size};
   auto entry = ensureEntry(st_->opsSeen.exchange(true) ? nullptr : &req);
@@ -2376,6 +2464,7 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
   // rounded miss already in flight (another handle/thread — RDF-IMT re-reads
   // the same baskets constantly) parks this read instead of duplicating the
   // fetch; the owner's staged pages then serve it from RAM.
+  noteWaitTier(handler, ReaderWait::kOrigin);
   auto [ws, we] = roundChunk(*entry, offset, size);
   {
     auto st = st_;
@@ -2423,6 +2512,13 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
 // locally computed kXR page checksums (crc32c, same as the wire protocol).
 XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buffer,
                                        ResponseHandler* handler, ucache::XrdTimeout timeout) {
+  return waited(st_, passthroughOnly_, handler, [&](ResponseHandler* h) {
+    return pgReadServe(offset, size, buffer, h, timeout);
+  });
+}
+
+XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void* buffer,
+                                            ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
   const std::pair<uint64_t, uint64_t> req{offset, size};
   auto entry = ensureEntry(st_->opsSeen.exchange(true) ? nullptr : &req);
@@ -2541,6 +2637,8 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
   for (size_t i = 0; i < chunks.size(); ++i)
     if (!entry->hasRange(chunks[i].offset, chunks[i].length))
       missIdx.push_back(i);
+  if (!missIdx.empty()) // fetched, or waited for while another fetch brings it
+    noteWaitTier(handler, ReaderWait::kOrigin);
   // Once per request, not once per pass: a read that parked and came back is
   // the same request, and counting it again inflated the chunk total by the
   // number of parked reads (6.5M -> 9.1M on a full pass).
@@ -2652,6 +2750,14 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
 
 XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer,
                                            ResponseHandler* handler, ucache::XrdTimeout timeout) {
+  return waited(st_, passthroughOnly_, handler, [&](ResponseHandler* h) {
+    return vectorReadServe(chunks, buffer, h, timeout);
+  });
+}
+
+XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* buffer,
+                                                ResponseHandler* handler,
+                                                ucache::XrdTimeout timeout) {
   st_->syncFork();
   st_->opsSeen.store(true, std::memory_order_relaxed);
   auto entry = ensureEntry();
@@ -2673,7 +2779,7 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
       c.buffer = at;
       at += c.length;
     }
-    return VectorRead(placed, nullptr, handler, timeout);
+    return vectorReadServe(placed, nullptr, handler, timeout);
   }
 #ifdef UCACHE_HAVE_COLDRUN
   if (cold) // the branches it touches, decoded in one read

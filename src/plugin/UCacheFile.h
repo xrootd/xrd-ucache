@@ -260,6 +260,15 @@ class UCacheFile : public XrdCl::FilePlugIn {
   bool GetProperty(const std::string& name, std::string& value) const override;
 
  private:
+  // The reads themselves; the public calls wrap the reader's handler to
+  // measure how long the reading thread waits (ReaderWait.h).
+  XrdCl::XRootDStatus readServe(uint64_t offset, uint32_t size, void* buffer,
+                                XrdCl::ResponseHandler* handler, ucache::XrdTimeout timeout);
+  XrdCl::XRootDStatus pgReadServe(uint64_t offset, uint32_t size, void* buffer,
+                                  XrdCl::ResponseHandler* handler, ucache::XrdTimeout timeout);
+  XrdCl::XRootDStatus vectorReadServe(const XrdCl::ChunkList& chunks, void* buffer,
+                                      XrdCl::ResponseHandler* handler,
+                                      ucache::XrdTimeout timeout);
   void invalidateOnWrite();
   // Lazily create the cache entry on the caller's thread (first read), doing
   // a synchronous inner Stat. Returns the entry, or nullptr for

@@ -23,4 +23,9 @@ XrdCl::AnyObject* vreadResponse(const XrdCl::ChunkList& chunks);
 // instead of being sent. One relaxed load when unset.
 bool readFaultFire();
 
+// The tier a request needed (ReaderWait::Tier), noted on the reader's handler
+// when the read's entry point wrapped it to measure the reader's wait; any
+// other handler is left alone. The costliest tier noted wins.
+void noteWaitTier(XrdCl::ResponseHandler* h, uint8_t tier);
+
 } // namespace ucache

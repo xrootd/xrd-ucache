@@ -72,6 +72,8 @@ the consumers together.
  "slot_crc_failures": 0, "slot_read_fallbacks": 0, "slot_pages_decoded": 0,
  "kept_reads": 0, "kept_read_bytes": 0,
  "pool_tasks": 0, "pool_busy_us": 0, "pool_queue_high_water": 0,
+ "reader_wait_byte_us": 0, "reader_wait_replica_us": 0, "reader_wait_slots_us": 0,
+ "reader_wait_origin_us": 0, "reader_threads": 0,
  "replica_reads": 0, "replica_read_bytes": 0,
  "relay_bytes": 0,
  "readv_chunks": 0, "readv_calls": 0, "readv_mixed": 0,
@@ -255,6 +257,21 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   its threads spent running them, the most tasks waiting at once, and how long
   each waited before a thread took it. A long queue wait with the threads busy
   the whole time means the pool, not the disk or the origin, sets the pace.
+- `reader_wait_byte_us`, `reader_wait_replica_us`, `reader_wait_slots_us`,
+  `reader_wait_origin_us`, `reader_threads` — how long the threads that read
+  through the cache waited on it. For each reading thread, the time during
+  which it had at least one read outstanding in the cache, from the moment it
+  sent one while none was outstanding until the last one was answered (reads
+  a thread sends together and waits for together count once). Each such wait
+  is charged to the costliest place any of its reads needed: the origin (a
+  fetch, or waiting for one already on the wire), then a slot store (the
+  first-pass layout), then a compact replica, then the byte cache.
+  `reader_threads` counts the threads that read. For TTree the readers are the
+  analysis threads, so the sum divided by threads x wall is the share of
+  their time spent waiting on the cache; for RNTuple they are ROOT's own I/O
+  threads, which wait by design while the analysis computes, so there the sum
+  is request latency only. Handles that do not cache (`UCACHE_DISABLE=1`, a
+  copy) record nothing here.
 
 Records a job reads from a slot store count in `replica_bytes_served` (and
 their reads from the cache disk in `replica_reads` / `replica_read_bytes`);

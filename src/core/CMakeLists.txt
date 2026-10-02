@@ -4,6 +4,7 @@ add_library(ucache-core STATIC
   CacheStore.cc
   CpuCounters.cc
   ReadFootprint.cc
+  ReaderWait.cc
   Config.cc
   FileEntry.cc
   IOBackend.cc

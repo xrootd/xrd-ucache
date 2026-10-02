@@ -12,6 +12,7 @@
 #include "UsableCpus.h"
 #endif
 #include "PluginSupport.h"
+#include "ReaderWait.h"
 #include "ReadRounding.h"
 #include "ReadRule.h"
 #include "ReplicaStore.h"
@@ -2069,6 +2070,8 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
                               }),
                need.end());
   }
+  if (!need.empty() || !req->origPieces.empty()) // fetched, or waited for
+    noteWaitTier(req->user, ReaderWait::kOrigin);
   // max_read_fraction is decided at the first request that needs the origin,
   // from the ORIGINAL ranges the request carries (a slot is its basket).
   if (cf.rule && cf.rule->state() == ReadRule::kUndecided &&
@@ -3458,6 +3461,7 @@ bool coldExactOriginRanges(ColdFill& cf, uint64_t off, uint64_t len,
 void coldServe(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
                std::shared_ptr<ColdFill> cf, ChunkList chunks, bool isVRead,
                ResponseHandler* user) {
+  noteWaitTier(user, ReaderWait::kSlots);
   auto req = std::make_shared<ColdRequest>();
   req->st = std::move(st);
   req->entry = std::move(entry);

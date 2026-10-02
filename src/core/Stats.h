@@ -139,6 +139,11 @@ struct Stats {
   std::atomic<uint64_t> poolTasks{0};
   std::atomic<uint64_t> poolBusyUs{0};
   std::atomic<uint64_t> poolQueueHighWater{0};
+  // How long reading threads waited on the cache (ReaderWait.h), per tier the
+  // wait was charged to (ReaderWait::Tier: byte cache, compact replica, slot
+  // store, origin), and how many threads read through it.
+  std::atomic<uint64_t> readerWaitUs[4] = {};
+  std::atomic<uint64_t> readerThreads{0};
   std::atomic<uint64_t> replicaReads{0};      // physical .tdata preads (one per
                                               // coalesced run of overlay pages, so
                                               // re-reads of a page count again — the
