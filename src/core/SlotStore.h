@@ -179,6 +179,19 @@ class SlotStore {
   // verifies the whole). False on I/O error or a short record.
   bool readHead(const SlotEntry& e, uint8_t* out, size_t n);
 
+  // Several committed records in as few reads as possible. Sorted by offset,
+  // records that start within `maxGap` bytes of the previous one's end are read
+  // in one pread of at most `maxRun` bytes (a longer record is read alone), and
+  // each is checked against its own CRC from that buffer: a record's bytes are
+  // exactly its own, never a neighbour's. A run whose read fails or comes back
+  // short is read again one record at a time, so only the records that fail on
+  // their own are lost. `out[i]` / `ok[i]` answer `es[i]`; a kept entry
+  // (no bytes here) is never read. `onRead(us, bytes)` is called once per
+  // pread made, for the caller's counters.
+  void readRecords(const std::vector<SlotEntry>& es, std::vector<std::vector<uint8_t>>& out,
+                   std::vector<char>& ok, uint64_t maxRun, uint64_t maxGap,
+                   const std::function<void(uint64_t us, uint64_t bytes)>& onRead = {});
+
   // The store's size on disk.
   uint64_t fileBytes();
 

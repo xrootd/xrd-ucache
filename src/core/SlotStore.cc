@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <fcntl.h>
 #include <random>
 #include <sys/file.h>
@@ -527,6 +528,77 @@ bool SlotStore::readRecord(const SlotEntry& e, std::vector<uint8_t>& out) {
   if (io_.preadFull(fd_, out.data(), e.len, e.off) != static_cast<int64_t>(e.len))
     return false;
   return recordCrc(hdr_.storeId, e.slot, out.data(), out.size()) == e.crc;
+}
+
+void SlotStore::readRecords(const std::vector<SlotEntry>& es,
+                            std::vector<std::vector<uint8_t>>& out, std::vector<char>& ok,
+                            uint64_t maxRun, uint64_t maxGap,
+                            const std::function<void(uint64_t, uint64_t)>& onRead) {
+  const size_t n = es.size();
+  out.assign(n, {});
+  ok.assign(n, 0);
+  std::vector<size_t> ord;
+  ord.reserve(n);
+  for (size_t i = 0; i < n; ++i)
+    if (es[i].kind != SlotEntry::kKept && es[i].len)
+      ord.push_back(i);
+  std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return es[a].off < es[b].off; });
+  auto timed = [&](uint64_t bytes, const std::function<bool()>& read) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool r = read();
+    if (onRead)
+      onRead(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - t0)
+                                       .count()),
+             bytes);
+    return r;
+  };
+  auto alone = [&](size_t i) {
+    ok[i] = timed(es[i].len, [&] { return readRecord(es[i], out[i]); }) ? 1 : 0;
+  };
+  std::unique_ptr<uint8_t[]> buf; // not zero-filled: every byte used is read first
+  uint64_t bufLen = 0;
+  for (size_t k = 0; k < ord.size();) {
+    const SlotEntry& first = es[ord[k]];
+    const uint64_t start = first.off;
+    uint64_t end = first.off + first.len;
+    size_t j = k + 1;
+    if (first.len <= maxRun)
+      for (; j < ord.size(); ++j) {
+        const SlotEntry& e = es[ord[j]];
+        // Overlapping or repeated offsets are not merged: each is read alone.
+        if (e.off < end || e.off - end > maxGap || e.off + e.len - start > maxRun)
+          break;
+        end = e.off + e.len;
+      }
+    if (j == k + 1) {
+      alone(ord[k]);
+      ++k;
+      continue;
+    }
+    const uint64_t len = end - start;
+    if (len > bufLen) {
+      buf.reset(new uint8_t[len]);
+      bufLen = len;
+    }
+    const bool got = timed(len, [&] {
+      return io_.preadFull(fd_, buf.get(), len, start) == static_cast<int64_t>(len);
+    });
+    for (size_t m = k; m < j; ++m) {
+      const size_t i = ord[m];
+      const SlotEntry& e = es[i];
+      if (!got) {
+        alone(i); // the run's read failed: each record on its own
+        continue;
+      }
+      const uint8_t* p = buf.get() + (e.off - start);
+      if (recordCrc(hdr_.storeId, e.slot, p, e.len) == e.crc) {
+        out[i].assign(p, p + e.len);
+        ok[i] = 1;
+      }
+    }
+    k = j;
+  }
 }
 
 bool SlotStore::readBlob(std::vector<uint8_t>& out) {

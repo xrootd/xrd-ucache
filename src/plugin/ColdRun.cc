@@ -38,7 +38,9 @@
 #include <mutex>
 #include <new>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace ucache {
 
@@ -203,6 +205,13 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
     bool persist = false;   // `mem` is to be committed
     bool fromCache = false; // converted from the byte cache's copy of the original
     bool transient = false; // `mem` is served, not to be committed (counted in transientBytes)
+    // Staged by a request that has not finished: neither pending nor transient
+    // yet, counted in no budget (the request holds the record anyway). When the
+    // request finishes, its records join `pending` together, in address order,
+    // so a later reader finds what one request read side by side in the store.
+    bool held = false;
+    uint64_t token = 0;    // which staging of the slot this is (it may be staged again)
+    uint64_t stagedUs = 0; // when, for a checkpoint that commits a stalled request's records
     SlotEntry e;
     std::shared_ptr<const std::vector<uint8_t>> mem; // the record, until committed
   };
@@ -257,6 +266,10 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   std::unordered_map<uint32_t, std::vector<Waiter>> waiters;
   std::vector<uint32_t> pending;
   uint64_t pendingBytes = 0;
+  uint64_t tokenSeq = 0;
+  // Slots held for requests (slot, token, staged at), oldest first; entries no
+  // longer held are dropped when met.
+  std::deque<std::tuple<uint32_t, uint64_t, uint64_t>> heldList;
   // Records served but not to be committed (the store is gone, or the
   // process's pending cap is reached): kept for the requests that need them,
   // oldest dropped first past kTransientBytes.
@@ -375,7 +388,16 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
 
   // A converted record for slot i: served from memory until it is committed.
   // `keepIt` false (a file this process reads directly): served to whoever asked, never kept.
-  void stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool keepIt = true);
+  // `group`: the caller is a request that will hand the record back with
+  // appendGroup() when it finishes; set to the staging's token (0: not held).
+  void stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool keepIt = true,
+             uint64_t* group = nullptr);
+  // A finished request's records (slot, token): to be committed together, in
+  // slot order; a slot staged again since, or committed meanwhile, is skipped.
+  void appendGroup(std::vector<std::pair<uint32_t, uint64_t>> group);
+  // Records held for requests that have not finished for `ageUs`: committed as
+  // their own group (a stalled request must not keep them from the store).
+  void appendHeldOlderThan(uint64_t ageUs);
 
   // A fetch that claimed slot i failed: give the claim back and tell whoever
   // waited on it, so they can fetch it themselves.
@@ -472,6 +494,13 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   bool makeMap(bool atExit);
 
  private:
+  // Send a staged record to `pending`, or -- when not allowed (the store is
+  // gone, or the process holds its cap of records waiting) -- to the transient
+  // budget. False when it is not kept at all.
+  bool placeLocked(uint32_t i, Info& s, const Rec& rec, uint64_t b, bool inCache, bool persist,
+                   uint64_t& lost, bool& kick);
+  void appendGroupLocked(std::vector<std::pair<uint32_t, uint64_t>>& group, uint64_t& lost,
+                         bool& kick);
   void forgetLocked(uint32_t i) {
     uint8_t expect = kReady;
     state[i].compare_exchange_strong(expect, kAbsent, std::memory_order_acq_rel);
@@ -1199,6 +1228,10 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
     uint32_t slot;
     uint64_t from, len; // within the slot
     char* dest;
+    // RNTuple: served by the conversion from the page it just decoded, so
+    // finish() does not decode the record again. Written before the
+    // conversion's done(), read in finish() after the last one.
+    bool served = false;
   };
   std::vector<SlotPiece> slotPieces;
   struct OrigPiece {
@@ -1217,6 +1250,9 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   // transient budget -- and a request must not lose what it already has.
   std::unordered_map<uint32_t, ColdFill::Where> held; // guarded by emu
   std::vector<uint32_t> converted; // claimed slots this request staged; guarded by emu
+  // ... and the stagings held for it (slot, token): handed back together at
+  // finish(), on every path, so they are committed side by side. Guarded by emu.
+  std::vector<std::pair<uint32_t, uint64_t>> staged;
   void hold(uint32_t i, ColdFill::Rec r) {
     ColdFill::Where w;
     w.mem = std::move(r);
@@ -1253,9 +1289,27 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
     }
   }
   void finish();
+  // The stored records this request's pieces need, read in as few reads as
+  // the store allows (neighbours together), into `mine`'s copies in memory;
+  // a record that fails its check is left for copySlot, which drops it.
+  void readStoredTogether(std::unordered_map<uint32_t, ColdFill::Where>& mine);
   // Serve the same chunks again from the start (a slot fell through).
   void again(bool mayParkAgain);
 };
+
+// Bytes [from, from+len) of an RNTuple slot: the decoded page, then the decoded
+// page's checksum.
+void servePage(const uint8_t* page, uint32_t pageLen, uint64_t from, uint64_t len, char* dest) {
+  uint8_t sum[tp::kSlotChecksumBytes];
+  if (from + len > pageLen)
+    tp::sealDecodedPage(page, pageLen, sum);
+  if (from < pageLen) {
+    const uint64_t n = std::min<uint64_t>(len, pageLen - from);
+    std::memcpy(dest, page + from, n);
+  }
+  for (uint64_t p = std::max<uint64_t>(from, pageLen); p < from + len; ++p)
+    dest[p - from] = static_cast<char>(sum[p - pageLen]);
+}
 
 // Copy bytes [from, from+len) of slot i -- its record, then zeros -- to dest.
 // False when the slot's bytes are not to be had after all: the slot is then
@@ -1327,15 +1381,7 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
       }
       page = raw.data();
     }
-    uint8_t sum[tp::kSlotChecksumBytes];
-    if (from + len > pageLen)
-      tp::sealDecodedPage(page, pageLen, sum);
-    if (from < pageLen) {
-      const uint64_t n = std::min<uint64_t>(len, pageLen - from);
-      std::memcpy(dest, page + from, n);
-    }
-    for (uint64_t p = std::max<uint64_t>(from, pageLen); p < from + len; ++p)
-      dest[p - from] = static_cast<char>(sum[p - pageLen]);
+    servePage(page, pageLen, from, len, dest);
     recBytes = len;
     return true;
   }
@@ -1375,7 +1421,70 @@ void ColdRequest::again(bool mayParkAgain) {
   Executor::instance().post([r2] { serveRequest(r2); });
 }
 
+// Merging limits for a request's stored records: a read of at most 1 MiB (the
+// compact replica's), across gaps of at most 64 KiB (a commit block's header
+// and alignment between two runs of records; ~3% more bytes on NanoAOD).
+constexpr uint64_t kStoredRunBytes = 1ull << 20;
+constexpr uint64_t kStoredRunGap = 64ull << 10;
+
+void ColdRequest::readStoredTogether(std::unordered_map<uint32_t, ColdFill::Where>& mine) {
+  std::vector<uint32_t> slots;
+  std::vector<SlotEntry> es;
+  std::vector<ColdFill::Where> ws;
+  std::unordered_set<uint32_t> seen; // a slot in several pieces: read once
+  for (const auto& p : slotPieces) {
+    if (p.served || !seen.insert(p.slot).second)
+      continue;
+    ColdFill::Where w;
+    auto h = mine.find(p.slot);
+    if (h != mine.end())
+      w = h->second;
+    else if (!cf->where(p.slot, w))
+      continue;
+    if (w.mem || !w.inStore || w.e.kind == SlotEntry::kKept || !w.e.len)
+      continue; // in memory, kept as stored, or not in the store: as before
+    slots.push_back(p.slot);
+    es.push_back(w.e);
+    ws.push_back(std::move(w));
+  }
+  if (es.size() < 2)
+    return; // one record: copySlot reads it as it always has
+  Stats* stats = st->store ? &st->store->stats() : nullptr;
+  std::vector<std::vector<uint8_t>> got;
+  std::vector<char> ok;
+  cf->store->readRecords(es, got, ok, kStoredRunBytes, kStoredRunGap,
+                         [stats](uint64_t us, uint64_t bytes) {
+                           if (!stats)
+                             return;
+                           stats->replicaReads.fetch_add(1, std::memory_order_relaxed);
+                           stats->replicaReadBytes.fetch_add(bytes, std::memory_order_relaxed);
+                           stats->replicaReadSize.add(bytes);
+                           stats->slotReadUs.add(us);
+                         });
+  for (size_t i = 0; i < es.size(); ++i) {
+    if (!ok[i])
+      continue; // copySlot reads it alone, and drops it if it fails again
+    ColdFill::Where w = std::move(ws[i]);
+    w.mem = std::make_shared<const std::vector<uint8_t>>(std::move(got[i]));
+    mine[slots[i]] = std::move(w);
+  }
+}
+
 void ColdRequest::finish() {
+  // What this request converted goes to the store together, before anything
+  // else and on every path (served, failed, retried): a retry is a new request
+  // that stages nothing it finds ready, so records left here would never be
+  // committed. Before the reader is answered, so a reader that closes on its
+  // answer cannot outrun it (an append with no handle open queues a commit).
+  {
+    std::vector<std::pair<uint32_t, uint64_t>> group;
+    {
+      std::lock_guard<std::mutex> g(emu);
+      group.swap(staged);
+    }
+    if (!group.empty())
+      cf->appendGroup(std::move(group));
+  }
   // Arrival (t0, kept across retries) to the answer handed to the reader.
   auto answered = [this] {
     if (st->store && t0)
@@ -1415,6 +1524,8 @@ void ColdRequest::finish() {
     std::lock_guard<std::mutex> g(emu);
     mine.swap(held);
   }
+  if (!lost && cf->store)
+    readStoredTogether(mine);
   // Every piece is tried, not only up to the first that fails: each failing
   // slot is forgotten (and a kept original's bad pages demoted), so the retry
   // fetches them all at once. Stopping at the first let a request with several
@@ -1423,6 +1534,10 @@ void ColdRequest::finish() {
   if (!lost)
     for (const auto& p : slotPieces) {
       uint64_t rec = 0;
+      if (p.served) { // converted by this request: its page is in place already
+        (std::binary_search(fetched.begin(), fetched.end(), p.slot) ? fillRec : replicaRec) += p.len;
+        continue;
+      }
       auto h = mine.find(p.slot);
       if (!copySlot(*cf, p.slot, p.from, p.len, p.dest, rec,
                     h == mine.end() ? nullptr : &h->second, st->coldMap != nullptr, fatal)) {
@@ -1529,12 +1644,24 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
       // (staging counts what goes to the byte cache).
       req->entry->obs().wireBytes.fetch_add(recLen, std::memory_order_relaxed);
     }
+    // This request's own pieces of the page, from the bytes just decoded: each
+    // page is decoded once per pass, not again in finish().
+    const uint32_t pageLen = slot.vLen - tp::kSlotChecksumBytes;
+    if (p.raw.size() == pageLen)
+      for (auto& piece : req->slotPieces)
+        if (piece.slot == i && !piece.served) {
+          servePage(p.raw.data(), pageLen, piece.from, piece.len, piece.dest);
+          piece.served = true;
+        }
     auto rec = std::make_shared<const std::vector<uint8_t>>(std::move(p.enc));
     req->hold(i, rec);
-    cf.stage(i, kind, std::move(rec), fromCache, /*keepIt=*/!direct);
+    uint64_t token = 0;
+    cf.stage(i, kind, std::move(rec), fromCache, /*keepIt=*/!direct, &token);
     { // staged: the claim is no longer this request's to give back
       std::lock_guard<std::mutex> g(req->emu);
       req->converted.push_back(i);
+      if (token)
+        req->staged.emplace_back(i, token);
     }
     req->done();
     return;
@@ -1586,11 +1713,14 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
   auto held = std::make_shared<const std::vector<uint8_t>>(std::move(c.record));
   req->hold(i, held);
   // A kept original is not punched from the byte cache: it is the only copy.
+  uint64_t token = 0;
   cf.stage(i, static_cast<uint8_t>(c.kind), std::move(held),
-           fromCache && c.kind != tp::ConvertedBasket::kOriginal, /*keepIt=*/!direct);
+           fromCache && c.kind != tp::ConvertedBasket::kOriginal, /*keepIt=*/!direct, &token);
   { // staged: the claim is no longer this request's to give back
     std::lock_guard<std::mutex> g(req->emu);
     req->converted.push_back(i);
+    if (token)
+      req->staged.emplace_back(i, token);
   }
   req->done();
 } catch (const std::exception& e) {
@@ -2102,10 +2232,13 @@ void ColdFill::releaseMemLocked(Info& s) {
   s.mem.reset();
 }
 
-void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool keepIt) {
+void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool keepIt,
+                     uint64_t* group) {
   std::vector<Waiter> wake;
   bool kick = false;
   uint64_t lost = 0; // records no longer held anywhere: converted again if read
+  if (group)
+    *group = 0;
   {
     std::lock_guard<std::mutex> g(mu);
     Info& s = info[i];
@@ -2116,6 +2249,7 @@ void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool kee
     } else if (!s.inStore) { // someone committed it meanwhile: theirs serves
       releaseMemLocked(s); // staged twice: the newer record replaces the older
       s.kind = kind;
+      s.held = false;
       // A basket kept as stored is served from the byte cache's copy of its
       // original, just written; memory keeps it only if that write did not
       // land.
@@ -2124,49 +2258,23 @@ void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool kee
                            entry->hasRange(fs.origSeek, fs.origLen);
       const uint64_t b = inCache ? 0 : rec->size();
       s.fromCache = fromCache;
-      // Committed, unless the store is gone or the process already holds its
-      // cap of records waiting: then it is served to the requests that asked
-      // for it (they hold it) and kept only while the transient budget allows
-      // -- memory never grows to cope, and nothing that serves reads waits
-      // for a commit.
-      s.persist = !storeGone.load(std::memory_order_relaxed) &&
-                  g_pendingTotal.load(std::memory_order_relaxed) + b <= kPendingCap;
-      if (s.persist) {
+      if (group && !storeGone.load(std::memory_order_relaxed)) {
+        // Held for its request, which commits it with the rest of what it read.
         s.mem = inCache ? nullptr : rec;
-        pending.push_back(i);
-        pendingBytes += b;
-        g_pendingTotal.fetch_add(b, std::memory_order_relaxed);
-        kick = pendingBytes >= kCommitBytes || handles == 0;
-      } else if (inCache) {
-        // Served from the byte cache: nothing to hold. Committed the next time
-        // this slot is staged with room.
+        s.held = true;
+        s.token = ++tokenSeq;
+        s.stagedUs = nowUs();
+        heldList.emplace_back(i, s.token, s.stagedUs);
+        *group = s.token;
       } else {
-        // Oldest first, never the record being staged, until both budgets fit.
-        while ((transientBytes + b > kTransientBytes ||
-                g_transientTotal.load(std::memory_order_relaxed) + b > kTransientCap) &&
-               !transient.empty()) {
-          const uint32_t j = transient.front();
-          transient.pop_front();
-          if (j == i)
-            continue;
-          auto it = info.find(j);
-          if (it != info.end() && it->second.transient && !it->second.inStore) {
-            forgetLocked(j);
-            ++lost;
-          }
-        }
-        keep = transientBytes + b <= kTransientBytes &&
-               g_transientTotal.load(std::memory_order_relaxed) + b <= kTransientCap;
-        if (!keep)
-          ++lost;
-        if (keep) {
-          s.mem = rec;
-          s.transient = true;
-          transient.push_back(i);
-          transientBytes += b;
-          g_transientTotal.fetch_add(b, std::memory_order_relaxed);
-        }
-        kick = !storeGone.load(std::memory_order_relaxed); // drain what waits
+        // Committed, unless the store is gone or the process already holds its
+        // cap of records waiting: then it is served to the requests that asked
+        // for it (they hold it) and kept only while the transient budget
+        // allows -- memory never grows to cope, and nothing that serves reads
+        // waits for a commit.
+        const bool persist = !storeGone.load(std::memory_order_relaxed) &&
+                             g_pendingTotal.load(std::memory_order_relaxed) + b <= kPendingCap;
+        keep = placeLocked(i, s, rec, b, inCache, persist, lost, kick);
       }
     }
     takeWaitersLocked(i, wake);
@@ -2179,6 +2287,125 @@ void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool kee
   }
   for (auto& w : wake)
     w(true, rec);
+  if (lost)
+    if (auto store = globalStore())
+      store->stats().coldReplicaDeclined.fetch_add(lost, std::memory_order_relaxed);
+  if (kick)
+    queueCommit();
+}
+
+bool ColdFill::placeLocked(uint32_t i, Info& s, const Rec& rec, uint64_t b, bool inCache,
+                           bool persist, uint64_t& lost, bool& kick) {
+  s.persist = persist;
+  if (persist) {
+    s.mem = inCache ? nullptr : rec;
+    pending.push_back(i);
+    pendingBytes += b;
+    g_pendingTotal.fetch_add(b, std::memory_order_relaxed);
+    kick = kick || pendingBytes >= kCommitBytes || handles == 0;
+    return true;
+  }
+  if (inCache)
+    return true; // served from the byte cache: committed the next time it is staged with room
+  // Oldest first, never this record, until both budgets fit.
+  while ((transientBytes + b > kTransientBytes ||
+          g_transientTotal.load(std::memory_order_relaxed) + b > kTransientCap) &&
+         !transient.empty()) {
+    const uint32_t j = transient.front();
+    transient.pop_front();
+    if (j == i)
+      continue;
+    auto it = info.find(j);
+    if (it != info.end() && it->second.transient && !it->second.inStore) {
+      forgetLocked(j);
+      ++lost;
+    }
+  }
+  const bool keep = transientBytes + b <= kTransientBytes &&
+                    g_transientTotal.load(std::memory_order_relaxed) + b <= kTransientCap;
+  if (!keep) {
+    ++lost;
+    return false;
+  }
+  s.mem = rec;
+  s.transient = true;
+  transient.push_back(i);
+  transientBytes += b;
+  g_transientTotal.fetch_add(b, std::memory_order_relaxed);
+  kick = kick || !storeGone.load(std::memory_order_relaxed); // drain what waits
+  return true;
+}
+
+void ColdFill::appendGroupLocked(std::vector<std::pair<uint32_t, uint64_t>>& group,
+                                 uint64_t& lost, bool& kick) {
+  std::sort(group.begin(), group.end());
+  // The whole group goes one way: committed if the process is under its cap of
+  // records waiting (it may pass it by one group), else served and transient.
+  const bool persist = !storeGone.load(std::memory_order_relaxed) &&
+                       g_pendingTotal.load(std::memory_order_relaxed) <= kPendingCap;
+  for (const auto& [i, token] : group) {
+    auto it = info.find(i);
+    if (it == info.end())
+      continue; // forgotten meanwhile
+    Info& s = it->second;
+    if (!s.held || s.token != token || s.inStore) {
+      if (s.token == token)
+        s.held = false;
+      continue; // staged again by another request, or committed by someone
+    }
+    s.held = false;
+    const bool inCache = !s.mem;
+    Rec rec = s.mem;
+    const uint64_t b = rec ? rec->size() : 0;
+    if (!placeLocked(i, s, rec, b, inCache, persist, lost, kick))
+      forgetLocked(i);
+  }
+  // Requests mostly finish in the order they staged: drop what is handed back.
+  while (!heldList.empty()) {
+    const auto& [i, token, at] = heldList.front();
+    (void)at;
+    auto it = info.find(i);
+    if (it != info.end() && it->second.held && it->second.token == token)
+      break;
+    heldList.pop_front();
+  }
+}
+
+void ColdFill::appendGroup(std::vector<std::pair<uint32_t, uint64_t>> group) {
+  uint64_t lost = 0;
+  bool kick = false;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    appendGroupLocked(group, lost, kick);
+  }
+  if (lost)
+    if (auto store = globalStore())
+      store->stats().coldReplicaDeclined.fetch_add(lost, std::memory_order_relaxed);
+  if (kick)
+    queueCommit();
+}
+
+void ColdFill::appendHeldOlderThan(uint64_t ageUs) {
+  uint64_t lost = 0;
+  bool kick = false;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    const uint64_t now = nowUs();
+    std::vector<std::pair<uint32_t, uint64_t>> group;
+    std::deque<std::tuple<uint32_t, uint64_t, uint64_t>> keep;
+    for (const auto& [i, token, at] : heldList) {
+      auto it = info.find(i);
+      if (it == info.end() || !it->second.held || it->second.token != token)
+        continue; // already handed back, or staged again
+      if (now - at >= ageUs)
+        group.emplace_back(i, token);
+      else
+        keep.emplace_back(i, token, at);
+    }
+    heldList.swap(keep);
+    if (!group.empty())
+      appendGroupLocked(group, lost, kick);
+  }
   if (lost)
     if (auto store = globalStore())
       store->stats().coldReplicaDeclined.fetch_add(lost, std::memory_order_relaxed);
@@ -2876,6 +3103,16 @@ namespace {
 // hard _exit() skips this, and loses at most what the periodic checkpoint had
 // not yet committed.
 void commitAtExit() {
+  { // at exit nothing more finishes: every record still held goes now
+    std::vector<std::shared_ptr<ColdFill>> held;
+    {
+      std::lock_guard<std::mutex> g(g_regMu);
+      for (const auto& [k, cf] : registry())
+        held.push_back(cf);
+    }
+    for (const auto& cf : held)
+      cf->appendHeldOlderThan(0);
+  }
   coldCheckpoint();
   {
     std::unique_lock<std::mutex> lk(g_cmtMu);
@@ -3046,7 +3283,9 @@ void coldCheckpoint() {
       all.push_back(cf);
   }
   const uint64_t now = wallSeconds();
+  const uint64_t stalledUs = static_cast<uint64_t>(std::max(1, globalConfig().metaFlushSeconds)) * 1000000;
   for (const auto& cf : all) {
+    cf->appendHeldOlderThan(stalledUs); // a request stalled this long gives up its records
     cf->queueCommit();
     bool due;
     {

@@ -6,6 +6,7 @@
 #include "SlotStore.h"
 
 #include "IOBackend.h"
+#include "testing/FaultIO.h"
 #include "TestUtil.h"
 #include "vendor/crc32c.h"
 
@@ -623,4 +624,150 @@ TEST(SlotStore, AnEntryWhoseKindAndSlotDisagreeIsNotRead) {
   auto seen = SlotStore::open(io, t.path(), kHash)->refresh(true);
   ASSERT_EQ(seen.size(), 1u);
   EXPECT_EQ(seen[0].kind, SlotEntry::kMap);
+}
+
+// ---- several records in one read ------------------------------------------
+
+namespace {
+struct Reads {
+  int n = 0;
+  std::vector<uint64_t> sizes;
+  std::function<void(uint64_t, uint64_t)> fn() {
+    return [this](uint64_t, uint64_t b) {
+      ++n;
+      sizes.push_back(b);
+    };
+  }
+};
+} // namespace
+
+TEST(SlotStoreReads, NeighboursAreReadInOneGoEachAsItself) {
+  TempDir t;
+  RealIO io;
+  auto s = make(io, t.path());
+  std::vector<SlotEntry> out;
+  std::vector<SlotRecord> recs;
+  for (uint32_t i = 0; i < 5; ++i)
+    recs.push_back(rec(10 + i, 3000 + 100 * i, static_cast<uint8_t>(i)));
+  ASSERT_GT(commitAll(*s, recs, out), 0);
+  std::vector<std::vector<uint8_t>> got;
+  std::vector<char> ok;
+  Reads r;
+  // Asked in a different order from the store's: the answer follows the asking.
+  std::vector<SlotEntry> ask = {out[3], out[0], out[4], out[1], out[2]};
+  s->readRecords(ask, got, ok, 1 << 20, 0, r.fn());
+  EXPECT_EQ(r.n, 1);
+  for (size_t i = 0; i < ask.size(); ++i) {
+    ASSERT_TRUE(ok[i]) << i;
+    EXPECT_EQ(got[i], rec(ask[i].slot, ask[i].len, static_cast<uint8_t>(ask[i].slot - 10)).bytes);
+  }
+}
+
+TEST(SlotStoreReads, ADamagedRecordInARunFailsAloneAndTheOthersAreServed) {
+  TempDir t;
+  RealIO io;
+  auto s = make(io, t.path());
+  std::vector<SlotEntry> out;
+  ASSERT_GT(commitAll(*s, {rec(1, 2000, 1), rec(2, 2000, 2), rec(3, 2000, 3)}, out), 0);
+  int fd = ::open(SlotStore::path(t.path(), kHash).c_str(), O_RDWR);
+  uint8_t b;
+  ASSERT_EQ(::pread(fd, &b, 1, out[1].off + 10), 1);
+  b ^= 0x10;
+  ASSERT_EQ(::pwrite(fd, &b, 1, out[1].off + 10), 1);
+  ::close(fd);
+  std::vector<std::vector<uint8_t>> got;
+  std::vector<char> ok;
+  Reads r;
+  s->readRecords(out, got, ok, 1 << 20, 0, r.fn());
+  EXPECT_EQ(r.n, 1);
+  EXPECT_TRUE(ok[0]);
+  EXPECT_FALSE(ok[1]);
+  EXPECT_TRUE(got[1].empty()); // nothing of a record that failed its check
+  EXPECT_TRUE(ok[2]);
+  EXPECT_EQ(got[2], rec(3, 2000, 3).bytes);
+}
+
+TEST(SlotStoreReads, AFailedRunIsReadAgainOneRecordAtATime) {
+  TempDir t;
+  RealIO real;
+  FaultIO io(real);
+  bool created = false;
+  std::string err;
+  auto s = SlotStore::openOrCreate(io, t.path(), kHash, hdr(), blob(), created, err);
+  ASSERT_TRUE(s);
+  std::vector<SlotEntry> out;
+  ASSERT_GT(commitAll(*s, {rec(1, 1000, 1), rec(2, 1000, 2), rec(3, 1000, 3)}, out), 0);
+  io.failNth(IoOp::kPread, 1, EIO); // the run's read
+  std::vector<std::vector<uint8_t>> got;
+  std::vector<char> ok;
+  Reads r;
+  s->readRecords(out, got, ok, 1 << 20, 0, r.fn());
+  EXPECT_EQ(r.n, 4); // the failed run, then one read per record
+  for (int i = 0; i < 3; ++i)
+    EXPECT_TRUE(ok[i]) << i;
+  // A record that fails on its own read stays failed; the others do not.
+  io.failNth(IoOp::kPread, 1, EIO); // the run
+  io.failNth(IoOp::kPread, 3, EIO); // the second record alone
+  s->readRecords(out, got, ok, 1 << 20, 0, r.fn());
+  EXPECT_TRUE(ok[0]);
+  EXPECT_FALSE(ok[1]);
+  EXPECT_TRUE(ok[2]);
+}
+
+TEST(SlotStoreReads, TheCapSplitsARunAndALongRecordIsReadAlone) {
+  TempDir t;
+  RealIO io;
+  auto s = make(io, t.path(), nullptr, hdr(), blob());
+  std::vector<SlotEntry> out;
+  ASSERT_GT(commitAll(*s, {rec(1, 400 << 10, 1), rec(2, 400 << 10, 2), rec(3, 400 << 10, 3),
+                           rec(4, 2 << 20, 4)},
+                      out),
+            0);
+  std::vector<std::vector<uint8_t>> got;
+  std::vector<char> ok;
+  Reads r;
+  s->readRecords(out, got, ok, 1 << 20, 0, r.fn());
+  ASSERT_EQ(r.n, 3);
+  EXPECT_EQ(r.sizes[0], 800u << 10); // the first two
+  EXPECT_EQ(r.sizes[1], 400u << 10); // the third: a fourth would pass the cap
+  EXPECT_EQ(r.sizes[2], 2u << 20);   // longer than the cap: alone
+  for (int i = 0; i < 4; ++i)
+    EXPECT_TRUE(ok[i]) << i;
+}
+
+TEST(SlotStoreReads, AGapDecidesWhetherTwoBlocksAreReadTogether) {
+  TempDir t;
+  RealIO io;
+  auto s = make(io, t.path());
+  std::vector<SlotEntry> a, b;
+  ASSERT_GT(commitAll(*s, {rec(1, 5000, 1)}, a), 0);
+  ASSERT_GT(commitAll(*s, {rec(2, 5000, 2)}, b), 0); // the next block: a header between
+  std::vector<SlotEntry> both = {a[0], b[0]};
+  std::vector<std::vector<uint8_t>> got;
+  std::vector<char> ok;
+  Reads r0, r64;
+  s->readRecords(both, got, ok, 1 << 20, 0, r0.fn());
+  EXPECT_EQ(r0.n, 2);
+  s->readRecords(both, got, ok, 1 << 20, 64 << 10, r64.fn());
+  EXPECT_EQ(r64.n, 1);
+  EXPECT_TRUE(ok[0] && ok[1]);
+  EXPECT_EQ(got[1], rec(2, 5000, 2).bytes);
+}
+
+TEST(SlotStoreReads, AKeptEntryIsNeverRead) {
+  TempDir t;
+  RealIO io;
+  auto s = make(io, t.path());
+  SlotRecord kept;
+  kept.slot = 4;
+  kept.kind = SlotEntry::kKept;
+  std::vector<SlotEntry> out;
+  ASSERT_GT(commitAll(*s, {rec(3, 1000, 3), kept}, out), 0);
+  std::vector<std::vector<uint8_t>> got;
+  std::vector<char> ok;
+  Reads r;
+  s->readRecords(out, got, ok, 1 << 20, 64 << 10, r.fn());
+  EXPECT_EQ(r.n, 1);
+  EXPECT_TRUE(ok[0]);
+  EXPECT_FALSE(ok[1]);
 }
