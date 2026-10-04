@@ -51,7 +51,10 @@
 namespace ucache {
 
 class ColdFill; // ColdRun.h
-struct ColdMap; // ColdRun.h
+namespace transpose {
+struct ColdMap; // StoreMaps.h
+}
+using ColdMap = transpose::ColdMap;
 class ReadRule; // ReadRule.h
 
 // The layout a handle a forked child inherited had been set up in: its next
