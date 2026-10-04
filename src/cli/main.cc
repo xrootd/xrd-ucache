@@ -141,8 +141,8 @@ void usage() {
       "  pin   <url>       protect an entry from eviction\n"
       "  unpin <url>       remove pin protection\n"
       "  verify <url>      CRC-scrub an entry (detect + invalidate bad pages)\n"
-      "  branches <url>    which branches your analysis read (fully-cached\n"
-      "                    branches, bytes, source codec, and the summary share)\n"
+      "  branches <url>    which branches your analysis read (cached, or converted\n"
+      "                    into the file's store: bytes, source codec, the share)\n"
       "  recompress [--jobs N] [--yes] [--strict]\n"
       "                                 convert what is cached of the files whose source\n"
       "                    codec is in recompress_codecs (default lzma,zlib) into\n"
@@ -2816,8 +2816,9 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
 
 // `ucache branches <url>`: which branches the analysis actually
 // read — the branch-level answer behind ls's COV%. For each branch of the
-// cached entry: fully cached? source codec? bytes. Summary = K of N branches,
-// share of branch bytes.
+// cached entry: every basket cached, or converted into the file's store (whose
+// originals leave the byte cache under recompress_keep_originals = off)?
+// source codec? bytes. Summary = K of N branches, share of branch bytes.
 int cmdBranches(const Config& cfg, IOBackend& io, const char* url) {
 #ifndef UCACHE_HAVE_TRANSPOSE
   (void)cfg;
@@ -2850,28 +2851,53 @@ int cmdBranches(const Config& cfg, IOBackend& io, const char* url) {
   CacheSource csrc;
   csrc.fd = fd;
   csrc.meta = &*cm;
-  size_t hotN = 0;
+  // The original baskets the file's store holds a record of (its layout names
+  // each slot's original basket by offset).
+  std::set<uint64_t> stored;
+  if (auto ss = SlotStore::open(io, key->objectDir(cfg.cacheDir), key->hashHex)) {
+    tp::StoredLayout lay;
+    lay.slotFactor100 = ss->header().slotFactor100;
+    if (!ss->header().declined && tp::decodeLayout(ss->layoutBlob(), lay) && !lay.rnt)
+      for (const auto& e : ss->refresh(/*wait=*/true))
+        if (e.kind != SlotEntry::kMap && e.slot < lay.L.slots.size())
+          stored.insert(lay.L.slots[e.slot].origSeek);
+  }
+  size_t hotN = 0, storedN = 0;
   uint64_t hotBytes = 0, allBytes = 0;
   std::printf("%-7s %-9s %-6s  %s\n", "READ", "BYTES", "CODEC", "BRANCH");
   for (const auto& b : fm.branches) {
     uint64_t bytes = 0;
-    for (int32_t i = 0; i < b.writeBasket; ++i)
+    bool all = b.writeBasket > 0, inStore = false;
+    for (int32_t i = 0; i < b.writeBasket; ++i) {
       bytes += static_cast<uint64_t>(b.basketBytes[i]);
+      if (!all)
+        continue;
+      if (stored.count(static_cast<uint64_t>(b.basketSeek[i]))) {
+        inStore = true;
+        continue;
+      }
+      all = csrc.has(static_cast<uint64_t>(b.basketSeek[i]),
+                     static_cast<uint64_t>(b.basketBytes[i]));
+    }
     allBytes += bytes;
-    const bool hot = tp::fullyCached(b, csrc);
-    if (hot) {
+    if (all) {
       ++hotN;
+      storedN += inStore;
       hotBytes += bytes;
-      std::printf("%-7s %-9s %-6s  %s\n", "yes", human(bytes).c_str(),
-                  tp::branchCodec(fm, b, csrc).c_str(), b.name.c_str());
+      const std::string codec = tp::branchCodec(fm, b, csrc); // "" once its original is let go of
+      std::printf("%-7s %-9s %-6s  %s\n", inStore ? "stored" : "yes", human(bytes).c_str(),
+                  codec.empty() ? "-" : codec.c_str(), b.name.c_str());
     }
   }
   ::close(fd);
-  std::printf("%zu of %zu branches fully read (%.1f%% of branch bytes; %s of %s)\n", hotN,
+  std::printf("%zu of %zu branches fully read (%.1f%% of branch bytes; %s of %s)", hotN,
               fm.branches.size(),
               allBytes ? 100.0 * static_cast<double>(hotBytes) / static_cast<double>(allBytes)
                        : 0.0,
               human(hotBytes).c_str(), human(allBytes).c_str());
+  if (storedN)
+    std::printf("; %zu converted into the file's store", storedN);
+  std::printf("\n");
   return 0;
 #endif
 }

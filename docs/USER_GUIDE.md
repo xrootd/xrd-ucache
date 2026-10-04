@@ -929,7 +929,7 @@ below and the dedicated guide in `docs/CACHE_MANAGEMENT.md`.
 | `ucache settings`  | every setting: effective value + where it comes from (default \| conf \| state \| env) |
 | `ucache set <key> <value>` / `unset <key>` | change / drop a **current** value without touching your defaults in the conf |
 | `ucache recompress [--jobs N] [--yes]` | convert what is cached of the files whose source codec is in `recompress_codecs` into their replicas — the same form a first pass with `recompress = on` makes — in the foreground with live progress (`--jobs` default: every core the process may use). Estimates the disk growth first; a file that would not fit above the free-space floor is deferred, never evicted around |
-| `ucache branches <url>` | which branches your analysis read: fully-cached branches with bytes + source codec, and the summary share |
+| `ucache branches <url>` | which branches your analysis read: branches whose every basket is cached or converted into the file's store (`stored`), with bytes + source codec, and the summary share |
 | `ucache untranspose <url>` | drop an entry's replica; the byte cache is kept |
 
 **Recompression (decompress-once replicas).** Tightly compressed (LZMA)
