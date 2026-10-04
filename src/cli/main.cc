@@ -2246,9 +2246,11 @@ int cmdStatus(CacheStore& store, IOBackend& io) {
     double med = covs.empty() ? 0.0 : covs[covs.size() / 2];
     std::printf("original  : %s (total size of the cached files at the origin)\n",
                 human(origTotal).c_str());
-    std::printf("cached    : %s — %.1f%% of the original bytes (median file: %.1f%%)\n",
-                human(used).c_str(), 100.0 * static_cast<double>(used) /
-                                         static_cast<double>(origTotal),
+    // With replicas, what a store holds in place of a basket's original is
+    // not in these figures: say whose bytes they are.
+    std::printf("cached    : %s%s — %.1f%% of the original bytes (median file: %.1f%%)\n",
+                human(used).c_str(), replicaN ? " in the byte cache" : "",
+                100.0 * static_cast<double>(used) / static_cast<double>(origTotal),
                 100.0 * med);
   } else
     std::printf("cached    : %s\n", human(used).c_str());
@@ -2357,13 +2359,19 @@ int cmdLs(CacheStore& store, int argc, char** argv) {
   uint64_t now = static_cast<uint64_t>(::time(nullptr));
   std::printf("%-9s %-9s %-6s %-6s %-9s %-4s  %s\n", "SIZE", "CACHED", "COV%", "LAST", "RECOMP",
               "PIN", "KEY");
-  for (const auto& e : entries)
+  bool anyReplica = false;
+  for (const auto& e : entries) {
     std::printf("%-9s %-9s %5.1f%% %-6s %-9s %-4s  %s\n", human(e.fileSize).c_str(),
                 human(e.cachedBytes).c_str(), e.coverage * 100.0,
                 humanAge(e.atime, now).c_str(),
                 e.replicaBytes ? human(e.replicaBytes).c_str() : "-", e.pinned ? "yes" : "",
                 e.key.c_str());
+    anyReplica = anyReplica || e.replicaBytes;
+  }
   std::printf("(%zu entries)\n", entries.size());
+  if (anyReplica)
+    std::printf("(CACHED and COV%% count the byte cache; a basket converted into a file's replica "
+                "may have left it for RECOMP: `ucache branches <url>` counts both)\n");
   return 0;
 }
 

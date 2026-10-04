@@ -90,7 +90,10 @@ SIZE      CACHED    COV%   LAST   RECOMP    PIN   KEY
 
 - **SIZE** — the origin file size; **CACHED** — how much of it is actually on
   your disk (uCache stores only the pages your jobs read, not whole files);
-  **COV%** — that fraction.
+  **COV%** — that fraction. Both count the byte cache: once a basket is
+  converted into the file's replica, its original leaves the byte cache
+  (`recompress_keep_originals = off`) and is counted under RECOMP instead, so
+  COV% falls after `ucache recompress`. `ucache branches <url>` counts both.
 - **LAST** — how long ago the entry was last *read* (`3d`, `5h`, `12m`). This is
   exactly what eviction ranks by, so it tells you what will roll off first.
 - **RECOMP** — size of a decompress-once (recompressed) replica if one
