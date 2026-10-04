@@ -195,9 +195,10 @@ class StoreMaps : public StoredLayout {
   bool sweepMapWantedLocked(uint64_t now) const;
   // Where a map record of `len` bytes can go at `now` (0: nowhere, and
   // `retryS` = when a place may free): clear of every map a reader may still
-  // hold. Before them all, else after them all, else between: a newer map
-  // states more and is a little longer, so it fits where an older one lay only
-  // together with the room next to it.
+  // hold -- this store's, and those of a store this one replaced (the in-use
+  // record keeps where they were handed out). Before them all, else after them
+  // all, else between: a newer map states more and is a little longer, so it
+  // fits where an older one lay only together with the room next to it.
   uint64_t freePlaceLocked(uint64_t len, uint64_t now, const InUseRecord& inUse,
                            uint64_t& retryS) const;
   // The compact map to make of the slots `real` states: its range, header and
@@ -219,6 +220,11 @@ class StoreMaps : public StoredLayout {
   // hold that is no longer valid (a map replaced and out of use, or a range of
   // a store this one replaced); else neither: unassigned, zeros up to `upto`.
   std::shared_ptr<const ColdMap> compactAt(uint64_t pos, bool& refused, uint64_t& upto);
+  // A read at `pos` in the tables area, in the tree record of a map of another
+  // store -- one this store replaced, whose readers may still hold positions
+  // there: `refused` (no bytes there are this store's to give). Else `upto` =
+  // where the next such record starts (UINT64_MAX: none).
+  void tablesForeign(uint64_t pos, bool& refused, uint64_t& upto);
   // The in-use record as last read, again at most every few seconds.
   InUseRecord inUseSnapshot(uint64_t now);
   std::mutex inUseMu;

@@ -387,6 +387,11 @@ handed to another process -- gets this error instead of another basket's
 bytes. Open the file again: the new handle is shown the current map. If your
 jobs reuse positions longer than a day after closing the file, raise
 `in_use_seconds`; `ucache stats` counts these reads as `slot_map_refused`.
+The same holds when a file's replica is removed (`ucache rm`,
+`ucache untranspose`) and made again while a reader still holds positions in
+it: the new replica's maps keep clear of the old ones' places while those are
+in use, and a read there fails (`... in the tree record of a map of a store
+that was replaced`).
 
 ## Corruption / CRC
 

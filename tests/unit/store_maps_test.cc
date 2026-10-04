@@ -1,10 +1,15 @@
 // A map's record in the store (StoreMaps.h): both forms read back as written,
-// and a record that is not one is refused.
+// and a record that is not one is refused; and where a map may go.
 #include "StoreMaps.h"
+
+#include "InUse.h"
+#include "TestUtil.h"
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 using namespace ucache;
@@ -104,4 +109,67 @@ TEST(StoreMaps, ARecordThatIsNotAMapIsRefused) {
   EXPECT_FALSE(decodeMapHead(rec.data(), rec.size(), h));
   // Too short for its own head.
   EXPECT_FALSE(decodeMapHead(junk.data(), kMapHead - 1, h));
+}
+
+namespace {
+// A book of maps with no store and no maps of its own: only the in-use
+// record speaks.
+struct BareMaps : StoreMaps {
+  bool storedEntry(uint32_t, SlotEntry&) const override { return false; }
+  void forEachStored(const std::function<void(uint32_t, const SlotEntry&)>&) const override {}
+  void applyOthers(const std::vector<SlotEntry>&) override {}
+};
+} // namespace
+
+// A store made after another was removed lays out the same tables area. A map
+// of the removed store handed out within the window keeps its place there:
+// the new store's map goes elsewhere, and a read there is refused rather than
+// answered with this store's bytes.
+TEST(StoreMaps, AReplacedStoresMapKeepsItsPlaceWhileInUse) {
+  test::TempDir td;
+  RealIO io;
+  BareMaps sm;
+  sm.cacheDir = td.path();
+  sm.key = *UrlKey::parse("root://h//data/replaced.root");
+  sm.tables.first = 1000;
+  sm.tables.end = 100000;
+  sm.seekLimit = UINT64_MAX;
+  sm.inUseSeconds = 86400;
+  const uint64_t now = wallSeconds();
+  InUseRecord rec;
+  InUseRange r;
+  r.storeId = 7; // not this store
+  r.lo = 1000;
+  r.hi = 3000;
+  r.lastS = now;
+  rec.ranges.push_back(r);
+  uint64_t retry = 0;
+  uint64_t at = 0;
+  {
+    std::lock_guard<std::mutex> g(sm.mu);
+    at = sm.freePlaceLocked(2000, now, rec, retry);
+  }
+  EXPECT_NE(at, 0u);
+  EXPECT_TRUE(at >= r.hi || at + 2000 <= r.lo) << at;
+  // Out of use: the place is free again.
+  rec.ranges[0].lastS = now - 2 * sm.inUseSeconds;
+  {
+    std::lock_guard<std::mutex> g(sm.mu);
+    at = sm.freePlaceLocked(2000, now, rec, retry);
+  }
+  EXPECT_EQ(at, sm.tables.first);
+  // Reads: inside the replaced store's map refused, before it bounded by it.
+  InUseSettings s;
+  ASSERT_TRUE(InUseRecord::note(io, InUseRecord::path(sm.cacheDir, sm.key.hashHex), r, &s,
+                                sm.inUseSeconds));
+  bool refused = false;
+  uint64_t upto = 0;
+  sm.tablesForeign(1500, refused, upto);
+  EXPECT_TRUE(refused);
+  sm.tablesForeign(500, refused, upto);
+  EXPECT_FALSE(refused);
+  EXPECT_EQ(upto, 1000u);
+  sm.tablesForeign(5000, refused, upto);
+  EXPECT_FALSE(refused);
+  EXPECT_EQ(upto, UINT64_MAX);
 }

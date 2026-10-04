@@ -218,6 +218,17 @@ uint64_t StoreMaps::freePlaceLocked(uint64_t len, uint64_t now, const InUseRecor
       live.emplace_back(a, b);
     newer.emplace_back(a, b);
   }
+  // A map of another store -- one this store replaced -- keeps its place too
+  // while it is in use: its readers may hold positions in its tree record, and
+  // this store's map there would hand them other bytes.
+  for (const auto& r : inUse.ranges) {
+    if (r.storeId == id || r.hi <= tables.first || r.lo >= tables.end ||
+        !inUse.inUse(r.storeId, r.lo, r.hi, now, window))
+      continue;
+    live.emplace_back(r.lo, r.hi);
+    const uint64_t at = inUse.freeAtS(r.storeId, r.lo, r.hi, window);
+    retryS = std::min(retryS, at <= now ? now + InUseRecord::kHoldRefreshS : at);
+  }
   const uint64_t end = std::min(tables.end, seekLimit == UINT64_MAX ? UINT64_MAX : seekLimit + len);
   if (end <= tables.first || end - tables.first < len)
     return 0;
@@ -364,6 +375,21 @@ InUseRecord StoreMaps::inUseSnapshot(uint64_t now) {
     inUseCacheS = now;
   }
   return inUseCache;
+}
+
+void StoreMaps::tablesForeign(uint64_t pos, bool& refused, uint64_t& upto) {
+  refused = false;
+  upto = UINT64_MAX;
+  const InUseRecord rec = inUseSnapshot(wallSeconds());
+  const uint64_t id = store ? store->header().storeId : 0;
+  for (const auto& r : rec.ranges) {
+    if (r.storeId == id || r.hi <= tables.first || r.lo >= tables.end)
+      continue;
+    if (pos >= r.lo && pos < r.hi)
+      refused = true;
+    else if (r.lo > pos)
+      upto = std::min(upto, r.lo);
+  }
 }
 
 std::shared_ptr<const ColdMap> StoreMaps::compactAt(uint64_t pos, bool& refused, uint64_t& upto) {

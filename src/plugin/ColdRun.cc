@@ -497,16 +497,20 @@ bool shownMapHeld(const std::string& key, uint64_t a, uint64_t b) {
       return true;
   return false;
 }
-// The identifying ranges of the maps this process showed `key` in; `held`:
-// only those a handle still holds.
+// The identifying ranges of the maps this process showed `key` in -- and a
+// TTree compact map's tree record, in the tables area apart from its range;
+// `held`: only those a handle still holds.
 std::vector<std::pair<uint64_t, uint64_t>> shownMapRanges(const std::string& key, bool held) {
   std::vector<std::pair<uint64_t, uint64_t>> out;
   std::lock_guard<std::mutex> g(g_shownMu);
   auto it = shownMap().find(key);
   if (it != shownMap().end())
     for (const auto& m : it->second.maps)
-      if (!held || !m.map.expired())
+      if (!held || !m.map.expired()) {
         out.emplace_back(m.lo, m.hi);
+        if (m.seek != m.lo)
+          out.emplace_back(m.seek, m.seek + m.len);
+      }
   return out;
 }
 // The parameters of the slot layout this process showed `key` in, if any.
@@ -1621,6 +1625,14 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
   bool layoutMeta = false;
   uint64_t mapLo = 0, mapHi = 0;
   bool mapOwn = false; // the map read is the one the handle was shown
+  // A TTree compact map's tree record, in the tables area: noted beside the
+  // map's range, so a store made after this one is replaced keeps clear of it.
+  uint64_t tabLo = 0, tabHi = 0;
+  auto noteTables = [&tabLo, &tabHi](const ColdMap& m) {
+    const bool apart = m.compact() && !m.metaInRange();
+    tabLo = apart ? m.metaSeek : 0;
+    tabHi = apart ? m.metaSeek + m.meta.size() : 0;
+  };
   std::vector<size_t> compactIdx; // pieces read at a compact map's address
   for (const auto& c : req->chunks) {
     char* base = static_cast<char*>(c.buffer);
@@ -1697,12 +1709,34 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
         }
         if (!at && !gone && (other = cf.mapCovering(pos)))
           at = other.get();
+        bool foreign = false;
+        uint64_t foreignAt = UINT64_MAX;
+        if (!at && !gone)
+          cf.tablesForeign(pos, foreign, foreignAt);
+        if (foreign) {
+          // A map's tree record of the store this one replaced, handed out and
+          // perhaps still held: no bytes here are this store's to give.
+          req->refused.store(true);
+          req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0,
+                                 "a read in the tree record of a map of a replaced store"));
+          if (auto cs = globalStore())
+            cs->stats().slotMapRefused.fetch_add(1, std::memory_order_relaxed);
+          const uint64_t nowS = wallSeconds();
+          if (uint64_t last = cf.refusedLogS.load(); nowS != last &&
+                                                     cf.refusedLogS.compare_exchange_strong(last, nowS))
+            UCACHE_ERROR("%s: a read at %llu, in the tree record of a map of a store that was "
+                         "replaced, fails; open the file again",
+                         cf.key.key.c_str(), static_cast<unsigned long long>(pos));
+        } else if (foreignAt != UINT64_MAX) {
+          n = std::min<uint64_t>(n, foreignAt - pos);
+        }
         if (at) {
           n = std::min<uint64_t>(n, at->metaSeek + at->meta.size() - pos);
           std::memcpy(d, at->meta.data() + (pos - at->metaSeek), n);
           mapLo = at->compact() ? at->rangeLo : at->metaSeek;
           mapHi = at->compact() ? at->end() : at->metaSeek + at->meta.size();
           mapOwn = at == map;
+          noteTables(*at);
         } else {
           if (map && pos < map->metaSeek)
             n = std::min<uint64_t>(n, map->metaSeek - pos);
@@ -1729,6 +1763,7 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
           mapLo = cm->rangeLo;
           mapHi = cm->end();
           mapOwn = cm.get() == map;
+          noteTables(*cm);
           pos += n;
         } else if (cm) {
           const auto& R = cm->recs;
@@ -1746,6 +1781,7 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
           mapLo = cm->rangeLo; // a use of the map: its positions are being read
           mapHi = cm->end();
           mapOwn = cm.get() == map;
+          noteTables(*cm);
           pos += n;
         } else if (refused) {
           req->refused.store(true);
@@ -1819,6 +1855,8 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
     noteSlotLayout(cf, Use::kHandOut);
   if (mapHi)
     noteUse(cf, mapLo, mapHi, mapOwn ? Use::kHandOut : Use::kUse);
+  if (tabHi)
+    noteUse(cf, tabLo, tabHi, mapOwn ? Use::kHandOut : Use::kUse);
 }
 
 void serveRequest(const std::shared_ptr<ColdRequest>& req) {

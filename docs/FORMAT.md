@@ -339,7 +339,10 @@ record uncompressed — in a place no live map holds. A map is live while it is
 the newest, while a handle in any process holds it, and for `in_use_seconds`
 (default 1 day) after it was last handed out or released (the file's in-use
 record, below); then its place may be taken. A map nobody was handed frees at
-once. A map is never rewritten.
+once. A map is never rewritten. A store made after the file's store was
+removed lays out the same place: there, a map of the removed store keeps its
+place while the in-use record says it is in use, and a read in it is refused
+(`slot_map_refused`).
 
 - **Releases sharing a cache:** every format keeps the magic at offset 0 and
   format_version at offset 8, so any build can tell a newer store from debris.
@@ -376,9 +379,11 @@ high <highest address handed out>
 range <store id, 16 hex digits> <first address> <end address> <last use> <last held> <pid>
 ```
 
-- A `range` line with pid `0` is a use: the newest time a map's metadata was
-  handed out, or a process that held the map closed the file. The window
-  counts from it.
+- A `range` line names a map by its addresses: a mixed map's tree record, a
+  compact map's range -- and a TTree compact map's tree record too, which lies
+  apart from its range. With pid `0` it is a use: the newest time a map's
+  metadata was handed out, or a process that held the map closed the file. The
+  window counts from it.
 - A line with a pid is that process's hold: noted when one of its handles is
   handed the map, refreshed while one holds it, removed at its last close. A
   held map stays in use whatever the window; a process that ends without

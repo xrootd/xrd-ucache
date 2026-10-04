@@ -234,8 +234,9 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   `mixed_maps = off`.
 - `slot_map_refused` — reads refused because they lay in the range of a compact
   map no longer live: replaced and, for `in_use_seconds`, neither held nor
-  used; or a range of a store that was replaced since. The reader gets an
-  error and the plugin logs one; reopening the file shows the current map.
+  used; or in a map of a store that was replaced since (its range, or its tree
+  record). The reader gets an error and the plugin logs one; reopening the file
+  shows the current map.
 - `slot_map_full` — maps not made because there was no place for one: the
   baskets converted since the newest map are read at their slot's size until
   a place frees: when no handle holds a replaced map and it has not been used
