@@ -512,6 +512,14 @@ FillLayout layoutForRNTupleFill(const RNTupleMeta& m, uint64_t fileSize,
       return decline("no convertible column range: its pages are stored uncompressed", true);
   }
   if (L.relocated.empty()) return decline("no convertible column range");
+  // Column by column, each column's clusters in order: a reader's request for a
+  // cluster takes pages of several columns, and the gaps it may read across
+  // are then pages of the same columns in other clusters, which it reads
+  // anyway, rather than pages of columns it never reads.
+  std::stable_sort(L.relocated.begin(), L.relocated.end(), [&m](uint32_t a, uint32_t b) {
+    const auto &x = m.ranges[a], &y = m.ranges[b];
+    return x.columnId != y.columnId ? x.columnId < y.columnId : x.clusterId < y.clusterId;
+  });
 
   // The page list and footer come first; their reservation is their RAW size in
   // an RBlob key each, since the patched envelopes keep their length and their

@@ -182,7 +182,11 @@ page (RNTuple) of the original sits in a slot past the original end, sized so
 its converted record fits, followed by zeros. An RNTuple slot is the page
 DECODED, followed by 8 bytes: the XXH3-64 of the decoded page, little-endian,
 the page's checksum in the format's own convention (the page list flags every
-such page as checksummed), so a reader verifies each page it is served. That layout is fixed when the
+such page as checksummed), so a reader verifies each page it is served.
+Slots lie branch by branch (TTree: each branch's baskets in order) or column
+by column (RNTuple: each column's clusters in order), so the gaps a reader's
+request may span between the pages it wants are pages of the same branches or
+columns, not of ones it never reads. That layout is fixed when the
 store is created and never changes, so a reader may reopen the file at any
 time and find its offsets unchanged. All integers little-endian.
 
@@ -198,7 +202,7 @@ Header:
 |---|---|---|---|
 | 0 | 8 | magic | `"UCSLOTS1"` |
 | 8 | 4 | format_version u32 | = 2. Below 2: not used, and replaced when a new store is made. Above 2 (a newer uCache's store): left in place — never replaced, unlinked or served; the file is served as stored |
-| 12 | 4 | layout_version u32 | the layout algorithm, = 4. Lower: store replaced — except that a version 3 store is served as it is unless it is a DECLINED one (version 4 changed only which files and branches are converted, never how a layout is laid out); higher: left in place, as a newer format is |
+| 12 | 4 | layout_version u32 | the layout algorithm: 4 for a TTree file, 5 for an RNTuple file (5 lays an RNTuple file's slots out column by column; 4 laid them out cluster by cluster). Lower: store replaced — except that a version 3 or 4 store is served as it is unless it is a version 3 DECLINED one (version 4 changed only which files and branches are converted, never how a layout is laid out); higher: left in place, as a newer format is |
 | 16 | 1 | container u8 | 0 = TTree, 1 = RNTuple |
 | 18 | 1 | declined u8 | 1 = the file is not served this way (nothing else follows) |
 | 20 | 4 | n_slots u32 | |

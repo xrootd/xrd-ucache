@@ -357,6 +357,36 @@ TEST(RNTupleFill, LayoutParsesBackAndServesTheSamePages) {
   EXPECT_EQ(decodeAllPages(t, v), decodeAllPages(m, src));
 }
 
+// The first-pass layout lies column by column, each column's clusters in
+// order: a reader's request for one cluster then spans pages of the columns it
+// reads, with other clusters of those columns between them, not pages of
+// columns it never reads.
+TEST(RNTupleFill, SlotsLieColumnByColumn) {
+  RNTupleMeta m = parseRNTuple(fixture(), "");
+  ASSERT_TRUE(m.error.empty()) << m.error;
+  const auto orig = slurp(fixture());
+  const std::vector<uint8_t> header(orig.begin(), orig.begin() + 100);
+  const std::string codec = rnTupleCodecName(m.ranges[0].compressionSettings);
+  FillLayout L = layoutForRNTupleFill(m, m.fileSize, header, {codec});
+  ASSERT_TRUE(L.error.empty()) << L.error;
+  std::set<uint32_t> clusters, columns;
+  for (uint32_t ri : L.relocated) {
+    clusters.insert(m.ranges[ri].clusterId);
+    columns.insert(m.ranges[ri].columnId);
+  }
+  ASSERT_GE(clusters.size(), 2u) << "the fixture needs two clusters";
+  ASSERT_GE(columns.size(), 2u) << "and two columns";
+  auto key = [&m](uint32_t ri) {
+    return std::make_pair(m.ranges[ri].columnId, m.ranges[ri].clusterId);
+  };
+  for (size_t i = 1; i < L.relocated.size(); ++i)
+    EXPECT_LT(key(L.relocated[i - 1]), key(L.relocated[i])) << i;
+  for (size_t i = 1; i < L.slots.size(); ++i) {
+    EXPECT_LT(L.slots[i - 1].vSeek, L.slots[i].vSeek) << i;
+    EXPECT_LE(key(L.slots[i - 1].branch), key(L.slots[i].branch)) << i;
+  }
+}
+
 // A compact map of the first-pass layout: its own page list and footer first
 // in a range of its own, then every page of a wholly converted range as its
 // record (ZSTD-1, or uncompressed) with the record's checksum; a range not

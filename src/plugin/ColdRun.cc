@@ -73,8 +73,16 @@ constexpr uint32_t kSlotFactor100 = 300;
 //    That changes which files and branches are converted, never how a layout
 //    is laid out: a version 3 layout is still served as it is, while a
 //    version 3 DECLINED store is decided again (see adoptable).
-constexpr uint32_t kLayoutVersion = 4;
+// 5: an RNTuple file's slots lie column by column (4: cluster by cluster). A
+//    version 3 or 4 layout is still served as it is. A TTree file's layout is
+//    computed as in 4, and its store still says 4, so an earlier release
+//    serves it.
+constexpr uint32_t kLayoutVersion = 5;
+constexpr uint32_t kTTreeLayoutVersion = 4;
 constexpr uint32_t kOldestServedLayout = 3;
+// Where a store's decision to convert (or to decline) was last changed.
+constexpr uint32_t kOldestDecision = 4;
+uint32_t layoutVersionOf(bool rnt) { return rnt ? kLayoutVersion : kTTreeLayoutVersion; }
 
 // Converted records wait in memory until this many bytes, the periodic
 // checkpoint, or the process's last close of the file, then go to the store in
@@ -1144,7 +1152,7 @@ bool adoptable(const SlotStoreHeader& h, uint64_t size, uint64_t originMtime, ui
                uint32_t originCksum) {
   const Config& cfg = globalConfig();
   if (h.layoutVersion > kLayoutVersion || h.originSize != size ||
-      h.layoutVersion < (h.declined ? kLayoutVersion : kOldestServedLayout))
+      h.layoutVersion < (h.declined ? kOldestDecision : kOldestServedLayout))
     return false;
   if (cfg.validate == ValidateMode::kSizeMtime && h.originMtime != originMtime)
     return false;
@@ -1187,7 +1195,8 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   if (store && store->header().layoutVersion > kLayoutVersion)
     return nullptr;
   if (store && !adoptable(store->header(), size, originMtime, cksumKind, originCksum)) {
-    if (store->header().layoutVersion != kLayoutVersion)
+    const SlotStoreHeader& oh = store->header();
+    if (oh.layoutVersion < (oh.declined ? kOldestDecision : kOldestServedLayout))
       UCACHE_INFO("slot store for %s was made by an earlier uCache; decided again",
                   key.key.c_str());
     else
@@ -1229,7 +1238,9 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
                                  shownSlotParams(key.key, cf->slotFactor100, shownCodecs))
       cf->codecs = splitCodecs(shownCodecs);
     else if (InUseRecord::load(io, InUseRecord::path(cfg.cacheDir, key.hashHex), rec) &&
-             rec.hasSettings && rec.settings.layoutVersion == kLayoutVersion &&
+             rec.hasSettings &&
+             (rec.settings.layoutVersion == kLayoutVersion ||
+              rec.settings.layoutVersion == kTTreeLayoutVersion) &&
              !rec.expired(wallSeconds(), cfg.inUseSeconds)) {
       cf->codecs = splitCodecs(rec.settings.codecs);
       cf->slotFactor100 = rec.settings.slotFactor100;
@@ -1237,7 +1248,7 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
     bool declined = false;
     const bool ok = computeLayout(*cf, src, size, cf->slotFactor100, declined);
     SlotStoreHeader want;
-    want.layoutVersion = kLayoutVersion;
+    want.layoutVersion = layoutVersionOf(cf->rnt);
     want.slotFactor100 = static_cast<uint16_t>(cf->slotFactor100);
     want.codecs = joinCodecs(cf->codecs);
     want.originSize = size;

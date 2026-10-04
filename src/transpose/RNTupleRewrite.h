@@ -104,9 +104,10 @@ RNTupleRewrite buildRNTupleRewriteFromPages(
 // checksum of the decoded bytes (sealDecodedPage), so a reader verifies every
 // page it is served exactly as it would the original's. The rebuilt page list and footer come first in
 // the extension, the anchor is patched in place, and the header says the new
-// end. `header` = the file's first fBEGIN bytes. `slots[i].branch` is the
-// range index and `.basket` the page index; a page several records share gets
-// one slot. Declines (error set) rather than guess.
+// end. `header` = the file's first fBEGIN bytes. Slots lie column by column,
+// each column's clusters in order (`relocated` is in that order).
+// `slots[i].branch` is the range index and `.basket` the page index; a page
+// several records share gets one slot. Declines (error set) rather than guess.
 // The checksum a slot serves after a decoded page: XXH3-64 of the page's
 // bytes, little-endian, as the format stores a page checksum.
 inline constexpr uint32_t kSlotChecksumBytes = 8;
