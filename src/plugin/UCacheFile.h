@@ -19,9 +19,9 @@
 // through HandleState::acquireInner/releaseInner; the plugin destructor
 // invalidates and drains. PgRead is pass-through and never cached (§4.7:
 // ROOT's path is Read/VectorRead; xrdcp's pgread traffic stays uncached) —
-// EXCEPT on a transposed handle, where pass-through would
-// return stale/missing bytes: there it is served from the stitched view
-// with locally computed crc32c page checksums.
+// EXCEPT on a handle shown a slot layout, where pass-through would return
+// other bytes: there it is served from the layout with locally computed
+// crc32c page checksums.
 //
 // A handle opened for a copy -- by a copy tool, XRootD's copy engine, ROOT's
 // TFile::Cp or gfal2's xrootd plugin -- is pure pass-through: it reads the
@@ -34,7 +34,6 @@
 #include "Config.h"
 #include "CopyGuard.h"
 #include "Executor.h"
-#include "ReplicaStore.h"
 #include "XrdClTimeout.h"
 
 #include <XrdCl/XrdClFile.hh>
@@ -59,7 +58,7 @@ class ReadRule; // ReadRule.h
 
 // The layout a handle a forked child inherited had been set up in: its next
 // setup in the child serves exactly that one (HandleState::syncFork).
-enum class ForkLayout : uint8_t { kNone, kOriginal, kView, kCold };
+enum class ForkLayout : uint8_t { kNone, kOriginal, kCold };
 
 // State shared between the plugin object, executor tasks, and wire handlers.
 struct HandleState {
@@ -70,9 +69,8 @@ struct HandleState {
   // first caller starts the handle over (the others wait for it): the locks
   // are made anew, the counts forgotten, the entry and slot run left behind
   // undestroyed, and the handle is set up again at its next read in the
-  // layout it had -- the original, the same compact replica view (kept: its
-  // reads take no lock), or the same slot layout; if that layout cannot be had
-  // again, every read on the handle fails. A handle the cache serves opens
+  // layout it had -- the original, or the same slot layout; if that layout
+  // cannot be had again, every read on the handle fails. A handle the cache serves opens
   // the origin file afresh at its first need of it (the parent's is left
   // behind); one that only relays keeps it, and XrdCl recovers it. Nothing is
   // held across fork, and nothing is done in the fork handler: a parent that
@@ -85,7 +83,6 @@ struct HandleState {
   std::atomic<uint64_t> forkGen{Executor::forkGeneration()};
   std::atomic<uint64_t> forkClaim{Executor::forkGeneration()};
   ForkLayout forkLayout = ForkLayout::kNone;  // under setupMu, then mu
-  std::shared_ptr<ReplicaView> keptView;       // with ForkLayout::kView
   bool innerStale = false;    // under innerOpenMu: the inner file is to be opened afresh
   bool reopenInChild = false; // set at Open: the cache serves this handle
   // The layout this handle's reader was shown before a fork could not be set
@@ -128,16 +125,9 @@ struct HandleState {
 
   std::mutex mu;
   std::shared_ptr<FileEntry> entry;            // null until setup completes
-  // Transposed-replica view: adopted once at entry setup after
-  // its open-time full verify, HANDLE-STABLE thereafter —
-  // overlay ranges do not exist at the origin, so a handle must keep the
-  // view it opened with. A mid-handle overlay fault errors that read
-  // faithfully (the "behaves like a local file" contract) and drops the
-  // replica for FUTURE opens; this handle keeps serving what still verifies.
-  std::shared_ptr<ReplicaView> view;
-  std::atomic<bool> replicaDropped{false};     // one-time drop-on-fault latch
-  // Cold replica run (ColdRun.h): the transient layout this handle was shown
-  // at setup, likewise HANDLE-STABLE. Never set together with `view`.
+  // Slot run (ColdRun.h): the layout this handle was shown at setup,
+  // HANDLE-STABLE thereafter: its addresses do not exist at the origin, so a
+  // handle keeps the layout it opened with.
   std::shared_ptr<ColdFill> cold;
   // With `cold`: the mixed map this handle was shown at setup (null: the slot
   // layout itself). HANDLE-STABLE like the layout.
@@ -276,15 +266,14 @@ class UCacheFile : public XrdCl::FilePlugIn {
   // Lazily create the cache entry on the caller's thread (first read), doing
   // a synchronous inner Stat. Returns the entry, or nullptr for
   // pass-through (write-open, disabled, denied host, Stat failure, closed).
-  // Also adopts the transposed-replica view when one validates.
+  // Also sets up the file's slot layout when it has a store.
   // `firstRead` is the handle's first request when this is its first operation:
   // a whole-file read there makes the handle a copy (no entry, the origin's
-  // bytes) where a compact replica or slot store exists, and shows it the file
-  // as stored where recompression could make one.
+  // bytes) where a slot store exists, and shows it the file as stored where
+  // recompression could make one.
   std::shared_ptr<FileEntry> ensureEntry(const std::pair<uint64_t, uint64_t>* firstRead = nullptr);
-  std::shared_ptr<ReplicaView> currentView() const;
   std::shared_ptr<ColdFill> currentCold() const;
-  // The size a replica or cold-run handle shows its reader; 0 for a plain one.
+  // The size a slot-layout handle shows its reader; 0 for a plain one.
   uint64_t shownSize() const;
 
   std::shared_ptr<HandleState> st_;

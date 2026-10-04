@@ -2,14 +2,10 @@
 // carry INDEPENDENT widths, and a 64-bit header over a 32-bit directory record
 // is a valid in-the-wild layout (a file that grew past 2 GB after its keys list
 // had been written keeps a narrow directory record pointing at an early keys
-// list). The parser must accept it, and the overlay builder must never write a
-// seek at the wrong site's width — the keys-list record is patched in place
-// precisely so that a narrow directory field never has to address the
-// extension, which for such a file necessarily starts past 2 GiB.
+// list). The parser must accept it.
 #include "CacheStore.h"
 #include "IOBackend.h"
 #include "ReadFootprint.h"
-#include "ReplicaStore.h"
 #include "Transposer.h"
 #include "TreeMeta.h"
 
@@ -37,18 +33,6 @@ void bePut32(uint8_t* p, uint32_t v) {
 void bePut64(uint8_t* p, uint64_t v) {
   for (int i = 0; i < 8; ++i)
     p[i] = static_cast<uint8_t>(v >> (56 - 8 * i));
-}
-uint64_t beGet64(const uint8_t* p) {
-  uint64_t v = 0;
-  for (int i = 0; i < 8; ++i)
-    v = (v << 8) | p[i];
-  return v;
-}
-uint32_t beGet32(const uint8_t* p) {
-  uint32_t v = 0;
-  for (int i = 0; i < 4; ++i)
-    v = (v << 8) | p[i];
-  return v;
 }
 
 // A TKey header. `wide` = version + 1000 => 64-bit fSeekKey/fSeekPdir (ROOT
@@ -114,99 +98,12 @@ std::string writeTemp(const ucache::test::TempDir& td, const std::vector<uint8_t
   return path;
 }
 
-// Byte source backed by explicit ranges (same shape as the learner's mock).
-struct MockSource : Source {
-  std::map<uint64_t, std::vector<uint8_t>> ranges;
-  bool has(uint64_t off, uint64_t n) override {
-    auto it = ranges.find(off);
-    return it != ranges.end() && it->second.size() >= n;
-  }
-  bool read(void* dst, uint64_t n, uint64_t off) override {
-    auto it = ranges.find(off);
-    if (it == ranges.end() || it->second.size() < n)
-      return false;
-    std::memcpy(dst, it->second.data(), n);
-    return true;
-  }
-};
-
-// Geometry of the mixed-width fixture: a 3 GB file (64-bit header) whose keys
+// Geometry of the mixed-width layout: a 3 GB file (64-bit header) whose keys
 // list was written at 512 MB and whose directory record therefore stayed
-// 32-bit. Every relocation target lies past 2 GiB.
+// 32-bit.
 constexpr int64_t kFend = 3000000000ll;
 constexpr int64_t kKeysListSeek = 511823714ll;
-constexpr int64_t kTreeKeySeek = 2900000000ll;
-constexpr int64_t kBasketSeek = 1000000ll;
-constexpr int32_t kBasketPayload = 128;
 
-struct Fixture {
-  FileMeta fm;
-  MockSource src;
-  size_t klNbytes = 0;   // keys-list record length
-  size_t klKeylen = 0;   // its own key header length
-  size_t basketLen = 0;  // relocated basket record length
-};
-
-// `wideBasketKey` = the real-world case (ROOT widened the basket keys); a narrow
-// basket key cannot be re-pointed past 2 GiB at all and must fail loudly.
-Fixture mixedWidthFixture(bool wideBasketKey) {
-  Fixture fx;
-  FileMeta& fm = fx.fm;
-  fm.large = true;
-  fm.headerSeekWidth = 8; // 64-bit header (fEND past 2 GB)
-  fm.dirSeekWidth = 4;    // 32-bit root directory record
-  fm.fend = kFend;
-  fm.keyslistSeek = kKeysListSeek;
-  fm.dirSeekKeysOff = 130; // inside the crafted directory record
-  fm.treeBlob.assign(128, 0xAB);
-
-  BranchInfo b;
-  b.name = "Muon_pt";
-  b.writeBasket = 1;
-  b.basketSeek = {kBasketSeek};
-  b.basketBytes = {0}; // set below, once the record length is known
-  b.seekArrayOff = 8;
-  b.bytesArrayOff = 40;
-
-  auto bk = keyHeader(wideBasketKey, "TBasket", "Muon_pt", 0, kBasketPayload, kBasketSeek);
-  fx.basketLen = bk.size() + kBasketPayload;
-  bePut32(bk.data(), static_cast<uint32_t>(fx.basketLen)); // fNbytes
-  // fObjlen == fNbytes - fKeylen => stored raw, so the builder relocates it
-  // verbatim (no codec needed to exercise the seek-width logic).
-  std::vector<uint8_t> basket = bk;
-  basket.resize(fx.basketLen, 0x5A);
-  b.basketBytes = {static_cast<int32_t>(fx.basketLen)};
-  fm.branches.push_back(b);
-  fx.src.ranges[kBasketSeek] = basket;
-
-  // Live tree key (wide: it sits past 2 GB in a 3 GB file).
-  auto tk = keyHeader(true, "TTree", "Events", 4096, 8192, kTreeKeySeek);
-  fm.treeKey.nbytes = 4096;
-  fm.treeKey.objlen = 8192;
-  fm.treeKey.keylen = static_cast<uint16_t>(tk.size());
-  fm.treeKey.ver = 1004;
-  fm.treeKey.cycle = 1;
-  fm.treeKey.seekkey = kTreeKeySeek;
-  fm.treeKey.cls = "TTree";
-  fm.treeKey.name = "Events";
-  std::vector<uint8_t> treeRec = tk;
-  treeRec.resize(4096, 0);
-  fx.src.ranges[kTreeKeySeek] = treeRec;
-
-  // Keys-list record: own key header, nkeys, one entry for the live tree.
-  auto own = keyHeader(true, "", "", 0, 0, kKeysListSeek);
-  auto entry = keyHeader(true, "TTree", "Events", 4096, 8192, kTreeKeySeek);
-  fx.klKeylen = own.size();
-  fx.klNbytes = own.size() + 4 + entry.size();
-  bePut32(own.data(), static_cast<uint32_t>(fx.klNbytes));
-  std::vector<uint8_t> kl = own;
-  kl.resize(own.size() + 4);
-  bePut32(kl.data() + own.size(), 1); // nkeys
-  kl.insert(kl.end(), entry.begin(), entry.end());
-  kl.resize(512, 0); // the builder probes 512 bytes before reading fNbytes
-  fx.src.ranges[kKeysListSeek] = kl;
-  return fx;
-}
 
 } // namespace
 
@@ -312,190 +209,4 @@ TEST(TransposeWidth, SourceThatCannotVouchFailsNotGuesses) {
   EXPECT_FALSE(parseTreeBlob(junk.data(), junk.size(), 40, blob));
   EXPECT_FALSE(blob.error.empty());
   EXPECT_TRUE(blob.branches.empty());
-}
-
-// ---------------------------------------------------------------- builder
-
-TEST(TransposeWidth, MixedWidthOverlayLeavesTheDirectoryUntouched) {
-  Fixture fx = mixedWidthFixture(/*wideBasketKey=*/true);
-  Overlay ov = buildOverlay(fx.fm, fx.src, {"Muon_pt"});
-  ASSERT_EQ(ov.error, "");
-  ASSERT_EQ(ov.meta.extents.size(), 3u);
-
-  // 1. fEND, at the HEADER's width — 8 bytes, not the directory's 4.
-  EXPECT_EQ(ov.meta.extents[0].virtOff, 12u);
-  EXPECT_EQ(ov.meta.extents[0].len, 8u);
-  EXPECT_EQ(ov.meta.extents[0].tdataOff, 0u);
-  // 2. the keys-list record, patched IN PLACE at its original offset.
-  EXPECT_EQ(ov.meta.extents[1].virtOff, static_cast<uint64_t>(kKeysListSeek));
-  EXPECT_EQ(ov.meta.extents[1].len, fx.klNbytes);
-  EXPECT_EQ(ov.meta.extents[1].tdataOff, 8u);
-  // 3. the extension, appended at fEND.
-  EXPECT_EQ(ov.meta.extents[2].virtOff, static_cast<uint64_t>(kFend));
-  EXPECT_EQ(ov.meta.extents[2].tdataOff, 8u + fx.klNbytes);
-
-  const uint64_t newFend = kFend + ov.meta.extents[2].len;
-  EXPECT_EQ(ov.meta.virtualSize, newFend);
-  EXPECT_EQ(beGet64(ov.tdata.data()), newFend); // full 64-bit fEND
-
-  // Nothing is written into the root directory record: a 4-byte fSeekKeys
-  // could not have expressed a target past 2 GiB, and now it needn't.
-  for (const auto& e : ov.meta.extents)
-    EXPECT_FALSE(e.virtOff <= fx.fm.dirSeekKeysOff &&
-                 fx.fm.dirSeekKeysOff < e.virtOff + e.len);
-
-  // The keys-list record keeps its own fSeekKey (it did not move) and its live
-  // tree entry now points at the relocated metadata key, past 2 GiB.
-  const uint8_t* klWin = ov.tdata.data() + 8;
-  EXPECT_EQ(beGet64(klWin + 18), static_cast<uint64_t>(kKeysListSeek));
-  const uint8_t* entry = klWin + fx.klKeylen + 4;
-  const uint64_t newMetaSeek = static_cast<uint64_t>(kFend) + fx.basketLen;
-  EXPECT_EQ(beGet64(entry + 18), newMetaSeek);
-  EXPECT_GT(newMetaSeek, 1ull << 31);
-  EXPECT_EQ(beGet32(entry), static_cast<uint32_t>(fx.fm.treeKey.keylen) + ov.metaStoredBytes);
-
-  // Relocations are punchable; in-place patch windows are not relocations, so
-  // the keys list is not offered up as superseded.
-  for (const auto& r : ov.meta.superseded)
-    EXPECT_NE(r.off, static_cast<uint64_t>(kKeysListSeek));
-  EXPECT_EQ(ov.baskets, 1u);
-  EXPECT_EQ(ov.verbatim, 1u);
-}
-
-TEST(TransposeWidth, NarrowKeyCannotBeRelocatedPastTwoGiB) {
-  // A 32-bit key has nowhere to point once the extension starts past 2 GiB.
-  // The builder must say so, never truncate the seek into the record.
-  Fixture fx = mixedWidthFixture(/*wideBasketKey=*/false);
-  Overlay ov = buildOverlay(fx.fm, fx.src, {"Muon_pt"});
-  EXPECT_EQ(ov.error, "32-bit key cannot point past 2 GiB");
-  EXPECT_TRUE(ov.meta.extents.empty());
-  // Where the record would have had to go, for the sweep to decline the file
-  // with the arithmetic rather than call it a failed build; not retryable.
-  EXPECT_GE(ov.narrowKeyEnd, 1ull << 31);
-  EXPECT_FALSE(ov.transient);
-  // A wide key takes the same placement: nothing to decline.
-  Fixture wide = mixedWidthFixture(/*wideBasketKey=*/true);
-  EXPECT_EQ(buildOverlay(wide.fm, wide.src, {"Muon_pt"}).narrowKeyEnd, 0u);
-}
-
-// The cold replica run publishes through buildOverlayFromRecords, from baskets
-// it converted itself. Given the same records, it must produce exactly what
-// buildOverlay does -- one builder, two ways of handing it baskets.
-TEST(TransposeWidth, FromRecordsMatchesBuildOverlay) {
-  Fixture fx = mixedWidthFixture(/*wideBasketKey=*/true);
-  Overlay ref = buildOverlay(fx.fm, fx.src, {"Muon_pt"});
-  ASSERT_TRUE(ref.error.empty()) << ref.error;
-  const auto& tree = fx.src.ranges[kTreeKeySeek];
-  std::vector<uint8_t> tkh(tree.begin(), tree.begin() + fx.fm.treeKey.keylen);
-  const auto& klFull = fx.src.ranges[kKeysListSeek];
-  std::vector<uint8_t> kl(klFull.begin(), klFull.begin() + fx.klNbytes);
-  const auto& basket = fx.src.ranges[kBasketSeek];
-  Overlay got = buildOverlayFromRecords(
-      fx.fm, tkh, kl, {RelocatedBasket{0, 0}}, [&](size_t, std::vector<uint8_t>& out) {
-        out.assign(basket.begin(), basket.begin() + fx.basketLen);
-        return true;
-      });
-  ASSERT_TRUE(got.error.empty()) << got.error;
-  EXPECT_EQ(got.tdata, ref.tdata);
-  EXPECT_EQ(got.meta.virtualSize, ref.meta.virtualSize);
-  ASSERT_EQ(got.meta.extents.size(), ref.meta.extents.size());
-  for (size_t i = 0; i < got.meta.extents.size(); ++i) {
-    EXPECT_EQ(got.meta.extents[i].virtOff, ref.meta.extents[i].virtOff);
-    EXPECT_EQ(got.meta.extents[i].len, ref.meta.extents[i].len);
-    EXPECT_EQ(got.meta.extents[i].tdataOff, ref.meta.extents[i].tdataOff);
-  }
-  ASSERT_EQ(got.meta.superseded.size(), ref.meta.superseded.size());
-  ASSERT_EQ(got.meta.origMap.size(), ref.meta.origMap.size());
-
-  // A record the stage cannot produce fails the build as retryable, and a
-  // record that is not this branch's basket fails it outright.
-  Overlay missing = buildOverlayFromRecords(fx.fm, tkh, kl, {RelocatedBasket{0, 0}},
-                                            [](size_t, std::vector<uint8_t>&) { return false; });
-  EXPECT_TRUE(missing.transient);
-  Overlay wrong = buildOverlayFromRecords(
-      fx.fm, tkh, kl, {RelocatedBasket{0, 0}}, [&](size_t, std::vector<uint8_t>& out) {
-        out.assign(basket.begin(), basket.begin() + fx.basketLen);
-        out[out.size() - 1] ^= 1; // payload only: still a record, still fine
-        out[43] = 'X';             // the branch name inside the key header
-        return true;
-      });
-  EXPECT_FALSE(wrong.error.empty());
-  EXPECT_FALSE(wrong.transient);
-  Overlay range = buildOverlayFromRecords(fx.fm, tkh, kl, {RelocatedBasket{0, 5}},
-                                          [](size_t, std::vector<uint8_t>&) { return true; });
-  EXPECT_FALSE(range.error.empty());
-}
-
-// A TTree compact replica read back in the ORIGINAL file's coordinates, for the
-// byte counts a run records (orig_bytes, unique_bytes). A reader reads each
-// relocated record WHOLE -- a basket at its fBasketSeek for its fBasketBytes, the
-// tree key for its fNbytes -- and each maps to its whole original record, so
-// the counts come out what the byte route counts for the same reads, and the
-// read signature is unchanged. A read into part of a relocated record has no
-// original bytes to give, and leaves the counts unknown.
-TEST(TransposeWidth, ReplicaReadsCountTheOriginalBytesOrNothing) {
-  Fixture fx = mixedWidthFixture(/*wideBasketKey=*/true);
-  Overlay ov = buildOverlay(fx.fm, fx.src, {"Muon_pt"});
-  ASSERT_EQ(ov.error, "");
-  const ucache::ReplicaMeta::OrigRange *basket = nullptr, *tree = nullptr;
-  for (const auto& r : ov.meta.origMap) {
-    if (r.origOff == static_cast<uint64_t>(kBasketSeek))
-      basket = &r;
-    if (r.origOff == static_cast<uint64_t>(kTreeKeySeek))
-      tree = &r;
-  }
-  ASSERT_NE(basket, nullptr);
-  ASSERT_NE(tree, nullptr);
-  ASSERT_NE(basket->virtOff, basket->origOff) << "the basket is relocated";
-
-  ucache::test::TempDir td;
-  ucache::RealIO io;
-  ucache::Config cfg;
-  cfg.cacheDir = td.path();
-  ucache::CacheStore store(io, cfg);
-  store.disableStatsDump();
-  ucache::Stats stats;
-  ucache::ReplicaStore rs(io, cfg, stats);
-  const auto key = *ucache::UrlKey::parse("root://origin//data/tree.root");
-  ov.meta.originSize = static_cast<uint64_t>(kFend);
-  ASSERT_EQ(rs.publish(key, ov.meta, ov.tdata.data(), ov.tdata.size()), 0);
-  auto view = rs.openView(key, static_cast<uint64_t>(kFend));
-  ASSERT_TRUE(view && view->hasOriginMap());
-
-  using Spans = std::vector<std::pair<uint64_t, uint64_t>>;
-  const uint64_t size = static_cast<uint64_t>(kFend);
-  // (replica read, the same read of the original file)
-  const std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::pair<uint64_t, uint64_t>>> reads{
-      {{0, 512}, {0, 512}}, // the header, fEND patched in place
-      {{static_cast<uint64_t>(kKeysListSeek), fx.klNbytes},
-       {static_cast<uint64_t>(kKeysListSeek), fx.klNbytes}}, // the keys list, in place
-      {{tree->virtOff, tree->len}, {tree->origOff, tree->origLen}},
-      {{basket->virtOff, basket->len}, {basket->origOff, basket->origLen}},
-      {{basket->virtOff, basket->len}, {basket->origOff, basket->origLen}}, // read again
-  };
-  ucache::ReadFootprint replica, byteRoute;
-  for (const auto& [r, o] : reads) {
-    Spans units, exact;
-    ASSERT_TRUE(view->mapToOrigin(r.first, r.second, units, exact)) << "at " << r.first;
-    replica.noteMapped(units, &exact, size);
-    byteRoute.note(o.first, o.second, size);
-  }
-  const auto t = replica.totals(size);
-  const auto b = byteRoute.totals(size);
-  ASSERT_TRUE(t.origKnown && t.uniqueKnown);
-  EXPECT_EQ(t.origBytes, b.origBytes);
-  EXPECT_EQ(t.uniqueBytes, b.uniqueBytes);
-  EXPECT_EQ(t.origBytes, 512 + fx.klNbytes + 4096 + 2 * fx.basketLen);
-  EXPECT_EQ(replica.sig(size), byteRoute.sig(size));
-  EXPECT_EQ(replica.buckets(size), byteRoute.buckets(size));
-
-  // Part of the relocated basket -- verbatim, same length as its original, and
-  // still not the same offsets -- leaves the counts unknown, the signature not.
-  Spans units, exact;
-  EXPECT_FALSE(view->mapToOrigin(basket->virtOff + 8, basket->len - 8, units, exact));
-  replica.noteMapped(units, nullptr, size);
-  byteRoute.note(basket->origOff, basket->origLen, size);
-  EXPECT_FALSE(replica.totals(size).origKnown);
-  EXPECT_FALSE(replica.totals(size).uniqueKnown);
-  EXPECT_EQ(replica.sig(size), byteRoute.sig(size));
 }

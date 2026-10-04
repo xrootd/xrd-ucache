@@ -18,7 +18,6 @@
 #include "PluginSupport.h"
 #include "ReaderWait.h"
 #include "ReadRounding.h"
-#include "ReplicaFile.h"
 #include "Trace.h"
 #include "vendor/crc32c.h"
 
@@ -553,8 +552,7 @@ static bool ruleReadsData(const std::shared_ptr<ReadRule>&, uint64_t, uint64_t) 
 #endif
 
 static void noteAppRead(const std::shared_ptr<HandleState>& st,
-                        const std::shared_ptr<FileEntry>& entry,
-                        const std::shared_ptr<ReplicaView>& view, uint64_t off,
+                        const std::shared_ptr<FileEntry>& entry, uint64_t off,
                         uint64_t len, const std::shared_ptr<ColdFill>& cold = nullptr) {
   if (!len)
     return;
@@ -585,53 +583,25 @@ static void noteAppRead(const std::shared_ptr<HandleState>& st,
       st->store->relayFootprint(st->url).note(off, len);
     return;
   }
-  if (view) {
-    // A stitched read addresses the REPLICA's layout, which is not the
-    // original file's. Without a map there is no way back, so the read
-    // contributes nothing and the signature stays empty -- "unknown", which
-    // the reader treats as no evidence. Recording it untranslated would put
-    // replica offsets into a signature that claims to be in original
-    // coordinates: relocated data lands past the end of the file and is
-    // dropped, data still in place lands correctly, and the result is a
-    // confident partial answer that matches no other route.
-    if (!view->hasOriginMap()) {
-      // Poisoned, not merely skipped. The footprint is shared across every
-      // handle on this file for the life of the process, so returning here
-      // would leave whatever a v1 open of the same file contributed -- and
-      // that gets emitted as a confident signature describing part of the
-      // work. Partial and confident is worse than absent.
-      entry->footprint().poison();
-      return;
-    }
-    // The buckets take each relocated range the read touched, whole; the
-    // byte counts only the bytes it carried exactly, or nothing, for good,
-    // when it read part of a recompressed basket or page
-    // (ReplicaView::mapToOrigin).
-    std::vector<std::pair<uint64_t, uint64_t>> units, exact;
-    const bool known = view->mapToOrigin(off, len, units, exact);
-    entry->noteMappedRead(units, known ? &exact : nullptr);
-    return;
-  }
   entry->noteRead(off, len);
 }
 
-// The chunks of one vector read. On a rewritten layout (a replica, the slot
-// store), chunks that follow one another end to end are noted as the one span
-// they make (forEachEndToEndRun): a basket a reader read in pieces is still
-// read whole. The buckets come out the same either way; the byte counts stay
-// exact where each piece alone would read part of the basket. Elsewhere every
-// chunk is noted as it is.
+// The chunks of one vector read. On a rewritten layout (the slot store),
+// chunks that follow one another end to end are noted as the one span they
+// make (forEachEndToEndRun): a basket a reader read in pieces is still read
+// whole. The buckets come out the same either way; the byte counts stay exact
+// where each piece alone would read part of the basket. Elsewhere every chunk
+// is noted as it is.
 static void noteAppChunks(const std::shared_ptr<HandleState>& st,
                           const std::shared_ptr<FileEntry>& entry,
-                          const std::shared_ptr<ReplicaView>& view, const XrdCl::ChunkList& chunks,
-                          const std::shared_ptr<ColdFill>& cold) {
-  if (!entry || (!view && !cold)) {
+                          const XrdCl::ChunkList& chunks, const std::shared_ptr<ColdFill>& cold) {
+  if (!entry || !cold) {
     for (const auto& c : chunks)
-      noteAppRead(st, entry, view, c.offset, c.length, cold);
+      noteAppRead(st, entry, c.offset, c.length, cold);
     return;
   }
-  forEachEndToEndRun(
-      chunks, [&](uint64_t off, uint64_t len) { noteAppRead(st, entry, view, off, len, cold); });
+  forEachEndToEndRun(chunks,
+                     [&](uint64_t off, uint64_t len) { noteAppRead(st, entry, off, len, cold); });
 }
 
 // Vector relay: the byte total and the footprint come from the same walk.
@@ -852,9 +822,7 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   // since an earlier fork (a grandchild forked while a child was at it): then
   // that one is still the one to keep, and so is a layout lost for good.
   if (forkLayout == ForkLayout::kNone && setupDone && !closed && !tripped && !layoutLost)
-    forkLayout = view ? ForkLayout::kView : cold ? ForkLayout::kCold : ForkLayout::kOriginal;
-  if (view && !keptView)
-    keptView = view; // immutable map and an fd, read without a lock
+    forkLayout = cold ? ForkLayout::kCold : ForkLayout::kOriginal;
   // The inner file is the parent's open. XrdCl recovers such a file at its
   // first use in the child, and that recovery does not survive vector reads
   // issued at once -- the reader's threads and the cache's own. A handle the
@@ -870,12 +838,11 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   }
   struct LeftBehind {
     std::shared_ptr<FileEntry> entry;
-    std::shared_ptr<ReplicaView> view;
     std::shared_ptr<ColdFill> cold;
     std::shared_ptr<ReadRule> rule;
     std::unique_ptr<XrdCl::StatInfo> statInfo;
   };
-  new LeftBehind{std::move(entry), std::move(view), std::move(cold), std::move(rule),
+  new LeftBehind{std::move(entry), std::move(cold), std::move(rule),
                  std::move(statInfo)}; // leaked on purpose: the parent's
   setupDone = closed || tripped || layoutLost; // nothing to set up again
   prefetchSeen.store(false, std::memory_order_relaxed);
@@ -1421,145 +1388,6 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
   }
 }
 
-//---------------------------------------------------------- stitched view --
-
-// Mid-handle overlay fault: the read errors faithfully —
-// there is no origin to pass through to for overlay bytes — and the replica
-// is dropped ONCE so subsequent opens get a clean v1 view. This handle keeps
-// its (handle-stable) view; pages that still verify keep serving.
-void replicaFault(const std::shared_ptr<HandleState>& st, const char* why) {
-  UCACHE_WARN("replica overlay fault for %s (%s); read fails like a local file, "
-              "replica dropped for future opens",
-              st->url.c_str(), why);
-  if (!st->replicaDropped.exchange(true)) {
-    auto store = st->store;
-    auto key = UrlKey::parse(st->url, globalConfig().keepCgi);
-    if (store && key)
-      Executor::instance().post([store, key] {
-        ReplicaStore rs(RealIO::instance(), store->config(), store->stats());
-        rs.drop(*key);
-      });
-  }
-}
-
-// Adapts the residual-fetch (vector) completion back into the original
-// request's completion: the overlay/hit bytes are already in the user's
-// buffer, so success just needs the original-shaped response.
-class StitchAdapter : public ResponseHandler {
- public:
-  // Single Read: respond with ChunkInfo(off, size, buf).
-  StitchAdapter(ResponseHandler* user, uint64_t off, uint32_t size, void* buf)
-      : user_(user), off_(off), size_(size), buf_(buf) {}
-  // VectorRead: respond with the ORIGINAL chunk list.
-  StitchAdapter(ResponseHandler* user, ChunkList original)
-      : user_(user), original_(std::move(original)), isVRead_(true) {}
-
-  void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
-                               HostList* hostList) override {
-    std::unique_ptr<XRootDStatus> s(status);
-    std::unique_ptr<AnyObject> r(response);
-    std::unique_ptr<HostList> h(hostList);
-    if (s && s->IsOK())
-      complete(user_, okStatus(),
-               isVRead_ ? vreadResponse(original_) : chunkResponse(off_, size_, buf_));
-    else
-      complete(user_, s ? new XRootDStatus(*s)
-                        : new XRootDStatus(XrdCl::stError, XrdCl::errInternal),
-               nullptr);
-    delete this;
-  }
-
- private:
-  ResponseHandler* user_;
-  uint64_t off_ = 0;
-  uint32_t size_ = 0;
-  void* buf_ = nullptr;
-  ChunkList original_;
-  bool isVRead_ = false;
-};
-
-// Serve one user chunk of the stitched view into `dest`: overlay segments
-// from .tdata (verified), original segments from the v1 cache when present.
-// Residual original sub-ranges are appended to `resid` for one wire fetch.
-// Returns false on an overlay fault (caller errors the request). Runs on the
-// executor (disk IO). Sub-chunk residuals are inherent to stitched entries —
-// the v1 "never split chunks" invariant applies to plain entries only.
-bool stitchChunk(const std::shared_ptr<HandleState>& st,
-                 const std::shared_ptr<FileEntry>& entry,
-                 const std::shared_ptr<ReplicaView>& view, uint64_t off, uint32_t len,
-                 void* dest, ChunkList& resid, uint64_t& localBytes,
-                 uint64_t& overlayBytes) {
-  for (const auto& seg : view->map(off, len)) {
-    char* d = static_cast<char*>(dest) + (seg.off - off);
-    if (seg.overlay) {
-      if (!view->read(seg.tdataOff, seg.len, d)) {
-        replicaFault(st, "page CRC/IO failure");
-        return false;
-      }
-      localBytes += seg.len;
-      overlayBytes += seg.len; // replica-tier share, distinct from v1 hits
-    } else if (seg.off + seg.len > entry->fileSize()) {
-      replicaFault(st, "extent map gap past origin EOF"); // corrupt map
-      return false;
-    } else if (entry->hasRange(seg.off, seg.len) &&
-               entry->readCached(seg.off, seg.len, d)) {
-      localBytes += seg.len;
-    } else {
-      resid.emplace_back(seg.off, static_cast<uint32_t>(seg.len), d);
-    }
-  }
-  return true;
-}
-
-// Full stitched service of Read/VectorRead-shaped requests on the executor.
-void stitchedServe(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
-                   std::shared_ptr<ReplicaView> view, ChunkList userChunks,
-                   bool isVRead, ResponseHandler* user) {
-  noteWaitTier(user, ReaderWait::kReplica);
-  ChunkList resid;
-  uint64_t localBytes = 0, overlayBytes = 0;
-  const uint64_t t0 = nowUs();
-  for (const auto& c : userChunks)
-    if (!stitchChunk(st, entry, view, c.offset, c.length, c.buffer, resid, localBytes,
-                     overlayBytes)) {
-      complete(user, new XRootDStatus(XrdCl::stError, XrdCl::errDataError), nullptr);
-      return;
-    }
-  if (st->store && localBytes)
-    st->store->stats().servedBytes.fetch_add(localBytes, std::memory_order_relaxed);
-  if (st->store && overlayBytes) {
-    auto& stats = st->store->stats();
-    stats.replicaBytesServed.fetch_add(overlayBytes, std::memory_order_relaxed);
-    stats.replicaReadUs.add(nowUs() - t0);
-    entry->obs().replicaBytes.fetch_add(overlayBytes, std::memory_order_relaxed);
-    entry->noteActivity(); // the replica path serves without touching readCached
-    if (stats.tracer)
-      stats.tracer->rec("replica", entry->key().key, userChunks[0].offset, overlayBytes,
-                        nowUs() - t0);
-  }
-  if (resid.empty()) {
-    st->noteCacheOk();
-    if (isVRead)
-      complete(user, okStatus(), vreadResponse(userChunks));
-    else
-      complete(user, okStatus(),
-               chunkResponse(userChunks[0].offset, userChunks[0].length,
-                             userChunks[0].buffer));
-    return;
-  }
-  // One wire fetch for every residual original sub-range, through the
-  // existing rounded/coalesced/persisting miss machinery; the adapter
-  // restores the original response shape.
-  StitchAdapter* adapter =
-      isVRead ? new StitchAdapter(user, userChunks)
-              : new StitchAdapter(user, userChunks[0].offset, userChunks[0].length,
-                                  userChunks[0].buffer);
-  std::vector<size_t> idx(resid.size());
-  for (size_t i = 0; i < idx.size(); ++i)
-    idx[i] = i;
-  issueMissVRead(st, entry, std::move(resid), std::move(idx), adapter);
-}
-
 } // namespace
 
 //---------------------------------------------------------------- plugin ---
@@ -1585,13 +1413,11 @@ UCacheFile::~UCacheFile() {
   // no-explicit-Close path). Not on any read's latency path.
   st_->drainPersists();
   std::shared_ptr<FileEntry> e;
-  std::shared_ptr<ReplicaView> v;
   std::shared_ptr<ColdFill> cold;
   {
     std::lock_guard<std::mutex> g(st_->mu);
     st_->closed = true;
     e.swap(st_->entry);
-    v.swap(st_->view);
     cold.swap(st_->cold);
   }
 #ifdef UCACHE_HAVE_COLDRUN
@@ -1766,26 +1592,17 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
 namespace {
 // Which layout of the file this handle is shown. A process never shows a file
 // in a layout it has not shown it in before -- a reader may hold offsets from
-// any of its opens -- except that the original may become a replica, whose
-// original region reads the same. Otherwise: a slot store first, then a
-// compact replica, then a new store when recompression is on.
+// any of its opens -- except that the original may become a slot layout, whose
+// original region reads the same. Otherwise: the file's store, else a new one
+// when recompression is on, else the file as stored.
 // A handle opened for a copy never gets here: Open makes it pass-through, so it
 // is neither recorded nor constrained by this. That is safe because a copy's
 // file handle is its own and holds no offset any reader uses.
-// Which compact replica a view is: a rebuild from a different cache state can
-// relocate a different set of branches, to other offsets. Within one process.
-uint64_t compactId(const ReplicaView& v) {
-  const auto img = ReplicaFile::serialize(v.meta());
-  return (static_cast<uint64_t>(crc32c(img.data(), img.size())) << 32) ^ v.virtualSize();
-}
-
 // `inherited`: the handle is one a forked child is setting up again, and says
 // itself what happens when its layout is gone.
 void chooseLayout(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEntry>& entry,
                   const UrlKey& key, const Config& cfg, uint64_t mtime, uint8_t cksumKind,
-                  uint32_t cksum, const std::function<std::shared_ptr<ReplicaView>()>& openView,
-                  std::shared_ptr<ReplicaView>& view, std::shared_ptr<ColdFill>& cold,
-                  bool inherited) {
+                  uint32_t cksum, std::shared_ptr<ColdFill>& cold, bool inherited) {
   // Each pass either settles on a layout this process has not contradicted, or
   // learns which layout another handle settled on meanwhile and follows it.
   for (int pass = 0;; ++pass) {
@@ -1799,38 +1616,14 @@ void chooseLayout(const std::shared_ptr<HandleState>& st, const std::shared_ptr<
                     key.key.c_str());
       return;
     }
-    if (shown == ShownLayout::kCompact) {
-      std::shared_ptr<ReplicaView> v = openView();
-      if (v && compactId(*v) == hash)
-        view = std::move(v);
-      else if (!inherited)
-        UCACHE_WARN("%s was shown as a replica earlier in this process and that replica is "
-                    "gone or rebuilt; it is served as stored, and offsets read from the "
-                    "replica fail",
-                    key.key.c_str());
-      return;
-    }
     if (pass >= 3) // cannot happen: a shown layout only ever moves away from original
       return;
     std::shared_ptr<ColdFill> c =
         coldAttach(st, entry, key, mtime, cksumKind, cksum, AttachMode::kExisting);
-    if (!c) {
-      std::shared_ptr<ReplicaView> v = openView();
-      if (v) {
-        const uint64_t id = compactId(*v);
-        uint64_t won = 0;
-        if (noteShownLayout(key.key, ShownLayout::kCompact, id, &won) == ShownLayout::kCompact &&
-            won == id) {
-          view = std::move(v);
-          return;
-        }
-        continue;
-      }
-      // Not for a file this process already reads directly: nothing it
-      // converted would be kept.
-      if (cfg.recompress && !readRuleDirect(key.key))
-        c = coldAttach(st, entry, key, mtime, cksumKind, cksum, AttachMode::kCreate);
-    }
+    // Not for a file this process already reads directly: nothing it
+    // converted would be kept.
+    if (!c && cfg.recompress && !readRuleDirect(key.key))
+      c = coldAttach(st, entry, key, mtime, cksumKind, cksum, AttachMode::kCreate);
     if (c) {
       const uint64_t mine = coldLayoutHash(*c);
       uint64_t won = 0;
@@ -1857,7 +1650,7 @@ namespace {
 // blocks larger than a small file (ROOT's raw-file layer reads 128 KiB).
 enum class WholeFirstRead : uint8_t {
   kNo,       // not a whole-file first read, or nothing to decide
-  kCopy,     // a compact replica or a slot store exists: the handle is a copy,
+  kCopy,     // a slot store exists: the handle is a copy,
              // and reads the origin's bytes straight from the origin
   kAsStored, // recompress = on and nothing converted yet: shown as stored and
              // cached, and no layout of its own is made for this handle
@@ -1874,9 +1667,27 @@ WholeFirstRead wholeFirstRead(const std::pair<uint64_t, uint64_t>* firstRead,
     return WholeFirstRead::kNo;
   const std::string base = key.objectDir(cfg.cacheDir) + "/" + key.hashHex;
   struct ::stat sb;
-  if (::stat((base + ".tmeta").c_str(), &sb) == 0 || ::stat((base + ".slots").c_str(), &sb) == 0)
+  if (::stat((base + ".slots").c_str(), &sb) == 0)
     return WholeFirstRead::kCopy;
   return cfg.recompress ? WholeFirstRead::kAsStored : WholeFirstRead::kNo;
+}
+
+// A replica an earlier release made beside the byte cache (<hash>.tdata, .tmeta,
+// .tok) is not served: the file's slot store takes its place. Removed by the
+// first open that finds it (and by `ucache recompress` and the eviction pass);
+// said once per process at WARN, later ones at INFO. A reader that held
+// positions in it fails, as after any replica is removed.
+void dropEarlierReplica(const UrlKey& key, const Config& cfg) {
+  if (!CacheStore::dropEarlierReplica(RealIO::instance(), key.objectDir(cfg.cacheDir), key.hashHex))
+    return;
+  static std::atomic<bool> said{false};
+  if (!said.exchange(true, std::memory_order_relaxed))
+    UCACHE_WARN("%s had a replica an earlier uCache made (.tdata), which this one does not serve; "
+                "removed. `ucache recompress` converts what is cached into the current form "
+                "(later files are logged at INFO)",
+                key.key.c_str());
+  else
+    UCACHE_INFO("%s had a replica an earlier uCache made (.tdata); removed", key.key.c_str());
 }
 
 // A request the truncated-copy guard refused (CopyGuard.h): the copy fails
@@ -1933,7 +1744,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
   }
   childWork(st_); // a handle a forked child inherited sets up again here
   const uint64_t setupT0 = nowUs(); // entry-setup span (sidecar load,
-                                    // validation, view adoption) — the per-open
+                                    // validation, layout choice) — the per-open
                                     // cost 65k opens multiply on a slow disk
   const Config& cfg = globalConfig();
   auto key = UrlKey::parse(st_->url, cfg.keepCgi);
@@ -1941,26 +1752,22 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
                  (cfg.allowHosts.empty() || hostMatchesAny(cfg.allowHosts, key->host)) &&
                  !hostMatchesAny(cfg.denyHosts, key->host);
   std::shared_ptr<FileEntry> entry;
-  std::shared_ptr<ReplicaView> view;
   std::shared_ptr<ColdFill> cold;
   std::unique_ptr<XrdCl::StatInfo> statClone;
 
   bool cacheOnly;
   ForkLayout forkLayout; // set when a forked child inherited this handle (syncFork)
-  std::shared_ptr<ReplicaView> keptView;
   {
     std::lock_guard<std::mutex> g(st_->mu);
     cacheOnly = st_->cacheOnly;
     forkLayout = st_->forkLayout;
-    keptView = st_->keptView;
   }
   // The layout such a handle was set up in before the fork is the one it keeps:
   // its reader holds offsets into it. The original stays the original; a
-  // compact replica view is the same view; a slot layout is matched again.
+  // slot layout is matched again.
   // A handle whose first request read the whole file is shown the file as
   // stored too (wholeFirstRead), or is a copy: no entry, the origin's bytes.
   bool keepOriginal = forkLayout == ForkLayout::kOriginal;
-  const bool keepView = forkLayout == ForkLayout::kView && keptView;
   bool copy = false;
 
   // Trusted recent cache (UCACHE_REVALIDATE_S): build from the local sidecar,
@@ -1985,29 +1792,14 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
         statClone = std::make_unique<XrdCl::StatInfo>("0", meta->fileSize,
                                                       XrdCl::StatInfo::IsReadable,
                                                       meta->originMtime);
-        if (keepView) {
-          view = keptView;
-        } else if (cfg.transpose && !keepOriginal) {
-          ReplicaStore rs(RealIO::instance(), cfg, st_->store->stats());
-          auto openView = [&] {
-            return rs.openView(*key, meta->fileSize, meta->originMtime, meta->cksumKind,
-                               meta->originCksum);
-          };
+        dropEarlierReplica(*key, cfg);
 #ifdef UCACHE_HAVE_COLDRUN
+        if (cfg.transpose && !keepOriginal)
           chooseLayout(st_, entry, *key, cfg, meta->originMtime, meta->cksumKind,
-                       meta->originCksum, openView, view, cold, forkLayout != ForkLayout::kNone);
-#else
-          view = openView();
+                       meta->originCksum, cold, forkLayout != ForkLayout::kNone);
+        if (cold)
+          statClone->SetSize(coldVirtualSize(*cold));
 #endif
-        }
-        {
-          if (view)
-            statClone->SetSize(view->virtualSize());
-#ifdef UCACHE_HAVE_COLDRUN
-          else if (cold)
-            statClone->SetSize(coldVirtualSize(*cold));
-#endif
-        }
       }
     }
     if (!entry && !copy) {
@@ -2052,33 +1844,18 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
       // broken. The read proceeds uncached either way; only the reason differs.
       if (!entry && !declinedForSpace && !copy)
         st_->store->stats().failopenEvents.fetch_add(1, std::memory_order_relaxed);
-      // Transposed replica: adopt the stitched view when one
-      // validates + fully verifies (openView); the reported size becomes
-      // the stitched fEND' so ROOT's fBEGIN <= fEND <= size check holds.
-      if (entry && keepView) {
-        view = keptView;
-      } else if (entry && cfg.transpose && !keepOriginal) {
-        ReplicaStore rs(RealIO::instance(), cfg, st_->store->stats());
-        auto openView = [&] { return rs.openView(*key, si->GetSize(), si->GetModTime()); };
+      // The file's store, when there is one or recompression makes one: the
+      // reported size becomes the layout's, so ROOT's fBEGIN <= fEND <= size
+      // check holds.
+      if (entry)
+        dropEarlierReplica(*key, cfg);
 #ifdef UCACHE_HAVE_COLDRUN
-        chooseLayout(st_, entry, *key, cfg, si->GetModTime(), MetaData::kCksumNone, 0, openView,
-                     view, cold, forkLayout != ForkLayout::kNone);
-#else
-        view = openView();
+      if (entry && cfg.transpose && !keepOriginal)
+        chooseLayout(st_, entry, *key, cfg, si->GetModTime(), MetaData::kCksumNone, 0, cold,
+                     forkLayout != ForkLayout::kNone);
+      if (entry && cold)
+        statClone->SetSize(coldVirtualSize(*cold));
 #endif
-      }
-      if (entry) {
-        if (view) {
-          statClone->SetSize(view->virtualSize());
-          UCACHE_INFO("serving stitched replica view for %s (virtual %llu bytes)",
-                      key->key.c_str(),
-                      static_cast<unsigned long long>(view->virtualSize()));
-        }
-#ifdef UCACHE_HAVE_COLDRUN
-        else if (cold)
-          statClone->SetSize(coldVirtualSize(*cold));
-#endif
-      }
       // Record the validation time so a later open within the window can trust
       // the cache and skip the origin (UCACHE_REVALIDATE_S).
       if (entry && cfg.revalidateSeconds > 0)
@@ -2090,12 +1867,10 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
     noteCopier(CopySignal::kWholeFile, st_->url);
   }
   // A handle a forked child inherited whose layout cannot be had again (the
-  // replica or slot store was removed, or rebuilt differently, and the cache
-  // cannot take the file back): its reader holds offsets into that layout,
-  // and the file as stored would give other bytes at some of them. Every read
-  // fails instead.
-  const bool lost =
-      (forkLayout == ForkLayout::kView || forkLayout == ForkLayout::kCold) && !view && !cold;
+  // slot store was removed, or rebuilt differently, and the cache cannot take
+  // the file back): its reader holds offsets into that layout, and the file as
+  // stored would give other bytes at some of them. Every read fails instead.
+  const bool lost = forkLayout == ForkLayout::kCold && !cold;
   if (lost) {
     UCACHE_WARN("%s was shown in a layout of the cache's before this process was forked, and "
                 "that layout is gone: reads through the handle the process inherited fail; "
@@ -2133,17 +1908,15 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
     st_->setupDone = true;
     st_->statInfo = std::move(statClone);
     st_->forkLayout = ForkLayout::kNone; // set up in this process now
-    st_->keptView.reset();
     if (lost)
       st_->layoutLost.store(true, std::memory_order_release);
     if (!st_->closed && !st_->tripped) {
       st_->entry = entry;
 #ifdef UCACHE_HAVE_COLDRUN
-      // A slot run keeps its own rule (ColdRun); a compact replica has none.
-      if (entry && !view && !cold)
+      // A slot run keeps its own rule (ColdRun).
+      if (entry && !cold)
         st_->rule = ReadRule::forFile(entry->key().key, entry->fileSize());
 #endif
-      st_->view = view;
       st_->cold = cold;
 #ifdef UCACHE_HAVE_COLDRUN
       if (cold && !st_->coldMapChosen) {
@@ -2164,11 +1937,6 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
   return st_->entry;
 }
 
-std::shared_ptr<ReplicaView> UCacheFile::currentView() const {
-  std::lock_guard<std::mutex> g(st_->mu);
-  return st_->view;
-}
-
 std::shared_ptr<ColdFill> UCacheFile::currentCold() const {
   std::lock_guard<std::mutex> g(st_->mu);
   return st_->cold;
@@ -2176,8 +1944,6 @@ std::shared_ptr<ColdFill> UCacheFile::currentCold() const {
 
 uint64_t UCacheFile::shownSize() const {
   std::lock_guard<std::mutex> g(st_->mu);
-  if (st_->view)
-    return st_->view->virtualSize();
 #ifdef UCACHE_HAVE_COLDRUN
   if (st_->cold)
     return coldShownSize(*st_->cold, st_->coldMap.get());
@@ -2193,13 +1959,11 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
   // goes away. This blocks Close, never a read (§5.2 step 4).
   st_->drainPersists();
   std::shared_ptr<FileEntry> e;
-  std::shared_ptr<ReplicaView> v;
   std::shared_ptr<ColdFill> cold;
   {
     std::lock_guard<std::mutex> g(st_->mu);
     st_->closed = true;
     e.swap(st_->entry);
-    v.swap(st_->view); // releases the overlay fd
     cold.swap(st_->cold);
   }
 #ifdef UCACHE_HAVE_COLDRUN
@@ -2267,7 +2031,7 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
     }
   }
   // Set up eagerly (caller thread, like the first read): ROOT may Stat before
-  // reading, and a transposed entry must report the stitched size from the
+  // reading, and a handle shown a slot layout must report its size from the
   // very first answer -- forced or not, and for a handle a forked child is
   // setting up again as much as for a new one.
   if (st_->inner->IsOpen() || cacheOpen_ || st_->reopenPending())
@@ -2285,8 +2049,8 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
       return XRootDStatus();
     }
   } else if (uint64_t vsize = shownSize()) {
-    // force=true forwards, but the size a transposed handle reports must
-    // stay the stitched one — the origin doesn't know about the extension.
+    // force=true forwards, but the size a handle shown a slot layout reports
+    // must stay the layout's — the origin doesn't know about the extension.
     struct SizeRelay : ResponseHandler {
       ResponseHandler* user;
       uint64_t vsize;
@@ -2338,44 +2102,35 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
     return lostLayoutError(st_);
   if (entry)
     noteRequestBytes(st_, size);
-  // ONE sample of the view, used for both. Taking it twice is not merely
-  // wasteful: a replica published between the two calls has the footprint
-  // recorded in the original file's coordinates and the read served in the
-  // replica's, which produces a WRONG signature rather than an absent one --
-  // and a wrong signature is evidence, so it is worse than none.
-  auto view = currentView();
+  // ONE sample of the layout, used for both. Taking it twice is not merely
+  // wasteful: a layout set up between the two calls has the footprint recorded
+  // in the original file's coordinates and the read served in the layout's,
+  // which produces a WRONG signature rather than an absent one -- and a wrong
+  // signature is evidence, so it is worse than none.
   auto cold = currentCold();
 #ifdef UCACHE_HAVE_COLDRUN
   if (cold && offset + size >= offset) // the branches it touches, decoded in one read
     coldPrepare(*cold, offset, size);
 #endif
-  noteAppRead(st_, entry, view, offset, size, cold);
-  if (entry && (view || cold)) {
-    // Stitched entry: serve on the executor — overlay + v1
-    // cache locally, residual original sub-ranges via the miss machinery.
-    // A cold-run handle likewise: its layout exists only here.
-    if (offset + size < offset) { // overflow: not a request we can reason about
-      if (cold) // the origin has no such layout to answer from
-        return XRootDStatus(XrdCl::stError, XrdCl::errInvalidArgs);
-      noteRelayBytes(st_, size, offset, size);
-      return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
-        return f->Read(offset, size, buffer, rh, timeout); // garbage in, origin's answer out
-      });
-    }
+  noteAppRead(st_, entry, offset, size, cold);
+#ifdef UCACHE_HAVE_COLDRUN
+  if (entry && cold) {
+    // A slot layout's handle: served on the executor, as its layout exists
+    // only here.
+    if (offset + size < offset) // overflow: the origin has no such layout to answer from
+      return XRootDStatus(XrdCl::stError, XrdCl::errInvalidArgs);
     // A read running past EOF is ORDINARY, not an error: readers that fetch in
     // fixed-size blocks (ROOT's raw-file layer uses 128 KiB) always overrun on
     // the last block, and the correct answer is a SHORT read. Relaying it to
-    // the origin cannot give that answer — a stitched file is LARGER than the
-    // file the origin has, so the origin returns nothing and the caller sees
-    // nread == 0. Clamp to the virtual size and serve what exists.
+    // the origin cannot give that answer — the layout is LARGER than the file
+    // the origin has, so the origin returns nothing and the caller sees
+    // nread == 0. Clamp to the shown size and serve what exists.
     uint64_t vsize = shownSize();
-#ifdef UCACHE_HAVE_COLDRUN
     // A read that starts past the handle's own end reads a position another
     // handle was shown (a compact map's range): bounded by every address
     // served. One that starts inside it ends at its end, as above.
-    if (cold && offset >= vsize)
+    if (offset >= vsize)
       vsize = std::max(vsize, coldAddressEnd(*cold));
-#endif
     const uint32_t served =
         offset >= vsize ? 0u : static_cast<uint32_t>(std::min<uint64_t>(size, vsize - offset));
     if (served == 0) { // at or past EOF, or a zero-length request: 0 bytes, not an error
@@ -2387,19 +2142,12 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
     auto st = st_;
     ChunkList one;
     one.emplace_back(offset, served, buffer);
-#ifdef UCACHE_HAVE_COLDRUN
-    if (cold) {
-      Executor::instance().post([st, entry, cold, one = std::move(one), handler]() mutable {
-        coldServe(st, entry, cold, std::move(one), /*isVRead=*/false, handler);
-      });
-      return XRootDStatus();
-    }
-#endif
-    Executor::instance().post([st, entry, view, one = std::move(one), handler]() mutable {
-      stitchedServe(st, entry, view, std::move(one), /*isVRead=*/false, handler);
+    Executor::instance().post([st, entry, cold, one = std::move(one), handler]() mutable {
+      coldServe(st, entry, cold, std::move(one), /*isVRead=*/false, handler);
     });
     return XRootDStatus();
   }
+#endif
   if (!entry || offset + size < offset) {
     noteRelayBytes(st_, size, offset, size);
     return relayToInner(
@@ -2518,10 +2266,10 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
 // deliberately uncached in v1, and a copy's handle is pass-through anyway
 // (CopyDetect.h). On a trusted-cache handle (UCACHE_REVALIDATE_S,
 // default-on) the relay lazy-opens the origin first
-// (relayToInner). EXCEPTION: a transposed handle
-// must never pass PgRead through — the origin lacks the extension bytes and
-// has stale patched windows — so it is served from the stitched view with
-// locally computed kXR page checksums (crc32c, same as the wire protocol).
+// (relayToInner). EXCEPTION: a handle shown a slot layout must never pass
+// PgRead through — the origin lacks the layout's bytes and has other bytes in
+// its patched windows — so it is served from the layout with locally computed
+// kXR page checksums (crc32c, same as the wire protocol).
 XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buffer,
                                        ResponseHandler* handler, ucache::XrdTimeout timeout) {
   return waited(st_, passthroughOnly_, handler, [&](ResponseHandler* h) {
@@ -2537,34 +2285,24 @@ XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void
   if (!entry && st_->layoutLost.load(std::memory_order_acquire))
     return lostLayoutError(st_);
   if (entry)
-    noteRequestBytes(st_, size); // a stitched PgRead drives the same physical
+    noteRequestBytes(st_, size); // a PgRead served here drives the same physical
                                  // reads as Read, so it must be sampled too
   // A PgRead is an application read like any other. Leaving it out of the
   // footprint meant a client that uses PgRead -- which some copy tools do by
   // default -- signed only whatever it happened to fetch through Read, so the
   // same work looked different depending on which call the reader chose. The
   // in-flight count and the width sample were missing for the same reason.
-  // ONE sample of the view, used for both. Taking it twice is not merely
-  // wasteful: a replica published between the two calls has the footprint
-  // recorded in the original file's coordinates and the read served in the
-  // replica's, which produces a WRONG signature rather than an absent one --
-  // and a wrong signature is evidence, so it is worse than none.
-  auto view = currentView();
+  // ONE sample of the layout, used for both (as in Read).
   auto cold = currentCold();
 #ifdef UCACHE_HAVE_COLDRUN
   if (cold && offset + size >= offset) // the branches it touches, decoded in one read
     coldPrepare(*cold, offset, size);
 #endif
-  noteAppRead(st_, entry, view, offset, size, cold);
-  if (entry && (view || cold)) {
-    if (offset + size < offset) { // overflow
-      if (cold)
-        return XRootDStatus(XrdCl::stError, XrdCl::errInvalidArgs);
-      noteRelayBytes(st_, size, offset, size);
-      return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
-        return f->PgRead(offset, size, buffer, rh, timeout);
-      });
-    }
+  noteAppRead(st_, entry, offset, size, cold);
+#ifdef UCACHE_HAVE_COLDRUN
+  if (entry && cold) {
+    if (offset + size < offset) // overflow
+      return XRootDStatus(XrdCl::stError, XrdCl::errInvalidArgs);
     // Same clamp as Read: past EOF is a short read, and the origin cannot
     // produce one for a file that is larger here than it is there.
     const uint64_t pgVsize = shownSize();
@@ -2615,19 +2353,12 @@ XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void
     auto st = st_;
     ChunkList one;
     one.emplace_back(offset, size, buffer);
-#ifdef UCACHE_HAVE_COLDRUN
-    if (cold) {
-      Executor::instance().post([st, entry, cold, one = std::move(one), pg]() mutable {
-        coldServe(st, entry, cold, std::move(one), /*isVRead=*/false, pg);
-      });
-      return XRootDStatus();
-    }
-#endif
-    Executor::instance().post([st, entry, view, one = std::move(one), pg]() mutable {
-      stitchedServe(st, entry, view, std::move(one), /*isVRead=*/false, pg);
+    Executor::instance().post([st, entry, cold, one = std::move(one), pg]() mutable {
+      coldServe(st, entry, cold, std::move(one), /*isVRead=*/false, pg);
     });
     return XRootDStatus();
   }
+#endif
   noteRelayBytes(st_, size, offset, size);
   return relayToInner(
       st_, handler,
@@ -2779,12 +2510,11 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
   // its own and the decision took another, so a replica published between them
   // recorded the chunks in the original file's coordinates and served them in
   // the replica's -- a WRONG signature rather than an absent one.
-  auto view = currentView();
   auto cold = currentCold();
   // The combined-buffer variant, where this handle shows a layout the origin
   // does not have (relaying it would send offsets the origin lacks): served as
   // the per-chunk form, each chunk given its place in the buffer.
-  if (entry && buffer && !chunks.empty() && (view || cold)) {
+  if (entry && buffer && !chunks.empty() && cold) {
     ChunkList placed = chunks;
     auto* at = static_cast<char*>(buffer);
     for (auto& c : placed) {
@@ -2797,7 +2527,7 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
   if (cold) // the branches it touches, decoded in one read
     coldPrepare(*cold, chunks);
 #endif
-  noteAppChunks(st_, entry, view, chunks, cold);
+  noteAppChunks(st_, entry, chunks, cold);
   // The combined-buffer variant is legacy and rare: pass through unchanged.
   if (!entry || buffer || chunks.empty()) {
     noteRelayChunks(st_, chunks);
@@ -2826,26 +2556,6 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
     return XRootDStatus();
   }
 #endif
-  if (view) {
-    // Stitched entry: whole vector served on the executor.
-    // A chunk past the view's end is the reader's error, answered here: the
-    // origin does not have this layout, so relaying the vector would send it
-    // offsets it does not have. A zero-length chunk (ROOT sends them) is
-    // served as the empty chunk it is.
-    for (const auto& c : chunks)
-      if (c.offset + c.length < c.offset || c.offset + c.length > view->virtualSize())
-        return XRootDStatus(XrdCl::stError, XrdCl::errInvalidArgs);
-    if (!guardAllowsChunks(st_, entry->fileSize(), view->virtualSize(), chunks))
-      return refuseCopy(st_);
-    auto st = st_;
-    noteVectorRequest(st_, chunks);
-    ChunkList userChunks = chunks;
-    Executor::instance().post(
-        [st, entry, view, userChunks = std::move(userChunks), handler]() mutable {
-          stitchedServe(st, entry, view, std::move(userChunks), /*isVRead=*/true, handler);
-        });
-    return XRootDStatus();
-  }
 
   for (const auto& c : chunks)
     if (c.length == 0 || c.offset + c.length > entry->fileSize()) {
@@ -2861,12 +2571,10 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
 
 void UCacheFile::invalidateOnWrite() {
   std::shared_ptr<FileEntry> e;
-  std::shared_ptr<ReplicaView> v;
   std::shared_ptr<ColdFill> cold;
   {
     std::lock_guard<std::mutex> g(st_->mu);
     e.swap(st_->entry);
-    v.swap(st_->view); // a written-to URL has no valid replica (§4.4)
     cold.swap(st_->cold);
     st_->tripped = true; // no caching on this handle after a write
   }

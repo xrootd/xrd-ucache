@@ -1040,8 +1040,10 @@ recompression was switched on (or with it off) and never read since, and for
 what a first pass did not keep. It converts into the same replica a first pass
 makes — every basket or page whose original is cached and not yet converted —
 and makes the file's next map; nothing is read from the origin. A replica an
-earlier release made beside the byte cache (`.tdata`/`.tmeta`) is removed and
-replaced. Check where you stand with `ucache status` (the `recompressed:`
+earlier release made beside the byte cache (`.tdata`/`.tmeta`) is not served
+by this one: the sweep removes it and converts what is cached in its place
+(the file's next open removes it too, and `ucache status` counts what is
+left). Check where you stand with `ucache status` (the `recompressed:`
 line) or per file with `ucache ls` (the `RECOMP` column). The sweep's own
 summary gives each outcome its own words —
 `recompressed`, `declined` (with the codec it found and the one-line fix),
@@ -1063,8 +1065,8 @@ warm analysis that is 80% LZMA decode gets several× faster; one dominated by
 its own compute may gain 10%. One instrumented run with ROOT's
 `TTreePerfStats` tells you your ceiling before you spend the disk (measured
 1.04–1.22× of the cached bytes on LZMA-9 sources, by container — see
-`docs/CACHE_MANAGEMENT.md` §3; `ucache status` totals it, and superseded
-original pages are hole-punched so the data is not stored twice). `ucache
+`docs/CACHE_MANAGEMENT.md` §3; `ucache status` totals it, and the originals a
+replica converted leave the byte cache, so the data is not stored twice). `ucache
 branches <url>` shows exactly which branches you read and their codecs.
 Escape hatches: `ucache set transpose off` stops serving replicas; `ucache
 untranspose <url>` drops one (a replica made on a first pass is rebuilt from the

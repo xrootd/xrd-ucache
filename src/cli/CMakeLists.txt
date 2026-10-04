@@ -1,7 +1,7 @@
 # ucache CLI: a single C++ binary linking libucache-core —
 # no XRootD, no runtime Python. When the transposer library is available
-# (codec libs present), `materialize` also works natively;
-# otherwise it requires --import (the Python-bridge overlay). Installed to bin/.
+# (codec libs present), `recompress` converts what is cached; otherwise it says
+# it cannot. Installed to bin/.
 # The storage self-test is built from interfaces that differ by platform:
 # Linux keeps the page cache out with O_DIRECT and reads per-device counters
 # from /proc, macOS asks with F_NOCACHE and has no equivalent counters. Both

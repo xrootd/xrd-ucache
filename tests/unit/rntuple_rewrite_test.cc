@@ -18,7 +18,6 @@
 #include "RNTupleMeta.h"
 #include "RNTupleRewrite.h"
 #include "ReadFootprint.h"
-#include "ReplicaStore.h"
 #include "TreeMeta.h"
 
 #include <gtest/gtest.h>
@@ -158,37 +157,6 @@ TEST(RNTupleRewrite, EveryPageDecodesToTheSameBytesAfterRecompression) {
     EXPECT_EQ(after[i], before[i]) << "page " << i << " changed content";
 }
 
-TEST(RNTupleRewrite, OverlayStitchesToTheRewrittenFile) {
-  // The replica serves the overlay, not the standalone file. If the two ever
-  // disagree, a check on one says nothing about the other.
-  auto m = parseRNTuple(fixture(), "");
-  ASSERT_TRUE(m.error.empty()) << m.error;
-  int fd = ::open(fixture().c_str(), O_RDONLY | O_CLOEXEC);
-  ASSERT_GE(fd, 0);
-  FileSource src(fd, m.fileSize);
-  auto rw = buildRNTupleRewrite(m, src, m.fileSize, 1);
-  ASSERT_TRUE(rw.error.empty()) << rw.error;
-
-  Rewritten out{std::string(::testing::TempDir()) + "/ucache_rntuple_stitch.root"};
-  std::string err;
-  ASSERT_TRUE(writeRewrittenRNTuple(fixture(), out.path, rw, err)) << err;
-
-  auto ov = rnTupleOverlay(m, rw);
-  ASSERT_TRUE(ov.error.empty()) << ov.error;
-  std::vector<uint8_t> stitched(ov.meta.virtualSize, 0);
-  ASSERT_EQ(::pread(fd, stitched.data(), m.fileSize, 0), (ssize_t)m.fileSize);
-  ::close(fd);
-  for (const auto& e : ov.meta.extents)
-    std::memcpy(stitched.data() + e.virtOff, ov.tdata.data() + e.tdataOff, e.len);
-
-  std::vector<uint8_t> written(ov.meta.virtualSize, 0);
-  int fd2 = ::open(out.path.c_str(), O_RDONLY | O_CLOEXEC);
-  ASSERT_GE(fd2, 0);
-  ASSERT_EQ(::pread(fd2, written.data(), written.size(), 0), (ssize_t)written.size());
-  ::close(fd2);
-  EXPECT_EQ(stitched, written);
-}
-
 TEST(RNTupleRewrite, CorruptPageIsRefusedRatherThanRecompressed) {
   // Negative control. A page whose bytes are damaged must stop the build, not
   // be re-encoded into a replica that serves wrong data for ever.
@@ -251,7 +219,7 @@ TEST(RNTupleRewrite, OriginMapCoversTheWholePageIncludingItsChecksum) {
       const uint64_t onDisk = (uint64_t)pg.nbytes + (pg.hasChecksum ? 8 : 0);
       if (pg.hasChecksum) ++checksummed;
       ++pages;
-      const ucache::ReplicaMeta::OrigRange* found = nullptr;
+      const RNTupleOrigRange* found = nullptr;
       for (const auto& r : rw.origMap)
         if (r.origOff == pg.offset) found = &r;
       ASSERT_NE(found, nullptr) << "page at " << pg.offset << " has no mapping";
@@ -672,177 +640,11 @@ TEST(RNTupleFill, NamedSettingsReadNothing) {
 // must be right or absent. A page read whole is its original page. A read that
 // takes PART of a relocated page -- a reader's buffered read of the footer runs
 // on into the pages beside it -- has no original bytes to give: counting the
-// page whole is what made these counts 2.3x too high on compact replicas. The
-// 1 MiB buckets of the read signature still take every page touched, whole,
-// exactly as before.
+// page whole made these counts 2.3x too high. The 1 MiB buckets of the read
+// signature still take every page touched, whole.
 namespace {
-
 using Spans = std::vector<std::pair<uint64_t, uint64_t>>;
-
-// The reader's reads of a file as it sees it: header block, footer, page list,
-// then every page of every column range, whole (block + checksum).
-Spans readerReads(const RNTupleMeta& t) {
-  Spans r;
-  r.emplace_back(0, std::min<uint64_t>(t.fileSize, 4096));
-  r.emplace_back(t.anchor.seekFooter, t.anchor.nbytesFooter);
-  r.emplace_back(t.pageListOffset, t.pageListNbytes);
-  for (const auto& range : t.ranges)
-    for (const auto& pg : range.pages)
-      r.emplace_back(pg.offset, (uint64_t)pg.nbytes + (pg.hasChecksum ? 8 : 0));
-  return r;
-}
-
-struct CompactReplica {
-  RNTupleMeta m, seen; // the original, and the file as the replica shows it
-  ucache::test::TempDir td;
-  ucache::RealIO io;
-  ucache::Config cfg;
-  ucache::Stats stats;
-  std::unique_ptr<ucache::CacheStore> store;
-  std::unique_ptr<ucache::ReplicaStore> rs;
-  std::shared_ptr<ucache::ReplicaView> view;
-  std::string error;
-
-  CompactReplica() {
-    m = parseRNTuple(fixture(), "");
-    if (!m.error.empty()) {
-      error = m.error;
-      return;
-    }
-    int fd = ::open(fixture().c_str(), O_RDONLY | O_CLOEXEC);
-    FileSource src(fd, m.fileSize);
-    auto rw = buildRNTupleRewrite(m, src, m.fileSize, 1);
-    auto ov = rnTupleOverlay(m, rw);
-    BytesSource v;
-    v.b.assign(ov.meta.virtualSize, 0);
-    const bool readOk = ::pread(fd, v.b.data(), m.fileSize, 0) == (ssize_t)m.fileSize;
-    ::close(fd);
-    if (!ov.error.empty() || !readOk) {
-      error = ov.error.empty() ? "cannot read the fixture" : ov.error;
-      return;
-    }
-    for (const auto& e : ov.meta.extents)
-      std::memcpy(v.b.data() + e.virtOff, ov.tdata.data() + e.tdataOff, e.len);
-    seen = parseRNTuple(v, static_cast<int64_t>(v.b.size()), "");
-    cfg.cacheDir = td.path();
-    store = std::make_unique<ucache::CacheStore>(io, cfg);
-    store->disableStatsDump();
-    rs = std::make_unique<ucache::ReplicaStore>(io, cfg, stats);
-    const auto key = *ucache::UrlKey::parse("root://origin//data/rntuple.root");
-    if (rs->publish(key, ov.meta, ov.tdata.data(), ov.tdata.size()) != 0) {
-      error = "publish failed";
-      return;
-    }
-    view = rs->openView(key, m.fileSize);
-    if (!view || !view->hasOriginMap())
-      error = "no view with an origin map";
-  }
-
-  // A read of the replica, into `f` as the plugin notes it, and into `whole`
-  // as it was noted before: every unit touched, counted whole.
-  bool read(uint64_t off, uint64_t len, ucache::ReadFootprint& f, ucache::ReadFootprint& whole) {
-    Spans units, exact;
-    const bool known = view->mapToOrigin(off, len, units, exact);
-    f.noteMapped(units, known ? &exact : nullptr, m.fileSize);
-    std::vector<ucache::ReplicaMeta::Range> old;
-    view->originRanges(off, len, old);
-    EXPECT_EQ(old.size(), units.size()) << "the units are what the signature always took";
-    for (size_t i = 0; i < old.size() && i < units.size(); ++i) {
-      EXPECT_EQ(units[i].first, old[i].off);
-      EXPECT_EQ(units[i].second, old[i].len);
-    }
-    for (const auto& r : old)
-      whole.note(r.off, r.len, m.fileSize);
-    return known;
-  }
-};
-
 } // namespace
-
-TEST(RNTupleReplicaBytes, WholeReadsCountTheOriginalBytesTheByteRouteCounts) {
-  CompactReplica c;
-  ASSERT_TRUE(c.error.empty()) << c.error;
-  ASSERT_TRUE(c.seen.error.empty()) << c.seen.error;
-  const Spans onReplica = readerReads(c.seen);
-  const Spans onOriginal = readerReads(c.m);
-  ASSERT_EQ(onReplica.size(), onOriginal.size());
-
-  ucache::ReadFootprint replica, whole, byteRoute;
-  size_t relocated = 0;
-  for (size_t i = 0; i < onReplica.size(); ++i) {
-    EXPECT_TRUE(c.read(onReplica[i].first, onReplica[i].second, replica, whole))
-        << "read " << i << " at " << onReplica[i].first << " is whole, so it maps exactly";
-    byteRoute.note(onOriginal[i].first, onOriginal[i].second, c.m.fileSize);
-    relocated += onReplica[i].first != onOriginal[i].first;
-  }
-  ASSERT_GT(relocated, 0u) << "the fixture's pages must have been relocated";
-  const auto t = replica.totals(c.m.fileSize);
-  const auto b = byteRoute.totals(c.m.fileSize);
-  ASSERT_TRUE(t.origKnown);
-  ASSERT_TRUE(t.uniqueKnown);
-  ASSERT_TRUE(b.origKnown);
-  EXPECT_EQ(t.origBytes, b.origBytes);
-  EXPECT_EQ(t.uniqueBytes, b.uniqueBytes);
-  EXPECT_EQ(replica.sig(c.m.fileSize), whole.sig(c.m.fileSize));
-  EXPECT_EQ(replica.sig(c.m.fileSize), byteRoute.sig(c.m.fileSize));
-}
-
-TEST(RNTupleReplicaBytes, AReadIntoPartOfARelocatedPageLeavesTheCountsUnknown) {
-  CompactReplica c;
-  ASSERT_TRUE(c.error.empty()) << c.error;
-  // The page the extension holds last, before the page list and footer: a
-  // buffered read of the footer region that starts inside it.
-  const ucache::ReplicaMeta::OrigRange* last = nullptr;
-  for (const auto& r : c.view->meta().origMap)
-    if (r.virtOff != r.origOff && r.len > 16 && r.origOff != c.m.anchor.seekFooter &&
-        r.origOff != c.m.pageListOffset && (!last || r.virtOff > last->virtOff))
-      last = &r;
-  ASSERT_NE(last, nullptr);
-  const uint64_t from = last->virtOff + last->len / 2;
-  const uint64_t len = c.view->virtualSize() - from;
-
-  ucache::ReadFootprint f, whole;
-  f.note(0, 4096, c.m.fileSize); // what came before is known ...
-  whole.note(0, 4096, c.m.fileSize);
-  ASSERT_TRUE(f.totals(c.m.fileSize).origKnown);
-  EXPECT_FALSE(c.read(from, len, f, whole));
-  // ... and is not the answer any more: the counts are unknown, not a guess.
-  const auto t = f.totals(c.m.fileSize);
-  EXPECT_FALSE(t.origKnown);
-  EXPECT_FALSE(t.uniqueKnown);
-  // What the whole-unit count would have said: the whole page, for a part of it.
-  const auto w = whole.totals(c.m.fileSize);
-  ASSERT_TRUE(w.origKnown);
-  EXPECT_GE(w.origBytes, 4096 + last->origLen);
-  // The signature is the one it always was.
-  EXPECT_FALSE(f.poisoned());
-  EXPECT_EQ(f.sig(c.m.fileSize), whole.sig(c.m.fileSize));
-  EXPECT_EQ(f.count(c.m.fileSize), whole.count(c.m.fileSize));
-}
-
-TEST(RNTupleReplicaBytes, InPlaceBytesMapByteForByte) {
-  // The anchor is patched in place: any part of it is the same part of the
-  // original. Bytes the overlay does not cover are the original's own.
-  CompactReplica c;
-  ASSERT_TRUE(c.error.empty()) << c.error;
-  const ucache::ReplicaMeta::OrigRange* win = nullptr;
-  for (const auto& r : c.view->meta().origMap)
-    if (r.virtOff == r.origOff && r.len == r.origLen && r.len > 2)
-      win = &r;
-  ASSERT_NE(win, nullptr) << "the fixture has a window patched in place";
-  Spans units, exact;
-  ASSERT_TRUE(c.view->mapToOrigin(win->virtOff + 1, win->len - 2, units, exact));
-  ASSERT_EQ(exact.size(), 1u);
-  EXPECT_EQ(exact[0], std::make_pair(win->virtOff + 1, win->len - 2));
-  units.clear();
-  exact.clear();
-  ASSERT_TRUE(c.view->mapToOrigin(0, 64, units, exact)); // the file header
-  ASSERT_FALSE(exact.empty());
-  uint64_t n = 0;
-  for (const auto& e : exact)
-    n += e.second;
-  EXPECT_EQ(n, 64u);
-}
 
 // The slot store's layout for RNTuple: a page's slot read whole is its page; a
 // read of the page list or footer alone is part of the relocated metadata

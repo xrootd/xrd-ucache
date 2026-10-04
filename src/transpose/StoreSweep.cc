@@ -5,7 +5,6 @@
 #include "Log.h"
 #include "MetaFile.h"
 #include "RNTupleRewrite.h"
-#include "ReplicaStore.h"
 #include "SlotStore.h"
 #include "StoreLayout.h"
 #include "StoreMaps.h"
@@ -80,14 +79,6 @@ class SweepMaps : public StoreMaps {
   void onMapMade(uint64_t storedBytes) override { mapBytes += storedBytes; }
 };
 
-// The replica forms an earlier uCache made beside the byte cache: replaced by
-// the store, which serves the file from now on.
-void dropOldReplica(IOBackend& io, const UrlKey& key, const std::string& cacheDir) {
-  io.unlink(ReplicaStore::tmetaPath(key, cacheDir));
-  io.unlink(ReplicaStore::tokPath(key, cacheDir));
-  io.unlink(ReplicaStore::tdataPath(key, cacheDir));
-}
-
 // The converted slots' originals, let go of by the byte cache: the whole pages
 // they cover, a page shared with anything else kept.
 uint64_t releaseConverted(SweepMaps& sm, FileEntry& entry) {
@@ -153,7 +144,7 @@ SweepResult sweepFile(CacheStore& cs, const Config& cfg, IOBackend& io, const Ur
     return fail(O::kNewer, "its store was made by a newer uCache");
   // The replica an earlier uCache made beside the byte cache is not served any
   // more: the store replaces it.
-  dropOldReplica(io, key, cfg.cacheDir);
+  res.droppedEarlier = CacheStore::dropEarlierReplica(io, dir, key.hashHex);
   if (store && !adoptable(store->header(), size, cm->originMtime, cm->cksumKind, cm->originCksum,
                           cfg.validate)) {
     // Made by an earlier uCache, or for another version of the file.

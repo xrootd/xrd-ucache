@@ -5,7 +5,6 @@
 #include "CacheStore.h"
 #include "FillLayout.h"
 #include "RNTupleRewrite.h"
-#include "ReplicaStore.h"
 #include "SlotStore.h"
 #include "StoreLayout.h"
 #include "TestUtil.h"
@@ -169,14 +168,15 @@ TEST(StoreSweep, AFileWhoseMetadataIsNotCachedIsLeftForLater) {
 TEST(StoreSweep, AnEarlierReplicaFormIsRemoved) {
   Fixture f("unnamed_codec_fixture.root", {"lzma", "zlib"});
   f.cache(f.file.size());
-  for (const auto& p : {ReplicaStore::tdataPath(f.key, f.cfg.cacheDir),
-                        ReplicaStore::tmetaPath(f.key, f.cfg.cacheDir)})
-    std::ofstream(p) << "x";
+  const std::string base = f.key.objectDir(f.cfg.cacheDir) + "/" + f.key.hashHex;
+  for (const char* suffix : {".tdata", ".tmeta", ".tok"})
+    std::ofstream(base + suffix) << "x";
   SweepResult r = f.sweep();
   EXPECT_EQ(r.outcome, SweepResult::Outcome::kConverted) << r.note;
+  EXPECT_TRUE(r.droppedEarlier);
   struct ::stat st;
-  EXPECT_NE(::stat(ReplicaStore::tdataPath(f.key, f.cfg.cacheDir).c_str(), &st), 0);
-  EXPECT_NE(::stat(ReplicaStore::tmetaPath(f.key, f.cfg.cacheDir).c_str(), &st), 0);
+  for (const char* suffix : {".tdata", ".tmeta", ".tok"})
+    EXPECT_NE(::stat((base + suffix).c_str(), &st), 0) << suffix;
 }
 
 TEST(StoreSweep, ACachedOriginalThatRottedIsCaughtAndCounted) {

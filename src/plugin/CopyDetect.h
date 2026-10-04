@@ -43,8 +43,8 @@
 //
 // Recognised when the read shows it, not the opener: a handle whose FIRST
 // request reads the whole file at once (fsspec's open().read(),
-// cat_file(path, 0, size)) is a copy too, for a file with a compact replica or
-// a slot store (UCacheFile.cc). A copy in pieces up to the origin's size that
+// cat_file(path, 0, size)) is a copy too, for a file with a slot store
+// (UCacheFile.cc). A copy in pieces up to the origin's size that
 // never reads the layout's own part is not a reader's pattern either, and is
 // refused before it completes (CopyGuard.h).
 //

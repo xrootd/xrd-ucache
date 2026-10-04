@@ -44,6 +44,7 @@ struct SweepResult {
   std::string declinedCodecs; // ... the codecs `recompress_codecs` does not name
   bool storeCreated = false;
   bool mapMade = false;
+  bool droppedEarlier = false; // a replica an earlier release made was removed
   uint64_t converted = 0;     // slots this sweep committed converted ...
   uint64_t kept = 0;          // ... and kept as stored (no record)
   uint64_t inBytes = 0;       // the originals of the converted slots

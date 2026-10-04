@@ -1,5 +1,5 @@
-// A copy of a file that the cache shows in another layout (a compact replica
-// or a slot store), made by a program that took the file's size from the
+// A copy of a file that the cache shows in another layout (its slot store's),
+// made by a program that took the file's size from the
 // origin -- fsspec's buffered file, a read loop sized by the namespace stat --
 // reads [0, origin size) of that layout and stops, or trims its last piece to
 // that size. Those bytes are not the origin's file: the header's end and the

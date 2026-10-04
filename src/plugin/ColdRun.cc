@@ -16,7 +16,6 @@
 #include "ReaderWait.h"
 #include "ReadRounding.h"
 #include "ReadRule.h"
-#include "ReplicaStore.h"
 #include "SlotStore.h"
 #include "SlotTable.h"
 #include "StoreLayout.h"
@@ -635,11 +634,6 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   if (!store) {
     if (mode == AttachMode::kExisting || SlotStore::newer(io, dir, key.hashHex))
       return nullptr;
-    // A compact replica is served in its own layout, to readers who may hold
-    // its offsets: a store is never made beside one.
-    struct ::stat tst;
-    if (io.stat(ReplicaStore::tmetaPath(key, cfg.cacheDir), &tst) == 0)
-      return nullptr;
     SetupSource src;
     src.st = st;
     src.entry = entry;
@@ -706,16 +700,6 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
     if (store->header().declined) {
       if (created || want.declined) // the decision is this process's: say why
         noteDeclined(st, key, cf->L, created);
-      return nullptr;
-    }
-    // A replica published while the layout was computed: one form per file.
-    // Every publish checks for a store after its sidecar lands, so of two
-    // racing, at least one sees the other.
-    if (created && io.stat(ReplicaStore::tmetaPath(key, cfg.cacheDir), &tst) == 0) {
-      store->dropIfCurrent();
-      store.reset();
-      UCACHE_INFO("slot store for %s withdrawn: a replica was published meanwhile",
-                  key.key.c_str());
       return nullptr;
     }
     if (!created) { // someone else made it first: theirs is the layout
@@ -944,7 +928,7 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
       cf.forget(i);
       return false;
     }
-    if (auto cs = globalStore()) { // the replica tier's disk reads, as for a compact replica
+    if (auto cs = globalStore()) { // the replica tier's disk reads
       auto& stats = cs->stats();
       stats.replicaReads.fetch_add(1, std::memory_order_relaxed);
       stats.replicaReadBytes.fetch_add(buf->size(), std::memory_order_relaxed);
@@ -1057,7 +1041,7 @@ void ColdRequest::again(bool mayParkAgain) {
 }
 
 // Merging limits for a request's stored records: a read of at most 1 MiB (the
-// compact replica's), across gaps of at most 64 KiB (a commit block's header
+// limit the byte cache's reads have too), across gaps of at most 64 KiB (a commit block's header
 // and alignment between two runs of records; ~3% more bytes on NanoAOD).
 constexpr uint64_t kStoredRunBytes = 1ull << 20;
 constexpr uint64_t kStoredRunGap = 64ull << 10;
@@ -2763,10 +2747,10 @@ ShownLayout noteShownLayout(const std::string& key, ShownLayout s, uint64_t hash
   std::lock_guard<std::mutex> g(g_shownMu);
   g_shownVersion.fetch_add(1, std::memory_order_acq_rel); // odd: changing
   auto& v = shownMap()[key];
-  // Original may later become compact or slot (the original region reads the
-  // same in both); nothing else changes once shown -- not even to another
-  // compact replica or slot layout of the same file. The caller learns which
-  // layout won, and must serve that one.
+  // Original may later become a slot layout (the original region reads the
+  // same); nothing else changes once shown -- not even to another slot layout
+  // of the same file. The caller learns which layout won, and must serve that
+  // one.
   if (v.layout == ShownLayout::kNone || v.layout == ShownLayout::kOriginal ||
       (v.layout == s && v.hash == hash)) {
     const bool first = v.layout != s || v.hash != hash;

@@ -407,8 +407,7 @@ void CacheStore::scanShard(const std::string& objRoot, const std::string& shard,
     }
     if ((s.artifacts & kArtTdata) &&
         io_.stat(objRoot + "/" + shard + "/" + stem + ".tdata", &tst) == 0) {
-      s.replicaBytes = static_cast<uint64_t>(tst.st_size);
-      s.replicated = true;
+      s.earlierReplicaBytes = static_cast<uint64_t>(tst.st_size);
       if (disk)
         s.replicaDisk += allocated(tst);
     }
@@ -487,6 +486,7 @@ std::vector<CacheStore::EntryInfo> CacheStore::listEntries(bool disk) {
     e.replicaBytes = s.replicaBytes;
     e.replicated = s.replicated;
     e.slotDeclined = s.slotDeclined;
+    e.earlierReplicaBytes = s.earlierReplicaBytes;
     e.atime = s.atime;
     e.coverage = s.coverage;
     e.pinned = s.pinned;
@@ -626,7 +626,7 @@ int CacheStore::evictNow() {
         io_.unlink(base + ".cost"); // CPU-span evidence
       if (s.artifacts & kArtSlots)
         io_.unlink(base + ".slots"); // the slot store goes with its entry
-      const uint64_t reclaimed = s.cachedBytes + s.replicaBytes;
+      const uint64_t reclaimed = s.cachedBytes + s.replicaBytes + s.earlierReplicaBytes;
       usage -= std::min(usage, reclaimed);
       avail += reclaimed; // reclaimed disk (approx; ignored when !haveSpace)
       ++evicted;
@@ -988,6 +988,15 @@ CacheStore::ClearedState CacheStore::clearedState(IOBackend& io, const std::stri
   return st;
 }
 
+bool CacheStore::dropEarlierReplica(IOBackend& io, const std::string& objectDir,
+                                    const std::string& hashHex) {
+  const std::string base = objectDir + "/" + hashHex;
+  bool had = false;
+  for (const char* suffix : {".tmeta", ".tok", ".tdata"})
+    had = io.unlink(base + suffix) == 0 || had;
+  return had;
+}
+
 void CacheStore::sweepReplicaOrphans() {
   const std::string objRoot = cfg_.cacheDir + "/objects";
   const uint64_t now = nowS();
@@ -1023,12 +1032,20 @@ void CacheStore::sweepReplicaOrphans() {
         creationDebris = true;
         hash = f.substr(0, at);
       }
-      if (!replicaArtifact || (metas.count(hash) && !creationDebris))
+      // A replica an earlier release made is never served: it goes whether or
+      // not its entry lives (the file's slot store takes its place).
+      auto endsWith = [&f](const char* suf) {
+        const size_t n = ::strlen(suf);
+        return f.size() > n && f.compare(f.size() - n, n, suf) == 0;
+      };
+      const bool earlier = endsWith(".tdata") || endsWith(".tmeta") || endsWith(".tok");
+      if (!replicaArtifact || (metas.count(hash) && !creationDebris && !earlier))
         continue;
       // Age guard: never sweep a concurrent publisher's in-flight files.
       const std::string path = objRoot + "/" + sh + "/" + f;
       struct ::stat st;
-      if (io_.stat(path, &st) != 0 || now < static_cast<uint64_t>(st.st_mtime) + 3600)
+      if (io_.stat(path, &st) != 0 ||
+          (!earlier && now < static_cast<uint64_t>(st.st_mtime) + 3600))
         continue;
       if (io_.unlink(path) == 0) {
         stats_.replicaOrphansSwept.fetch_add(1, std::memory_order_relaxed);

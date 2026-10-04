@@ -66,6 +66,11 @@ class CacheStore {
   // into the store's own copy, and a caller reading the unresolved one would
   // see 0 and conclude there is nothing to protect.
   static uint64_t headroomToFloor(const Config& cfg, IOBackend& io);
+  // Remove the replica an earlier release made beside the entry's byte cache
+  // (<hash>.tdata, .tmeta, .tok): this one never serves it, and the file's slot
+  // store takes its place. True when there was one.
+  static bool dropEarlierReplica(IOBackend& io, const std::string& objectDir,
+                                 const std::string& hashHex);
 
   // Opens (or shares) the entry for `key`, validating against the origin
   // metadata. nullptr => caller fails open to pass-through.
@@ -108,14 +113,17 @@ class CacheStore {
     std::string hashHex;     // its object name
     uint64_t fileSize = 0;   // origin size
     uint64_t cachedBytes = 0;
-    uint64_t replicaBytes = 0; // .tdata overlay + .slots size; 0 = none
-    // A replica serves: a compact overlay, or a slot store holding records (a
-    // store with only its layout takes space, and has recompressed nothing).
+    uint64_t replicaBytes = 0; // the slot store's size; 0 = none
+    // A replica serves: a slot store holding records (a store with only its
+    // layout takes space, and has recompressed nothing).
     bool replicated = false;
-    // The file's first-pass layout was DECLINED (a slot store holding only its
-    // header): it is served from the byte cache, and only `ucache recompress`
-    // can give it a replica.
+    // The file's layout was DECLINED (a slot store holding only its header):
+    // it is served from the byte cache.
     bool slotDeclined = false;
+    // A replica an earlier release made beside the byte cache (.tdata/.tmeta):
+    // never served, removed at the next open, `ucache recompress` or eviction
+    // pass. Its size; 0 = none.
+    uint64_t earlierReplicaBytes = 0;
     uint64_t atime = 0;
     double coverage = 0.0;   // fraction of the file present in cache [0,1]
     bool pinned = false;
@@ -125,7 +133,7 @@ class CacheStore {
     // page into a hole stores the zeros around it too.
     uint64_t dataDisk = 0;    // .data
     uint64_t metaDisk = 0;    // .meta
-    uint64_t replicaDisk = 0; // .tdata + .tmeta + .slots
+    uint64_t replicaDisk = 0; // .slots, and an earlier release's .tdata + .tmeta
   };
   // Snapshot of every cached entry (authoritative disk scan; torn sidecars
   // skipped). Cold path — use approxUsageBytes()/stats for hot checks.
@@ -301,9 +309,10 @@ class CacheStore {
     std::string dataPath, metaPath, hashHex, key;
     uint64_t fileSize = 0; // origin size (listEntries reporting)
     uint64_t atime = 0, cachedBytes = 0;
-    uint64_t replicaBytes = 0; // .tdata + .slots size (0 = none) — evicted with the entry
+    uint64_t replicaBytes = 0; // .slots size (0 = none) — evicted with the entry
     bool replicated = false;   // see EntryInfo::replicated
     bool slotDeclined = false; // see EntryInfo::slotDeclined
+    uint64_t earlierReplicaBytes = 0; // see EntryInfo::earlierReplicaBytes
     double coverage = 0.0;     // fraction of pages present [0,1]
     uint8_t artifacts = 0;     // kArt* bits present in the shard listing
     bool pinned = false;
@@ -322,10 +331,11 @@ class CacheStore {
   // One shard directory's entries, appended to `out` (worker body of the scan).
   void scanShard(const std::string& objRoot, const std::string& shard,
                  std::vector<MetaScan>& out, bool replicated = false, bool disk = false);
-  // Remove replica artifacts (.tdata/.tmeta/*.tmp) whose v1 .meta is gone —
-  // debris of a crash mid-publish or of a v1.0.0 process evicting an entry
-  // without knowing about replica files (D1 mixed-version caveat). Age-guarded
-  // (1 h) so a concurrent publisher's in-flight files are never swept.
+  // Remove replica artifacts whose .meta is gone (a store's creation file left
+  // by a crash, a store an older release left behind when it evicted the
+  // entry), age-guarded (1 h) so nothing being written is swept; and every
+  // replica an earlier release made beside the byte cache (.tdata, .tmeta,
+  // .tok), entry or not, which this release never serves.
   // Caller must hold the cache-wide eviction LOCK.
   void sweepReplicaOrphans();
   // Called from the page-write path: add persisted bytes to the running total

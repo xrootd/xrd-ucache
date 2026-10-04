@@ -112,8 +112,8 @@ struct Source {
     }
     off_t size = ::lseek(fd, 0, SEEK_END);
     bytes.resize(size);
-    // Loop: a single pread caps at ~2 GiB (MAX_RW_COUNT); stitched ground
-    // truths (patched replicas) can exceed it.
+    // Loop: a single pread caps at ~2 GiB (MAX_RW_COUNT); ground truths in a
+    // layout of the cache's (a file written out in it) can exceed it.
     off_t done = 0;
     while (done < size) {
       ssize_t r = ::pread(fd, bytes.data() + done, size - done, done);
@@ -211,7 +211,7 @@ void worker(Ctx* ctx, const Source& src, const Walk* walk, uint64_t seed, uint64
       // One in 32 reads deliberately runs PAST EOF, and must come back SHORT.
       // Every read here used to be placed in bounds by construction, so the
       // last-block overrun that any fixed-block reader performs was never
-      // exercised — and a stitched entry answering it with zero bytes went
+      // exercised — and an entry the cache lays out answering it with zero bytes went
       // unnoticed until a real client aborted on it.
       const bool overrun = (rng() % 32 == 0) && len > 1;
       const uint64_t off = overrun ? fsize - len / 2 : rng() % (fsize - len + 1);
@@ -286,7 +286,7 @@ void worker(Ctx* ctx, const Source& src, const Walk* walk, uint64_t seed, uint64
       XrdCl::ChunkList chunks;
       for (int c = 0; c < n; ++c) {
         // Now and then a zero-length chunk: ROOT sends them, and one must be
-        // served empty, never make the plugin relay a stitched vector (whose
+        // served empty, never make the plugin relay a vector in a cache's layout (whose
         // other chunks are offsets the origin does not have).
         uint32_t len = rng() % 16 == 0 ? 0 : 1 + rng() % (64 * 1024);
         if (len > fsize)
@@ -310,7 +310,7 @@ void worker(Ctx* ctx, const Source& src, const Walk* walk, uint64_t seed, uint64
         ++gFailures;
         return;
       }
-    } else { // pgread (>= 1 page by API contract; stitched handles serve locally)
+    } else { // pgread (>= 1 page by API contract; slot-layout handles serve locally)
       uint32_t len = 4096 + rng() % (256 * 1024);
       if (len > fsize)
         len = static_cast<uint32_t>(fsize);

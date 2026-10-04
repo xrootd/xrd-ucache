@@ -77,13 +77,12 @@ std::shared_ptr<ColdFill> coldAttach(const std::shared_ptr<HandleState>& st,
 
 // Which layout this process has shown a file (by key) in. A reader may hold
 // offsets from any open it made, so a file is never shown a different layout
-// later in the same process: a slot layout stays that slot layout; a compact
-// replica's stays compact (or falls back to the original); only the original
-// may later become either. `hash` = the slot layout's hash.
-enum class ShownLayout : uint8_t { kNone, kOriginal, kCompact, kSlot };
+// later in the same process: a slot layout stays that slot layout; only the
+// original may later become one. `hash` = the slot layout's hash.
+enum class ShownLayout : uint8_t { kNone, kOriginal, kSlot };
 ShownLayout shownLayout(const std::string& key, uint64_t& hash);
 // Record that `s` is being shown, with its identity `hash` (a slot layout's
-// hash; a compact replica's id; 0 for the original); returns the layout that
+// hash; 0 for the original); returns the layout that
 // holds for the file in this process from now on (and its identity). When that
 // is not `s` and `hash`, another handle got there first, and the caller must
 // serve the winner instead. For a slot layout, `run` is the run being shown:

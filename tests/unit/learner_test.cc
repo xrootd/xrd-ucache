@@ -1,6 +1,6 @@
-// Learner (deriveHotBranches / withCounters / branchCodec) contract tests:
-// a partially-read counter must never fail a build (it is left
-// out), and the recompress_codecs policy filters by source codec.
+// What the cache tells about a TTree file's branches (Transposer.h): the codec
+// a branch's baskets are stored in, read from the basket itself, and whether
+// every basket of a branch is cached.
 #include "Transposer.h"
 
 #include <cstring>
@@ -73,33 +73,7 @@ BranchInfo mkBranch(const std::string& name, uint64_t seek, int32_t nb,
 
 } // namespace
 
-TEST(Learner, PartiallyCachedCounterIsLeftOutNotFatal) {
-  FileMeta fm;
-  fm.branches.push_back(mkBranch("mm_pt", 1000, 100, "nmm"));
-  fm.branches.push_back(mkBranch("nmm", 5000, 50)); // the counter branch
-  MockSource src;
-  src.ranges[1000] = std::vector<uint8_t>(100, 0); // mm_pt fully cached
-  // nmm's basket deliberately ABSENT (the real-cache failure: "nmm: basket 0
-  // not available" used to fail the whole file's build).
-  auto hot = deriveHotBranches(fm, src);
-  ASSERT_EQ(hot.size(), 1u);
-  EXPECT_EQ(hot[0], "mm_pt"); // dependent kept, unbuildable counter left out
-}
-
-TEST(Learner, CoveredCounterRidesAlong) {
-  FileMeta fm;
-  fm.branches.push_back(mkBranch("mm_pt", 1000, 100, "nmm"));
-  fm.branches.push_back(mkBranch("nmm", 5000, 50));
-  MockSource src;
-  src.ranges[1000] = std::vector<uint8_t>(100, 0);
-  src.ranges[5000] = std::vector<uint8_t>(50, 0);
-  auto hot = deriveHotBranches(fm, src);
-  ASSERT_EQ(hot.size(), 2u);
-  EXPECT_EQ(hot[0], "mm_pt");
-  EXPECT_EQ(hot[1], "nmm");
-}
-
-TEST(Learner, CodecFilterKeepsOnlyListedSources) {
+TEST(BranchCodec, ReadFromTheBasketsOwnFrame) {
   FileMeta fm;
   fm.branches.push_back(mkBranch("lzma_b", 1000, 100));
   fm.branches.push_back(mkBranch("zstd_b", 3000, 100));
@@ -109,18 +83,14 @@ TEST(Learner, CodecFilterKeepsOnlyListedSources) {
   EXPECT_EQ(branchCodec(fm, fm.branches[0], src), "lzma");
   EXPECT_EQ(branchCodec(fm, fm.branches[1], src), "zstd");
 
-  auto lzmaOnly = deriveHotBranches(fm, src, {"lzma"});
-  ASSERT_EQ(lzmaOnly.size(), 1u);
-  EXPECT_EQ(lzmaOnly[0], "lzma_b");
-
-  auto both = deriveHotBranches(fm, src, {"lzma", "zstd"});
-  EXPECT_EQ(both.size(), 2u);
-
-  auto unfiltered = deriveHotBranches(fm, src); // empty list = no filter
-  EXPECT_EQ(unfiltered.size(), 2u);
+  EXPECT_TRUE(fullyCached(fm.branches[0], src));
+  EXPECT_TRUE(fullyCached(fm.branches[1], src));
+  fm.branches.push_back(mkBranch("absent_b", 5000, 100)); // nothing cached there
+  EXPECT_FALSE(fullyCached(fm.branches[2], src));
+  EXPECT_EQ(branchCodec(fm, fm.branches[2], src), "");
 }
 
-TEST(Learner, UncompressedAndUnreadableExcludedByFilter) {
+TEST(BranchCodec, UncompressedAndUnreadableAreNamedAsSuch) {
   FileMeta fm;
   fm.branches.push_back(mkBranch("raw_b", 1000, 130));
   fm.branches.push_back(mkBranch("garbage_b", 3000, 100));
@@ -129,6 +99,4 @@ TEST(Learner, UncompressedAndUnreadableExcludedByFilter) {
   src.ranges[3000] = std::vector<uint8_t>(100, 0xFF); // unparseable key
   EXPECT_EQ(branchCodec(fm, fm.branches[0], src), "none");
   EXPECT_EQ(branchCodec(fm, fm.branches[1], src), "");
-  EXPECT_TRUE(deriveHotBranches(fm, src, {"lzma"}).empty());
-  EXPECT_EQ(deriveHotBranches(fm, src).size(), 2u); // no filter: both qualify
 }

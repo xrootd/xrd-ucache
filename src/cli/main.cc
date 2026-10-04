@@ -7,7 +7,6 @@
 #include "IOBackend.h"
 #include "MetaFile.h"
 #include "SlotStore.h"
-#include "ReplicaStore.h"
 #include "ConfTemplate.h"
 #include "PluginFile.h"
 #include "HistoryJson.h"
@@ -160,7 +159,6 @@ void usage() {
       "  unset <key>       drop a current value (back to your defaults)\n"
       "\n"
       "developer plumbing (gates/debugging):\n"
-      "  materialize <url> [--branches a,b] [--punch] [--from-file F --overlay-out P]\n"
       "  untranspose <url> drop an entry's replica (keeps the byte cache)\n"
       "\n"
       "config: defaults = `key = value` lines in ucache.conf, edited by hand\n"
@@ -1189,10 +1187,9 @@ bool anyReplicaExists(const std::string& cacheDir) {
       const std::string n = f->d_name;
       // A slot store counts once it has recompressed something, as in
       // `status`: one marked DECLINED, or holding only its layout, has not.
-      if ((n.size() > 6 && n.compare(n.size() - 6, 6, ".tmeta") == 0) ||
-          (n.size() > 6 && n.compare(n.size() - 6, 6, ".slots") == 0 &&
-           SlotStore::holdsRecords(RealIO::instance(), root + "/" + shard->d_name,
-                                   n.substr(0, n.size() - 6)))) {
+      if (n.size() > 6 && n.compare(n.size() - 6, 6, ".slots") == 0 &&
+          SlotStore::holdsRecords(RealIO::instance(), root + "/" + shard->d_name,
+                                  n.substr(0, n.size() - 6))) {
         found = true;
         break;
       }
@@ -1203,6 +1200,31 @@ bool anyReplicaExists(const std::string& cacheDir) {
   }
   ::closedir(d);
   return found;
+}
+
+// How many replicas an earlier release made (.tdata) lie in the cache. Walks
+// objects/ directly, as anyReplicaExists does: `doctor` has no cache store.
+size_t countEarlierReplicas(const std::string& cacheDir) {
+  const std::string root = cacheDir + "/objects";
+  DIR* d = ::opendir(root.c_str());
+  if (!d)
+    return 0;
+  size_t n = 0;
+  while (dirent* shard = ::readdir(d)) {
+    if (shard->d_name[0] == '.')
+      continue;
+    DIR* sd = ::opendir((root + "/" + shard->d_name).c_str());
+    if (!sd)
+      continue;
+    while (dirent* f = ::readdir(sd)) {
+      const std::string name = f->d_name;
+      if (name.size() > 6 && name.compare(name.size() - 6, 6, ".tdata") == 0)
+        ++n;
+    }
+    ::closedir(sd);
+  }
+  ::closedir(d);
+  return n;
 }
 
 // Why is `recompress = on` producing nothing?
@@ -2284,6 +2306,19 @@ int cmdStatus(CacheStore& store, IOBackend& io) {
     std::printf("declined  : %zu file%s the first pass could not recompress — served from the "
                 "byte cache; `ucache doctor` names why\n",
                 declinedN, declinedN == 1 ? "" : "s");
+  // Replicas an earlier release made beside the byte cache: never served by
+  // this one, and gone at the next contact -- said here until then.
+  size_t earlierN = 0;
+  uint64_t earlierBytes = 0;
+  for (const auto& e : entries)
+    if (e.earlierReplicaBytes) {
+      ++earlierN;
+      earlierBytes += e.earlierReplicaBytes;
+    }
+  if (earlierN)
+    std::printf("earlier   : %zu replica%s an earlier uCache made (%s), not served by this one; "
+                "removed at the file's next open, by `ucache recompress` or by eviction\n",
+                earlierN, earlierN == 1 ? "" : "s", human(earlierBytes).c_str());
   // Recompression on and nothing built: say why when a cheap check can tell.
   // Status is a fast command; the codec comparison is left to `doctor`.
   if (std::string why = recompressStall(cfg, io, replicaN, /*deep=*/false); !why.empty())
@@ -2329,304 +2364,6 @@ int cmdLs(CacheStore& store, int argc, char** argv) {
                 e.replicaBytes ? human(e.replicaBytes).c_str() : "-", e.pinned ? "yes" : "",
                 e.key.c_str());
   std::printf("(%zu entries)\n", entries.size());
-  return 0;
-}
-
-#ifdef UCACHE_HAVE_TRANSPOSE
-// Byte sources for the native transposer: a plain file, or the entry's
-// sparse v1 .data image gated by its bitmap (only cached ranges are usable —
-// `materialize` never touches the network).
-struct FdSource : tp::Source {
-  int fd = -1;
-  uint64_t size = 0;
-  bool read(void* dst, uint64_t n, uint64_t off) override {
-    return ::pread(fd, dst, n, off) == static_cast<ssize_t>(n);
-  }
-  bool has(uint64_t off, uint64_t n) override { return off + n <= size; }
-};
-
-// Native overlay build: parse + transcode from `srcPath` (bitmap-
-// gated when it is the cache image). Returns 0 and fills meta/tdata.
-int buildNative(const std::string& srcPath, const MetaData* cacheMeta,
-                const std::string& branches, const std::string& tree,
-                ReplicaMeta& outMeta, std::vector<uint8_t>& outTdata,
-                std::string& summary, uint64_t* oldHotOut = nullptr,
-                uint64_t* newHotOut = nullptr,
-                const std::vector<std::string>& codecs = {}) {
-  tp::FileMeta fm = tp::parseFile(srcPath, tree);
-  if (!fm.error.empty()) {
-    std::fprintf(stderr, "materialize: parse failed: %s\n", fm.error.c_str());
-    return 1;
-  }
-  int fd = ::open(srcPath.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) {
-    std::fprintf(stderr, "materialize: cannot open %s\n", srcPath.c_str());
-    return 1;
-  }
-  FdSource fsrc;
-  CacheSource csrc;
-  tp::Source* src;
-  if (cacheMeta) {
-    csrc.fd = fd;
-    csrc.meta = cacheMeta;
-    src = &csrc;
-  } else {
-    fsrc.fd = fd;
-    fsrc.size = static_cast<uint64_t>(fm.fend);
-    src = &fsrc;
-  }
-  std::vector<std::string> hot;
-  if (!branches.empty()) {
-    std::istringstream ss(branches);
-    std::string b;
-    while (std::getline(ss, b, ','))
-      if (!b.empty())
-        hot.push_back(b);
-    hot = tp::withCounters(fm, hot, *src);
-  } else {
-    hot = tp::deriveHotBranches(fm, *src, codecs); // learner + codec policy
-    if (hot.empty()) {
-      ::close(fd);
-      return 3; // nothing qualifies (not read enough, or codec policy) — skip
-    }
-  }
-  tp::Overlay ov = tp::buildOverlay(fm, *src, hot);
-  ::close(fd);
-  if (!ov.error.empty()) {
-    std::fprintf(stderr, "materialize: build failed: %s\n", ov.error.c_str());
-    return 1;
-  }
-  if (oldHotOut)
-    *oldHotOut = ov.oldBytes;
-  if (newHotOut)
-    *newHotOut = ov.newBytes;
-  outMeta = std::move(ov.meta);
-  outTdata = std::move(ov.tdata);
-  char buf[256];
-  std::snprintf(buf, sizeof buf,
-                "  built natively: %llu baskets from %zu branches "
-                "(%llu transcoded, %llu verbatim, %llu raw-fallback), "
-                "%s -> %s hot bytes",
-                (unsigned long long)ov.baskets, hot.size(),
-                (unsigned long long)ov.transcoded, (unsigned long long)ov.verbatim,
-                (unsigned long long)ov.fallbackRaw, human(ov.oldBytes).c_str(),
-                human(ov.newBytes).c_str());
-  summary = buf;
-  char mbuf[160];
-  std::snprintf(mbuf, sizeof mbuf, "\n  relocated metadata: %s -> %s at rest (%.2fx, ZSTD)",
-                human(ov.metaRawBytes).c_str(), human(ov.metaStoredBytes).c_str(),
-                ov.metaStoredBytes ? (double)ov.metaRawBytes / (double)ov.metaStoredBytes
-                                   : 1.0);
-  summary += mbuf;
-  return 0;
-}
-#endif // UCACHE_HAVE_TRANSPOSE
-
-// materialize <url> [--branches a,b|--import PREFIX] [--punch] [--from-file F]
-// [--overlay-out PREFIX]: build (natively, from the entry's cached bytes —
-// or from an explicit file in test mode) or import a replica overlay, and
-// publish it through the crash-safe publish path. --overlay-out writes the
-// overlay files instead of publishing (the byte-differential gate vs the
-// Python builder).
-// `store` may be NULL only in the pure builder mode (--from-file +
-// --overlay-out): a file->file transform that never touches the cache and
-// therefore needs no cache dir (deliberate exemption; the roundtrip gate runs
-// it store-less).
-int cmdMaterialize(CacheStore* store, const Config& cfg, IOBackend& io, int argc,
-                   char** argv) {
-  const char* url = nullptr;
-  std::string prefix, branches, fromFile, overlayOut, tree = "Events";
-  bool punch = false;
-  for (int i = 2; i < argc; ++i) {
-    if (!std::strcmp(argv[i], "--import") && i + 1 < argc)
-      prefix = argv[++i];
-    else if (!std::strcmp(argv[i], "--branches") && i + 1 < argc)
-      branches = argv[++i];
-    else if (!std::strcmp(argv[i], "--from-file") && i + 1 < argc)
-      fromFile = argv[++i];
-    else if (!std::strcmp(argv[i], "--overlay-out") && i + 1 < argc)
-      overlayOut = argv[++i];
-    else if (!std::strcmp(argv[i], "--tree") && i + 1 < argc)
-      tree = argv[++i];
-    else if (!std::strcmp(argv[i], "--punch"))
-      punch = true;
-    else if (!url)
-      url = argv[i];
-    else {
-      std::fprintf(stderr, "materialize: unexpected argument %s\n", argv[i]);
-      return 2;
-    }
-  }
-  if (!url && overlayOut.empty()) {
-    std::fputs("materialize: needs a <url> (or --from-file F --overlay-out P)\n", stderr);
-    return 2;
-  }
-  std::optional<UrlKey> key;
-  if (url) {
-    key = UrlKey::parse(url, cfg.keepCgi); // SAME normalization as the plugin
-    if (!key) {
-      std::fprintf(stderr, "%s: not a valid URL\n", url);
-      return 2;
-    }
-  }
-
-  ReplicaMeta meta;
-  std::vector<uint8_t> tdata8;
-  std::string buildSummary;
-  if (prefix.empty()) {
-#ifdef UCACHE_HAVE_TRANSPOSE
-    std::optional<MetaData> cm;
-    std::string srcPath = fromFile;
-    if (srcPath.empty()) {
-      if (!store) {
-        std::fputs("materialize: no cache dir configured — set `dir =` in ucache.conf "
-                   "(USER_GUIDE §2) or UCACHE_DIR\n", stderr);
-        return 2;
-      }
-      cm = MetaFile::load(io, key->metaPath(cfg.cacheDir));
-      if (!cm) {
-        std::fprintf(stderr, "materialize: %s is not in the byte cache "
-                             "(run the analysis once first)\n",
-                     key->key.c_str());
-        return 1;
-      }
-      srcPath = key->dataPath(cfg.cacheDir);
-    }
-    if (int rc = buildNative(srcPath, cm ? &*cm : nullptr, branches, tree, meta, tdata8,
-                             buildSummary)) {
-      if (rc == 3)
-        std::fputs("materialize: no fully-cached branches to transpose "
-                   "(run the analysis once to teach the cache)\n",
-                   stderr);
-      return 1;
-    }
-    if (cm) { // validators: what the plugin validated the entry against (§7)
-      meta.originMtime = cm->originMtime;
-      meta.cksumKind = cm->cksumKind;
-      meta.originCksum = cm->originCksum;
-      if (meta.originSize != cm->fileSize) {
-        std::fputs("materialize: cached size != parsed fEND; refusing\n", stderr);
-        return 1;
-      }
-    }
-    if (!overlayOut.empty()) { // differential-gate mode: emit files, no publish
-      std::ofstream td(overlayOut + ".tdata", std::ios::binary);
-      td.write(reinterpret_cast<const char*>(tdata8.data()),
-               static_cast<std::streamsize>(tdata8.size()));
-      std::ofstream mp(overlayOut + ".map");
-      mp << "ucache-overlay-map v1\n";
-      mp << "origin_size " << meta.originSize << "\n";
-      mp << "virtual_size " << meta.virtualSize << "\n";
-      mp << "encoding zstd1\n";
-      mp << "encoder_version " << meta.encoderVersion << "\n";
-      for (const auto& e : meta.extents)
-        mp << "extent " << e.virtOff << " " << e.len << " " << e.tdataOff << "\n";
-      for (const auto& r : meta.superseded)
-        mp << "superseded " << r.off << " " << r.len << "\n";
-      std::printf("overlay written to %s.{tdata,map}\n%s\n", overlayOut.c_str(),
-                  buildSummary.c_str());
-      return 0;
-    }
-#else
-    std::fputs("materialize: built without the native transposer (codec libs "
-               "missing); use --import PREFIX\n",
-               stderr);
-    return 2;
-#endif
-  }
-
-  if (!prefix.empty()) { // import mode
-  std::ifstream map(prefix + ".map");
-  if (!map) {
-    std::fprintf(stderr, "materialize: cannot read %s.map\n", prefix.c_str());
-    return 1;
-  }
-  std::string line;
-  if (!std::getline(map, line) || line != "ucache-overlay-map v1") {
-    std::fprintf(stderr, "materialize: %s.map is not an overlay map (v1)\n", prefix.c_str());
-    return 1;
-  }
-  while (std::getline(map, line)) {
-    if (line.empty() || line[0] == '#')
-      continue;
-    std::istringstream ss(line);
-    std::string k;
-    ss >> k;
-    if (k == "origin_size")
-      ss >> meta.originSize;
-    else if (k == "virtual_size")
-      ss >> meta.virtualSize;
-    else if (k == "encoder_version")
-      ss >> meta.encoderVersion;
-    else if (k == "encoding") {
-      std::string v;
-      ss >> v;
-      meta.encoding = v == "zstd1"  ? ReplicaMeta::kZstd1
-                      : v == "lz4"  ? ReplicaMeta::kLz4
-                      : v == "raw"  ? ReplicaMeta::kRaw
-                                    : 0;
-    } else if (k == "extent") {
-      ReplicaMeta::Extent e;
-      ss >> e.virtOff >> e.len >> e.tdataOff;
-      meta.extents.push_back(e);
-    } else if (k == "superseded") {
-      ReplicaMeta::Range r;
-      ss >> r.off >> r.len;
-      meta.superseded.push_back(r);
-    } // unknown keys: ignored (forward compatibility)
-  }
-  if (!meta.encoding || !meta.originSize || meta.virtualSize < meta.originSize) {
-    std::fprintf(stderr, "materialize: %s.map is incomplete\n", prefix.c_str());
-    return 1;
-  }
-
-  std::ifstream td(prefix + ".tdata", std::ios::binary | std::ios::ate);
-  if (!td) {
-    std::fprintf(stderr, "materialize: cannot read %s.tdata\n", prefix.c_str());
-    return 1;
-  }
-  tdata8.resize(static_cast<size_t>(td.tellg()));
-  td.seekg(0);
-  td.read(reinterpret_cast<char*>(tdata8.data()),
-          static_cast<std::streamsize>(tdata8.size()));
-  if (!td) {
-    std::fprintf(stderr, "materialize: short read of %s.tdata\n", prefix.c_str());
-    return 1;
-  }
-  } // import mode
-
-  if (!store) { // url/publish modes need the cache
-    std::fputs("materialize: no cache dir configured — set `dir =` in ucache.conf "
-               "(USER_GUIDE §2) or UCACHE_DIR\n", stderr);
-    return 2;
-  }
-  ReplicaStore rs(io, cfg, store->stats());
-  int rc = rs.publish(*key, meta, tdata8.data(), tdata8.size());
-  if (rc != 0) {
-    std::fprintf(stderr, "materialize: publish failed (%d)\n", rc);
-    return 1;
-  }
-  // Adoption check right away — the same validated open the plugin will do.
-  auto view = rs.openView(*key, meta.originSize, meta.originMtime, meta.cksumKind,
-                          meta.originCksum);
-  if (!view) {
-    std::fputs("materialize: published replica failed its own adoption check\n", stderr);
-    return 1;
-  }
-  if (!buildSummary.empty())
-    std::puts(buildSummary.c_str());
-  std::printf("materialized %s\n  overlay %s in %zu extent(s), virtual size %s\n",
-              key->key.c_str(), human(tdata8.size()).c_str(), view->meta().extents.size(),
-              human(view->virtualSize()).c_str());
-  uint64_t punched = 0;
-  if (punch) {
-    if (auto entry = store->open(*key, meta.originSize)) {
-      punched = rs.punchSuperseded(*entry, view->meta().superseded);
-      std::printf("  punched %s of superseded v1 pages\n", human(punched).c_str());
-    } else {
-      std::puts("  (entry not in the byte cache; nothing to punch)");
-    }
-  }
   return 0;
 }
 
@@ -2756,11 +2493,16 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   // Every file with something cached, or with a store (its map may be due).
   std::vector<CacheStore::EntryInfo> work;
   int preSkipped = 0;
+  std::atomic<int> earlier{0}; // replicas an earlier release made, removed
   for (const auto& e : store.listEntries()) {
-    if (e.cachedBytes == 0 && e.replicaBytes == 0)
+    if (e.cachedBytes == 0 && e.replicaBytes == 0) {
       ++preSkipped;
-    else
+      if (e.earlierReplicaBytes)
+        if (auto key = UrlKey::parse(e.key, cfg.keepCgi))
+          earlier += CacheStore::dropEarlierReplica(io, key->objectDir(cfg.cacheDir), key->hashHex);
+    } else {
       work.push_back(e);
+    }
   }
   // Capacity pre-flight: state what this sweep is likely to cost against the
   // headroom to the eviction trigger. ADVISORY, and deliberately so, since the
@@ -2886,6 +2628,8 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       totReleased += r.releasedBytes;
       if (r.mapMade)
         ++maps;
+      if (r.droppedEarlier)
+        ++earlier;
       using O = tp::SweepResult::Outcome;
       std::lock_guard<std::mutex> g(outMu);
       switch (r.outcome) {
@@ -3033,6 +2777,9 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
                 human(totStored.load()).c_str(), maps.load(), maps.load() == 1 ? "" : "s",
                 human(totReleased.load()).c_str(),
                 release ? "" : " (recompress_keep_originals = on)");
+  if (earlier.load())
+    std::printf("  removed %d replica%s an earlier uCache made, which this one does not serve\n",
+                earlier.load(), earlier.load() == 1 ? "" : "s");
   // Nothing carries a deferred file forward: the next sweep finds it by
   // scanning the cache, so the one thing to say is when to run it.
   if (deferred.load())
@@ -3135,20 +2882,19 @@ int cmdUntranspose(CacheStore& store, const Config& cfg, IOBackend& io, const ch
     std::fprintf(stderr, "%s: not a valid URL\n", url);
     return 2;
   }
-  ReplicaStore rs(io, cfg, store.stats());
+  (void)store;
   struct ::stat st;
-  const std::string slots = SlotStore::path(key->objectDir(cfg.cacheDir), key->hashHex);
-  const bool compact = io.stat(ReplicaStore::tmetaPath(*key, cfg.cacheDir), &st) == 0;
-  const bool slotted = io.stat(slots, &st) == 0;
-  if (!compact && !slotted) {
+  const std::string dir = key->objectDir(cfg.cacheDir);
+  const bool slotted = io.stat(SlotStore::path(dir, key->hashHex), &st) == 0;
+  const bool earlier = CacheStore::dropEarlierReplica(io, dir, key->hashHex);
+  if (!slotted && !earlier) {
     std::fprintf(stderr, "%s: no replica (nothing to drop)\n", url);
     return 1;
   }
-  if (compact)
-    rs.drop(*key);
   if (slotted)
-    SlotStore::drop(io, key->objectDir(cfg.cacheDir), key->hashHex);
-  std::printf("dropped replica for %s (byte cache kept; punched pages refetch on demand)\n",
+    SlotStore::drop(io, dir, key->hashHex);
+  std::printf("dropped replica for %s (byte cache kept; what it no longer holds is fetched "
+              "again when read)\n",
               key->key.c_str());
   return 0;
 }
@@ -4236,6 +3982,13 @@ int cmdDoctor(const Config& cfg) {
                 "         the cache). If they run short, set recompress off and convert what is\n"
                 "         cached with `ucache recompress` between passes: it gives each file a\n"
                 "         map, which the next pass reads at the file's real size\n");
+  if (!cfg.cacheDir.empty())
+    if (const size_t n = countEarlierReplicas(cfg.cacheDir))
+      std::printf("  [NOTE] %zu replica%s an earlier uCache made %s in the cache. This one does not\n"
+                  "         serve them: each is removed at its file's next open, by\n"
+                  "         `ucache recompress` (which converts what is cached into the current\n"
+                  "         form) or by eviction\n",
+                  n, n == 1 ? "" : "s", n == 1 ? "is" : "are");
   if (!cfg.cacheDir.empty() && cfg.recompress) {
     RealIO dio;
     const size_t replicas = anyReplicaExists(cfg.cacheDir) ? 1 : 0;
@@ -4357,9 +4110,8 @@ int cmdTest(CacheStore& store, const Config& cfg, int argc, char** argv) {
   const bool existed = fileExists(key->objectDir(cfg.cacheDir) + "/" + key->hashHex + ".meta");
   // A recompressed entry no longer keeps every byte of the original file, so
   // a whole-file copy would fetch the rest again -- and store it a second time.
-  if (existed && (fileExists(ReplicaStore::tmetaPath(*key, cfg.cacheDir)) ||
-                  SlotStore::serving(RealIO::instance(), key->objectDir(cfg.cacheDir),
-                                     key->hashHex))) {
+  if (existed && SlotStore::serving(RealIO::instance(), key->objectDir(cfg.cacheDir),
+                                    key->hashHex)) {
     std::printf("test: %s is cached and recompressed, and a whole-file copy would read bytes "
                 "it no longer keeps. Test with a file that is not cached yet.\n",
                 url.c_str());
@@ -4529,18 +4281,14 @@ int main(int argc, char** argv) {
     return cmdBench(cfg, argc, argv);
   if (cmd == "netbench")
     return cmdNetbench(cfg, argc, argv);
-  // materialize's pure builder mode (--from-file + --overlay-out) is a
-  // file->file transform: no cache touched, no cache dir required or created.
+  // `materialize` built the compact replicas of earlier releases, which this
+  // one neither makes nor serves: refused by name, with what replaced it.
   if (cmd == "materialize") {
-    bool ff = false, oo = false;
-    for (int i = 2; i < argc; ++i) {
-      if (!std::strcmp(argv[i], "--from-file"))
-        ff = true;
-      else if (!std::strcmp(argv[i], "--overlay-out"))
-        oo = true;
-    }
-    if (ff && oo)
-      return cmdMaterialize(nullptr, cfg, io, argc, argv);
+    std::fputs("ucache materialize: removed — it built a kind of replica this uCache no longer "
+               "makes or serves. `ucache recompress` converts what is cached into the current "
+               "one\n",
+               stderr);
+    return 2;
   }
 
   // Everything else operates on the cache, and there is deliberately no
@@ -4675,8 +4423,6 @@ int main(int argc, char** argv) {
     }
     return cmdUntranspose(store, cfg, io, argv[2]);
   }
-  if (cmd == "materialize")
-    return cmdMaterialize(&store, cfg, io, argc, argv);
   if (cmd == "recompress" || cmd == "transpose") { // "transpose --auto" = legacy alias
     // Default parallelism: every core this process may use. The sweep is a
     // command the user runs and waits for, so it takes what it is allowed;

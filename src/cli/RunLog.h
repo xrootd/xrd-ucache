@@ -126,7 +126,7 @@ struct Run {
 
     // The three tiers a byte can reach the application by. They are DISJOINT
     // counters written at three different places -- the byte tier in
-    // readCached, the replica tier where stitched bytes are handed over, the
+    // readCached, the replica tier where stored records are handed over, the
     // origin where fetched bytes are staged -- so the work this file did is
     // their SUM. Nothing here may be derived by comparing two of them: taking
     // the larger of served and wire silently drops the replica tier entirely,

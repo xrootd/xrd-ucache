@@ -81,34 +81,6 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // The overlay must stitch to exactly the file ROOT was given. This is what
-  // makes the standalone verification transfer to the served form: if the two
-  // agree byte for byte, ROOT's verdict on one is a verdict on both.
-  auto ov = ucache::transpose::rnTupleOverlay(m, rw);
-  if (!ov.error.empty()) {
-    std::fprintf(stderr, "overlay: %s\n", ov.error.c_str());
-    return 1;
-  }
-  {
-    std::vector<uint8_t> stitched(ov.meta.virtualSize, 0);
-    int f = ::open(argv[1], O_RDONLY | O_CLOEXEC);
-    if (f < 0 || ::pread(f, stitched.data(), m.fileSize, 0) != (ssize_t)m.fileSize) {
-      std::fprintf(stderr, "stitch: cannot re-read source\n");
-      return 1;
-    }
-    ::close(f);
-    for (const auto& e : ov.meta.extents)
-      std::memcpy(stitched.data() + e.virtOff, ov.tdata.data() + e.tdataOff, e.len);
-
-    std::vector<uint8_t> written(ov.meta.virtualSize, 0);
-    f = ::open(argv[2], O_RDONLY | O_CLOEXEC);
-    const ssize_t got = f < 0 ? -1 : ::pread(f, written.data(), written.size(), 0);
-    if (f >= 0) ::close(f);
-    if (got != (ssize_t)written.size() || stitched != written) {
-      std::fprintf(stderr, "stitch: overlay does not reproduce the rewritten file\n");
-      return 1;
-    }
-  }
   std::printf("{\"pages\":%llu,\"stored_raw\":%llu,\"page_bytes\":[%llu,%llu],"
               "\"ratio\":%.4f,\"extension_bytes\":%llu,\"decoded_bytes\":%llu,"
               "\"decode_ms\":%.1f}\n",
@@ -121,14 +93,11 @@ int main(int argc, char** argv) {
               "\"shared_pages\":%llu}\n",
               (unsigned long long)rw.rangesRelocated, (unsigned long long)rw.rangesUncached,
               (unsigned long long)rw.rangesDeclined, (unsigned long long)rw.sharedPages);
-  std::printf("{\"overlay_extents\":%zu,\"tdata_bytes\":%zu,\"superseded_ranges\":%zu,"
-              "\"superseded_bytes\":%llu,\"virtual_size\":%llu,\"stitch\":\"matches\"}\n",
-              ov.meta.extents.size(), ov.tdata.size(), ov.meta.superseded.size(),
+  std::printf("{\"superseded_ranges\":%zu,\"superseded_bytes\":%llu}\n", rw.superseded.size(),
               [&] {
                 unsigned long long t = 0;
-                for (const auto& r : ov.meta.superseded) t += r.len;
+                for (const auto& r : rw.superseded) t += r.len;
                 return t;
-              }(),
-              (unsigned long long)ov.meta.virtualSize);
+              }());
   return 0;
 }

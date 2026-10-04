@@ -97,8 +97,9 @@ struct Stats {
   std::atomic<uint64_t> openRetries{0};          // transient open failures re-attempted
   std::atomic<uint64_t> openRetriesExhausted{0}; // opens that gave up after the budget
   // Replica tier (docs/STATS.md):
-  std::atomic<uint64_t> replicaOpens{0};        // stitched views adopted
-  std::atomic<uint64_t> replicaPublished{0};    // successful publishes
+  // Of earlier releases' compact replicas, no longer made or served: always 0.
+  std::atomic<uint64_t> replicaOpens{0};
+  std::atomic<uint64_t> replicaPublished{0};
   std::atomic<uint64_t> replicaInvalid{0};      // quarantined at open (stale/torn)
   std::atomic<uint64_t> replicaCrcFailures{0};  // overlay page CRC mismatches
   std::atomic<uint64_t> replicaPunchedBytes{0}; // v1 bytes reclaimed by punch
@@ -115,7 +116,7 @@ struct Stats {
                                               // pages, not one per page)
   std::atomic<uint64_t> hitDiskBytes{0};
   std::atomic<uint64_t> hitDiskSeq{0};        // preads starting at the previous pread's end
-  std::atomic<uint64_t> replicaBytesServed{0}; // stitched bytes served from .tdata
+  std::atomic<uint64_t> replicaBytesServed{0}; // bytes served from slot-store records
   // Cold replica run: a file's replica created on its first pass.
   std::atomic<uint64_t> coldReplicaFiles{0};             // files served in the cold-run layout
   std::atomic<uint64_t> coldReplicaInBytes{0};   // original basket bytes converted
@@ -141,8 +142,9 @@ struct Stats {
   std::atomic<uint64_t> poolBusyUs{0};
   std::atomic<uint64_t> poolQueueHighWater{0};
   // How long reading threads waited on the cache (ReaderWait.h), per tier the
-  // wait was charged to (ReaderWait::Tier: byte cache, compact replica, slot
-  // store, origin), and how many threads read through it.
+  // wait was charged to (ReaderWait::Tier: byte cache, an earlier release's
+  // compact replica -- always 0 now --, slot store, origin), and how many
+  // threads read through it.
   std::atomic<uint64_t> readerWaitUs[4] = {};
   std::atomic<uint64_t> readerThreads{0};
   std::atomic<uint64_t> replicaReads{0};      // physical .tdata preads (one per
@@ -216,7 +218,7 @@ struct Stats {
   // which counts the cache's own fetches and nothing else.
   Histogram relayRtUs;
   Histogram openUs;        // open-to-completion for cache-engaged handles
-  Histogram replicaReadUs; // stitched serve spans
+  Histogram replicaReadUs; // earlier releases' compact-replica serve spans (unused)
   Histogram flushWriteUs;  // per coalesced flush pwrite
   Histogram metaFlushUs;   // sidecar store spans
   // Size histograms (log2 BYTES, same bucketing as the µs ones). The pair

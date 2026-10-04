@@ -1,111 +1,21 @@
-// Native overlay builder: re-encodes a hot branch
-// set's baskets to ZSTD-1 in an extension region, relocates the (patched)
-// tree metadata, repoints the keys list at it in place, and emits the replica
-// overlay — byte-for-byte the artifact the uproot-based reference builder
-// produces (the differential gate), ready for ReplicaStore::publish.
-//
-// Sources: a plain file, or a v1 cache .data image where every range the
-// build touches must be PRESENT in the entry's bitmap (deriveHotBranches
-// only ever selects fully-cached branches, so `ucache materialize` works
-// from cached bytes alone — no network in the CLI).
-//
-// Every failure returns Overlay{error}; the caller fails open (no replica).
+// What the recompressing code shares about a TTree file's branches: whether a
+// branch's baskets are all cached, the codec they are stored in, and ROOT's
+// ZSTD block framing (one encoder for baskets and RNTuple pages alike, so the
+// two cannot drift).
 //
 // Thread-safety: pure functions over caller-owned data; no shared state.
 #pragma once
-
-#include "ReplicaFile.h"
 #include "TreeMeta.h"
-
 #include <cstdint>
-#include <functional>
 #include <string>
 #include <vector>
-
 namespace ucache::transpose {
-
 // `Source` (byte source with presence semantics) is declared in TreeMeta.h.
-
-// Σ uncompressed bytes (fObjlen from each basket's key header — NO decode)
-// of the `hot` branches: the estimator's numerator.
-uint64_t hotUncompressedBytes(const FileMeta& fm, const std::vector<std::string>& hot,
-                              Source& src);
-
-struct Overlay {
-  uint64_t decodeBytes = 0; // uncompressed bytes produced by the transcode's
-  uint64_t decodeNs = 0;    // decodes + the time they took: calibration data
-  std::vector<uint8_t> tdata;
-  ReplicaMeta meta; // extents/superseded/virtualSize/encoding filled; origin
-                    // validators + publish integrity are the caller's job
-  // build accounting (mirrors the Python builder's report)
-  uint64_t baskets = 0, transcoded = 0, verbatim = 0, fallbackRaw = 0;
-  uint64_t oldBytes = 0, newBytes = 0;
-  // relocated tree-metadata key: raw (decompressed) size vs
-  // the size actually stored at rest (ROOT-compressed, or raw on fallback).
-  uint64_t metaRawBytes = 0, metaStoredBytes = 0;
-  std::string error; // non-empty => build failed (fail open)
-  // Set with `error` when the build stopped because the SOURCE could not vouch
-  // for bytes it was asked for — not yet cached, or reclaimed/rotted under the
-  // build. Such a build is retryable and self-heals once the entry is complete
-  // again; it says nothing about the file being malformed, and callers should
-  // not report it as a failure. A parse or codec error leaves this false.
-  bool transient = false;
-  // Set with `error` when a record would have had to sit past 2 GiB in a file
-  // whose keys are 32-bit: where it would have gone. Not a fault of the file,
-  // nor retryable: this file cannot take this replica (what it holds decides
-  // how long the replica is, so another analysis's may fit).
-  uint64_t narrowKeyEnd = 0;
-};
-
-// Append `name`'s counter leaves so the hot set is loop-complete — the same
-// rule the Python builder applies (with_counters).
-// Counters ride along ONLY when buildable (all their baskets present in
-// `src`): a partially-read counter must not fail the file's build.
-std::vector<std::string> withCounters(const FileMeta& fm,
-                                      const std::vector<std::string>& names, Source& src);
-
 // Source codec of a branch's baskets, from basket 0's compression frame:
 // "lzma" | "zlib" | "zstd" | "lz4" | "none" (uncompressed) | "" (unreadable).
 std::string branchCodec(const FileMeta& fm, const BranchInfo& b, Source& src);
-
 // Every basket of `b` fully present in `src`?
 bool fullyCached(const BranchInfo& b, Source& src);
-
-// Learner: branches whose EVERY basket range is fully present in the
-// cache — exactly what warm runs touched. Counters ride along when buildable.
-// The `codecs` form keeps only branches whose source codec is listed
-// (recompress_codecs policy); empty list = no filter.
-std::vector<std::string> deriveHotBranches(const FileMeta& fm, Source& src);
-std::vector<std::string> deriveHotBranches(const FileMeta& fm, Source& src,
-                                           const std::vector<std::string>& codecs);
-
-// Build the overlay for `hot` (already counter-completed) over `src`.
-Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::string>& hot);
-
-// One basket to relocate, named by its place in the tree: FileMeta::branches
-// index and basket index.
-struct RelocatedBasket {
-  uint32_t branch = 0;
-  uint32_t basket = 0;
-};
-
-// Build the same overlay from baskets already converted elsewhere — the cold
-// replica run converts them as the reader asks for them. Each listed basket is
-// relocated on its own, in the order given; every other basket keeps its
-// original locator (so a branch read only in part keeps what was converted).
-// `record(j, out)` fills `out` with basket j's converted record: its original
-// key header (same length) and payload, fNbytes set; fSeekKey is patched here.
-// It returns false when the record cannot be produced, which fails the build
-// as transient. `treeKeyHeader` = the tree key's header bytes, `keysList` = the
-// whole keys-list record, both as read from the origin.
-Overlay buildOverlayFromRecords(const FileMeta& fm, const std::vector<uint8_t>& treeKeyHeader,
-                                const std::vector<uint8_t>& keysList,
-                                const std::vector<RelocatedBasket>& baskets,
-                                const std::function<bool(size_t, std::vector<uint8_t>&)>& record);
-
-// raw bytes -> a ROOT multi-frame ZSTD container. Exposed because RNTuple
-// pages are the same ROOT block format as TTree baskets and must be encoded
-// identically; one encoder, so the two cannot drift.
+// raw bytes -> a ROOT multi-frame ZSTD container.
 std::vector<uint8_t> encodeZstdFrames(const uint8_t* raw, size_t n, int level);
-
 } // namespace ucache::transpose

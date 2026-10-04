@@ -108,8 +108,8 @@ class SlotStore {
                                                  std::string& err);
 
   // Is there a store here that the file's layout belongs to: one this build
-  // serves (a valid header, not DECLINED), or a newer uCache's (newer())? No
-  // compact replica is made beside either. Reads only the header.
+  // serves (a valid header, not DECLINED), or a newer uCache's (newer())?
+  // Reads only the header.
   static bool serving(IOBackend& io, const std::string& objectDir, const std::string& hashHex);
 
   // Is there a store here made by a newer uCache, in a format this build does

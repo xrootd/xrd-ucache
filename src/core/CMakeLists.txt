@@ -11,8 +11,6 @@ add_library(ucache-core STATIC
   IOBackend.cc
   Log.cc
   MetaFile.cc
-  ReplicaFile.cc
-  ReplicaStore.cc
   SlotStore.cc
   Stats.cc
   Trace.cc

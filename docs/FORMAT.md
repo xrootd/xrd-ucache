@@ -1,4 +1,4 @@
-# FORMAT.md — on-disk cache format (entry sidecars v1, replica sidecars v2)
+# FORMAT.md — on-disk cache format (entry sidecars v1, slot stores v2)
 
 Bump `MetaData::kFormatVersion` on ANY layout change; readers reject other
 versions (entry treated as absent and rebuilt).
@@ -87,96 +87,19 @@ reach disk, in keys or file names.
   the owner detects `st_nlink == 0` before sidecar flushes and skips them so
   the entry is not resurrected.
 
-## Replica sidecars: `<hash>.tdata` + `<hash>.tmeta`, format_version 2
+## Replicas of earlier releases: `<hash>.tdata`, `.tmeta`, `.tok`
 
-A transposed replica adds two files next to the v1
-pair — the v1 `.meta` layout above is UNCHANGED (coexistence: a pre-replica
-process never reads or writes replica files, and both generations share one
-cache dir safely).
-
-`.tdata` — overlay bytes, dense (not sparse): the patched header/directory
-windows plus the extension region (re-encoded hot baskets, relocated tree
-metadata) that, stitched over the origin bytes, form the virtual view.
-
-> Metadata-at-rest: the relocated tree-metadata key MAY be a ROOT-compressed
-> record ('ZS' framing, ZSTD; `fObjlen > fNbytes − fKeylen`) rather than raw —
-> it compresses ~5–7× and dominates the overlay for tiny-hot-set files. This is
-> a `.tdata`-content change only: **readers are agnostic** — `.tdata` is opaque
-> CRC'd bytes, ROOT inflates the key on open exactly as it does the original's
-> LZMA key, the `.tmeta` version is untouched by it, and older (raw-metadata)
-> replicas keep serving unchanged in the same cache (no migration).
-
-`.tmeta` layout (little-endian, fixed 80-byte header + arrays, whole-image
-crc32c at offset 68 computed with that field zeroed). Version 1 wrote a
-72-byte header and no origin map; it is still read, with the map empty:
-
-| off | field | notes |
-|---|---|---|
-| 0 | magic `UCTR` | |
-| 4 | format_version u32 | 2 today; 1 still accepted. Anything else is treated as absent — see the version note below |
-| 8 | flags u32 | reserved |
-| 12 | encoding u8 | 1=ZSTD-1, 2=LZ4, 3=raw (current builders write ZSTD-1) |
-| 13 | cksum_kind u8 | origin validator kind |
-| 16 | origin_size u64 | validator: must equal the origin's size |
-| 24 | origin_mtime u64 | validator per UCACHE_VALIDATE |
-| 32 | origin_cksum u32 | validator per UCACHE_VALIDATE |
-| 36 | encoder_version u32 | builder codec version pin (repair never mixes encoder builds) |
-| 40 | virtual_size u64 | stitched fEND′; the Stat size ROOT sees |
-| 48 | tdata_bytes u64 | exact `.tdata` size |
-| 56 | key_len u32 · 60 n_extents u32 · 64 n_superseded u32 | |
-| 68 | tmeta_crc u32 | whole-image crc32c |
-| 72 | n_orig_map u32 (v2 only) | 76..79 padding; a v1 image ends the header at 72 |
-| 80 | key, extents (virt_off,len,tdata_off u64×3), superseded (off,len u64×2), orig_map (virt_off,len,orig_off,orig_len u64×4), crc32c u32 × n_overlay_pages | extents sorted, non-overlapping; overlay page = 64 KiB. The map is sorted by virt_off; v1 images have none and the array is absent |
-
-The origin map records, for each piece the builder relocated, the range of the
-ORIGINAL file whose content it carries. No SERVED BYTE depends on it —
-`.tdata` stays opaque bytes and which bytes come back is exactly what it was
-without the map — but the read path does consult it, to record which part of
-the original file a read touched. (An earlier wording here said serving never
-consults it, which is not the same claim and is not true.) It is
-what lets a read served from a replica be reported in the original file's own
-coordinates, and so compared with the same read served any other way. It is not
-a linear mapping: a recompressed piece has a different length than the piece it
-replaced, so an offset inside a mapped range has no meaningful original offset
-and the RANGE is the unit. Fields 0..71 are unchanged from version 1, which is
-why the crc keeps its place and a v1 image still parses.
-
-**Version skew is a hazard worth knowing about.** A reader that predates a
-version simply cannot tell an unfamiliar sidecar from a damaged one, so it
-reports corruption and removes the replica; the newer writer then rebuilds it,
-and two versions sharing a cache directory can take turns undoing each other's
-work. Nothing is lost and no wrong bytes are served, but the transcoding is
-paid for repeatedly. Point one version at a cache directory at a time.
-
-Rules:
-
-- **Publish protocol**: `.tdata.tmp` → write → fdatasync → rename `.tdata`,
-  THEN `.tmeta` (tmp+fsync+rename). Readers adopt only via a valid `.tmeta`,
-  so a visible sidecar implies a complete, durable overlay; a torn publish
-  is unadoptable and its debris is swept by eviction (age-guarded 1 h).
-- **Open-time full verify**: every overlay page CRC-checked before a view is
-  served; any failure (or validator mismatch) quarantines the replica —
-  fail-open to the plain v1 view, never wrong bytes. After open, reads
-  re-verify touched pages.
-- **Punch-and-clear**: when the overlay supersedes original ranges, the v1
-  bitmap bits of fully-covered pages are cleared and flushed FIRST, then the
-  bytes are hole-punched (`FALLOC_FL_PUNCH_HOLE`) — a crash between costs
-  cached pages only; v1 readers refetch punched ranges from origin.
-- Replica files are part of the entry's eviction unit: counted in usage,
-  unlinked with the entry, dropped on invalidation. Orphans (e.g. an older
-  process evicted the entry without knowing about replica files) are swept.
-  The `.cost` sidecar is likewise part of the eviction unit and is unlinked
-  with its entry.
-- **Verify-once marker `<hash>.tok`** (28 bytes, self-checksummed: magic
-  `UCTV` + `.tdata` size + mtime(ns) + crc32c of the page-CRC array): ADVISORY — written by
-  publish and by the first successful full verify; a matching marker skips
-  the open-time full overlay scan (a 32-process batch scans once, not 32×).
-  Stale/torn/absent markers just re-run the scan; the per-read page CRC is
-  never skipped, so served bytes are always verified regardless.
+Earlier releases kept a compact replica beside the byte cache: `.tdata` (its
+bytes), `.tmeta` (its map) and `.tok` (a verify-once marker). This release
+neither makes nor serves one: the file's slot store (below) takes its place.
+Each is removed at the file's next open, by `ucache recompress`, and by the
+eviction pass (whether or not its entry still exists); until then
+`ucache status` and `ucache doctor` say how many are left.
 
 ## Slot store: `<hash>.slots`, format_version 2
 
-The replica of a file recompressed as it is read (`recompress = on`). The file
+The replica of a file: recompressed as it is read (`recompress = on`), and by
+`ucache recompress` from what the byte cache holds. The file
 is served to readers in its SLOT layout: every convertible basket (TTree) or
 page (RNTuple) of the original sits in a slot past the original end, sized so
 its converted record fits, followed by zeros. An RNTuple slot is the page
@@ -346,8 +269,8 @@ place while the in-use record says it is in use, and a read in it is refused
 
 - **Releases sharing a cache:** every format keeps the magic at offset 0 and
   format_version at offset 8, so any build can tell a newer store from debris.
-  A newer store still counts as the file's store: no compact replica is made
-  beside it.
+  A newer store still counts as the file's store: it is left in place, neither
+  replaced nor served, and the file is served as stored.
 - **Creation:** header and blob are written to `.slots.tmp.<pid>.<n>`, then
   `link()`ed into place. That fails if the store already exists, so a store is
   never visible without its layout.

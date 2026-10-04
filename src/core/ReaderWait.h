@@ -6,7 +6,7 @@
 // latencies would count a reader that issues several requests and waits for
 // all of them (ROOT's vector reads for one fill) several times over. Each such
 // interval is charged to the costliest tier any of its requests needed: the
-// origin over the slot store over a compact replica over the byte cache.
+// origin over the slot store over the byte cache.
 //
 // Who the callers are decides what the sum means. For TTree they are the
 // analysis threads, so the sum over threads, divided by threads x wall, is

@@ -200,7 +200,7 @@ RNTupleRewrite buildImpl(const RNTupleMeta& m, uint64_t fileSize, int level,
   // Sharing makes this necessary: punching a page because one range moved off
   // it would silently destroy a page another range is still serving from.
   std::set<uint64_t> live;
-  std::vector<ReplicaMeta::Range> supersedeCandidates;
+  std::vector<RNTupleRange> supersedeCandidates;
 
   for (size_t ri = 0; ri < m.ranges.size(); ++ri) {
     const auto& range = m.ranges[ri];
@@ -740,110 +740,6 @@ ConvertedPage convertPage(const uint8_t* onDisk, size_t n, uint32_t nbytes, bool
   c.enc = encodeZstdFrames(c.raw.data(), c.raw.size(), 1);
   if (c.enc.empty() || c.enc.size() >= c.raw.size()) c.enc = c.raw;
   return c;
-}
-
-Overlay rnTupleOverlay(const RNTupleMeta& m, const RNTupleRewrite& rw) {
-  Overlay ov;
-  if (!rw.error.empty()) {
-    ov.error = rw.error;
-    ov.transient = rw.transient;
-    return ov;
-  }
-
-  // Patches first, then the extension: extents must be sorted by virtual
-  // offset and non-overlapping, and .tdata is concatenated in the same order.
-  struct Piece {
-    uint64_t virtOff;
-    const std::vector<uint8_t>* bytes;
-  };
-  std::vector<Piece> pieces;
-  for (const auto& p : rw.patches) pieces.push_back({p.offset, &p.bytes});
-  std::sort(pieces.begin(), pieces.end(),
-            [](const Piece& a, const Piece& b) { return a.virtOff < b.virtOff; });
-  for (size_t i = 1; i < pieces.size(); ++i) {
-    if (pieces[i].virtOff < pieces[i - 1].virtOff + pieces[i - 1].bytes->size()) {
-      ov.error = "overlapping patch windows";
-      return ov;
-    }
-  }
-
-  uint64_t tdataAt = 0;
-  for (const auto& pc : pieces) {
-    ov.tdata.insert(ov.tdata.end(), pc.bytes->begin(), pc.bytes->end());
-    ov.meta.extents.push_back({pc.virtOff, pc.bytes->size(), tdataAt});
-    tdataAt += pc.bytes->size();
-  }
-  ov.meta.extents.push_back({rw.extBase, rw.extension.size(), tdataAt});
-  {
-    // Patch windows are rewritten in place, so each IS its own original range.
-    std::vector<ReplicaMeta::OrigRange> om = rw.origMap;
-    for (const auto& pc : pieces)
-      om.push_back({pc.virtOff, pc.bytes->size(), pc.virtOff, pc.bytes->size()});
-    std::sort(om.begin(), om.end(),
-              [](const ReplicaMeta::OrigRange& a, const ReplicaMeta::OrigRange& b) {
-                return a.virtOff < b.virtOff;
-              });
-    ov.meta.origMap = std::move(om);
-  }
-  ov.tdata.insert(ov.tdata.end(), rw.extension.begin(), rw.extension.end());
-
-  // Superseded: the pages the rewrite replaced, plus the page list and footer
-  // it repointed away from. The HEADER envelope is not superseded — the
-  // rewrite still points at it.
-  std::vector<ReplicaMeta::Range> sup = rw.superseded;
-  if (m.pageListNbytes) sup.push_back({m.pageListOffset, m.pageListNbytes});
-  if (m.anchor.nbytesFooter) sup.push_back({m.anchor.seekFooter, m.anchor.nbytesFooter});
-
-  // RESERVE THE FILE HEAD, even where it is genuinely superseded. A reader takes
-  // the head as ONE OPAQUE BLOCK and asks for bytes it will never interpret:
-  // ROOT's raw-file layer requests 4 KiB and then 128 KiB at offset 0, measured
-  // identically on a 1.4 MB file and a 2.4 GB one. Reclaiming inside that window
-  // buys nothing and costs a round trip — the block read spans the hole, misses,
-  // refetches the whole 128 KiB from the origin, and writes the same pages back,
-  // so the range ends up resident anyway with a fetch paid for it. Keeping it is
-  // therefore free in the steady state, and it is what makes a warm pass over a
-  // replicated entry reach origin_bytes == 0.
-  //
-  // The pages themselves ARE dead: their recompressed copies live in the appended
-  // extent, and nothing in the rewritten file points here. That is exactly why
-  // the distinction matters — deadness is a property of the bytes, and this is a
-  // property of how they are asked for.
-  constexpr uint64_t kHeadReserve = 128 * 1024;
-  for (auto& r : sup) {
-    if (r.off < kHeadReserve) {
-      const uint64_t end = r.off + r.len;
-      r.off = kHeadReserve;
-      r.len = end > kHeadReserve ? end - kHeadReserve : 0;
-    }
-  }
-  sup.erase(std::remove_if(sup.begin(), sup.end(),
-                           [](const ReplicaMeta::Range& r) { return r.len == 0; }),
-            sup.end());
-
-  // Merge, so reclaim is a few large punches rather than one per page.
-  std::sort(sup.begin(), sup.end(),
-            [](const auto& a, const auto& b) { return a.off < b.off; });
-  std::vector<ReplicaMeta::Range> merged;
-  for (const auto& r : sup) {
-    if (!merged.empty() && r.off <= merged.back().off + merged.back().len) {
-      const uint64_t end = std::max(merged.back().off + merged.back().len, r.off + r.len);
-      merged.back().len = end - merged.back().off;
-    } else {
-      merged.push_back(r);
-    }
-  }
-  ov.meta.superseded = std::move(merged);
-  ov.meta.virtualSize = rw.extBase + rw.extension.size();
-  ov.meta.originSize = m.fileSize;
-  ov.meta.encoding = ReplicaMeta::kZstd1;
-  ov.baskets = rw.pages; // pages here; the accounting field is shared
-  ov.transcoded = rw.pages - rw.storedRaw;
-  ov.fallbackRaw = rw.storedRaw;
-  ov.oldBytes = rw.oldPageBytes;
-  ov.newBytes = rw.newPageBytes;
-  ov.decodeBytes = rw.decodeBytes;
-  ov.decodeNs = rw.decodeNs;
-  return ov;
 }
 
 bool writeRewrittenRNTuple(const std::string& srcPath, const std::string& dstPath,

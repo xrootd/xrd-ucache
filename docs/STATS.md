@@ -20,7 +20,7 @@ how to read the printed summary.
 | Is the job re-reading the same data? | `opens` / `files_opened`, `first_touch_bytes` against `hit_bytes` |
 | What is the cache disk being asked to do? | `hit_disk_reads`, `hit_disk_bytes`, `replica_reads`, `replica_read_bytes`, `hist_*_read_bytes` |
 | Is the cache disk keeping up? | `buffer_stalls`, `buffer_stall_us`, `hist_hit_read_us`, `hist_flush_write_us` |
-| Did the replica tier get used? | `replica_opens`, `replica_published`, `replica_bytes_served` |
+| Did the replica tier get used? | `replica_bytes_served`, `cold_replica_files` |
 | Were replicas created as files were read? | `cold_replica_files`, `cold_replica_in_bytes`, `cold_replica_baskets_kept`, `cold_replica_declined`, `cold_replica_skipped` |
 | Were later passes shown the converted baskets at their real size? | `slot_maps_made`, `slot_map_opens`, `slot_map_full` |
 
@@ -94,9 +94,10 @@ the consumers together.
 
 What each counter means, and the reasoning behind the ones that are easy to
 misread. Three words recur. The **byte tier** is the page-granular copy of the
-original file — the ordinary cache. The **replica tier** is a recompressed
-overlay built by `ucache recompress`, which serves the same data with less
-decompression work; a cache with recompression off has none. A **sidecar** is
+original file — the ordinary cache. The **replica tier** is a file's slot
+store: its baskets or pages recompressed (as a job reads them with
+`recompress = on`, or by `ucache recompress`), which serves the same data with
+less decompression work; a cache that never recompressed has none. A **sidecar** is
 the small file beside each cached entry holding its page bitmap and checksums.
 [How it works](USER_GUIDE.md#how-it-works-briefly) covers the tiers, and
 [FORMAT.md](FORMAT.md) the files.
@@ -150,7 +151,7 @@ not to cache, and says the cache is under pressure rather than broken.
   served as pure pass-through, so a copy is the origin's bytes: their reads
   are in `relay_bytes`, and they add nothing to the cache. Also counted: a
   handle whose first request read the whole file at once, for a file with a
-  compact replica or a slot store. Zero with `copy_detect = off`.
+  slot store. Zero with `copy_detect = off`.
 - `copies_refused` (plugin layer) — requests refused because they would have
   completed a copy, in pieces up to the origin's size, of a file shown in a
   replica's layout (the handle read all of [0, origin size) without reading
@@ -167,23 +168,15 @@ not to cache, and says the cache is under pressure rather than broken.
   that ultimately gave up after retrying. Uncounted when caching is off (retry
   still works, just unrecorded — no store to hold the counters).
 
-### Replica tier
+### Compact replicas of earlier releases
 
-Only meaningful once `ucache recompress` has built overlays; all zero
-otherwise. They track the life of an overlay: built, adopted for serving,
-rejected, or cleaned up. See the replica section of [FORMAT.md](FORMAT.md).
-
-- `replica_opens` — overlays adopted for serving, after the full verification
-  done when the entry is opened.
-- `replica_published` — overlays successfully built and made available.
-- `replica_invalid` — overlays rejected at open as torn, stale or mismatched;
-  each rejection also drops the overlay.
-- `replica_crc_failures` — overlay pages whose checksum did not match, at open
-  or while serving.
-- `replica_punched_bytes` — original bytes reclaimed once an overlay covered
-  them, freeing the space the byte-tier copy held.
-- `replica_orphans_swept` — leftover overlay files removed by eviction, after a
-  crash or a version change.
+`replica_opens`, `replica_published`, `replica_invalid`,
+`replica_crc_failures` and `replica_punched_bytes` counted the compact replicas
+earlier releases built beside the byte cache. This release neither builds nor
+serves one, so they stay 0; they are kept so that every record has the same
+fields. `replica_orphans_swept` still counts replica files removed by the
+eviction pass: a slot store whose entry is gone, and every replica an earlier
+release left (see [FORMAT.md](FORMAT.md)).
 
 ### Replicas created as files are read
 
@@ -273,8 +266,9 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   sent one while none was outstanding until the last one was answered (reads
   a thread sends together and waits for together count once). Each such wait
   is charged to the costliest place any of its reads needed: the origin (a
-  fetch, or waiting for one already on the wire), then a slot store (the
-  first-pass layout), then a compact replica, then the byte cache.
+  fetch, or waiting for one already on the wire), then a slot store, then the
+  byte cache. (The fourth slot, an earlier release's compact replica, stays
+  0.)
   `reader_threads` counts the threads that read. For TTree the readers are the
   analysis threads, so the sum divided by threads x wall is the share of
   their time spent waiting on the cache; for RNTuple they are ROOT's own I/O
@@ -321,11 +315,11 @@ reading was re-reading, and what the cache disk was asked to do.
   acceptance triple can show slightly fewer bytes than an older one.
 
 - Replica-tier reads: `replica_bytes_served` / `replica_reads` /
-  `replica_read_bytes` — bytes served from replica overlays, the physical `.tdata` preads that delivered
-  them, and the bytes those preads moved (the replica-tier analogue of the
-  byte-tier trio, coalesced the same way; `replica_read_bytes` ≥
-  `replica_bytes_served` because whole overlay pages are read and verified,
-  and a page read for two different user reads counts twice).
+  `replica_read_bytes` — bytes served from slot-store records, the physical
+  `.slots` preads that delivered them, and the bytes those preads moved (the
+  replica-tier analogue of the byte-tier trio; `replica_read_bytes` ≥
+  `replica_bytes_served` because whole records are read and verified, and a
+  record read for two different user reads counts twice).
 - Pass-through and vector reads: `relay_bytes` — pure pass-through, the cache
   never touched them (copies included: see `copier_handles`; files read directly
   too: see `direct_read_files`); `readv_chunks` /

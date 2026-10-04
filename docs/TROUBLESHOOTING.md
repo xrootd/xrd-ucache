@@ -406,25 +406,19 @@ affected; each page was fetched again. Later releases do not do this, and they
 treat such a page as absent when they open the entry, so the cache heals
 without `ucache clear`.
 
-## `replica ... dropped: torn/corrupt sidecar` right after an upgrade
+## Replicas keep disappearing when an older uCache shares the cache directory
 
-If this appears for many entries at once, and the entries are ones a *newer*
-uCache recompressed, the sidecars are almost certainly fine. An older version
-reading a cache directory it shares with a newer one does not recognise the
-newer sidecar layout, and an unreadable sidecar is indistinguishable from a
-damaged one, so it reports corruption, counts `replica_invalid`, and removes
-the replica. The next recompression rebuilds it in the older layout, and the
-two versions can then take turns undoing each other's work.
+This release does not serve the compact replicas earlier releases made beside
+the byte cache (`<hash>.tdata`, `.tmeta`): it removes each one at the file's
+next open, in `ucache recompress` and in the eviction pass, and recompresses
+into the file's slot store instead. An older release reading the same cache
+directory keeps building them again, and this one keeps removing them, so the
+transcoding is paid for over and over.
 
-Nothing is lost and no wrong bytes are served — reads fall back to the byte
-cache or the origin — but the transcoding is paid for repeatedly, and what the
-replica replaced was already released from the byte cache, so those reads go
-back to the origin.
-
-Point one version at a cache directory at a time. A cache directory is version
-coupled state, not a shared scratch area; separate directories cost only disk.
-Genuine sidecar damage looks different: it turns up on a few entries rather
-than all of them, and it does not correlate with a version change.
+Point one version at a cache directory at a time. A cache directory is
+version-coupled state, not a shared scratch area; separate directories cost
+only disk. `ucache status` (`earlier` line) and `ucache doctor` say how many
+such replicas are left.
 
 ## Pinned data got evicted / a pin didn't take
 

@@ -35,19 +35,29 @@ struct RNTuplePatch {
   std::vector<uint8_t> bytes;
 };
 
+// A range of the original file.
+struct RNTupleRange {
+  uint64_t off = 0, len = 0;
+};
+// A range of the rewritten file and the original range whose content it
+// carries (a recompressed page is another length than the page it replaced).
+struct RNTupleOrigRange {
+  uint64_t virtOff = 0, len = 0, origOff = 0, origLen = 0;
+};
+
 struct RNTupleRewrite {
   uint64_t extBase = 0;             // where `extension` is appended (old file size)
   std::vector<uint8_t> extension;   // relocated pages + page list + footer
   std::vector<RNTuplePatch> patches; // anchor payload, and fEND
-  // Original ranges the overlay replaced, and therefore the only ones safe to
-  // punch. A range left un-relocated still serves from the original bytes, and
+  // Original ranges the rewrite replaced, and therefore the only ones safe to
+  // release. A range left un-relocated still serves from the original bytes, and
   // because pages are SHARED a page kept alive by one such range must survive
   // even when another, relocated range also pointed at it.
-  std::vector<ReplicaMeta::Range> superseded;
+  std::vector<RNTupleRange> superseded;
   // Where each relocated piece came from in the ORIGINAL file, at page
-  // granularity. Serving never reads this; it is what lets a replica read be
-  // named in origin coordinates.
-  std::vector<ReplicaMeta::OrigRange> origMap;
+  // granularity: what lets a read of the rewritten file be named in origin
+  // coordinates.
+  std::vector<RNTupleOrigRange> origMap;
 
   uint64_t pages = 0, storedRaw = 0;
   // Page records whose bytes were already transcoded for an earlier record —
@@ -181,12 +191,5 @@ std::string rangeCodec(const ColumnRange& r, const std::string& unnamedCodec);
 // the result and reports the same physics.
 bool writeRewrittenRNTuple(const std::string& srcPath, const std::string& dstPath,
                            const RNTupleRewrite& rw, std::string& error);
-
-// Package a rewrite as a replica overlay — the same artifact the basket
-// transposer emits, so it publishes and serves through the existing path
-// unchanged. The patch windows and the extension become extents over .tdata;
-// the pages they replace become superseded ranges, which is what makes the
-// original bytes reclaimable.
-Overlay rnTupleOverlay(const RNTupleMeta& m, const RNTupleRewrite& rw);
 
 } // namespace ucache::transpose

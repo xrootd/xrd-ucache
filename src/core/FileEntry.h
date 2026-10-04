@@ -225,7 +225,7 @@ class FileEntry {
     std::atomic<uint64_t> opens{0};           // CacheStore::open calls
     std::atomic<uint64_t> servedBytes{0};     // byte-tier bytes served
     std::atomic<uint64_t> ramBytes{0};        //   … of which from staged RAM
-    std::atomic<uint64_t> replicaBytes{0};    // stitched bytes (plugin-attributed)
+    std::atomic<uint64_t> replicaBytes{0};    // replica-tier bytes (plugin-attributed)
     std::atomic<uint64_t> diskReads{0};       // physical .data preads (hit path)
     std::atomic<uint64_t> diskSeq{0};         //   … starting at the previous end
     std::atomic<uint64_t> diskBytes{0};
@@ -289,11 +289,11 @@ class FileEntry {
   // the first call); called from the serve and fill paths.
   void noteActivity();
   // Record that [off, off+len) of the ORIGINAL file was read. A read of a
-  // rewritten layout (a replica, the slot store) goes to noteMappedRead
-  // instead; every other route already addresses the origin's layout.
+  // rewritten layout (the slot store) goes to noteMappedRead instead; every
+  // other route already addresses the origin's layout.
   void noteRead(uint64_t off, uint64_t len) { footprint().note(off, len, meta_.fileSize); }
   // A read of a rewritten layout, mapped back to the original file by the
-  // caller (ReplicaView::mapToOrigin, or the slot store's map): see
+  // caller (the slot store's map): see
   // ReadFootprint::noteMapped. `exact` null = the original bytes are not known
   // exactly, and the file then records no byte totals for this process.
   void noteMappedRead(const std::vector<ReadFootprint::Span>& units,

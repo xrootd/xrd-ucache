@@ -1,9 +1,9 @@
-// Mutational fuzz for the ROOT-free transposer: the parser
-// (TreeMeta) and overlay builder (Transposer) consume attacker-influenceable
-// file bytes with hand-rolled bounds checks — this harness proves the
-// fail-open contract holds under hostile input: parse/build either succeed
-// or set `error`; they never crash, never throw, never scribble (run the
-// ASan build for the memory-safety half of that claim).
+// Mutational fuzz for the ROOT-free parser and the slot layout computed from
+// it: the parser (TreeMeta) and the layout (StoreLayout, FillLayout) consume
+// attacker-influenceable file bytes with hand-rolled bounds checks — this
+// harness proves the fail-open contract holds under hostile input: parse and
+// layout either succeed or set `error`; they never crash, never throw, never
+// scribble (run the ASan build for the memory-safety half of that claim).
 //
 //   transpose-fuzz [seed-root-file]     (or UCACHE_FUZZ_FILE)
 //
@@ -11,12 +11,13 @@
 // buffers. Stage 2 (with a seed file — a SMALL ROOT-written TTree):
 // whole-file mutants (byte flips biased into the header/tree-key/
 // keys-list regions the parser actually reads, big-endian length bombs,
-// truncations, extensions, zeroed spans) -> parseFile -> deriveHotBranches ->
-// buildOverlay over an in-memory Source.
+// truncations, extensions, zeroed spans) -> parseFile -> the slot layout over
+// an in-memory Source, stored and read back.
 //
 // Knobs: UCACHE_FUZZ_ITERS (file-level mutants, default 1000; buffer-level
 // runs 20x that), UCACHE_FUZZ_SEED (default 424242).
 // exit 0 = clean; 1 = invariant violation (iter+seed printed); 2 = setup.
+#include "StoreLayout.h"
 #include "Transposer.h"
 #include "TreeMeta.h"
 
@@ -172,11 +173,15 @@ int fileFuzz(const char* path, uint64_t iters, uint64_t seed) {
                                   static_cast<uint64_t>(fm0.treeKey.nbytes)},
                                  {static_cast<uint64_t>(fm0.keyslistSeek), 65536},
                                  {fm0.dirSeekKeysOff, 16}};
+  const std::vector<std::string> everyCodec = {"lzma", "zlib", "zstd", "lz4"};
   {
     MemSource src(pristine);
-    Overlay ov = buildOverlay(fm0, src, deriveHotBranches(fm0, src));
-    if (!ov.error.empty() || ov.tdata.empty()) {
-      std::fprintf(stderr, "seed does not build (%s)\n", ov.error.c_str());
+    StoredLayout lay;
+    lay.codecs = everyCodec;
+    bool declined = false;
+    std::string why;
+    if (!computeLayout(lay, src, nullptr, pristine.size(), kSlotFactor100, declined, why)) {
+      std::fprintf(stderr, "seed has no slot layout (%s %s)\n", why.c_str(), lay.L.error.c_str());
       return 2;
     }
   }
@@ -246,20 +251,22 @@ int fileFuzz(const char* path, uint64_t iters, uint64_t seed) {
         continue; // refused: the fail-open answer
       ++parsedOk;
       MemSource src(m);
-      // Bounded rotating hot set: a full-set build on every parsed mutant is
-      // O(file); 16 branches exercise the same per-branch patch arithmetic.
-      std::vector<std::string> names;
-      if (!fm.branches.empty()) {
-        size_t start = rng() % fm.branches.size();
-        for (size_t k = 0; k < std::min<size_t>(16, fm.branches.size()); ++k)
-          names.push_back(fm.branches[(start + k) % fm.branches.size()].name);
-      }
-      auto hot = withCounters(fm, names, src);
-      Overlay ov = buildOverlay(fm, src, hot);
-      if (ov.error.empty()) {
+      StoredLayout lay;
+      lay.codecs = everyCodec;
+      bool declined = false;
+      std::string why;
+      if (computeLayout(lay, src, nullptr, m.size(), kSlotFactor100, declined, why)) {
         ++builtOk;
-        if (ov.tdata.empty() && !hot.empty())
-          violate("successful build produced an empty overlay", i, seed);
+        if (lay.L.slots.empty())
+          violate("a layout with no slots", i, seed);
+        // What a store keeps must read back as the same layout.
+        StoredLayout back;
+        back.slotFactor100 = lay.slotFactor100;
+        if (!decodeLayout(encodeLayout(lay), back) ||
+            layoutHash(back.L, back.rnt) != layoutHash(lay.L, lay.rnt))
+          violate("a stored layout does not read back as itself", i, seed);
+      } else if (declined && lay.L.error.empty() && why.empty()) {
+        violate("declined without a reason", i, seed);
       }
     } catch (const std::exception& e) {
       violate(e.what(), i, seed); // parse/build must not throw (fail open)
@@ -268,7 +275,7 @@ int fileFuzz(const char* path, uint64_t iters, uint64_t seed) {
   ::close(tfd);
   ::unlink(tpath.data());
   if (!failures)
-    std::printf("transpose-fuzz: file stage clean (%llu mutants, %llu parsed, %llu built)\n",
+    std::printf("transpose-fuzz: file stage clean (%llu mutants, %llu parsed, %llu laid out)\n",
                 (unsigned long long)iters, (unsigned long long)parsedOk,
                 (unsigned long long)builtOk);
   return 0;
