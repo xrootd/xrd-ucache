@@ -153,6 +153,31 @@ TEST(SlotTable, OneRequestsBranchesCostOneRead) {
   EXPECT_EQ(z.reads, 1) << "everything it needed was decoded at once";
 }
 
+// A reader touches its branches one request at a time at first: the stored
+// layout is read once for all of them, and let go of once requests stop
+// needing new branches (then a new branch reads it again).
+TEST(SlotTable, BranchesTouchedOneByOneCostOneRead) {
+  Lazy z(fixture(20, 50));
+  auto touch = [&z](uint32_t b) {
+    const auto& s = z.fx.slots[b * 50 + 3];
+    return z.t.prepare(s.vSeek, s.vSeek + 1);
+  };
+  for (uint32_t b = 0; b < 10; ++b)
+    ASSERT_TRUE(touch(b));
+  EXPECT_EQ(z.reads, 1) << "ten branches, one read";
+  EXPECT_EQ(z.t.decodedSlots(), 10u * 50);
+  EXPECT_TRUE(z.t.holdsRaw());
+  for (uint32_t n = 0; n + 1 < SlotTable::kKeepQuiet; ++n)
+    ASSERT_TRUE(touch(n % 10));
+  EXPECT_TRUE(z.t.holdsRaw()) << "one request short of the limit";
+  ASSERT_TRUE(touch(0));
+  EXPECT_FALSE(z.t.holdsRaw()) << "let go of after kKeepQuiet requests that needed nothing new";
+  ASSERT_TRUE(touch(15));
+  EXPECT_EQ(z.reads, 2) << "a new branch reads it again";
+  for (uint32_t i = 0; i < z.t.size(); ++i)
+    ASSERT_TRUE(same(z.t.at(i), z.fx.slots[i])) << i;
+}
+
 TEST(SlotTable, FindAndForEachAnswerAsTheFullTableDoes) {
   Lazy z(fixture(12, 30, 11));
   const auto& v = z.fx.slots;
@@ -239,6 +264,7 @@ TEST(SlotTable, OtherBytesAtTheRunsPlaceAreRefused) {
                       }));
   uint32_t i = 0;
   EXPECT_FALSE(t.find(fx.slots[15].vSeek, i));
+  EXPECT_FALSE(t.holdsRaw()) << "bytes that did not decode are not kept";
 }
 
 TEST(SlotTable, AMalformedSectionIsNotIndexed) {

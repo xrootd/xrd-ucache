@@ -70,6 +70,7 @@ void SlotTable::assign(std::vector<FillSlot> all) {
   owned_.clear();
   byOrig_.clear();
   byOrigFresh_ = false;
+  std::vector<uint8_t>().swap(raw_);
   std::vector<std::pair<uint32_t, uint32_t>> rs; // first, count
   for (uint32_t i = 0; i < n_; ++i)
     if (rs.empty() || all_[i].branch != all_[rs.back().first].branch)
@@ -96,6 +97,8 @@ bool SlotTable::index(const std::vector<uint8_t>& raw, size_t& off, uint32_t n, 
   owned_.clear();
   byOrig_.clear();
   byOrigFresh_ = false;
+  std::vector<uint8_t>().swap(raw_);
+  quiet_.store(0, std::memory_order_relaxed);
   runs_.reset();
   nRuns_ = 0;
   n_ = 0;
@@ -187,14 +190,18 @@ bool SlotTable::decodeRuns(const std::vector<size_t>& want) {
       todo.push_back(k);
   if (todo.empty())
     return true;
-  std::vector<uint8_t> raw;
-  if (!src_ || !src_(raw))
+  quiet_.store(0, std::memory_order_relaxed);
+  if (raw_.empty() && (!src_ || !src_(raw_))) {
+    std::vector<uint8_t>().swap(raw_);
     return false;
+  }
   for (size_t k : todo) {
     Run& r = runs_[k];
     std::unique_ptr<FillSlot[]> buf;
-    if (!decodeRun(raw, r, buf))
+    if (!decodeRun(raw_, r, buf)) {
+      std::vector<uint8_t>().swap(raw_); // read again next time, not these bytes
       return false;
+    }
     r.slots.store(buf.get(), std::memory_order_release);
     owned_.push_back(std::move(buf));
     decodedSlots_.fetch_add(r.count, std::memory_order_relaxed);
@@ -220,11 +227,26 @@ void SlotTable::runsIn(uint64_t a, uint64_t b, std::vector<size_t>& out) const {
       out.push_back(k);
 }
 
+void SlotTable::noteQuiet() {
+  if (quiet_.fetch_add(1, std::memory_order_relaxed) + 1 != kKeepQuiet)
+    return;
+  std::lock_guard<std::mutex> g(mu_);
+  if (quiet_.load(std::memory_order_relaxed) >= kKeepQuiet)
+    std::vector<uint8_t>().swap(raw_);
+}
+
+bool SlotTable::holdsRaw() {
+  std::lock_guard<std::mutex> g(mu_);
+  return !raw_.empty();
+}
+
 bool SlotTable::prepare(uint64_t a, uint64_t b) {
   std::vector<size_t> want;
   runsIn(a, b, want);
-  if (want.empty())
+  if (want.empty()) {
+    noteQuiet();
     return true;
+  }
   std::lock_guard<std::mutex> g(mu_);
   return decodeRuns(want);
 }
@@ -234,8 +256,10 @@ bool SlotTable::prepareRanges(const std::vector<std::pair<uint64_t, uint64_t>>& 
   for (const auto& [off, len] : ranges)
     if (off + len > g_.slotsBegin)
       runsIn(std::max(off, g_.slotsBegin), off + len, want);
-  if (want.empty())
+  if (want.empty()) {
+    noteQuiet();
     return true;
+  }
   std::sort(want.begin(), want.end());
   want.erase(std::unique(want.begin(), want.end()), want.end());
   std::lock_guard<std::mutex> g(mu_);
@@ -250,8 +274,10 @@ bool SlotTable::prepareSlots(const std::vector<uint32_t>& idx) {
       if (!runs_[k].slots.load(std::memory_order_acquire))
         want.push_back(k);
     }
-  if (want.empty())
+  if (want.empty()) {
+    noteQuiet();
     return true;
+  }
   std::sort(want.begin(), want.end());
   want.erase(std::unique(want.begin(), want.end()), want.end());
   std::lock_guard<std::mutex> g(mu_);

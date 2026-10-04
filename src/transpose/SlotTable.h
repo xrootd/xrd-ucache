@@ -6,8 +6,12 @@
 // few dozen of those branches. This table keeps an index of the RUNS (the
 // consecutive slots of one branch) and decodes a run's entries only when a
 // read first touches it, from the stored layout read again through a
-// caller-supplied source. A table can also be given every slot at once
-// (assign): RNTuple files, and tests.
+// caller-supplied source. A reader touches its branches one request at a time
+// at first (ROOT's read cache learns them one by one), so the bytes of a
+// source read are kept until that is over -- until kKeepQuiet requests in a
+// row decode nothing new -- rather than read and decompressed again for every
+// branch (about 20 times per NanoAOD file, ~5 MB each). A table can also be
+// given every slot at once (assign): RNTuple files, and tests.
 //
 // The stored encoding is the layout blob's slot section, one record per slot
 // against the slot before (the first against zeros and against `slotsBegin`):
@@ -79,6 +83,12 @@ class SlotTable {
   void decodedOverlappingOrig(uint64_t a, uint64_t b, std::vector<uint32_t>& out);
   // Slots whose entries the table holds.
   uint64_t decodedSlots() const { return decodedSlots_.load(std::memory_order_relaxed); }
+  // Whether the bytes of the last source read are held.
+  bool holdsRaw();
+
+  // Requests in a row that decode nothing new before the source's bytes are
+  // let go of.
+  static constexpr uint32_t kKeepQuiet = 256;
 
  private:
   struct Run {
@@ -93,6 +103,7 @@ class SlotTable {
   size_t runOf(uint32_t i) const;           // the run holding slot i
   void runsIn(uint64_t a, uint64_t b, std::vector<size_t>& out) const; // undecoded, overlapping
   bool decodeRuns(const std::vector<size_t>& want); // under mu_
+  void noteQuiet(); // a request that decoded nothing new
   bool decodeRun(const std::vector<uint8_t>& raw, Run& r, std::unique_ptr<FillSlot[]>& out) const;
 
   uint32_t n_ = 0;
@@ -100,12 +111,14 @@ class SlotTable {
   Source src_;
   std::unique_ptr<Run[]> runs_;
   size_t nRuns_ = 0;
-  std::mutex mu_; // decoding; guards owned_, byOrig_
+  std::mutex mu_; // decoding; guards owned_, byOrig_, raw_
   std::vector<std::unique_ptr<FillSlot[]>> owned_;
   std::vector<FillSlot> all_; // assign()'s
   std::vector<uint32_t> byOrig_; // decoded slots by original seek (built on first need)
   bool byOrigFresh_ = false;
   std::atomic<uint64_t> decodedSlots_{0};
+  std::vector<uint8_t> raw_;        // the last source read's bytes, while runs are being touched
+  std::atomic<uint32_t> quiet_{0}; // requests since one decoded a run
 };
 
 } // namespace ucache::transpose
