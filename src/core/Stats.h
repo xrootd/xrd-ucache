@@ -126,6 +126,11 @@ struct Stats {
   std::atomic<uint64_t> coldReplicaOutBytes{0};  // converted record bytes staged
   std::atomic<uint64_t> coldReplicaBaskets{0}; // staged as ZSTD-1, or uncompressed
   std::atomic<uint64_t> coldReplicaBasketsKept{0};      // kept as stored (did not fit, unlisted, undecodable)
+  // check_origin_integrity (docs/STATS.md): baskets and pages from the origin
+  // whose own checksum held, failed (never kept or served), or that carry none.
+  std::atomic<uint64_t> originChecksPassed{0};
+  std::atomic<uint64_t> originChecksFailed{0};
+  std::atomic<uint64_t> originChecksNone{0};
   std::atomic<uint64_t> coldReplicaConvertUs{0};        // time spent converting, summed over threads
   std::atomic<uint64_t> coldReplicaDeclined{0};  // replicas not published (no room, or failed)
   std::atomic<uint64_t> coldReplicaSkipped{0};   // files whose own content declined the first pass
@@ -267,6 +272,7 @@ struct StatsTotals {
            hitDiskBytes = 0, hitDiskSeq = 0, replicaBytesServed = 0, replicaReads = 0,
            coldReplicaFiles = 0, coldReplicaInBytes = 0, coldReplicaOutBytes = 0,
            coldReplicaBaskets = 0, coldReplicaBasketsKept = 0, coldReplicaConvertUs = 0,
+           originChecksPassed = 0, originChecksFailed = 0, originChecksNone = 0,
            coldReplicaDeclined = 0, coldReplicaSkipped = 0, slotMapsMade = 0, slotMapOpens = 0,
            slotMapFull = 0,
            replicaReadBytes = 0, relayBytes = 0,

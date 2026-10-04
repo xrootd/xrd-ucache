@@ -160,6 +160,10 @@ class ColdFill : public tp::StoreMaps, public std::enable_shared_from_this<ColdF
   // slotFactor100, the slot table): StoreLayout.h; key, cacheDir, store,
   // entry, storeGone, mu, handles and the maps: StoreMaps.h.
   bool keepOriginals = false;
+  // check_origin_integrity (forced on by recompress = on, so always set on a
+  // first pass): a basket or page whose own checksum fails is never kept or
+  // served.
+  bool checkIntegrity = false;
   // max_read_fraction: null when no rule applies. Once it says direct, what
   // this process converts is served and never kept, and nothing it fetches
   // goes to the byte cache but the file's own records.
@@ -600,6 +604,7 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   cf->cacheDir = cfg.cacheDir;
   cf->entry = entry;
   cf->keepOriginals = cfg.recompressKeepOriginals;
+  cf->checkIntegrity = cfg.checkOriginIntegrity;
   cf->inUseSeconds = cfg.inUseSeconds;
   cf->fsync = cfg.fsync != FsyncMode::kOff;
   cf->rule = ReadRule::forFile(key.key, size);
@@ -840,6 +845,10 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   std::atomic<bool> failed{false};
   std::atomic<bool> retry{false}; // a slot someone else was fetching fell through
   std::atomic<bool> refused{false}; // read in an invalid map's range: asking again cannot help
+  // Bytes the origin sent failed their own checksum: the same source would send
+  // the same bytes, so the read is not asked again (another source is a matter
+  // for adaptive_federation).
+  std::atomic<bool> checkFailed{false};
   std::mutex emu;
   XRootDStatus err;
 
@@ -1127,7 +1136,7 @@ void ColdRequest::finish() {
     // Served again from the start, as a request whose slot fell through is
     // (requests that waited on this fetch do the same): a read the origin
     // failed once is asked for once more, as the plain miss path relays it.
-    if (attempt < 2 && !refused.load()) {
+    if (attempt < 2 && !refused.load() && !checkFailed.load()) {
       again(false);
       return;
     }
@@ -1226,6 +1235,36 @@ void ColdRequest::finish() {
     complete(user, okStatus(), chunkResponse(chunks[0].offset, chunks[0].length, chunks[0].buffer));
 }
 
+// A basket or page failed its own checksum (check_origin_integrity). Bytes that
+// came from the byte cache are dropped there, and the read is asked again (the
+// retry fetches them from the origin): they may have been cached from another
+// source, or before the check was on. Bytes the origin sent for this read fail
+// it, reported with where they came from, and are never kept or served.
+void failOriginCheck(const std::shared_ptr<ColdRequest>& req, uint64_t pos, uint32_t len,
+                     const std::string& what, const char* why, bool fromCache, uint64_t rStart,
+                     uint64_t rLen) {
+  if (fromCache) {
+    req->entry->releaseRanges({{rStart, rStart + rLen}});
+    req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError));
+    return;
+  }
+  std::string server;
+  if (XrdCl::File* f = req->st->acquireInnerIfOpen()) {
+    f->GetProperty("DataServer", server);
+    req->st->releaseInner();
+  }
+  char msg[600];
+  std::snprintf(msg, sizeof msg,
+                "%s: %s at %llu (%u bytes) from %s failed its checksum (%s); not served",
+                req->cf->key.key.c_str(), what.c_str(), static_cast<unsigned long long>(pos), len,
+                server.empty() ? "the origin" : server.c_str(), why);
+  UCACHE_WARN("%s", msg);
+  if (req->st->store)
+    req->st->store->stats().originChecksFailed.fetch_add(1, std::memory_order_relaxed);
+  req->checkFailed.store(true);
+  req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, msg));
+}
+
 // Convert one claimed basket and stage it. `rounded` holds the page-rounded
 // original range starting at `rStart`; the basket is [recOff, recOff+recLen)
 // inside it. `fromCache` = the original came from the byte cache (its copy
@@ -1245,12 +1284,21 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     if (!p.error.empty()) {
       // A page whose checksum or decode fails must not be served decoded: the
       // reader could no longer detect it. Fail the read, as ROOT would.
-      UCACHE_WARN("slot run for %s: page at %llu: %s", cf.key.key.c_str(),
-                  static_cast<unsigned long long>(slot.origSeek), p.error.c_str());
-      req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError));
+      if (cf.checkIntegrity) {
+        failOriginCheck(req, slot.origSeek, recLen, "an RNTuple page", p.error.c_str(), fromCache,
+                        rStart, rounded->size());
+      } else {
+        UCACHE_WARN("slot run for %s: page at %llu: %s", cf.key.key.c_str(),
+                    static_cast<unsigned long long>(slot.origSeek), p.error.c_str());
+        req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError));
+      }
       req->done();
       return;
     }
+    if (cf.checkIntegrity && req->st->store)
+      (pg.hasChecksum ? req->st->store->stats().originChecksPassed
+                      : req->st->store->stats().originChecksNone)
+          .fetch_add(1, std::memory_order_relaxed);
     const uint8_t kind = p.enc.size() == p.raw.size() ? tp::ConvertedBasket::kRaw
                                                       : tp::ConvertedBasket::kZstd;
     cf.convertUs.fetch_add(us, std::memory_order_relaxed);
@@ -1299,6 +1347,19 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
   if (!c.error.empty()) { // not a basket: the reader gets the origin's bytes, as it would have
     c.kind = tp::ConvertedBasket::kOriginal;
     c.record.assign(rec, rec + recLen);
+  }
+  if (cf.checkIntegrity) {
+    if (c.check == tp::ConvertedBasket::kFailed) {
+      failOriginCheck(req, slot.origSeek, recLen,
+                      c.codec.empty() ? std::string("a basket") : "a basket (" + c.codec + ")",
+                      c.checkWhy, fromCache, rStart, rounded->size());
+      req->done();
+      return;
+    }
+    if (req->st->store)
+      (c.check == tp::ConvertedBasket::kPassed ? req->st->store->stats().originChecksPassed
+                                               : req->st->store->stats().originChecksNone)
+          .fetch_add(1, std::memory_order_relaxed);
   }
   const uint64_t us = nowUs() - t0;
   cf.convertUs.fetch_add(us, std::memory_order_relaxed);

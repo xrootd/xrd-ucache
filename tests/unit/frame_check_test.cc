@@ -1,6 +1,7 @@
 // The origin-integrity checks on compressed objects and basket key headers,
 // pinned against blocks ROOT itself wrote: a check that is wrong but
 // self-consistent would pass our own round trip and still fail on real data.
+#include "FillLayout.h"
 #include "TreeMeta.h"
 #include "vendor/xxh3.h"
 
@@ -343,6 +344,25 @@ TEST(BasketKey, FieldsRootReliesOnFail) {
   EXPECT_TRUE(checkBasketKey(x.k, x.b, x.br, 0, "Events").fail);
   x = rootBasket();
   EXPECT_TRUE(checkBasketKey(x.k, x.b, x.br, 1, "Events").fail); // no such basket
+}
+
+TEST(ConvertBasket, ReportsWhatItsDecodeSaid) {
+  // A basket ROOT wrote converts, and says its check passed.
+  const std::vector<std::string> lzma = {"lzma"};
+  ConvertedBasket ok = convertBasket(kLzmaRecord, sizeof(kLzmaRecord), 3 * sizeof(kLzmaRecord), lzma);
+  EXPECT_NE(ok.kind, ConvertedBasket::kOriginal);
+  EXPECT_EQ(ok.check, ConvertedBasket::kPassed);
+  // One byte changed in its compressed data: kept as stored, and failed.
+  std::vector<uint8_t> bad(kLzmaRecord, kLzmaRecord + sizeof(kLzmaRecord));
+  bad[70 + 9 + 60] ^= 0x10;
+  ConvertedBasket b = convertBasket(bad.data(), bad.size(), 3 * bad.size(), lzma);
+  EXPECT_EQ(b.kind, ConvertedBasket::kOriginal);
+  EXPECT_EQ(b.check, ConvertedBasket::kFailed);
+  // A codec not converted is not decoded, so not examined.
+  ConvertedBasket n = convertBasket(kLzmaRecord, sizeof(kLzmaRecord), 3 * sizeof(kLzmaRecord),
+                                    std::vector<std::string>{"zlib"});
+  EXPECT_EQ(n.kind, ConvertedBasket::kOriginal);
+  EXPECT_EQ(n.check, ConvertedBasket::kNotExamined);
 }
 
 TEST(BasketKey, FieldsRootIgnoresAreOnlyNoted) {

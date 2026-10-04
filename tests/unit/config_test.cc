@@ -135,6 +135,34 @@ TEST(Config, MaxReadFraction) {
   }
 }
 
+// check_origin_integrity: off by default, its own setting, and forced on by
+// recompress = on whatever any layer says, which `settings` names.
+TEST(Config, CheckOriginIntegrityForcedByRecompress) {
+  EnvGuard g;
+  {
+    Config c = Config::fromEnv();
+    EXPECT_FALSE(c.checkOriginIntegrity);
+    EXPECT_EQ(c.valueOf("check_origin_integrity"), "off");
+  }
+  std::map<std::string, std::string> conf = {{"check_origin_integrity", "on"}};
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_TRUE(c.checkOriginIntegrity);
+    EXPECT_EQ(c.sources.at("check_origin_integrity"), "conf");
+  }
+  conf = {{"check_origin_integrity", "off"}, {"recompress", "on"}};
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_TRUE(c.checkOriginIntegrity) << "recompress decodes anyway: always checked";
+    EXPECT_EQ(c.sources.at("check_origin_integrity"), "forced by recompress");
+  }
+  ::setenv("UCACHE_CHECK_ORIGIN_INTEGRITY", "off", 1);
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_TRUE(c.checkOriginIntegrity) << "no layer undoes the forcing";
+  }
+}
+
 // mixed_maps: on by default. in_use_seconds: 1 day, seconds >= 0 only (0 = no
 // protection); it replaces evict_protect_seconds and map_expiry_seconds.
 TEST(Config, MixedMapsAndTheInUseWindow) {

@@ -214,6 +214,8 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.recompress = truthy(v);
   else if (k == "recompress_keep_originals")
     c.recompressKeepOriginals = truthy(v);
+  else if (k == "check_origin_integrity")
+    c.checkOriginIntegrity = truthy(v);
   else if (k == "mixed_maps")
     c.mixedMaps = !falsy(v); // default on; see Config.h
   else if (k == "recompress_codecs")
@@ -325,6 +327,12 @@ void clampAndFinish(Config& c, bool explicitMax) {
   // budgetAuto iff NO explicit (positive) byte cap from any layer: resolve a
   // free-disk floor in CacheStore.
   c.budgetAuto = !explicitMax;
+  // Recompression decodes what it converts: checking it there costs nothing,
+  // so it is always done. Applied after every layer, so none can undo it.
+  if (c.recompress && !c.checkOriginIntegrity) {
+    c.checkOriginIntegrity = true;
+    c.sources["check_origin_integrity"] = "forced by recompress";
+  }
 }
 
 // Layers above the conf: state file (found under the EFFECTIVE cache dir —
@@ -410,6 +418,7 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"max_read_fraction", "UCACHE_MAX_READ_FRACTION"},
       {"recompress", "UCACHE_RECOMPRESS"},
       {"recompress_keep_originals", "UCACHE_RECOMPRESS_KEEP_ORIGINALS"},
+      {"check_origin_integrity", "UCACHE_CHECK_ORIGIN_INTEGRITY"},
       {"mixed_maps", "UCACHE_MIXED_MAPS"},
       {"recompress_codecs", "UCACHE_RECOMPRESS_CODECS"},
       {"trace", "UCACHE_TRACE"},
@@ -550,6 +559,8 @@ std::string Config::valueOf(const std::string& key) const {
     return onoff(recompress);
   if (key == "recompress_keep_originals")
     return onoff(recompressKeepOriginals);
+  if (key == "check_origin_integrity")
+    return onoff(checkOriginIntegrity);
   if (key == "mixed_maps")
     return onoff(mixedMaps);
   if (key == "recompress_codecs")

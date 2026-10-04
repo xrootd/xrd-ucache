@@ -149,6 +149,13 @@ struct ConvertedBasket {
   std::vector<uint8_t> record;
   std::string codec;  // the codec the basket was actually stored in ("" = raw/unknown)
   std::string error;  // non-empty => not a basket record; nothing to place
+  // What decoding said about the basket's bytes: kNotExamined when it was not
+  // decoded (stored uncompressed, or a codec not converted); kFailed means the
+  // bytes are not the basket that was written (its codec check failed, or it
+  // did not decode) and `kind` is kOriginal.
+  enum Check : uint8_t { kNotExamined, kPassed, kFailed, kNotCheckable };
+  Check check = kNotExamined;
+  const char* checkWhy = "";
 };
 
 // ZSTD-1 when the basket's actual codec is listed and the result fits the

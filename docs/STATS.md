@@ -201,10 +201,20 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   where ZSTD could not shrink a basket).
 - `cold_replica_baskets` — baskets converted.
 - `cold_replica_baskets_kept` — baskets kept exactly as stored because their
-  converted form did not fit their slot, or they could not be decoded. Their
-  original bytes are the byte cache's share of such a file. (Branches whose
-  codec is not in `recompress_codecs` are not counted: they are never
-  converted.)
+  converted form did not fit their slot, or they could not be decoded (with
+  `check_origin_integrity` on, a basket that fails its own checksum is not
+  kept: it is counted under `origin_checks_failed`). Their original bytes are
+  the byte cache's share of such a file. (Branches whose codec is not in
+  `recompress_codecs` are not counted: they are never converted.)
+- `origin_checks_passed`, `origin_checks_failed`, `origin_checks_none` — with
+  `check_origin_integrity` on (forced on by `recompress = on`): baskets and
+  RNTuple pages from the origin whose own checksum held (ROOT's LZMA CRC32,
+  zlib adler32, LZ4 XXH64, a ZSTD content checksum, the RNTuple page
+  checksum); that failed it — never kept or served, the read fails with "data
+  is corrupted" and the log names the file, the position, the codec and the
+  server; or that carry no checksum (ZSTD as ROOT writes it, baskets stored
+  uncompressed), which nothing can check. Only what a first pass converts is
+  checked for now; other bytes are not counted here.
 - `cold_replica_convert_us` — time spent converting, summed over the threads that did
   it; it is CPU a pass spends that a pass without recompression does not.
 - `cold_replica_declined` — converted records not kept: they still did not fit

@@ -444,9 +444,14 @@ ConvertedBasket convertBasket(const uint8_t* rec, size_t n, uint32_t slotLen,
   if (!listed(codecs, c.codec) ||
       payloadCodec(pay, payLen, static_cast<uint64_t>(k->objlen)) != c.codec)
     return original();
-  std::vector<uint8_t> raw = decompressFrames(pay, payLen, static_cast<uint64_t>(k->objlen));
-  if (raw.empty())
+  DecodedFrames d = decodeFrames(pay, payLen, static_cast<uint64_t>(k->objlen));
+  c.check = d.check == FrameCheck::kPassed   ? ConvertedBasket::kPassed
+            : d.check == FrameCheck::kFailed ? ConvertedBasket::kFailed
+                                             : ConvertedBasket::kNotCheckable;
+  c.checkWhy = d.why;
+  if (d.check == FrameCheck::kFailed || d.out.empty())
     return original();
+  std::vector<uint8_t> raw = std::move(d.out);
   std::vector<uint8_t> z = encodeZstdFrames(raw.data(), raw.size(), 1);
   const std::vector<uint8_t>* use = nullptr;
   if (!z.empty() && z.size() < raw.size()) {

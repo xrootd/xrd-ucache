@@ -194,6 +194,12 @@ struct Config {
   // cache (the cache would otherwise hold the same data twice). `on` keeps them
   // too, for comparing the two tiers on one cache.
   bool recompressKeepOriginals = false;          // UCACHE_RECOMPRESS_KEEP_ORIGINALS
+  // Check what arrives from the origin by the file's own checksums (ROOT's
+  // codec checks) before it is cached or served; a basket that fails is never
+  // kept or served, the read fails with "data is corrupted" and the failure is
+  // reported. Forced on by `recompress = on`, which decodes what it converts
+  // anyway (`settings` names it "forced by recompress").
+  bool checkOriginIntegrity = false;             // UCACHE_CHECK_ORIGIN_INTEGRITY
   // `mixed_maps`: a TTree file with a slot store is shown, at each open, the
   // newest MIXED map -- the baskets converted by then stated at their real
   // length, the rest at their slot's -- so a later pass reads what the store

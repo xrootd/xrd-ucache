@@ -385,6 +385,11 @@ void printStats(const StatsTotals& t) {
   row("open_retries_exhausted", t.openRetriesExhausted);
   row("validations_failed", t.validationsFailed);
   row("size_disagreements", t.sizeDisagreements);
+  if (t.originChecksPassed || t.originChecksFailed || t.originChecksNone) {
+    row("origin_checks_passed", t.originChecksPassed);
+    row("origin_checks_failed", t.originChecksFailed);
+    row("origin_checks_none", t.originChecksNone);
+  }
 
   // The derived workflow picture — the divisions a human would do.
   std::printf("workflow:\n");
