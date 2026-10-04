@@ -65,6 +65,9 @@ struct FillLayout {
   // declines such a file too; any other decline is the slot layout's own, and
   // `ucache recompress` can still build the file's replica from the byte cache.
   bool codecDecline = false;
+  // A codec decline for codecs `recompress_codecs` does not name: those the
+  // file's baskets (pages) are stored in, comma-separated.
+  std::string declinedCodecs;
   uint64_t originSize = 0;  // the original fEND
   uint64_t virtualSize = 0; // the fEND the reader is shown
   // Ranges of the ORIGINAL file that read differently, in place: the header

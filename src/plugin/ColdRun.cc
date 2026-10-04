@@ -377,8 +377,6 @@ class ColdFill : public tp::StoreMaps, public std::enable_shared_from_this<ColdF
   void onMapFull() override;
   void onMapMade(uint64_t storedBytes) override;
 
- public:
-
  private:
   // Send a staged record to `pending`, or -- when not allowed (the store is
   // gone, or the process holds its cap of records waiting) -- to the transient

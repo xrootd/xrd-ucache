@@ -499,11 +499,15 @@ FillLayout layoutForRNTupleFill(const RNTupleMeta& m, uint64_t fileSize,
     for (const auto& c : unlisted)
       if (c != "none") seen += (seen.empty() ? "" : ", ") + c;
     for (const auto& c : codecs) list += (list.empty() ? "" : ",") + c;
-    if (!seen.empty())
-      return decline("no convertible column range: its pages are " + seen +
-                         ", which recompress_codecs (" + (list.empty() ? "empty" : list) +
-                         ") does not name",
-                     true);
+    if (!seen.empty()) {
+      decline("no convertible column range: its pages are " + seen + ", which recompress_codecs (" +
+                  (list.empty() ? "empty" : list) + ") does not name",
+              true);
+      for (size_t at; (at = seen.find(", ")) != std::string::npos;)
+        seen.erase(at + 1, 1);
+      L.declinedCodecs = seen;
+      return L;
+    }
     if (unconverted)
       return decline("no convertible column range: its pages are compressed in a codec that is "
                      "not converted",

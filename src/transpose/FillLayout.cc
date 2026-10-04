@@ -300,10 +300,13 @@ FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vecto
         seen += (seen.empty() ? "" : ", ") + c;
       for (const auto& c : codecs)
         list += (list.empty() ? "" : ",") + c;
-      return decline("no relocatable branch: its baskets are " + seen +
-                         ", which recompress_codecs (" + (list.empty() ? "empty" : list) +
-                         ") does not name",
-                     true);
+      decline("no relocatable branch: its baskets are " + seen + ", which recompress_codecs (" +
+                  (list.empty() ? "empty" : list) + ") does not name",
+              true);
+      for (size_t at; (at = seen.find(", ")) != std::string::npos;)
+        seen.erase(at + 1, 1);
+      L.declinedCodecs = seen;
+      return L;
     }
     if (unconverted)
       return decline("no relocatable branch: its baskets are compressed in a codec that is not "
