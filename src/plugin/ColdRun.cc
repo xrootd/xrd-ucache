@@ -19,6 +19,7 @@
 #include "ReplicaStore.h"
 #include "SlotStore.h"
 #include "SlotTable.h"
+#include "StoreLayout.h"
 #include "Transposer.h"
 #include "UCacheFile.h"
 #include "XrdClTimeout.h"
@@ -55,34 +56,13 @@ using XrdCl::XRootDStatus;
 
 namespace {
 
-// The slot factor: a TTree basket's slot is 3 times its stored length. Fixed,
-// not a setting: where every slot sits follows from it, so a store made again
-// after one was removed lays out the same grid, and a reader still holding the
-// old store's positions reads the same baskets there. (At 3 the ZSTD-1 form of
-// all but ~2% of NanoAOD's LZMA baskets fits, 0.1% of the bytes; a basket
-// whose form does not fit is served as it was stored.) An existing store is
-// served with the factor it records.
-constexpr uint32_t kSlotFactor100 = 300;
-
-// Bumped whenever the layout a store was made for could be computed
-// differently: a store of another version is replaced, never served.
-// 2: RNTuple slot pages carry their checksum.
-// 3: the tree states its real total size; the slot factor is fixed.
-// 4: a compression setting that names no codec takes the codec the file's own
-//    baskets (pages) are stored in, where 3 left those branches as stored.
-//    That changes which files and branches are converted, never how a layout
-//    is laid out: a version 3 layout is still served as it is, while a
-//    version 3 DECLINED store is decided again (see adoptable).
-// 5: an RNTuple file's slots lie column by column (4: cluster by cluster). A
-//    version 3 or 4 layout is still served as it is. A TTree file's layout is
-//    computed as in 4, and its store still says 4, so an earlier release
-//    serves it.
-constexpr uint32_t kLayoutVersion = 5;
-constexpr uint32_t kTTreeLayoutVersion = 4;
-constexpr uint32_t kOldestServedLayout = 3;
-// Where a store's decision to convert (or to decline) was last changed.
-constexpr uint32_t kOldestDecision = 4;
-uint32_t layoutVersionOf(bool rnt) { return rnt ? kLayoutVersion : kTTreeLayoutVersion; }
+// The layout constants and versions (StoreLayout.h).
+using tp::kLayoutVersion;
+using tp::kOldestDecision;
+using tp::kOldestServedLayout;
+using tp::kSlotFactor100;
+using tp::kTTreeLayoutVersion;
+using tp::layoutVersionOf;
 
 // Converted records wait in memory until this many bytes, the periodic
 // checkpoint, or the process's last close of the file, then go to the store in
@@ -286,7 +266,7 @@ uint8_t basketKind(uint8_t entryKind) {
 
 } // namespace
 
-class ColdFill : public std::enable_shared_from_this<ColdFill> {
+class ColdFill : public tp::StoredLayout, public std::enable_shared_from_this<ColdFill> {
  public:
   enum : uint8_t { kAbsent = 0, kFetching = 1, kReady = 2 };
   // What is known of a slot someone has touched. Guarded by ColdFill::mu.
@@ -310,22 +290,11 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   // Told when a slot it waited on is ready (with the record, when the one who
   // converted it has it in hand) or was given up.
   using Waiter = std::function<void(bool, Rec)>;
-  // RNTuple only: what decoding a page needs, per slot.
-  struct Page {
-    uint32_t nbytes = 0;
-    bool hasChecksum = false;
-  };
 
+  // The layout and its settings (rnt, L, pages, metaOrigin, codecs,
+  // slotFactor100, the slot table): StoreLayout.h.
   UrlKey key;
   std::string cacheDir;
-  bool rnt = false;  // an RNTuple container: slots hold DECODED pages
-  tp::FillLayout L;
-  std::vector<Page> pages; // RNTuple, by slot
-  // The original ranges the layout's relocated metadata stands for (the tree
-  // record; or the page list and footer), for the read footprint.
-  std::vector<std::pair<uint64_t, uint64_t>> metaOrigin;
-  std::vector<std::string> codecs; // the store's: which baskets are converted
-  uint32_t slotFactor100 = 0;      // the store's, in hundredths
   bool keepOriginals = false;
   // max_read_fraction: null when no rule applies. Once it says direct, what
   // this process converts is served and never kept, and nothing it fetches
@@ -336,11 +305,6 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   std::atomic<bool> storeGone{false}; // dropped or replaced: nothing more is committed
   std::shared_ptr<FileEntry> entry;
   std::unique_ptr<std::atomic<uint8_t>[]> state; // per slot: kAbsent / kFetching / kReady
-  // The slot table (L.slots is empty once the run is set up): for a TTree
-  // file only the branches a request has touched are decoded (SlotTable.h).
-  tp::SlotTable slots;
-  uint32_t nSlots() const { return slots.size(); }
-  const tp::FillSlot& slot(uint32_t i) { return slots.at(i); }
   // Slot i's first committed record's length (a kept original's own length;
   // 0 when nothing is committed): what a mixed map states it at.
   uint32_t committedLenLocked(uint32_t i, const tp::FillSlot& s) const {
@@ -761,365 +725,22 @@ bool shownSlotParams(const std::string& key, uint32_t& slotFactor100, std::strin
 // The parser's byte source at setup (shared with the read rule).
 using SetupSource = OriginSource;
 
-// Everything a reader could learn from the layout, hashed: two layouts that
-// agree on it serve the same bytes at the same offsets.
-uint64_t layoutHash(const tp::FillLayout& L, bool rnt) {
-  std::vector<uint8_t> b;
-  auto put64 = [&](uint64_t v) {
-    const auto* p = reinterpret_cast<const uint8_t*>(&v);
-    b.insert(b.end(), p, p + 8);
-  };
-  put64(rnt ? 1 : 0);
-  put64(L.originSize);
-  put64(L.virtualSize);
-  put64(L.metaSeek);
-  put64(L.slotsBegin);
-  put64(L.windows.size());
-  for (const auto& w : L.windows) {
-    put64(w.off);
-    put64(w.bytes.size());
-    b.insert(b.end(), w.bytes.begin(), w.bytes.end());
-  }
-  put64(L.metaRecord.size());
-  b.insert(b.end(), L.metaRecord.begin(), L.metaRecord.end());
-  put64(L.slots.size());
-  for (const auto& s : L.slots) {
-    put64(s.origSeek);
-    put64(s.vSeek);
-    put64((static_cast<uint64_t>(s.origLen) << 32) | s.vLen);
-  }
-  return xxh3_64(b.data(), b.size());
-}
+using tp::decodeLayout;
+using tp::encodeLayout;
+using tp::joinCodecs;
+using tp::layoutRaw;
+using tp::layoutHash;
+using tp::splitCodecs;
 
-std::string joinCodecs(const std::vector<std::string>& v) {
-  std::string s;
-  for (const auto& c : v)
-    s += (s.empty() ? "" : ",") + c;
-  return s;
-}
-std::vector<std::string> splitCodecs(const std::string& s) {
-  std::vector<std::string> v;
-  std::string cur;
-  for (char c : s + ",")
-    if (c == ',') {
-      if (!cur.empty())
-        v.push_back(cur);
-      cur.clear();
-    } else
-      cur += c;
-  return v;
-}
-
-// ---- the stored layout: what the store's creator computed, as everyone serves it
-//
-// Serialized once, at creation, and never recomputed: parsing a large tree's
-// metadata costs ~200 ms per open, and a layout recomputed by another build
-// could differ in its compressed metadata bytes.
-
-constexpr char kLayoutMagic[8] = {'U', 'C', 'L', 'A', 'Y', 'T', '0', '2'};
-
-struct Writer {
-  std::vector<uint8_t> b;
-  template <typename T> void put(T v) {
-    const auto* p = reinterpret_cast<const uint8_t*>(&v);
-    b.insert(b.end(), p, p + sizeof v);
-  }
-  void bytes(const std::vector<uint8_t>& v) {
-    put<uint64_t>(v.size());
-    b.insert(b.end(), v.begin(), v.end());
-  }
-  void varint(uint64_t v) {
-    while (v >= 0x80) {
-      b.push_back(static_cast<uint8_t>(v | 0x80));
-      v >>= 7;
-    }
-    b.push_back(static_cast<uint8_t>(v));
-  }
-  void svarint(int64_t v) { varint((static_cast<uint64_t>(v) << 1) ^ static_cast<uint64_t>(v >> 63)); }
-};
-struct Reader {
-  const uint8_t* p;
-  size_t n, at = 0;
-  bool ok = true;
-  template <typename T> T get() {
-    T v{};
-    if (at + sizeof v > n) {
-      ok = false;
-      return v;
-    }
-    std::memcpy(&v, p + at, sizeof v);
-    at += sizeof v;
-    return v;
-  }
-  bool bytes(std::vector<uint8_t>& v) {
-    const uint64_t len = get<uint64_t>();
-    if (!ok || len > n - at)
-      return ok = false;
-    v.assign(p + at, p + at + len);
-    at += len;
-    return true;
-  }
-  uint64_t varint() {
-    uint64_t v = 0;
-    for (int shift = 0; shift < 64; shift += 7) {
-      if (at >= n) {
-        ok = false;
-        return 0;
-      }
-      const uint8_t c = p[at++];
-      v |= static_cast<uint64_t>(c & 0x7f) << shift;
-      if (!(c & 0x80))
-        return v;
-    }
-    ok = false;
-    return 0;
-  }
-  int64_t svarint() {
-    const uint64_t u = varint();
-    return static_cast<int64_t>(u >> 1) ^ -static_cast<int64_t>(u & 1);
-  }
-};
-
-// A TTree slot's length when nothing capped it: k (in hundredths) times the stored basket.
-uint32_t plainSlotLen(uint32_t origLen, uint32_t k100) {
-  const uint64_t v = static_cast<uint64_t>(origLen) * k100 / 100; // as layoutForFill sizes it
-  return v > INT32_MAX ? static_cast<uint32_t>(INT32_MAX) : static_cast<uint32_t>(v);
-}
-
-std::vector<uint8_t> encodeLayout(const ColdFill& cf) {
-  Writer w;
-  w.b.insert(w.b.end(), kLayoutMagic, kLayoutMagic + 8);
-  const tp::FillLayout& L = cf.L;
-  w.put<uint8_t>(cf.rnt ? 1 : 0);
-  w.put<uint64_t>(L.originSize);
-  w.put<uint64_t>(L.virtualSize);
-  w.put<uint64_t>(L.metaSeek);
-  w.put<uint64_t>(L.slotsBegin);
-  w.put<uint32_t>(static_cast<uint32_t>(L.windows.size()));
-  for (const auto& win : L.windows) {
-    w.put<uint64_t>(win.off);
-    w.bytes(win.bytes);
-  }
-  w.bytes(L.metaRecord);
-  w.put<uint32_t>(static_cast<uint32_t>(cf.metaOrigin.size()));
-  for (const auto& [o, n] : cf.metaOrigin) {
-    w.put<uint64_t>(o);
-    w.put<uint64_t>(n);
-  }
-  w.put<uint32_t>(static_cast<uint32_t>(L.relocated.size()));
-  for (uint32_t r : L.relocated)
-    w.put<uint32_t>(r);
-  // The slot table, delta-coded: slots follow one another from slotsBegin, a
-  // branch's baskets are consecutive, and a TTree slot is k times its basket
-  // unless capped -- so most of a slot is implied by the one before it.
-  w.put<uint32_t>(static_cast<uint32_t>(L.slots.size()));
-  uint64_t prevOrig = 0, nextV = L.slotsBegin;
-  uint32_t prevBranch = 0, prevBasket = 0;
-  for (const auto& s : L.slots) {
-    w.svarint(static_cast<int64_t>(s.branch) - static_cast<int64_t>(prevBranch));
-    w.svarint(static_cast<int64_t>(s.basket) - static_cast<int64_t>(prevBasket) - 1);
-    w.svarint(static_cast<int64_t>(s.origSeek - prevOrig));
-    w.varint(s.origLen);
-    w.varint(!cf.rnt && s.vLen == plainSlotLen(s.origLen, cf.slotFactor100) ? 0 : uint64_t(s.vLen) + 1);
-    w.svarint(static_cast<int64_t>(s.vSeek - nextV)); // 0 when contiguous
-    prevBranch = s.branch;
-    prevBasket = s.basket;
-    prevOrig = s.origSeek;
-    nextV = s.vSeek + s.vLen;
-  }
-  if (cf.rnt)
-    for (const auto& pg : cf.pages) {
-      w.put<uint32_t>(pg.nbytes);
-      w.put<uint8_t>(pg.hasChecksum ? 1 : 0);
-    }
-  // Stored compressed: the slot table of a large tree is tens of MB raw.
-  std::vector<uint8_t> out(8);
-  const uint64_t raw = w.b.size();
-  std::memcpy(out.data(), &raw, 8);
-  auto z = tp::encodeZstdFrames(w.b.data(), w.b.size(), 3);
-  if (z.empty())
-    out.insert(out.end(), w.b.begin(), w.b.end()); // stored raw (flagged by length)
-  else
-    out.insert(out.end(), z.begin(), z.end());
-  return out;
-}
-
-// A stored layout blob's raw bytes (it is stored compressed, or raw when that
-// did not shrink it). False when they are not a layout's.
-bool layoutRaw(const std::vector<uint8_t>& blob, std::vector<uint8_t>& b) {
-  if (blob.size() < 8)
-    return false;
-  uint64_t raw = 0;
-  std::memcpy(&raw, blob.data(), 8);
-  if (blob.size() - 8 == raw)
-    b.assign(blob.begin() + 8, blob.end());
-  else
-    b = tp::decompressFrames(blob.data() + 8, blob.size() - 8, raw);
-  return b.size() == raw && raw >= 8 && std::memcmp(b.data(), kLayoutMagic, 8) == 0;
-}
-
-// Decode a stored layout into cf. With `lazy` (a TTree file), the slot table
-// is indexed into cf.slots, its runs decoded from `lazy` when first needed;
-// otherwise every slot lands in cf.L.slots.
-bool decodeLayout(const std::vector<uint8_t>& blob, ColdFill& cf,
-                  tp::SlotTable::Source lazy = nullptr) {
-  std::vector<uint8_t> b;
-  if (!layoutRaw(blob, b))
-    return false;
-  Reader r{b.data(), b.size(), 8};
-  tp::FillLayout& L = cf.L;
-  cf.rnt = r.get<uint8_t>() != 0;
-  L.originSize = r.get<uint64_t>();
-  L.virtualSize = r.get<uint64_t>();
-  L.metaSeek = r.get<uint64_t>();
-  L.slotsBegin = r.get<uint64_t>();
-  const uint32_t nw = r.get<uint32_t>();
-  for (uint32_t i = 0; r.ok && i < nw; ++i) {
-    tp::FillLayout::Window win;
-    win.off = r.get<uint64_t>();
-    r.bytes(win.bytes);
-    L.windows.push_back(std::move(win));
-  }
-  r.bytes(L.metaRecord);
-  const uint32_t nm = r.get<uint32_t>();
-  for (uint32_t i = 0; r.ok && i < nm; ++i) {
-    const uint64_t o = r.get<uint64_t>();
-    cf.metaOrigin.emplace_back(o, r.get<uint64_t>());
-  }
-  const uint32_t nr = r.get<uint32_t>();
-  if (!r.ok || nr > b.size())
-    return false;
-  L.relocated.resize(nr);
-  for (uint32_t i = 0; r.ok && i < nr; ++i)
-    L.relocated[i] = r.get<uint32_t>();
-  const uint32_t ns = r.get<uint32_t>();
-  if (!r.ok || static_cast<uint64_t>(ns) * 6 > b.size())
-    return false;
-  if (lazy && !cf.rnt) {
-    if (L.virtualSize < L.slotsBegin || L.slotsBegin < L.metaSeek)
-      return false;
-    tp::SlotTable::Geometry g;
-    g.slotsBegin = L.slotsBegin;
-    g.virtualSize = L.virtualSize;
-    g.originSize = L.originSize;
-    g.slotFactor100 = cf.slotFactor100;
-    size_t at = r.at;
-    if (!cf.slots.index(b, at, ns, g, std::move(lazy)) || at != b.size())
-      return false;
-    for (const auto& win : L.windows)
-      if (win.off + win.bytes.size() > L.originSize)
-        return false;
-    return true;
-  }
-  L.slots.resize(ns);
-  uint64_t prevOrig = 0, nextV = L.slotsBegin;
-  uint32_t prevBranch = 0, prevBasket = 0;
-  for (uint32_t i = 0; r.ok && i < ns; ++i) {
-    tp::FillSlot& s = L.slots[i];
-    s.branch = static_cast<uint32_t>(prevBranch + r.svarint());
-    s.basket = static_cast<uint32_t>(prevBasket + 1 + r.svarint());
-    s.origSeek = prevOrig + static_cast<uint64_t>(r.svarint());
-    s.origLen = static_cast<uint32_t>(r.varint());
-    const uint64_t vl = r.varint();
-    s.vLen = vl ? static_cast<uint32_t>(vl - 1) : plainSlotLen(s.origLen, cf.slotFactor100);
-    s.vSeek = nextV + static_cast<uint64_t>(r.svarint());
-    prevBranch = s.branch;
-    prevBasket = s.basket;
-    prevOrig = s.origSeek;
-    nextV = s.vSeek + s.vLen;
-  }
-  if (cf.rnt) {
-    cf.pages.resize(ns);
-    for (uint32_t i = 0; r.ok && i < ns; ++i) {
-      cf.pages[i].nbytes = r.get<uint32_t>();
-      cf.pages[i].hasChecksum = r.get<uint8_t>() != 0;
-    }
-  }
-  // Checked, not trusted: every slot lies in the layout, in order.
-  if (!r.ok || r.at != b.size() || L.virtualSize < L.slotsBegin || L.slotsBegin < L.metaSeek)
-    return false;
-  uint64_t prev = L.slotsBegin;
-  for (const auto& s : L.slots) {
-    // (An RNTuple slot is the page's DECODED size plus its checksum, which may
-    // be shorter than the page as stored; a TTree slot holds the record.)
-    if (s.vSeek < prev || s.vSeek + s.vLen > L.virtualSize ||
-        (!cf.rnt && s.vLen < s.origLen) || s.origSeek + s.origLen > L.originSize)
-      return false;
-    prev = s.vSeek + s.vLen;
-  }
-  for (const auto& win : L.windows)
-    if (win.off + win.bytes.size() > L.originSize)
-      return false;
-  return true;
-}
-
-// Parse the file and compute its layout with the given parameters into cf.
-// False when the file is not served this way; `declined` then says whether
-// that is the file's nature (worth remembering) or a failed read (not).
+// Parse the file and compute its layout with the given parameters into cf
+// (StoreLayout.h), reading the file's head as one block for an RNTuple file.
 bool computeLayout(ColdFill& cf, SetupSource& src, uint64_t size, uint32_t k100, bool& declined) {
-  declined = false;
-  std::vector<uint8_t> header(100);
-  cf.rnt = false;
-  tp::FileMeta fm = tp::parseReaderTree(src, static_cast<int64_t>(size));
-  if (!fm.error.empty() && fm.error.find("not found") != std::string::npos) {
-    // No TTree: perhaps an RNTuple.
-    if (!src.fetchHead())
-      return false;
-    tp::RNTupleMeta rm = tp::parseRNTuple(src, static_cast<int64_t>(size), "");
-    if (!rm.error.empty() || !src.read(header.data(), header.size(), 0)) {
-      UCACHE_DEBUG("slot run declined for %s: %s", cf.key.key.c_str(), fm.error.c_str());
-      // Remembered only when the file has neither container: any other
-      // parse failure may be a read that failed, and is tried again next time.
-      declined = rm.error.find("not found") != std::string::npos;
-      return false;
-    }
-    cf.rnt = true;
-    std::string unnamed; // the codec of ranges whose setting names none: one page header
-    if (!tp::unnamedRNTupleCodec(rm, src, unnamed))
-      return false; // a failed read: tried again next time, not remembered
-    cf.L = tp::layoutForRNTupleFill(rm, size, header, cf.codecs, unnamed);
-    cf.metaOrigin = {{rm.pageListOffset, rm.pageListNbytes},
-                     {rm.anchor.seekFooter, rm.anchor.nbytesFooter}};
-    if (cf.L.error.empty()) {
-      cf.pages.resize(cf.L.slots.size());
-      for (size_t i = 0; i < cf.L.slots.size(); ++i) {
-        const auto& pg = rm.ranges[cf.L.slots[i].branch].pages[cf.L.slots[i].basket];
-        cf.pages[i].nbytes = static_cast<uint32_t>(pg.nbytes);
-        cf.pages[i].hasChecksum = pg.hasChecksum;
-      }
-    }
-  } else {
-    if (!fm.error.empty()) {
-      UCACHE_DEBUG("slot run declined for %s: %s", cf.key.key.c_str(), fm.error.c_str());
-      return false; // perhaps a failed read: tried again next time, not remembered
-    }
-    std::vector<uint8_t> treeKeyHeader(fm.treeKey.keylen), keysList;
-    uint8_t klLen[4];
-    if (!src.read(header.data(), header.size(), 0) ||
-        !src.read(treeKeyHeader.data(), treeKeyHeader.size(),
-                  static_cast<uint64_t>(fm.treeKey.seekkey)) ||
-        !src.read(klLen, 4, static_cast<uint64_t>(fm.keyslistSeek)))
-      return false;
-    const int32_t kn = static_cast<int32_t>(static_cast<uint32_t>(klLen[0]) << 24 |
-                                            static_cast<uint32_t>(klLen[1]) << 16 |
-                                            static_cast<uint32_t>(klLen[2]) << 8 | klLen[3]);
-    if (kn <= 0 || static_cast<uint64_t>(fm.keyslistSeek) + static_cast<uint64_t>(kn) > size)
-      return false;
-    keysList.resize(static_cast<size_t>(kn));
-    if (!src.read(keysList.data(), keysList.size(), static_cast<uint64_t>(fm.keyslistSeek)))
-      return false;
-    std::string unnamed; // the codec of branches whose setting names none: one basket header
-    if (!tp::unnamedSettingCodec(fm, header, src, unnamed))
-      return false; // a failed read: tried again next time, not remembered
-    cf.L = tp::layoutForFill(fm, size, header, treeKeyHeader, keysList, cf.codecs, k100, unnamed);
-    cf.metaOrigin = {{static_cast<uint64_t>(fm.treeKey.seekkey),
-                      static_cast<uint64_t>(fm.treeKey.nbytes)}};
-  }
-  if (!cf.L.error.empty()) {
-    declined = true; // decided by the file's own content: build() says so
-    return false;
-  }
-  return true;
+  std::string why;
+  const bool ok = tp::computeLayout(
+      cf, src, [&src] { return src.fetchHead(); }, size, k100, declined, why);
+  if (!ok && !why.empty())
+    UCACHE_DEBUG("slot run declined for %s: %s", cf.key.key.c_str(), why.c_str());
+  return ok;
 }
 
 // A first pass the file's own layout declined (L.error): counted, and said
@@ -1145,21 +766,11 @@ void noteDeclined(const std::shared_ptr<HandleState>& st, const UrlKey& key,
                 note.c_str());
 }
 
-// The replica tier's adoption rule: size always; mtime or checksum only when
-// `validate` asks for them (some storage reports differing mtimes for a file
-// that has not changed).
+// The replica tier's adoption rule (StoreLayout.h), under this process's
+// `validate` setting.
 bool adoptable(const SlotStoreHeader& h, uint64_t size, uint64_t originMtime, uint8_t cksumKind,
                uint32_t originCksum) {
-  const Config& cfg = globalConfig();
-  if (h.layoutVersion > kLayoutVersion || h.originSize != size ||
-      h.layoutVersion < (h.declined ? kOldestDecision : kOldestServedLayout))
-    return false;
-  if (cfg.validate == ValidateMode::kSizeMtime && h.originMtime != originMtime)
-    return false;
-  if (cfg.validate == ValidateMode::kCksum && cksumKind != 0 &&
-      (h.cksumKind != cksumKind || h.originCksum != originCksum))
-    return false;
-  return true;
+  return tp::adoptable(h, size, originMtime, cksumKind, originCksum, globalConfig().validate);
 }
 
 // Set up the slot run of a file.
