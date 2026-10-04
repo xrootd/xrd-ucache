@@ -36,6 +36,10 @@ if (UCACHE_LZMA AND UCACHE_ZLIB AND UCACHE_ZSTD AND UCACHE_LZMA_INC AND UCACHE_Z
   add_executable(ucache-tree-dump tree_dump.cc)
   target_link_libraries(ucache-tree-dump PRIVATE ucache-transpose)
 
+  # runs the origin-integrity checks over every basket of a local file
+  add_executable(ucache-basket-check basket_check.cc)
+  target_link_libraries(ucache-basket-check PRIVATE ucache-transpose)
+
   add_executable(ucache-rntuple-dump rntuple_dump.cc)
   target_link_libraries(ucache-rntuple-dump PRIVATE ucache-transpose)
 

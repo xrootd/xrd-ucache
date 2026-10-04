@@ -229,4 +229,63 @@ uint64_t xxh3_64(const void* data, size_t len) {
   return hashLong(in, len);
 }
 
+namespace {
+
+inline uint64_t xxh64Round(uint64_t acc, uint64_t input) {
+  acc += input * kPrime64_2;
+  acc = rotl64(acc, 31);
+  return acc * kPrime64_1;
+}
+
+inline uint64_t xxh64MergeRound(uint64_t acc, uint64_t val) {
+  acc ^= xxh64Round(0, val);
+  return acc * kPrime64_1 + kPrime64_4;
+}
+
+} // namespace
+
+uint64_t xxh64(const void* data, size_t len, uint64_t seed) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  const uint8_t* const end = p + len;
+  uint64_t h;
+  if (len >= 32) {
+    uint64_t v1 = seed + kPrime64_1 + kPrime64_2;
+    uint64_t v2 = seed + kPrime64_2;
+    uint64_t v3 = seed;
+    uint64_t v4 = seed - kPrime64_1;
+    const uint8_t* const limit = end - 32;
+    do {
+      v1 = xxh64Round(v1, rd64(p));
+      v2 = xxh64Round(v2, rd64(p + 8));
+      v3 = xxh64Round(v3, rd64(p + 16));
+      v4 = xxh64Round(v4, rd64(p + 24));
+      p += 32;
+    } while (p <= limit);
+    h = rotl64(v1, 1) + rotl64(v2, 7) + rotl64(v3, 12) + rotl64(v4, 18);
+    h = xxh64MergeRound(h, v1);
+    h = xxh64MergeRound(h, v2);
+    h = xxh64MergeRound(h, v3);
+    h = xxh64MergeRound(h, v4);
+  } else {
+    h = seed + kPrime64_5;
+  }
+  h += static_cast<uint64_t>(len);
+  while (end - p >= 8) {
+    h ^= xxh64Round(0, rd64(p));
+    h = rotl64(h, 27) * kPrime64_1 + kPrime64_4;
+    p += 8;
+  }
+  if (end - p >= 4) {
+    h ^= static_cast<uint64_t>(rd32(p)) * kPrime64_1;
+    h = rotl64(h, 23) * kPrime64_2 + kPrime64_3;
+    p += 4;
+  }
+  while (p < end) {
+    h ^= static_cast<uint64_t>(*p) * kPrime64_5;
+    h = rotl64(h, 11) * kPrime64_1;
+    ++p;
+  }
+  return avalanche64(h);
+}
+
 } // namespace ucache

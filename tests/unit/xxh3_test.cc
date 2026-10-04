@@ -91,3 +91,39 @@ TEST(Xxh3, UnalignedInputMatchesAligned) {
     EXPECT_EQ(xxh3_64(shifted.data() + shift, buf.size()), xxh3_64(buf.data(), buf.size()));
   }
 }
+
+namespace {
+
+// XXH64 known answers on the same byte ramp, from the reference library
+// (libxxhash 0.8.2). The lengths straddle the algorithm's boundaries: the
+// 4- and 8-byte tails, and 32, where four-lane striping starts.
+const Vector kXxh64Vectors[] = {
+    {0, 0xef46db3751d8e999ull},    {1, 0xe934a84adb052768ull},  {3, 0xe5c7bb4533bc65ddull},
+    {4, 0xffced8604453cc1eull},    {5, 0xdd0274386e26030cull},  {7, 0x14cc643f630c72d2ull},
+    {8, 0x884a173614b81b8dull},    {9, 0x67d85784a7c78c5bull},  {15, 0xa948f5f0f6abac2dull},
+    {16, 0x44b6ef2fb84169f7ull},   {31, 0xc346d2b59b4d8ee1ull}, {32, 0xcbf59c5116ff32b4ull},
+    {33, 0x0c535d1acafb8eadull},   {35, 0xf8c4b2dacbdcba83ull}, {63, 0xe26aa9e2a95f8e4full},
+    {64, 0xf7c67301db6713f0ull},   {100, 0x6ac1e58032166597ull},
+    {1024, 0x6f3914f18fe4df57ull}, {1025, 0x0614c40149130943ull},
+};
+
+} // namespace
+
+TEST(Xxh64, KnownAnswers) {
+  const auto buf = ramp(2048);
+  for (const auto& v : kXxh64Vectors) {
+    EXPECT_EQ(xxh64(buf.data(), v.len), v.digest) << "length " << v.len;
+  }
+  EXPECT_EQ(xxh64(buf.data(), 100, 0x9E3779B97F4A7C15ull), 0x3b97d91eba03e785ull) << "seeded";
+}
+
+TEST(Xxh64, SensitiveToEveryByteAndToLength) {
+  auto buf = ramp(1024);
+  const uint64_t base = xxh64(buf.data(), buf.size());
+  for (size_t i : {size_t(0), size_t(7), size_t(31), size_t(32), size_t(1020), size_t(1023)}) {
+    auto flipped = buf;
+    flipped[i] ^= 0x01;
+    EXPECT_NE(xxh64(flipped.data(), flipped.size()), base) << "byte " << i << " ignored";
+  }
+  EXPECT_NE(xxh64(buf.data(), buf.size() - 1), base);
+}

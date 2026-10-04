@@ -39,13 +39,55 @@ struct KeyInfo {
   uint16_t cycle = 0;
   int64_t seekkey = 0;
   std::string cls, name, title;
+  uint16_t keyPartLen = 0; // bytes of the TKey part: its fields and three strings
 };
 // Parses a TKey header at `off`; nullopt on malformed/out-of-bounds.
 std::optional<KeyInfo> parseKey(const uint8_t* p, size_t n, uint64_t off);
 
-// Decompress a ROOT multi-frame compression container (XZ/ZL/ZS/L4) into
-// exactly `objlen` bytes; empty vector on failure or unknown frames.
+// What a decode could say about a compressed object's integrity.
+//   kPassed        every block carried a check (LZMA CRC32, ZLIB adler32, LZ4
+//                  XXH64, ZSTD content checksum) and it held, and the blocks
+//                  decoded to exactly the object's length.
+//   kFailed        a check failed, a block did not decode, or the lengths do
+//                  not add up: these bytes are not the object that was written.
+//   kNotCheckable  nothing to judge them by: a block this build cannot decode
+//                  (an unknown codec, the old ROOT algorithm, LZ4 without lz4
+//                  support) leaves `out` empty; a block that decodes but
+//                  carries no check (ZSTD without a checksum, an LZMA stream
+//                  declaring none) leaves `out` filled.
+enum class FrameCheck : uint8_t { kPassed, kFailed, kNotCheckable };
+
+struct DecodedFrames {
+  FrameCheck check = FrameCheck::kFailed;
+  std::vector<uint8_t> out; // the object, when it could be decoded
+  // The last block's header claimed more input or output than there is, which
+  // ROOT tolerates as long as the block's own check holds and the total is
+  // right; counted so a report can say so, never a failure by itself.
+  bool headerTolerated = false;
+  const char* why = ""; // the reason, for kFailed and kNotCheckable
+};
+
+// Decode a ROOT multi-block compression container (XZ/ZL/ZS/L4) of an object
+// `objlen` bytes long, checking each block as ROOT would. Never throws.
+DecodedFrames decodeFrames(const uint8_t* payload, size_t n, uint64_t objlen);
+
+// The same, for callers that only need the bytes: exactly `objlen` bytes, or
+// empty when the object failed its check or cannot be decoded here.
 std::vector<uint8_t> decompressFrames(const uint8_t* payload, size_t n, uint64_t objlen);
+
+// The TBasket fields that follow the TKey part of a basket's key header.
+struct BasketHeader {
+  uint16_t version = 0;
+  int32_t bufferSize = 0;
+  int32_t nevBufSize = 0; // the entry size for fixed-size entries
+  int32_t nevBuf = 0;     // entries in the basket
+  int32_t last = 0;       // end of the entry data within the buffer (key included)
+  uint8_t flag = 0;
+};
+// Parses the TBasket fields of key `k` at `off`; nullopt when the header is too
+// short to hold them.
+std::optional<BasketHeader> parseBasketHeader(const uint8_t* p, size_t n, uint64_t off,
+                                              const KeyInfo& k);
 
 // The codec a ROOT compression block names in the first two bytes of its
 // 9-byte header: "zlib" (ZL), "lzma" (XZ), "zstd" (ZS) or "lz4" (L4). "" for
@@ -167,5 +209,19 @@ FileMeta parseFile(Source& src, int64_t fileSize, const std::string& tree = "Eve
 // `fm`, or sets `fm.error`. Exposed so the walk can be fuzzed and unit-tested
 // on crafted blobs without a container around them.
 bool parseTreeBlob(const uint8_t* blob, size_t n, uint16_t keylen, FileMeta& fm);
+
+// A basket's key header held against the tree's own record of that basket.
+// The key header carries no checksum; these comparisons are what can be
+// checked in it. `fail` is set only for fields ROOT relies on when it reads
+// the basket (where it sits, where its data ends, how many entries it holds)
+// — a contradiction there means the bytes are not the basket that was
+// written. Fields ROOT does not use are only noted.
+struct BasketKeyCheck {
+  bool fail = false;
+  std::vector<std::string> problems;  // why `fail` is set
+  std::vector<std::string> anomalies; // differences ROOT does not act on
+};
+BasketKeyCheck checkBasketKey(const KeyInfo& k, const BasketHeader& b, const BranchInfo& br,
+                              size_t basket, const std::string& treeName);
 
 } // namespace ucache::transpose

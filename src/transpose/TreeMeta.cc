@@ -7,6 +7,8 @@
 #include <type_traits>
 #include <unistd.h>
 
+#include "vendor/xxh3.h"
+
 #include <lzma.h>
 #include <utility>
 #include <zlib.h>
@@ -193,7 +195,66 @@ std::optional<KeyInfo> parseKey(const uint8_t* p, size_t n, uint64_t off) {
   };
   if (!str(o.cls) || !str(o.name) || !str(o.title))
     return std::nullopt;
+  o.keyPartLen = static_cast<uint16_t>(q);
   return o;
+}
+
+std::optional<BasketHeader> parseBasketHeader(const uint8_t* p, size_t n, uint64_t off,
+                                              const KeyInfo& k) {
+  // TBasket::Streamer, after the TKey part: version (2), fBufferSize,
+  // fNevBufSize, fNevBuf, fLast (4 each), flag (1).
+  constexpr size_t kFields = 2 + 4 * 4 + 1;
+  const uint64_t at = off + k.keyPartLen;
+  if (k.keyPartLen == 0 || at > n || n - at < kFields)
+    return std::nullopt;
+  const uint8_t* b = p + at;
+  BasketHeader h;
+  h.version = beGet<uint16_t>(b);
+  h.bufferSize = beGet<int32_t>(b + 2);
+  h.nevBufSize = beGet<int32_t>(b + 6);
+  h.nevBuf = beGet<int32_t>(b + 10);
+  h.last = beGet<int32_t>(b + 14);
+  h.flag = b[18];
+  return h;
+}
+
+BasketKeyCheck checkBasketKey(const KeyInfo& k, const BasketHeader& b, const BranchInfo& br,
+                              size_t basket, const std::string& treeName) {
+  BasketKeyCheck c;
+  auto fail = [&](std::string why) {
+    c.fail = true;
+    c.problems.push_back(std::move(why));
+  };
+  if (basket >= br.basketSeek.size() || basket >= br.basketBytes.size()) {
+    fail("basket index past the branch's record");
+    return c;
+  }
+  // ROOT itself refuses a basket whose key does not say it sits where the
+  // branch says it does.
+  if (k.seekkey != br.basketSeek[basket])
+    fail("key position differs from the branch's record");
+  // The basket fields sit inside the key header, so it must at least hold
+  // them, and it cannot be longer than the record.
+  if (k.keylen < k.keyPartLen + 19 || k.keylen > k.nbytes)
+    fail("key header length inconsistent");
+  if (k.objlen < 0)
+    fail("negative object length");
+  // ROOT reads the entry data up to fLast and the entry offsets after it.
+  else if (b.last < k.keylen || static_cast<int64_t>(b.last) > int64_t{k.keylen} + k.objlen)
+    fail("end of entry data outside the basket");
+  if (basket + 1 < br.basketEntry.size() &&
+      int64_t{b.nevBuf} != br.basketEntry[basket + 1] - br.basketEntry[basket])
+    fail("entry count differs from the branch's record");
+  // ROOT reads fBasketBytes[i] bytes, whatever the key says.
+  if (k.nbytes != br.basketBytes[basket])
+    c.anomalies.push_back("record length differs from the branch's record");
+  if (k.cls != "TBasket")
+    c.anomalies.push_back("key class is not TBasket");
+  if (k.name != br.name)
+    c.anomalies.push_back("key name is not the branch's");
+  if (!treeName.empty() && k.title != treeName)
+    c.anomalies.push_back("key title is not the tree's");
+  return c;
 }
 
 std::string blockCodec(const uint8_t* p, size_t n) {
@@ -210,54 +271,120 @@ std::string blockCodec(const uint8_t* p, size_t n) {
   return "";
 }
 
-std::vector<uint8_t> decompressFrames(const uint8_t* payload, size_t n, uint64_t objlen) {
-  std::vector<uint8_t> out;
+DecodedFrames decodeFrames(const uint8_t* payload, size_t n, uint64_t objlen) {
+  DecodedFrames d;
+  auto failed = [&](const char* why) {
+    d.check = FrameCheck::kFailed;
+    d.why = why;
+    d.out.clear();
+    return std::move(d);
+  };
+  auto unsupported = [&](const char* why) {
+    d.check = FrameCheck::kNotCheckable;
+    d.why = why;
+    d.out.clear();
+    return std::move(d);
+  };
   // objlen is attacker-influenceable: cap the upfront reservation (growth past
-  // it amortizes per frame) so a hostile value cannot force a giant allocation.
-  out.reserve(std::min<uint64_t>(objlen, 64ull << 20));
+  // it amortizes per block) so a hostile value cannot force a giant allocation.
+  d.out.reserve(std::min<uint64_t>(objlen, 64ull << 20));
+  bool everyBlockChecked = true;
   size_t p = 0;
-  while (out.size() < objlen) {
-    if (p + 9 > n)
-      return {};
-    const char m0 = static_cast<char>(payload[p]), m1 = static_cast<char>(payload[p + 1]);
+  while (d.out.size() < objlen) {
+    if (p > n || n - p < 9)
+      return failed("compression block header past the payload");
+    const std::string codec = blockCodec(payload + p, n - p);
+    if (codec.empty()) {
+      // ROOT's old algorithm (CS) is legitimate and not decoded here; any
+      // other tag is one ROOT itself does not know, so the bytes are damaged.
+      if (payload[p] == 'C' && payload[p + 1] == 'S')
+        return unsupported("compression block of ROOT's old algorithm");
+      return failed("unknown compression block");
+    }
     uint64_t csize = payload[p + 3] | payload[p + 4] << 8 | payload[p + 5] << 16;
     uint64_t usize = payload[p + 6] | payload[p + 7] << 8 | payload[p + 8] << 16;
-    if (p + 9 + csize > n)
-      return {};
+    if (usize == 0)
+      return failed("empty compression block");
+    const uint64_t availIn = n - p - 9;
+    const uint64_t wantOut = objlen - d.out.size();
+    // ROOT decodes each block with the sizes its header states and stops once
+    // the object is complete, so a LAST block whose header claims more input or
+    // more output than there is still reads correctly in ROOT; its own check
+    // decides. Smaller values, or larger ones in a block that is not the last,
+    // fail in ROOT too. LZ4 is the exception: its hash covers exactly the
+    // compressed size the header states.
+    if (csize > availIn || usize > wantOut) {
+      if (usize < wantOut)
+        return failed("compression block runs past the payload");
+      if (csize > availIn && codec == "lz4")
+        return failed("lz4 block runs past the payload");
+      csize = std::min(csize, availIn);
+      usize = wantOut;
+      d.headerTolerated = true;
+    }
     const uint8_t* blob = payload + p + 9;
-    size_t pre = out.size();
-    out.resize(pre + usize);
-    if (m0 == 'X' && m1 == 'Z') {
+    const size_t pre = d.out.size();
+    d.out.resize(pre + usize);
+    uint8_t* dst = d.out.data() + pre;
+    if (codec == "lzma") {
+      // An xz stream names its check in the second byte of its stream flags;
+      // ROOT writes CRC32, and liblzma verifies whatever is named.
+      if (csize < 8)
+        return failed("lzma block too short");
+      if ((blob[7] & 0x0F) == 0)
+        everyBlockChecked = false;
       uint64_t memlim = UINT64_MAX;
       size_t inPos = 0, outPos = 0;
-      if (lzma_stream_buffer_decode(&memlim, 0, nullptr, blob, &inPos, csize,
-                                    out.data() + pre, &outPos, usize) != LZMA_OK ||
+      if (lzma_stream_buffer_decode(&memlim, 0, nullptr, blob, &inPos, csize, dst, &outPos,
+                                    usize) != LZMA_OK ||
           outPos != usize)
-        return {};
-    } else if (m0 == 'Z' && m1 == 'L') {
+        return failed("lzma block failed its check or did not decode");
+    } else if (codec == "zlib") {
+      // The zlib wrapper ends with an adler32 that uncompress() verifies.
       uLongf dl = usize;
-      if (::uncompress(out.data() + pre, &dl, blob, csize) != Z_OK || dl != usize)
-        return {};
-    } else if (m0 == 'Z' && m1 == 'S') {
-      if (ZSTD_decompress(out.data() + pre, usize, blob, csize) != usize)
-        return {};
-    } else if (m0 == 'L' && m1 == '4') {
+      if (::uncompress(dst, &dl, blob, csize) != Z_OK || dl != usize)
+        return failed("zlib block failed its check or did not decode");
+    } else if (codec == "zstd") {
+      // Frame header: 4-byte magic, then the descriptor whose bit 2 says a
+      // content checksum follows the frame (ZSTD verifies it when present).
+      if (csize < 5)
+        return failed("zstd block too short");
+      if ((blob[4] & 0x04) == 0)
+        everyBlockChecked = false;
+      if (ZSTD_decompress(dst, usize, blob, csize) != usize)
+        return failed("zstd block did not decode");
+    } else { // lz4
 #ifdef UCACHE_HAVE_LZ4
-      if (csize < 8 ||
-          LZ4_decompress_safe(reinterpret_cast<const char*>(blob + 8),
-                              reinterpret_cast<char*>(out.data() + pre),
+      // ROOT's LZ4 block: an 8-byte XXH64 (big-endian) of the compressed bytes
+      // that follow it, then the LZ4 data.
+      if (csize < 8)
+        return failed("lz4 block too short");
+      uint64_t want = 0;
+      for (int b = 0; b < 8; ++b)
+        want = (want << 8) | blob[b];
+      if (xxh64(blob + 8, csize - 8, 0) != want)
+        return failed("lz4 block failed its check");
+      if (LZ4_decompress_safe(reinterpret_cast<const char*>(blob + 8), reinterpret_cast<char*>(dst),
                               static_cast<int>(csize - 8),
                               static_cast<int>(usize)) != static_cast<int>(usize))
-        return {};
+        return failed("lz4 block did not decode");
 #else
-      return {}; // built without lz4: refuse (fail-open, no transpose)
+      return unsupported("lz4 block, and this build has no lz4");
 #endif
-    } else {
-      return {};
     }
     p += 9 + csize;
   }
-  return out.size() == objlen ? out : std::vector<uint8_t>{};
+  d.check = everyBlockChecked ? FrameCheck::kPassed : FrameCheck::kNotCheckable;
+  if (!everyBlockChecked)
+    d.why = "a block carries no check";
+  return d;
+}
+
+std::vector<uint8_t> decompressFrames(const uint8_t* payload, size_t n, uint64_t objlen) {
+  DecodedFrames d = decodeFrames(payload, n, objlen);
+  if (d.check == FrameCheck::kFailed)
+    return {};
+  return std::move(d.out); // empty for a block this build cannot decode
 }
 
 namespace {

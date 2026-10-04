@@ -6,8 +6,11 @@
 // Scope is deliberately narrow: one-shot, unseeded, default secret. That is
 // exactly what ROOT calls, and dropping the seed removes the custom-secret
 // derivation along with every code path that could get it wrong. There is no
-// streaming interface and no XXH32/XXH64 — add them only if something needs
-// them.
+// streaming interface and no XXH32.
+//
+// XXH64 is here too, for one reason: ROOT's LZ4 compression blocks carry an
+// XXH64 of their compressed bytes, and checking it is how damage in such a
+// block is told apart from data.
 //
 // Correctness is pinned by tests against values ROOT itself wrote, not by
 // self-consistency: a hash that is wrong but stable round-trips perfectly
@@ -23,5 +26,8 @@ namespace ucache {
 
 // XXH3_64bits(data, len) with the default secret and no seed.
 uint64_t xxh3_64(const void* data, size_t len);
+
+// XXH64(data, len, seed). ROOT's LZ4 blocks use seed 0.
+uint64_t xxh64(const void* data, size_t len, uint64_t seed = 0);
 
 } // namespace ucache
