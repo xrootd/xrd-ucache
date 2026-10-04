@@ -138,6 +138,14 @@ not to cache, and says the cache is under pressure rather than broken.
   changed page size. The entry is refetched from scratch, so a read still
   succeeds; a steadily rising count means the data is being rewritten
   underneath the cache.
+- `size_disagreements` — times a source reported a different file size than
+  the cached entry it was about to extend. Bytes from that source are never
+  mixed into the entry: a handle that already holds the cached size fails its
+  read with a "data is corrupted" error naming both sizes and the server (and
+  the next open checks the origin again); a handle opening while the process
+  holds the entry reads that file uncached. Non-zero means two copies of one
+  file disagree — usually one damaged or truncated copy among a federation's
+  sites — or a file rewritten while it was being read.
 - `crc_failures` — pages that failed CRC on read and were quarantined
   (refetched later). `meta_corrupt` — sidecars that failed to load (torn or
   damaged) and were rebuilt.

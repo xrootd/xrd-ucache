@@ -62,6 +62,30 @@ TEST(CacheStore, RegistrySharesOneEntryPerKey) {
   (void)raw;
 }
 
+TEST(CacheStore, LiveEntryOfAnotherSizeIsNotShared) {
+  // A second source of the same file reporting another size (a truncated or
+  // damaged copy, or the file rewritten) must not join the entry whose
+  // readers hold the first size: the open declines, says why, and counts it.
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  auto a = store.open(keyN(1), 100000);
+  ASSERT_TRUE(a);
+  bool space = true, differs = false;
+  auto b = store.open(keyN(1), 99999, 0, MetaData::kCksumNone, 0, &space, &differs);
+  EXPECT_FALSE(b);
+  EXPECT_TRUE(differs);
+  EXPECT_FALSE(space);
+  EXPECT_EQ(store.stats().sizeDisagreements.load(), 1u);
+  // The same size still shares, and says nothing was declined.
+  auto c = store.open(keyN(1), 100000, 0, MetaData::kCksumNone, 0, &space, &differs);
+  EXPECT_EQ(a.get(), c.get());
+  EXPECT_FALSE(differs);
+  EXPECT_EQ(store.stats().sizeDisagreements.load(), 1u);
+}
+
 TEST(CacheStore, OpenFailureFailsOpen) {
   TempDir td;
   RealIO io;

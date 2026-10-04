@@ -222,17 +222,34 @@ CacheStore::~CacheStore() {
 
 std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSize,
                                             uint64_t originMtime, uint8_t cksumKind,
-                                            uint32_t originCksum, bool* declinedForSpace) {
+                                            uint32_t originCksum, bool* declinedForSpace,
+                                            bool* declinedSizeDiffers) {
   ensureOwnIdentity();
   if (declinedForSpace)
     *declinedForSpace = false;
+  if (declinedSizeDiffers)
+    *declinedSizeDiffers = false;
   {
     std::lock_guard<std::mutex> g(regMu_);
     auto it = registry_.find(key.hashHex);
     if (it != registry_.end()) {
       if (auto live = it->second.lock()) {
+        // One entry per key per process — for one size. A source of another
+        // size is another copy of the file (a damaged or truncated one, or the
+        // file rewritten): its bytes never join an entry whose readers hold
+        // the first size.
+        if (live->fileSize() != originSize) {
+          stats_.sizeDisagreements.fetch_add(1, std::memory_order_relaxed);
+          UCACHE_WARN("%s: the origin reports %llu bytes, the open cache entry holds %llu; "
+                      "not mixing them, this handle reads uncached",
+                      key.key.c_str(), static_cast<unsigned long long>(originSize),
+                      static_cast<unsigned long long>(live->fileSize()));
+          if (declinedSizeDiffers)
+            *declinedSizeDiffers = true;
+          return nullptr;
+        }
         live->obs().opens.fetch_add(1, std::memory_order_relaxed);
-        return live; // one entry per key per process
+        return live;
       }
       registry_.erase(it);
     }

@@ -171,6 +171,13 @@ struct HandleState {
   XrdCl::XRootDStatus lazyOpenError;
   uint64_t lazyOpenFailUs = 0;
   int lazyOpenAttempt = 0; // cumulative across cool-down re-attempts (fault hook numbering)
+  // The file size a trusted handle showed its reader (from the sidecar), 0 when
+  // none: the lazy open refuses a source of another size, because the reader
+  // holds positions in this one. A refusal latches for the handle and drops
+  // the entry's trust, so the next open checks the origin again.
+  std::atomic<uint64_t> expectedOriginSize{0};
+  std::string trustMarker;              // the entry's .val path, removed on such a refusal
+  std::atomic<bool> sizeRefused{false}; // set: no origin read of this handle reaches that source
   bool ensureInnerOpen(); // lazy synchronous origin open on first miss
   // The status a cache miss should fail with when the inner file is
   // unavailable: the recorded lazy-open failure if there is one, else

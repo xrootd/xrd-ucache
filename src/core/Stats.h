@@ -50,6 +50,9 @@ struct Histogram {
 struct Stats {
   std::atomic<uint64_t> opens{0};
   std::atomic<uint64_t> validationsFailed{0};
+  // A source whose file size differs from the cached entry it would extend:
+  // never mixed (docs/STATS.md).
+  std::atomic<uint64_t> sizeDisagreements{0};
   std::atomic<uint64_t> hitBytes{0};
   std::atomic<uint64_t> missBytes{0};
   std::atomic<uint64_t> originBytes{0}; // post-rounding — the amplification numerator
@@ -249,7 +252,7 @@ struct StatsTotals {
            prefetchDroppedUnread = 0, prefetchLateBytes = 0, prefetchParses = 0,
            prefetchBridgeBytes = 0, prefetchDisabled = 0,
            prefetchFetchErrors = 0;
-  uint64_t opens = 0, validationsFailed = 0, hitBytes = 0, missBytes = 0, originBytes = 0,
+  uint64_t opens = 0, validationsFailed = 0, sizeDisagreements = 0, hitBytes = 0, missBytes = 0, originBytes = 0,
            servedBytes = 0, originReads = 0, fetchesJoined = 0, originReadvs = 0, pageWrites = 0, crcFailures = 0,
            metaCorrupt = 0, evictedEntries = 0, evictedBytes = 0, failopenEvents = 0,
            admissionsBypassed = 0, copierHandles = 0, copiesRefused = 0, directReadFiles = 0,

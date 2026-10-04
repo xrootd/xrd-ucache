@@ -402,6 +402,39 @@ bool HandleState::ensureInnerOpen() {
   }
   if (!s.IsOK() && retry > 1 && store) // retried at least once and still failed
     store->stats().openRetriesExhausted.fetch_add(1, std::memory_order_relaxed);
+  // The reader of a trusted handle holds positions in the size it was shown.
+  // A source of another size is another copy of the file — a damaged or
+  // truncated one, or the file rewritten — and its bytes must not complete
+  // this entry. The open already returned the source's stat, so this asks
+  // nothing more of it.
+  if (const uint64_t want = expectedOriginSize.load(std::memory_order_relaxed); s.IsOK() && want) {
+    XrdCl::StatInfo* si = nullptr;
+    const XRootDStatus ss = inner->Stat(false, si);
+    std::unique_ptr<XrdCl::StatInfo> sip(si);
+    if (ss.IsOK() && si && si->GetSize() != want) {
+      std::string server;
+      inner->GetProperty("DataServer", server);
+      char msg[512];
+      std::snprintf(msg, sizeof msg,
+                    "%s: %s serves %llu bytes, the cached file has %llu; not mixing them",
+                    url.c_str(), server.empty() ? "the origin" : server.c_str(),
+                    static_cast<unsigned long long>(si->GetSize()),
+                    static_cast<unsigned long long>(want));
+      UCACHE_WARN("%s (the read fails; the next open checks the origin again)", msg);
+      if (store)
+        store->stats().sizeDisagreements.fetch_add(1, std::memory_order_relaxed);
+      if (!trustMarker.empty())
+        RealIO::instance().unlink(trustMarker);
+      lazyOpenError = XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, msg);
+      lazyOpenFailUs = nowUs();
+      innerOpenOk = false;
+      sizeRefused = true; // before the latch: acquireInner reads them in this order
+      innerOpened = true; // latch: the same source would answer the same
+      if (innerOps == 0)
+        resetInner(); // let go of the refused source's open file
+      return false;
+    }
+  }
   innerOpenOk = s.IsOK();
   if (innerOpenOk) {
     innerOpened = true; // success latches; failure only arms the cool-down
@@ -432,6 +465,8 @@ XrdCl::File* HandleState::acquireInner() {
   // nullptr here makes the miss path return an error, never bad data).
   if (cacheOnly && !innerOpened && !ensureInnerOpen())
     return nullptr;
+  if (sizeRefused.load(std::memory_order_acquire))
+    return nullptr; // the origin serves another size of this file: never read it here
   std::lock_guard<std::mutex> g(mu);
   if (!innerValid)
     return nullptr;
@@ -442,6 +477,8 @@ XrdCl::File* HandleState::acquireInner() {
 XrdCl::File* HandleState::acquireInnerIfOpen() {
   if (cacheOnly && !innerOpened)
     return nullptr; // would have to open the origin; the caller is speculative
+  if (sizeRefused.load(std::memory_order_acquire))
+    return nullptr;
   std::lock_guard<std::mutex> g(mu);
   if (!innerValid || !inner->IsOpen())
     return nullptr;
@@ -1782,6 +1819,10 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
   if (cacheOnly && allowed) {
     if (auto meta = MetaFile::load(RealIO::instance(), key->metaPath(cfg.cacheDir));
         meta && meta->key == key->key) {
+      // Set before anything here can open the origin lazily (the layout choice
+      // reads the file's records): that open must serve this size or nothing.
+      st_->trustMarker = valPath(*key, cfg.cacheDir);
+      st_->expectedOriginSize.store(meta->fileSize, std::memory_order_relaxed);
       const WholeFirstRead whole = wholeFirstRead(firstRead, meta->fileSize, *key, cfg, forkLayout);
       keepOriginal = keepOriginal || whole == WholeFirstRead::kAsStored;
       if (whole == WholeFirstRead::kCopy) {
@@ -1835,19 +1876,22 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
     std::unique_ptr<XrdCl::StatInfo> sip(si);
     if (s.IsOK() && si && allowed) {
       statClone = std::make_unique<XrdCl::StatInfo>(*si);
-      bool declinedForSpace = false;
+      bool declinedForSpace = false, declinedSizeDiffers = false;
       const WholeFirstRead whole = wholeFirstRead(firstRead, si->GetSize(), *key, cfg, forkLayout);
       keepOriginal = keepOriginal || whole == WholeFirstRead::kAsStored;
       if (whole == WholeFirstRead::kCopy)
         copy = true;
       else
         entry = st_->store->open(*key, si->GetSize(), si->GetModTime(),
-                                 MetaData::kCksumNone, 0, &declinedForSpace);
+                                 MetaData::kCksumNone, 0, &declinedForSpace,
+                                 &declinedSizeDiffers);
       // A capacity DECISION is not a fail-open. failopenEvents means something
       // went wrong and every benchmark requires it to be zero, so counting a
       // deliberate decline there would make a cache that is merely full look
       // broken. The read proceeds uncached either way; only the reason differs.
-      if (!entry && !declinedForSpace && !copy)
+      // Nor is refusing to mix a source of another size into the entry this
+      // process already holds (size_disagreements counts that).
+      if (!entry && !declinedForSpace && !declinedSizeDiffers && !copy)
         st_->store->stats().failopenEvents.fetch_add(1, std::memory_order_relaxed);
       // The file's store, when there is one or recompression makes one: the
       // reported size becomes the layout's, so ROOT's fBEGIN <= fEND <= size

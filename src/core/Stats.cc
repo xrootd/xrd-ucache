@@ -67,6 +67,7 @@ std::string Stats::toJsonBody() const {
   };
   f("opens", opens);
   f("validations_failed", validationsFailed);
+  f("size_disagreements", sizeDisagreements);
   f("hit_bytes", hitBytes);
   f("miss_bytes", missBytes);
   f("origin_bytes", originBytes);
@@ -195,6 +196,7 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     ++t.files;
     t.opens += extractU64(last, "opens");
     t.validationsFailed += extractU64(last, "validations_failed");
+    t.sizeDisagreements += extractU64(last, "size_disagreements");
     t.hitBytes += extractU64(last, "hit_bytes");
     t.missBytes += extractU64(last, "miss_bytes");
     t.originBytes += extractU64(last, "origin_bytes");

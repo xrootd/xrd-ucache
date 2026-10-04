@@ -384,6 +384,7 @@ void printStats(const StatsTotals& t) {
   row("open_retries", t.openRetries);
   row("open_retries_exhausted", t.openRetriesExhausted);
   row("validations_failed", t.validationsFailed);
+  row("size_disagreements", t.sizeDisagreements);
 
   // The derived workflow picture — the divisions a human would do.
   std::printf("workflow:\n");

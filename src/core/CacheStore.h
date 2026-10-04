@@ -80,11 +80,16 @@ class CacheStore {
   // something is wrong) from a capacity DECISION — every resident entry is still
   // inside the protection window, so this NEW entry is not admitted. The read
   // still succeeds uncached either way, but only the first is a fail-open event.
+  // `declinedSizeDiffers` (optional, out) marks the third: the process already
+  // holds this file's entry at a different size. Its readers hold that size, so
+  // the entry is neither restarted nor extended from this source; the caller
+  // reads uncached and `size_disagreements` counts it.
   std::shared_ptr<FileEntry> open(const UrlKey& key, uint64_t originSize,
                                   uint64_t originMtime = 0,
                                   uint8_t cksumKind = MetaData::kCksumNone,
                                   uint32_t originCksum = 0,
-                                  bool* declinedForSpace = nullptr);
+                                  bool* declinedForSpace = nullptr,
+                                  bool* declinedSizeDiffers = nullptr);
 
   // True once an eviction pass has found the budget exceeded with NOTHING
   // eligible to remove: the cache is full of entries too recently read to touch,
