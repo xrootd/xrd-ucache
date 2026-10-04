@@ -175,11 +175,13 @@ std::string rnTupleCodecName(int32_t compressionSettings);
 // The codec the pages of a file's UNNAMED column ranges are stored in: ranges
 // whose setting names no codec (rnTupleCodecName gives "") while the page list
 // shows compressed pages (stored smaller than they decode). Named by the block
-// header of ONE such page read through `src` -- the first one `src` has -- so a
-// file whose settings name their codecs reads nothing here. `codec` = "" when
-// there is no such page, or it names no codec converted here. False only when
-// a read failed: nothing is decided then.
-bool unnamedRNTupleCodec(const RNTupleMeta& m, Source& src, std::string& codec);
+// header of ONE such page read through `src` -- the first one -- so a file
+// whose settings name their codecs reads nothing here. `codec` = "" when there
+// is no such page, or it names no codec converted here. False only when a read
+// failed: nothing is decided then. With `anyCached`, the first such page `src`
+// has (as unnamedSettingCodec: a byte cache, no layout's positions held).
+bool unnamedRNTupleCodec(const RNTupleMeta& m, Source& src, std::string& codec,
+                         bool anyCached = false);
 
 // A range's codec: the one its setting names; for an unnamed range with
 // compressed pages, `unnamedCodec`; "none" for one whose pages are stored

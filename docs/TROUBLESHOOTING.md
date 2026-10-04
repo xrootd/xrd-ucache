@@ -288,6 +288,11 @@ reasons:
 A file whose compression setting names no codec — setting 1, "the global
 default", which files from older ROOT versions and `hadd -f1` carry — is
 judged by the codec its baskets are actually stored in, read from one basket.
+`ucache recompress` takes that basket from what your jobs cached: the first
+basket of any of those branches will do. The exception is a file whose replica
+readers were shown within `in_use_seconds`: then it asks for the same basket the
+replica was laid out by, and the file stays `incomplete` until that basket is
+cached.
 
 Data cached before recompression was switched on and not read since gets a
 replica only from `ucache recompress`. The rest of this section covers these
@@ -351,9 +356,11 @@ the first two (it scans the whole cache, so it covers every file they listed);
 Only `failed` means something is wrong. The others are ordinary states with
 their own words, because conflating them made healthy runs look broken:
 
-- **`incomplete (bytes not cached)`** — the file's metadata, which its layout is
-  computed from, is not in the byte cache yet. It retries for free on the next
-  pass and needs no action. The message reads `not built yet, will retry`.
+- **`incomplete (bytes not cached)`** — what the file's layout is computed from
+  (its metadata, and for a file whose compression setting names no codec, a
+  basket that names it) is not in the byte cache yet. It retries for free on
+  the next pass and needs no action. The message reads `not built yet, will
+  retry`.
 - **`deferred (no space)`** — no headroom above the eviction floor; the file is
   left for a later `ucache recompress` once there is room. See cause 3 above.
 - **`declined (source codec …)`** — working as configured; see cause 1 above.

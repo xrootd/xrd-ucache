@@ -620,6 +620,54 @@ TEST(RNTupleFill, UnnamedSettingTakesThePagesCodec) {
   EXPECT_EQ(rangeCodec(raw, "zlib"), "lzma"); // a named setting is taken as it is
 }
 
+// A byte cache without the first such page: that page is asked for anyway
+// (every process asks the same one), unless any cached page may name the
+// codec; with none cached, nothing is decided.
+TEST(RNTupleFill, AnUncachedFirstPageIsAskedForUnlessAnyMayName) {
+  RNTupleMeta m = parseRNTuple(unnamedFixture(), "");
+  ASSERT_TRUE(m.error.empty()) << m.error;
+  struct Lacking : CountingFileSource {
+    using CountingFileSource::CountingFileSource;
+    uint64_t from = 0, upto = 0; // [from, upto) is not held
+    bool has(uint64_t off, uint64_t n) override {
+      return off + n <= from || off >= upto ? FileSource::has(off, n) : false;
+    }
+    bool read(void* dst, uint64_t n, uint64_t off) override {
+      return has(off, n) && CountingFileSource::read(dst, n, off);
+    }
+  };
+  int fd = ::open(unnamedFixture().c_str(), O_RDONLY | O_CLOEXEC);
+  ASSERT_GE(fd, 0);
+  Lacking src(fd, m.fileSize);
+  std::string codec;
+  ASSERT_TRUE(unnamedRNTupleCodec(m, src, codec));
+  ASSERT_EQ(codec, "zlib");
+  // The first compressed page of the first unnamed range, and a later one.
+  const PageInfo* first = nullptr;
+  uint64_t later = 0;
+  for (const auto& r : m.ranges)
+    for (const auto& pg : r.pages)
+      if (pg.nbytes < pg.uncompressedBytes && pg.nbytes >= 9 && pg.offset >= 100) {
+        if (!first)
+          first = &pg;
+        else if (!later && pg.offset > first->offset + first->nbytes)
+          later = pg.offset;
+      }
+  ASSERT_TRUE(first);
+  ASSERT_GT(later, 0u);
+  src.from = first->offset;
+  src.upto = first->offset + first->nbytes;
+  EXPECT_FALSE(unnamedRNTupleCodec(m, src, codec));
+  src.reads = 0;
+  ASSERT_TRUE(unnamedRNTupleCodec(m, src, codec, /*anyCached=*/true));
+  EXPECT_EQ(codec, "zlib");
+  EXPECT_EQ(src.reads, 1);
+  src.from = 0; // no page held
+  src.upto = m.fileSize;
+  EXPECT_FALSE(unnamedRNTupleCodec(m, src, codec, /*anyCached=*/true));
+  ::close(fd);
+}
+
 // A file whose settings name their codecs reads nothing for this.
 TEST(RNTupleFill, NamedSettingsReadNothing) {
   RNTupleMeta m = parseRNTuple(fixture(), "");

@@ -8,6 +8,7 @@
 #include "Transposer.h"
 #include "TreeMeta.h"
 
+#include <algorithm>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -703,10 +704,16 @@ struct CountingSource : Source {
   std::vector<uint8_t> b;
   int reads = 0;
   bool failReads = false;
-  bool has(uint64_t off, uint64_t n) override { return off + n >= off && off + n <= b.size(); }
+  std::vector<uint64_t> lacks; // ranges starting here are not held
+  bool held(uint64_t off) const {
+    return std::find(lacks.begin(), lacks.end(), off) == lacks.end();
+  }
+  bool has(uint64_t off, uint64_t n) override {
+    return off + n >= off && off + n <= b.size() && held(off);
+  }
   bool read(void* dst, uint64_t n, uint64_t off) override {
     ++reads;
-    if (failReads || off + n > b.size())
+    if (failReads || off + n > b.size() || !held(off))
       return false;
     std::memcpy(dst, b.data() + off, n);
     return true;
@@ -956,6 +963,20 @@ TEST(FillLayoutUnnamed, ReadsOnlyWhatItMust) {
 
     src.failReads = true;
     EXPECT_FALSE(unnamedSettingCodec(fx.fm, fx.header, src, codec)); // nothing decided
+    src.failReads = false;
+
+    // A byte cache without the first branch's basket: asked anyway (every
+    // process asks the same one) unless any cached one may name the codec.
+    src.lacks = {static_cast<uint64_t>(fx.fm.branches[0].basketSeek[0])};
+    src.reads = 0;
+    EXPECT_FALSE(unnamedSettingCodec(fx.fm, fx.header, src, codec));
+    src.reads = 0;
+    ASSERT_TRUE(unnamedSettingCodec(fx.fm, fx.header, src, codec, /*anyCached=*/true));
+    EXPECT_EQ(codec, "zstd");
+    EXPECT_EQ(src.reads, 1);
+    // Neither cached: nothing decided, rather than "no codec".
+    src.lacks.push_back(static_cast<uint64_t>(fx.fm.branches[1].basketSeek[0]));
+    EXPECT_FALSE(unnamedSettingCodec(fx.fm, fx.header, src, codec, /*anyCached=*/true));
   }
 }
 

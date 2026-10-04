@@ -110,8 +110,14 @@ std::string codecOfSetting(int32_t compress, int32_t fileCompress);
 // most), so a file whose settings name their codecs reads nothing here.
 // `codec` = that basket's codec, or "" (no branch in that state, or a codec
 // not converted here). False only when a read failed: nothing is decided.
+// With `anyCached`, a first basket `src` does not have is passed over for the
+// next branch's, not counted among the three: for a byte cache that holds only
+// what a job read, when no reader holds a layout's positions (any basket of
+// these branches names the same codec in all but merged files, and the store
+// keeps the layout it decides). Without, the basket is read whether `src` has
+// it or not, so every process asks the same one.
 bool unnamedSettingCodec(const FileMeta& fm, const std::vector<uint8_t>& header, Source& src,
-                         std::string& codec);
+                         std::string& codec, bool anyCached = false);
 
 // Compute the layout. `fileSize` = the origin's size, which must equal fEND
 // (anything past fEND would lie under the extension). `header` = the file's

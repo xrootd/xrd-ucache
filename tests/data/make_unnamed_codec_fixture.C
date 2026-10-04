@@ -7,6 +7,7 @@
 //
 //   root -l -b -q 'make_unnamed_codec_fixture.C("unnamed_codec_fixture.root")'
 #include <TFile.h>
+#include <TRandom3.h>
 #include <TSystem.h>
 #include <TTree.h>
 
@@ -53,4 +54,30 @@ void make_unnamed_codec_fixture(const char* path) {
   t.Write();
   in.reset();
   gSystem->Unlink(lzmaPath);
+}
+
+// unnamed_codec_wide_fixture.root: the same setting (1, baskets ZLIB), with
+// each unnamed branch's first basket on 4 KiB pages of its own (a branch that
+// names its codec is written first, so none shares the file's first page), so
+// a byte cache can hold one branch's first basket without another's:
+//   root -l -b -q -e '.L make_unnamed_codec_fixture.C' \
+//     -e 'make_unnamed_codec_wide_fixture("unnamed_codec_wide_fixture.root")'
+void make_unnamed_codec_wide_fixture(const char* path) {
+  TFile out(path, "RECREATE", "", 1);
+  TTree t("Events", "Events");
+  double pad = 0, a = 0, b = 0, c = 0;
+  t.Branch("pad", &pad, "pad/D")->SetCompressionSettings(101);
+  t.Branch("a", &a, "a/D");
+  t.Branch("b", &b, "b/D");
+  t.Branch("c", &c, "c/D");
+  t.SetAutoFlush(4000);
+  TRandom3 r(7);
+  for (int i = 0; i < 8000; ++i) {
+    pad = r.Uniform();
+    a = r.Integer(64) * 0.5;
+    b = r.Integer(512) * 0.25;
+    c = r.Integer(4096) * 0.125;
+    t.Fill();
+  }
+  t.Write();
 }

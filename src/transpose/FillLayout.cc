@@ -182,7 +182,7 @@ std::string codecOfSetting(int32_t compress, int32_t fileCompress) {
 }
 
 bool unnamedSettingCodec(const FileMeta& fm, const std::vector<uint8_t>& header, Source& src,
-                         std::string& codec) {
+                         std::string& codec, bool anyCached) {
   codec.clear();
   Header H;
   if (!fm.error.empty() || !parseHeader(header, H))
@@ -202,10 +202,17 @@ bool unnamedSettingCodec(const FileMeta& fm, const std::vector<uint8_t>& header,
   // A key header is at most ~560 bytes (three names of up to 255); the
   // compression header follows it.
   constexpr uint64_t kHead = 1024;
-  for (size_t i = 0; i < unnamed.size() && i < kTries; ++i) {
+  size_t asked = 0;
+  bool passedOver = false;
+  for (size_t i = 0; i < unnamed.size() && asked < kTries; ++i) {
     const BranchInfo& br = *unnamed[i];
     const uint64_t off = static_cast<uint64_t>(br.basketSeek[0]);
     const uint64_t want = std::min<uint64_t>(static_cast<uint64_t>(br.basketBytes[0]), kHead);
+    if (anyCached && !src.has(off, want)) {
+      passedOver = true; // not read by any job: the next branch's
+      continue;
+    }
+    ++asked;
     if (off + want > static_cast<uint64_t>(fm.fend))
       continue; // outside the file: the layout never relocates it
     uint8_t head[kHead];
@@ -219,7 +226,7 @@ bool unnamedSettingCodec(const FileMeta& fm, const std::vector<uint8_t>& header,
     codec = blockCodec(head + k->keylen, static_cast<size_t>(want - k->keylen));
     return true;
   }
-  return true;
+  return !passedOver; // a basket not cached yet may still name it: nothing decided
 }
 
 std::string declineNote(const FillLayout& L) { return L.error; }

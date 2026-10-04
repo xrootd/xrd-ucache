@@ -160,7 +160,8 @@ SweepResult sweepFile(CacheStore& cs, const Config& cfg, IOBackend& io, const Ur
       probe.codecs = cfg.recompressCodecs;
       bool declined = false;
       std::string why;
-      computeLayout(probe, src, nullptr, size, store->header().slotFactor100, declined, why);
+      computeLayout(probe, src, nullptr, size, store->header().slotFactor100, declined, why,
+                    /*anyCachedProbe=*/true);
       res.codecDecline = probe.L.codecDecline;
       res.declinedCodecs = probe.L.declinedCodecs;
       return fail(O::kDeclined, probe.L.error.empty() ? "declined when it was first read"
@@ -173,10 +174,14 @@ SweepResult sweepFile(CacheStore& cs, const Config& cfg, IOBackend& io, const Ur
   if (!store) {
     // From the cached metadata alone, with the settings of the layout readers
     // were last shown within the window, if any (their positions stay right).
+    // Then the codec of branches whose setting names none comes from the
+    // basket every process asks, as the layout they were shown did; with none
+    // shown, from any cached one (a job need not have read that basket).
     StoredLayout lay;
     lay.codecs = cfg.recompressCodecs;
     lay.slotFactor100 = kSlotFactor100;
     InUseRecord rec;
+    bool shown = false;
     if (InUseRecord::load(io, InUseRecord::path(cfg.cacheDir, key.hashHex), rec) &&
         rec.hasSettings &&
         (rec.settings.layoutVersion == kLayoutVersion ||
@@ -184,10 +189,12 @@ SweepResult sweepFile(CacheStore& cs, const Config& cfg, IOBackend& io, const Ur
         !rec.expired(wallSeconds(), cfg.inUseSeconds)) {
       lay.codecs = splitCodecs(rec.settings.codecs);
       lay.slotFactor100 = rec.settings.slotFactor100;
+      shown = true;
     }
     bool declined = false;
     std::string why;
-    if (!computeLayout(lay, src, nullptr, size, lay.slotFactor100, declined, why)) {
+    if (!computeLayout(lay, src, nullptr, size, lay.slotFactor100, declined, why,
+                       /*anyCachedProbe=*/!shown)) {
       if (!lay.L.error.empty()) { // the file's own content: a store is not made
         res.codecDecline = lay.L.codecDecline;
         res.declinedCodecs = lay.L.declinedCodecs;
@@ -198,7 +205,7 @@ SweepResult sweepFile(CacheStore& cs, const Config& cfg, IOBackend& io, const Ur
       if (entry->hasRange(0, size))
         return fail(why.find("not found") != std::string::npos ? O::kNothing : O::kFailed,
                     why.empty() ? "parse failed" : "parse: " + why);
-      return fail(O::kIncomplete, "its metadata is not cached");
+      return fail(O::kIncomplete, "what decides its layout is not cached");
     }
     SlotStoreHeader want;
     want.layoutVersion = layoutVersionOf(lay.rnt);

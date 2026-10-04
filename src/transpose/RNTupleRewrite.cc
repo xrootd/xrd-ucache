@@ -31,22 +31,25 @@ std::string rangeCodec(const ColumnRange& r, const std::string& unnamedCodec) {
   return hasCompressedPage(r) ? unnamedCodec : "none";
 }
 
-bool unnamedRNTupleCodec(const RNTupleMeta& m, Source& src, std::string& codec) {
+bool unnamedRNTupleCodec(const RNTupleMeta& m, Source& src, std::string& codec, bool anyCached) {
   codec.clear();
   if (!m.error.empty()) return true;
+  bool passedOver = false;
   for (const auto& r : m.ranges) {
     if (!rnTupleCodecName(r.compressionSettings).empty()) continue;
     for (const auto& pg : r.pages) {
-      if (pg.nbytes >= pg.uncompressedBytes || pg.nbytes < 9 || pg.offset < 100 ||
-          !src.has(pg.offset, 9))
+      if (pg.nbytes >= pg.uncompressedBytes || pg.nbytes < 9 || pg.offset < 100) continue;
+      if (anyCached && !src.has(pg.offset, 9)) {
+        passedOver = true;
         continue;
+      }
       uint8_t head[9];
       if (!src.read(head, sizeof head, pg.offset)) return false;
       codec = blockCodec(head, sizeof head);
       return true;
     }
   }
-  return true;
+  return !passedOver; // a page not cached yet may still name it: nothing decided
 }
 
 namespace {
@@ -336,7 +339,7 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
       if (rnTupleCodecName(range.compressionSettings).empty()) {
         if (!unnamedAsked) {
           unnamedAsked = true;
-          unnamedFailed = !unnamedRNTupleCodec(m, src, unnamed);
+          unnamedFailed = !unnamedRNTupleCodec(m, src, unnamed, /*anyCached=*/true);
         }
         // Unreadable now: not a verdict, for this range or any later one whose
         // codec the same page was to name.

@@ -295,7 +295,8 @@ bool decodeLayout(const std::vector<uint8_t>& blob, StoredLayout& cf, SlotTable:
 }
 
 bool computeLayout(StoredLayout& cf, Source& src, const std::function<bool()>& fetchHead,
-                   uint64_t size, uint32_t k100, bool& declined, std::string& why) {
+                   uint64_t size, uint32_t k100, bool& declined, std::string& why,
+                   bool anyCachedProbe) {
   declined = false;
   why.clear();
   std::vector<uint8_t> header(100);
@@ -315,7 +316,7 @@ bool computeLayout(StoredLayout& cf, Source& src, const std::function<bool()>& f
     }
     cf.rnt = true;
     std::string unnamed; // the codec of ranges whose setting names none: one page header
-    if (!unnamedRNTupleCodec(rm, src, unnamed))
+    if (!unnamedRNTupleCodec(rm, src, unnamed, anyCachedProbe))
       return false; // a failed read: tried again next time, not remembered
     cf.L = layoutForRNTupleFill(rm, size, header, cf.codecs, unnamed);
     cf.metaOrigin = {{rm.pageListOffset, rm.pageListNbytes},
@@ -349,7 +350,7 @@ bool computeLayout(StoredLayout& cf, Source& src, const std::function<bool()>& f
     if (!src.read(keysList.data(), keysList.size(), static_cast<uint64_t>(fm.keyslistSeek)))
       return false;
     std::string unnamed; // the codec of branches whose setting names none: one basket header
-    if (!unnamedSettingCodec(fm, header, src, unnamed))
+    if (!unnamedSettingCodec(fm, header, src, unnamed, anyCachedProbe))
       return false; // a failed read: tried again next time, not remembered
     cf.L = layoutForFill(fm, size, header, treeKeyHeader, keysList, cf.codecs, k100, unnamed);
     cf.metaOrigin = {{static_cast<uint64_t>(fm.treeKey.seekkey),

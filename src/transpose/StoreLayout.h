@@ -105,9 +105,13 @@ bool decodeLayout(const std::vector<uint8_t>& blob, StoredLayout& lay,
 // nothing to do). False when the file is not served this way: `declined` then
 // says whether that is the file's own content (worth remembering: lay.L.error
 // says why, or the file has neither container) or a failed read (not), and
-// `why` holds the parser's message.
+// `why` holds the parser's message. `anyCachedProbe`: the codec of branches
+// (columns) whose setting names none may come from any basket (page) `src`
+// has, not only the one every process asks (unnamedSettingCodec) -- for a
+// byte cache's view, when no reader holds a layout's positions.
 bool computeLayout(StoredLayout& lay, Source& src, const std::function<bool()>& fetchHead,
-                   uint64_t size, uint32_t k100, bool& declined, std::string& why);
+                   uint64_t size, uint32_t k100, bool& declined, std::string& why,
+                   bool anyCachedProbe = false);
 
 // The replica tier's adoption rule: size always; mtime or checksum only when
 // `validate` asks for them (some storage reports differing mtimes for a file

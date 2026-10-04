@@ -4,14 +4,19 @@
 
 #include "CacheStore.h"
 #include "FillLayout.h"
+#include "InUse.h"
 #include "RNTupleRewrite.h"
+#include "ReadMap.h"
 #include "SlotStore.h"
 #include "StoreLayout.h"
 #include "TestUtil.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <ctime>
 #include <fstream>
 #include <string>
 #include <sys/stat.h>
@@ -50,12 +55,35 @@ struct Fixture {
   }
   // The file's first `n` bytes in the byte cache (whole pages; the last one
   // short at the end of the file).
-  void cache(uint64_t n) {
+  void cache(uint64_t n) { cacheAllBut(n, 0, 0); }
+  // Bytes [0, n) in the byte cache except the pages that touch [lo, hi).
+  void cacheAllBut(uint64_t n, uint64_t lo, uint64_t hi) {
     CacheStore cs(io, cfg);
     auto e = cs.open(key, file.size());
     ASSERT_TRUE(e);
-    e->writePages(0, n, file.data());
+    const uint64_t pg = e->pageSize();
+    if (lo >= hi) {
+      e->writePages(0, n, file.data());
+    } else {
+      const uint64_t a = lo / pg * pg, b = std::min<uint64_t>(n, (hi + pg - 1) / pg * pg);
+      e->writePages(0, a, file.data());
+      e->writePages(b, n - b, file.data() + b);
+    }
     e->flushMeta(true);
+  }
+  // A layout shown to readers within the window, as a first pass notes it.
+  void noteShown(uint32_t layoutVersion) {
+    InUseSettings s;
+    s.layoutVersion = layoutVersion;
+    s.slotFactor100 = static_cast<uint16_t>(kSlotFactor100);
+    s.codecs = joinCodecs(cfg.recompressCodecs);
+    InUseRange r;
+    r.storeId = 1;
+    r.lo = 1;
+    r.hi = 2;
+    r.lastS = static_cast<uint64_t>(std::time(nullptr));
+    ASSERT_TRUE(InUseRecord::note(io, InUseRecord::path(cfg.cacheDir, key.hashHex), r, &s,
+                                  cfg.inUseSeconds));
   }
   SweepResult sweep() {
     CacheStore cs(io, cfg);
@@ -63,6 +91,21 @@ struct Fixture {
   }
   std::shared_ptr<SlotStore> store() {
     return SlotStore::open(io, key.objectDir(cfg.cacheDir), key.hashHex);
+  }
+};
+
+// The file in memory, noting where it was read.
+struct MemSource : Source {
+  const std::vector<uint8_t>& b;
+  std::vector<uint64_t> at;
+  explicit MemSource(const std::vector<uint8_t>& f) : b(f) {}
+  bool has(uint64_t off, uint64_t n) override { return off + n >= off && off + n <= b.size(); }
+  bool read(void* dst, uint64_t n, uint64_t off) override {
+    if (!has(off, n))
+      return false;
+    at.push_back(off);
+    std::memcpy(dst, b.data() + off, n);
+    return true;
   }
 };
 
@@ -217,4 +260,53 @@ TEST(StoreSweep, ACachedOriginalThatRottedIsCaughtAndCounted) {
     }
   }
   EXPECT_TRUE(seen) << "no basket's rot was caught";
+}
+
+// A file whose compression setting names no codec has the codec named by one
+// basket every process asks for. A job that never read it leaves it out of the
+// byte cache: with no layout shown to readers, any cached basket of those
+// branches names the codec and the file is converted; with one shown within
+// the window, the sweep asks the same basket the layout was decided by, and
+// leaves the file for later rather than lay it out another way. (The same
+// choice for an RNTuple file's pages: rntuple_rewrite_test.)
+TEST(StoreSweep, AnUnnamedCodecIsNamedByACachedBasketUnlessALayoutWasShown) {
+  const char* name = "unnamed_codec_wide_fixture.root";
+  std::vector<uint8_t> file = slurp(name);
+  ASSERT_FALSE(file.empty());
+  MemSource m(file);
+  FileMeta fm = parseReaderTree(m, static_cast<int64_t>(file.size()));
+  ASSERT_TRUE(fm.error.empty()) << fm.error;
+  const std::vector<uint8_t> header(file.begin(), file.begin() + 100);
+  m.at.clear();
+  std::string codec;
+  ASSERT_TRUE(unnamedSettingCodec(fm, header, m, codec));
+  ASSERT_EQ(codec, "zlib");
+  ASSERT_EQ(m.at.size(), 1u);
+  const uint64_t probe = m.at[0];
+  ASSERT_GE(probe, 4096u); // past the file's first page
+
+  Fixture f(name, {"lzma", "zlib"});
+  f.cacheAllBut(f.file.size(), probe, probe + 1);
+  SweepResult r = f.sweep();
+  ASSERT_EQ(r.outcome, SweepResult::Outcome::kConverted) << r.note;
+  EXPECT_GT(r.converted, 0u);
+  EXPECT_GT(r.uncached, 0u); // the basket on the page left out
+  auto s = f.store();
+  ASSERT_TRUE(s);
+  StoredLayout lay;
+  entriesOf(*s, lay);
+  EXPECT_EQ(lay.L.relocated.size(), 4u); // the unnamed branches with the named one
+
+  Fixture g(name, {"lzma", "zlib"});
+  g.cacheAllBut(g.file.size(), probe, probe + 1);
+  g.noteShown(kTTreeLayoutVersion);
+  SweepResult held = g.sweep();
+  EXPECT_EQ(held.outcome, SweepResult::Outcome::kIncomplete) << held.note;
+  EXPECT_FALSE(g.store());
+  // Once that basket is cached, the same layout is made.
+  g.cache(g.file.size());
+  held = g.sweep();
+  ASSERT_EQ(held.outcome, SweepResult::Outcome::kConverted) << held.note;
+  ASSERT_TRUE(g.store());
+  EXPECT_EQ(g.store()->header().layoutHash, s->header().layoutHash);
 }
