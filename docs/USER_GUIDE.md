@@ -252,8 +252,8 @@ dir = /path/on/a/local/disk/ucache
 #
 # MEMORY: with it on, a job holds more memory while it reads. On the analyses
 # measured, warm passes needed about 1.8x (TTree) and 2.3x (RNTuple) the memory
-# the same job needs from a replica made by `ucache recompress`. If your jobs
-# run short of memory, leave it off and build replicas with `ucache recompress`
+# the same job needs with no cache. If your jobs run short of memory, leave it
+# off and convert what is cached with `ucache recompress` between passes
 # instead. Turning it off later does not change files already recompressed
 # this way: remove those first, while no job is reading them (`ucache
 # untranspose <url>`, or `ucache clear`; a job still reading one would fail).
@@ -748,7 +748,6 @@ overriding your defaults. Common keys:
 | `recompress_keep_originals = off` | `UCACHE_RECOMPRESS_KEEP_ORIGINALS` | `on` = when baskets are converted into a replica, keep their original bytes in the byte cache too (by default they are not kept, and a copy held from before is released: the cache would hold the same data twice) |
 | `mixed_maps = on` | `UCACHE_MIXED_MAPS` | with `recompress = on`: each open of a TTree or RNTuple file is shown its newest map, the baskets or pages converted by then back to back at their real size (see "Recompression"); `off` = every open sees the first-pass layout, every basket at the size of its room and every RNTuple page decoded — for jobs that hand basket positions to workers on other machines with caches of their own |
 | `recompress_codecs = lzma,zlib` | `UCACHE_RECOMPRESS_CODECS` | which **source** codecs are worth recompressing (comma list); branches in other codecs are served as-is |
-| `recompress_reclaim = superseded` | `UCACHE_RECOMPRESS_RECLAIM` | what to free from the byte cache once a file's replica exists: `superseded` (default) punches only the ranges the replica replaced; `full` drops the **entire** byte copy — replicas become the primary copy, uncovered reads refetch from origin (space-tight disks) |
 | `page_size = 4k` | `UCACHE_PAGE_SIZE` | size of the pages the cache stores: 4 KiB, and 16 KiB on macOS, where a smaller page written into a hole of the cache file takes 16 KiB of disk anyway. Applies to files cached from then on. `ucache doctor` checks it against the cache disk |
 | `log = warn` | `UCACHE_LOG` | `error` / `warn` / `info` / `debug`, optionally `:/path/to/file`. The XRootD client's own switch works too: `XRD_LOGLEVEL=Debug` shows uCache's debug messages, and with `XRD_LOGFILE` they go into the client's log file under the topic `UCache`. `ucache set log debug` turns debug on for every job; `ucache unset log` turns it off |
 | `trace = off` | `UCACHE_TRACE` | `io` = write a sampled per-operation JSON trace next to the process's stats file (deep-dive forensics; zero cost when off). Best set per job: `UCACHE_TRACE=io python3 my_analysis.py` |
@@ -929,7 +928,7 @@ below and the dedicated guide in `docs/CACHE_MANAGEMENT.md`.
 | `ucache verify <url>` | CRC-scrub an entry; quarantine (not wipe) bad pages |
 | `ucache settings`  | every setting: effective value + where it comes from (default \| conf \| state \| env) |
 | `ucache set <key> <value>` / `unset <key>` | change / drop a **current** value without touching your defaults in the conf |
-| `ucache recompress [--jobs N] [--yes]` | transcode the cached files whose source codec is in `recompress_codecs`, in the foreground with live progress (`--jobs` default: every core the process may use). Estimates disk growth first and asks for confirmation if the sweep would push the cache into eviction; `--yes` overrides (scripts) |
+| `ucache recompress [--jobs N] [--yes]` | convert what is cached of the files whose source codec is in `recompress_codecs` into their replicas — the same form a first pass with `recompress = on` makes — in the foreground with live progress (`--jobs` default: every core the process may use). Estimates the disk growth first; a file that would not fit above the free-space floor is deferred, never evicted around |
 | `ucache branches <url>` | which branches your analysis read: fully-cached branches with bytes + source codec, and the summary share |
 | `ucache untranspose <url>` | drop an entry's replica; the byte cache is kept |
 
@@ -956,11 +955,11 @@ read buffers from the layout described below and does not shrink them to fit
 the memory there is, and uCache keeps a table for each such file while it is
 open (about 20 MB for a large NanoAOD file). On the analyses measured (32
 threads), warm passes needed about 1.8x the memory on TTree and 2.3x on RNTuple
-of the same job reading a replica made by `ucache recompress` — which in turn
-needs about what the job needs with no cache at all. A job that runs short of
+of the same job reading the compact replicas earlier releases made, which
+needed about what the job needs with no cache at all. A job that runs short of
 memory is killed by the system, not warned: if yours are near their memory
-limit, leave recompression off and build replicas with `ucache recompress`
-instead. Turning it off later does not change files already recompressed this
+limit, leave recompression off and convert what is cached with
+`ucache recompress` between passes instead. Turning it off later does not change files already recompressed this
 way; `docs/TROUBLESHOOTING.md` ("Jobs are killed for memory") says how to get
 them back. `ucache doctor` repeats this note whenever recompression is on.
 
@@ -1032,13 +1031,17 @@ codec that is not in `recompress_codecs` is left as it is, and changing the
 list makes the next read decide again. A file whose compression setting names
 no codec (setting 1, "the global default", from older ROOT versions or
 `hadd -f1`) is judged by the codec its baskets are actually stored in. For
-other reasons (an unusual structure), the warning says so, and an explicit
-`ucache recompress` may still build a replica.
+other reasons (an unusual structure), the warning says so; `ucache recompress`
+declines the same files, and they stay in the byte cache.
 
 `ucache recompress` runs one foreground sweep, with live progress, over what is
 already in the byte cache: you need it only for data cached before
-recompression was switched on and never read since, and for files the first
-pass declined. Check where you stand with `ucache status` (the `recompressed:`
+recompression was switched on (or with it off) and never read since, and for
+what a first pass did not keep. It converts into the same replica a first pass
+makes — every basket or page whose original is cached and not yet converted —
+and makes the file's next map; nothing is read from the origin. A replica an
+earlier release made beside the byte cache (`.tdata`/`.tmeta`) is removed and
+replaced. Check where you stand with `ucache status` (the `recompressed:`
 line) or per file with `ucache ls` (the `RECOMP` column). The sweep's own
 summary gives each outcome its own words —
 `recompressed`, `declined` (with the codec it found and the one-line fix),
@@ -1048,18 +1051,12 @@ is room).
 `ucache doctor` will tell you why nothing is being built if that is what you are
 seeing (see Troubleshooting).
 
-Replicas coexist with the byte cache by default (only the ranges the replica
-physically replaced are punched). If disk space is tight, make replicas the
-primary copy instead:
-
-```sh
-ucache set recompress_reclaim full
-ucache recompress            # also retroactively reclaims existing replicas
-```
-
-Every entry with a valid replica then gives back its whole byte-cache copy the
-moment the replica is available; anything the replica does not cover refetches
-from the origin on demand. See CACHE_MANAGEMENT §4 for details.
+What the sweep converts leaves the byte cache, as on a first pass, unless
+`recompress_keep_originals = on`; a basket or page kept as stored stays there,
+since it is the only copy, and so do the file's first 128 KiB. The setting
+`recompress_reclaim` of earlier releases is retired: the sweep frees every
+converted original, which is what its `superseded` did, and its `full` freed
+originals the replica still needs.
 
 Set expectations honestly: the replica removes *decompression* time only. A
 warm analysis that is 80% LZMA decode gets several× faster; one dominated by

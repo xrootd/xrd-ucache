@@ -218,17 +218,7 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.mixedMaps = !falsy(v); // default on; see Config.h
   else if (k == "recompress_codecs")
     c.recompressCodecs = splitCommas(v);
-  else if (k == "recompress_reclaim") {
-    if (v == "superseded")
-      c.recompressReclaim = Config::Reclaim::kSuperseded;
-    else if (v == "full")
-      c.recompressReclaim = Config::Reclaim::kFull;
-    else {
-      UCACHE_WARN("%s: recompress_reclaim '%s' unknown (superseded|full); ignored", src,
-                  v.c_str());
-      return false;
-    }
-  } else if (k == "trace") {
+  else if (k == "trace") {
     if (v == "io")
       c.trace = "io";
     else if (v == "off" || falsy(v))
@@ -422,7 +412,6 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"recompress_keep_originals", "UCACHE_RECOMPRESS_KEEP_ORIGINALS"},
       {"mixed_maps", "UCACHE_MIXED_MAPS"},
       {"recompress_codecs", "UCACHE_RECOMPRESS_CODECS"},
-      {"recompress_reclaim", "UCACHE_RECOMPRESS_RECLAIM"},
       {"trace", "UCACHE_TRACE"},
       {"trace_sample", "UCACHE_TRACE_SAMPLE"},
       {"keep_cgi", "UCACHE_KEEP_CGI"},
@@ -444,6 +433,10 @@ const std::vector<Config::RetiredKey>& Config::retiredKeys() {
       {"recompress_drain_jobs", "UCACHE_RECOMPRESS_DRAIN_JOBS",
        "sized the background recompression worker, which no longer exists (a file's replica is "
        "created as a job first reads it, and `ucache recompress` builds what is already cached)"},
+      {"recompress_reclaim", "UCACHE_RECOMPRESS_RECLAIM",
+       "chose what the byte cache freed once a file had a replica; now every original that was "
+       "converted is freed (unless `recompress_keep_originals = on`), and a basket or page kept "
+       "as stored always stays, since it is the only copy"},
       {nullptr, "UCACHE_RECOMPRESS_HELPER",
        "named the program the background recompression worker ran as, and that worker no longer "
        "exists (a file's replica is created as a job first reads it, and `ucache recompress` "
@@ -561,8 +554,6 @@ std::string Config::valueOf(const std::string& key) const {
     return onoff(mixedMaps);
   if (key == "recompress_codecs")
     return join(recompressCodecs);
-  if (key == "recompress_reclaim")
-    return recompressReclaim == Reclaim::kFull ? "full" : "superseded";
   if (key == "trace")
     return trace.empty() ? "off" : trace;
   if (key == "trace_sample")

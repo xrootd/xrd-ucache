@@ -329,7 +329,7 @@ Both respect pins (§4) — a pinned entry is never removed by age or size.
 ucache rm root://host//path/to/file.root [more URLs…]
 ```
 
-Drops those entries entirely — page cache **and** any replica overlay. Use this
+Drops those entries entirely — page cache **and** any replica. Use this
 when you know exactly which datasets you are done with. It reports `not cached`
 (and exits non-zero) for a URL that has nothing to remove.
 
@@ -370,21 +370,23 @@ benchmark, for example).
 ucache untranspose root://host//path/to/file.root
 ```
 
-Removes a decompress-once replica overlay while keeping the ordinary page
-cache. Useful if replicas are the bulk of your footprint (check the RECOMP
-column in `ucache ls`).
+Removes a decompress-once replica while keeping the ordinary page cache.
+Useful if replicas are the bulk of your footprint (check the RECOMP column in
+`ucache ls`). Do it while no job is reading the file: a job holding positions
+in the replica's layout would fail.
 
-### The opposite: let replicas replace the byte cache (space-tight disks)
+### Converting what is cached: `ucache recompress`
 
-If you use recompressed replicas and space is tight, the byte-cache copy of a
-replicated file is mostly dead weight: the replica already serves the branches
-your analysis reads, and what's left in the byte cache is prefetch margin and
-odds and ends. Reclaim it:
+A replica replaces the byte-cache copy of what it converted, rather than adding
+to it: a converted basket or page is the copy, and its original leaves the byte
+cache (unless `recompress_keep_originals = on`). A basket or page kept as
+stored stays in the byte cache, since it is the only copy, and so do the file's
+first 128 KiB. That holds for what a first pass converts and for what
+`ucache recompress` converts from the byte cache:
 
 ```sh
-ucache set recompress_reclaim full     # make replicas the primary copy
-ucache recompress                      # builds what's missing + reclaims,
-                                       # file by file, space freed as it goes
+ucache recompress                      # converts what is cached and not yet
+                                       # converted, file by file, space freed as it goes
 ```
 
 Space first: replicas cost between 1.04× and 1.22× of the bytes they replace
@@ -394,7 +396,8 @@ needs and turn a warm loop into an origin-refetch storm. `ucache recompress`
 therefore checks headroom **per file, against live free space**, and defers any
 build that would not fit rather than evicting around it; deferred files are
 left for a later `ucache recompress` and counted in the summary as
-`deferred (no space)`. It also prints its up-front estimate, which is advisory:
+`deferred (no space)`, and a file whose sweep reaches the floor stops there
+(what it converted stays). It also prints its up-front estimate, which is advisory:
 at a flat 1.4× it is an upper bound on every case measured, so treating it as a
 verdict refused sweeps that would have fit. Check where you stand any time with
 the `headroom` line in `ucache status`.
@@ -417,19 +420,10 @@ eviction runs on the byte cap instead, which this check cannot see — a sweep i
 then bounded only by the cap's own eviction. Set `min_free_bytes` as well if you
 want a sweep to defer rather than evict on such a cache.
 
-With `recompress_reclaim = full`, every pass that builds or finds a valid
-replica drops that entry's **entire** byte-cache copy (holes are punched, so
-the space is back immediately — watch the `cached` line in `ucache status`
-shrink). The first sweep also reclaims retroactively: entries recompressed
-earlier give their byte copy back too. Anything the replica does not cover
-(rarely-read header bytes, branches that were only partially cached) is simply
-refetched from the origin on demand and re-cached — reads always stay correct.
-The first pass after a reclaim therefore reads a little from the origin (about
-12 KB per file on NanoAOD), so an origin outage just then would stop it; from
-the second pass on, the cache again needs no origin.
-
-The default (`recompress_reclaim = superseded`) keeps today's behavior:
-only the ranges the replica physically replaced are punched.
+Earlier releases had a setting, `recompress_reclaim`, for what the byte cache
+gave back once a file had a replica. It is retired: what is converted is always
+given back (its `superseded`), and giving back the rest (its `full`) would drop
+originals the replica still serves.
 
 ---
 
@@ -499,7 +493,7 @@ second-level precision.
 | Empty the whole cache | `ucache clear` (`--yes` to skip the prompt) |
 | Set a permanent size cap | `ucache set max_bytes 20g` (or `max_bytes = 20g` in ucache.conf) |
 | Protect / unprotect a dataset | `ucache pin` / `ucache unpin <url>` |
-| Drop one file's replica overlay | `ucache untranspose <url>` |
+| Drop one file's replica | `ucache untranspose <url>` |
 | Turn caching off entirely | `ucache disable` (or `UCACHE_DISABLE=1`) |
 
 ## 8. Is my cache disk fast enough? — `ucache bench`

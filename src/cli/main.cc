@@ -19,6 +19,8 @@
 #ifdef UCACHE_HAVE_TRANSPOSE
 #include "CacheSource.h"
 #include "RNTupleRewrite.h"
+#include "StoreLayout.h"
+#include "StoreSweep.h"
 #include "Transposer.h"
 namespace tp = ucache::transpose;
 #endif
@@ -143,15 +145,14 @@ void usage() {
       "  branches <url>    which branches your analysis read (fully-cached\n"
       "                    branches, bytes, source codec, and the summary share)\n"
       "  recompress [--jobs N] [--yes] [--strict]\n"
-      "                                 transcode the cached files whose source codec is in\n"
-      "                    recompress_codecs (default lzma,zlib), foreground with live\n"
-      "                    progress (default jobs: every core it may use). With\n"
-      "                    `recompress = on` a file gets its replica as a job first\n"
-      "                    reads it; this sweep is for data already cached and for\n"
-      "                    files that first pass declines. With\n"
-      "                    `recompress_reclaim = full` the sweep also drops each\n"
-      "                    replicated entry's v1 byte copy (space back right away;\n"
-      "                    uncovered reads refetch from origin on demand)\n"
+      "                                 convert what is cached of the files whose source\n"
+      "                    codec is in recompress_codecs (default lzma,zlib) into\n"
+      "                    their replicas, foreground with live progress (default\n"
+      "                    jobs: every core it may use). With `recompress = on` a\n"
+      "                    file is converted as a job first reads it; this sweep is\n"
+      "                    for data cached before, and what a first pass left.\n"
+      "                    What it converts leaves the byte cache, unless\n"
+      "                    recompress_keep_originals = on\n"
       "  settings          every setting: effective value + where it comes from\n"
       "                    (default | conf | state | env)\n"
       "  set <key> <value> set a CURRENT value (state file in the cache dir) —\n"
@@ -1264,8 +1265,7 @@ std::string recompressStall(const Config& cfg, IOBackend& io, size_t replicaN, b
   if (headroomToFloor(cfg, io) == 0)
     return "there is no headroom above the eviction floor, so converted records are not kept "
            "(`cold_replica_declined` in `ucache stats`) and a sweep defers the files that would "
-           "not fit — free space, or set recompress_reclaim = full so a sweep replaces byte "
-           "copies instead of adding to them";
+           "not fit — free space (`ucache evict --to-size`, `ucache rm`)";
   if (!deep)
     return "";
 #ifdef UCACHE_HAVE_TRANSPOSE
@@ -2265,9 +2265,7 @@ int cmdStatus(CacheStore& store, IOBackend& io) {
                   return s;
                 }()
                     .c_str(),
-                cfg.recompressReclaim == Config::Reclaim::kFull
-                    ? "; reclaim full — replicas replace the byte copy"
-                    : "");
+                cfg.recompressKeepOriginals ? "; originals kept too" : "");
   else
     std::printf("recompressed: none%s\n",
                 cfg.recompress
@@ -2632,27 +2630,23 @@ int cmdMaterialize(CacheStore* store, const Config& cfg, IOBackend& io, int argc
   return 0;
 }
 
-// transpose --auto: one-shot sweep — natively materialize every cached
-// entry that has data but no replica yet (the learned hot set = every
-// fully-cached branch). Failures are counted and skipped (fail-open); rerun
-// any time (idempotent: entries with a replica are skipped).
 // ---- Recompression: one switch --------------------------------------------
 //
 // `recompress = on` (conf default or `ucache set recompress on`) => the
 // plugin gives a file with no replica one on its first pass, in the reading
 // process (its slot store). An explicit `ucache recompress` is the other way
 // in: a foreground sweep, with live progress, over what is already in the byte
-// cache — data cached before the switch was turned on, and files whose layout
-// that first pass declined. The sweep's only skip rules are static facts: the
-// codec list (recompress_codecs — transcoding zstd->zstd is pointless) and
-// buildability (the hot branches must be fully cached). The retired evidence
+// cache — data cached before the switch was turned on, and what a first pass
+// did not keep — into the same store (transpose/StoreSweep.h). The sweep's only
+// skip rules are static facts: the codec list (recompress_codecs — transcoding
+// zstd->zstd is pointless) and what is cached. The retired evidence
 // gate (min-share threshold, verdicts, --estimate/--force) is PARKED — the user
 // asking IS the worth-it decision. The plugin still writes .cost sidecars and
 // builds still calibrate the decode rate below: evidence keeps accumulating
 // for the gate's future revival, but nothing is gated on it.
 
-// Calibrated LZMA decode rate (MB/s == bytes/µs), measured from real
-// transcodes (Overlay.decodeBytes/decodeNs) and persisted per cache dir.
+// Calibrated conversion rate (MB/s == bytes/µs), measured from real
+// conversions (original bytes per conversion time) and persisted per cache dir.
 // 0 = not calibrated yet. Not consulted for decisions while the gate is
 // parked — maintained for its revival. Only the transcoding sweep calls
 // these, so codec-less builds must not compile them (-Werror=unused-function).
@@ -2676,23 +2670,6 @@ void writeCalibration(const Config& cfg, double mbps) {
 }
 #endif // UCACHE_HAVE_TRANSPOSE
 
-#ifdef UCACHE_HAVE_TRANSPOSE
-// Reclaim policy, applied wherever a pass punches v1 pages under a
-// VALIDATED replica view. `superseded` (default) frees only the ranges the
-// overlay relocated; `full` drops the entry's ENTIRE v1 byte copy (whole-file
-// range; releaseRanges keeps the partial tail page) — the replica becomes the
-// durable form, and anything it does not cover (prefetch margin, partial
-// branches, header/streamers) refetches from origin on demand (fail-open).
-static uint64_t punchPerReclaim(ReplicaStore& rs, FileEntry& entry, const ReplicaMeta& meta,
-                                const Config& cfg) {
-  if (cfg.recompressReclaim == Config::Reclaim::kFull) {
-    std::vector<ReplicaMeta::Range> whole{{0, meta.originSize}};
-    return rs.punchSuperseded(entry, whole);
-  }
-  return rs.punchSuperseded(entry, meta.superseded);
-}
-
-#endif
 
 // The cores this process may run on: those its CPU affinity allows (a batch
 // slot or `taskset` confines a process to a subset of the machine), else all of
@@ -2776,48 +2753,35 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
                   "(%zu entr%s; this sweep covers them)\n",
                   staleKeys, staleKeys == 1 ? "y" : "ies");
   }
-  const bool reclaimFull = cfg.recompressReclaim == Config::Reclaim::kFull;
+  // Every file with something cached, or with a store (its map may be due).
   std::vector<CacheStore::EntryInfo> work;
-  std::vector<CacheStore::EntryInfo> reclaimWork; // replicated, v1 copy still on disk
-  int preSkipped = 0, preAlready = 0;
+  int preSkipped = 0;
   for (const auto& e : store.listEntries()) {
-    if (e.cachedBytes == 0 || e.replicaBytes > 0) {
-      if (e.replicaBytes > 0)
-        ++preAlready; // has a replica: reported apart from "nothing cached"
-      else
-        ++preSkipped;
-      // reclaim full, retroactive half: entries recompressed by EARLIER
-      // passes still hold their v1 byte copy (> the kept tail page).
-      if (reclaimFull && e.replicaBytes > 0 && e.cachedBytes > cfg.pageSize)
-        reclaimWork.push_back(e);
-    } else {
+    if (e.cachedBytes == 0 && e.replicaBytes == 0)
+      ++preSkipped;
+    else
       work.push_back(e);
-    }
   }
   // Capacity pre-flight: state what this sweep is likely to cost against the
   // headroom to the eviction trigger. ADVISORY, and deliberately so, since the
   // per-file claim below is what guards the floor: the estimate exists
   // to tell a human what they are about to spend an hour on, not to decide
   // whether the pass is safe. It cannot decide that honestly — it is a flat
-  // upper bound (1.4x of the candidates' resident bytes), while the measured
+  // upper bound (1.4x of the candidates' cached bytes), while the measured
   // ratio ranges from 1.04x to 1.45x with the source codec AND the container, so
   // refusing on it declines sweeps that fit. One field run refused a sweep
   // estimated at 148.3 GiB against 134.7 GiB of headroom; the replicas needed
   // 110.3 GiB, and the campaign reported a full results table with an empty
   // replica tier. What protects the floor is the per-file claim, which defers
   // exactly the files that do not fit and reports them as `deferred (no space)`.
+  const bool release = !cfg.recompressKeepOriginals;
   if (!work.empty()) {
     uint64_t candBytes = 0;
     for (const auto& e : work)
       candBytes += e.cachedBytes;
-    uint64_t reclaimCredit = 0;
-    if (reclaimFull) {
-      reclaimCredit = candBytes;
-      for (const auto& e : reclaimWork)
-        reclaimCredit += e.cachedBytes;
-    }
     const uint64_t estReplicas = estimatedReplicaBytes(candBytes);
-    const uint64_t growth = estReplicas > reclaimCredit ? estReplicas - reclaimCredit : 0;
+    const uint64_t releaseCredit = release ? candBytes : 0;
+    const uint64_t growth = estReplicas > releaseCredit ? estReplicas - releaseCredit : 0;
     const uint64_t headroom = headroomToFloor(cfg, io);
     uint64_t avail = 0, total = 0;
     io.spaceInfo(cfg.cacheDir, avail, total); // for the arithmetic printed below
@@ -2826,18 +2790,18 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
                    "recompress: this sweep may not fit entirely — each file that does not is "
                    "deferred, never evicted around:\n"
                    "  candidates        : %zu file(s), %s cached\n"
-                   "  replicas, est.    : up to %s (1.4x of the cached bytes — an UPPER bound; "
+                   "  records, est.     : up to %s (1.4x of the cached bytes — an UPPER bound; "
                    "measured 1.04x-1.45x by source codec and container)\n"
-                   "  reclaimed, est.   : %s (%s)\n"
+                   "  let go of, est.   : %s (%s)\n"
                    "  net growth, est.  : up to %s\n"
                    "  headroom to floor : %s (disk free %s, eviction floor %s)\n"
-                   "the pass builds what fits and defers the rest (`deferred (no space)` in the "
+                   "the pass converts what fits and defers the rest (`deferred (no space)` in the "
                    "summary below). To fit more, free space first (`ucache evict --to-size`, "
-                   "`rm`, or `recompress_reclaim = full` to replace byte copies).\n",
+                   "`rm`).\n",
                    work.size(), human(candBytes).c_str(), human(estReplicas).c_str(),
-                   human(reclaimCredit).c_str(),
-                   reclaimFull ? "reclaim full" : "reclaim superseded: counted as 0 — "
-                                                  "punch size is unknowable before the build",
+                   human(releaseCredit).c_str(),
+                   release ? "recompress_keep_originals = off: the originals converted go"
+                           : "recompress_keep_originals = on: every original stays",
                    human(growth).c_str(), human(headroom).c_str(), human(avail).c_str(),
                    human(cfg.minFreeBytes).c_str());
       if (yes)
@@ -2852,31 +2816,23 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   // a sweep can run beside live jobs that are filling the same volume (byte
   // fills, and first passes committing converted records), so "this pass is
   // the only writer" is false exactly when it matters. What the pass must track
-  // itself is only the bytes it has promised but not yet written — once a build
-  // lands, statvfs sees it.
+  // itself is only the bytes it has promised but not yet written — once a
+  // commit lands, statvfs sees it. The sweep of a file also stops on its own
+  // at the floor (`deferred (no space)` as well).
   // Guard applies whenever eviction is enabled at all; ~0ull means it is off.
-  // It is the real protection because an up-front estimate is not a guard:
-  // once approved, nothing re-checked the floor, so a sweep whose estimate was
-  // low (or that ran beside another writer) evicted anyway; and a sweep whose
-  // estimate was HIGH built nothing at all, which is how a field run produced a
-  // complete-looking results table with an empty replica tier. The per-file
-  // claim below is the real protection — live headroom, one file at a time —
-  // and it works the same whoever asked for the pass.
   const bool budgetGuard = headroomToFloor(cfg, io) != ~0ull;
   std::atomic<uint64_t> inFlight{0};
   std::atomic<int> deferred{0};
   std::atomic<uint64_t> deferBytes{0};
   std::atomic<size_t> next{0};
   std::atomic<int> done{0}, skipped{preSkipped}, failed{0}, incomplete{0};
-  std::atomic<int> declined{0}, already{preAlready}, pastTwoGiB{0};
+  std::atomic<int> declined{0}, already{0}, layoutDeclined{0}, newer{0}, maps{0};
   std::set<std::string> declinedCodecs; // observed source codecs, under outMu
-  std::atomic<uint64_t> totOverlay{0}, totPunched{0};
-  std::atomic<uint64_t> decB{0}, decNs{0};
+  std::atomic<uint64_t> totIn{0}, totOut{0}, totStored{0}, totReleased{0}, totNs{0};
   std::atomic<size_t> processed{0};
   std::mutex outMu;
   const bool progress = ::isatty(2);
   auto worker = [&] {
-    ReplicaStore rs(io, cfg, store.stats());
     for (;;) {
       const size_t i = next.fetch_add(1);
       if (i >= work.size())
@@ -2894,36 +2850,15 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
         ++failed;
         continue;
       }
-      {
-        struct ::stat st;
-        if (io.stat(ReplicaStore::tmetaPath(*key, cfg.cacheDir), &st) == 0 ||
-            SlotStore::serving(io, key->objectDir(cfg.cacheDir), key->hashHex)) {
-          ++already; // replica or slot store exists (or appeared while this pass ran)
-          continue;
-        }
-      }
-      auto cm = MetaFile::load(io, key->metaPath(cfg.cacheDir));
-      if (!cm) {
-        std::lock_guard<std::mutex> g(outMu);
-        std::fprintf(stderr,
-                     "recompress: build failed: %s has no readable cache sidecar "
-                     "(evicted, or never cached)\n",
-                     key->key.c_str());
-        ++failed;
-        continue;
-      }
-      // Capacity budget: a replica this pass writes must fit in the headroom
-      // above the eviction floor. The pass may not be the thing that pushes a
-      // volume into eviction, and cannot know up front what it will cost — so it
-      // decides here, per file, against live headroom. Deciding per file rather
-      // than per batch matters under `recompress_reclaim = full`, where each
-      // build hands back the v1 copy and so pays for the next one.
-      // Charge the FULL estimate, with no credit for the byte copy that
-      // `reclaim = full` will hand back: the punch happens only after the
-      // replica is published, so that space is not free while it is written.
-      const uint64_t est = budgetGuard ? estimatedReplicaBytes(cm->cachedBytes()) : 0;
+      // Capacity budget: what this pass writes must fit in the headroom above
+      // the eviction floor. The pass may not be the thing that pushes a volume
+      // into eviction, and cannot know up front what it will cost — so it
+      // decides here, per file, against live headroom. Charged in full, with no
+      // credit for the originals let go of: that happens only once the records
+      // are committed, so that space is not free while they are written.
+      const uint64_t est = budgetGuard ? estimatedReplicaBytes(e.cachedBytes) : 0;
       InFlightClaim claim; // releases on every exit from this iteration
-      if (budgetGuard) {
+      if (budgetGuard && est) {
         uint64_t promised = inFlight.load(std::memory_order_relaxed);
         bool claimed = false;
         for (;;) {
@@ -2943,193 +2878,71 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
           continue;
         }
       }
-      // Parse + hot set once; gate before any transcode work.
-      // Publishing is identical whatever produced the overlay, so both the
-      // basket and the page builder end here rather than each growing a copy.
-      auto publishOverlay = [&](const tp::Overlay& ov) -> bool {
-        ReplicaMeta meta = ov.meta;
-        meta.originMtime = cm->originMtime;
-        meta.cksumKind = cm->cksumKind;
-        meta.originCksum = cm->originCksum;
-        if (meta.originSize != cm->fileSize)
-          return false;
-        if (int prc = rs.publish(*key, meta, ov.tdata.data(), ov.tdata.size()); prc == -EEXIST) {
-          // A slot store appeared while this was built. Racing its creation,
-          // both may have stepped back: then the file has neither yet.
-          if (!SlotStore::serving(io, key->objectDir(cfg.cacheDir), key->hashHex))
-            return false;
-          ++already; // the file is served from the store
-          return true;
-        } else if (prc != 0) {
-          return false;
-        }
-        decB += ov.decodeBytes;
-        decNs += ov.decodeNs;
-        auto view = rs.openView(*key, meta.originSize, meta.originMtime, cm->cksumKind,
-                                cm->originCksum);
-        if (!view)
-          return false;
-        uint64_t punchedB = 0;
-        if (auto entry = store.open(*key, meta.originSize, meta.originMtime, cm->cksumKind,
-                                    cm->originCksum))
-          punchedB = punchPerReclaim(rs, *entry, view->meta(), cfg);
-        totOverlay += ov.tdata.size();
-        totPunched += punchedB;
+      const tp::SweepResult r = tp::sweepFile(store, cfg, io, *key);
+      totIn += r.inBytes;
+      totOut += r.outBytes;
+      totNs += r.convertNs;
+      totStored += r.storedBytes;
+      totReleased += r.releasedBytes;
+      if (r.mapMade)
+        ++maps;
+      using O = tp::SweepResult::Outcome;
+      std::lock_guard<std::mutex> g(outMu);
+      switch (r.outcome) {
+      case O::kConverted:
         ++done;
-        return true;
-      };
-
-      tp::FileMeta fm = tp::parseFile(key->dataPath(cfg.cacheDir), "Events");
-      // An RNTuple container has no TTree to find, so the tree parse failing is
-      // the FIRST hint that this might be one. Only then is the RNTuple parse
-      // attempted, which keeps the cost off every TTree entry and leaves that
-      // path's behaviour exactly as it was.
-      tp::RNTupleMeta rm;
-      bool isRNTuple = false;
-      if (!fm.error.empty()) {
-        rm = tp::parseRNTuple(key->dataPath(cfg.cacheDir), "");
-        isRNTuple = rm.error.empty();
-      }
-      if (!fm.error.empty() && !isRNTuple) {
-        // The parser reads the header, keys list and tree key from the sparse
-        // image DIRECTLY, without the bitmap gate and checksum that basket reads
-        // go through, so on a partially cached entry a hole surfaces here as
-        // "not a ROOT file" or similar. Coverage tells the two apart: on a fully
-        // cached entry the file really is malformed. Either way SAY so — this
-        // path used to increment `failed` and print nothing at all.
-        const bool complete = cm->bitmap.count() == cm->npages();
-        std::lock_guard<std::mutex> g(outMu);
-        if (complete) {
-          std::fprintf(stderr, "recompress: build failed: parse: %s\n", fm.error.c_str());
-          ++failed;
-        } else {
-          std::fprintf(stderr,
-                       "recompress: not built yet, will retry: parse: %s "
-                       "(entry only partially cached)\n",
-                       fm.error.c_str());
-          ++incomplete;
-        }
-        continue;
-      }
-      int fd = ::open(key->dataPath(cfg.cacheDir).c_str(), O_RDONLY | O_CLOEXEC);
-      if (fd < 0) {
-        std::lock_guard<std::mutex> g(outMu);
-        std::fprintf(stderr, "recompress: build failed: cannot open %s (%s)\n",
-                     key->dataPath(cfg.cacheDir).c_str(), std::strerror(errno));
-        ++failed;
-        continue;
-      }
-      CacheSource csrc;
-      csrc.fd = fd;
-      csrc.meta = &*cm;
-      if (isRNTuple) {
-        // Pages are relocated per (cluster, column) range, to ZSTD-1 — the
-        // same target the basket path uses.
-        auto rw = tp::buildRNTupleRewrite(rm, csrc, rm.fileSize, 1, cfg.recompressCodecs);
-        if (rw.rangesRelocated == 0) {
-          // Same three-way distinction the basket path draws, for the same
-          // reason: "nothing happened" hides whether the policy declined the
-          // file, nothing was cached, or there was nothing to do.
-          ::close(fd);
-          if (rw.rangesDeclined > 0) {
-            ++declined;
-            std::lock_guard<std::mutex> g(outMu);
-            if (!rw.declinedCodec.empty())
-              declinedCodecs.insert(rw.declinedCodec);
-          } else {
-            ++skipped;
-          }
-          continue;
-        }
-        tp::Overlay ov = tp::rnTupleOverlay(rm, rw);
-        ::close(fd);
-        if (!ov.error.empty()) {
-          std::lock_guard<std::mutex> g(outMu);
-          std::fprintf(stderr, "recompress: build failed: %s\n", ov.error.c_str());
-          ++failed;
-          continue;
-        }
-        if (!publishOverlay(ov)) ++failed;
-        continue;
-      }
-      auto hot = tp::deriveHotBranches(fm, csrc, cfg.recompressCodecs);
-      if (hot.empty()) {
-        // Nothing to transcode here. Two very different reasons, and conflating
-        // them is what made a 100%-declined dataset read as "already optimal":
-        // the entry may hold no fully-cached content at all, or its content may
-        // be in a codec the policy does not list. In the second case the codec
-        // we DID see is the one fact that tells the user what to change, and it
-        // is already in hand — so record it.
-        std::string seen;
-        for (const auto& b : fm.branches)
-          if (tp::fullyCached(b, csrc)) {
-            seen = tp::branchCodec(fm, b, csrc);
-            if (!seen.empty())
-              break;
-          }
-        if (!seen.empty()) {
+        break;
+      case O::kAlready:
+        ++already;
+        break;
+      case O::kNothing:
+        ++skipped;
+        break;
+      case O::kIncomplete:
+        std::fprintf(stderr, "recompress: not built yet, will retry: %s: %s\n", e.key.c_str(),
+                     r.note.c_str());
+        ++incomplete;
+        break;
+      case O::kDeclined:
+        if (r.codecDecline && !r.declinedCodecs.empty()) {
+          for (const auto& c : tp::splitCodecs(r.declinedCodecs))
+            declinedCodecs.insert(c);
           ++declined;
-          std::lock_guard<std::mutex> g(outMu);
-          declinedCodecs.insert(seen);
+        } else if (r.codecDecline) {
+          ++declined;
         } else {
-          ++skipped;
+          // Not a failure: the file's own layout cannot be served converted
+          // (32-bit keys past 2 GiB, a compressed anchor, ...). It stays in the
+          // byte cache.
+          std::fprintf(stderr, "recompress: declined %s: %s. It stays in the byte cache\n",
+                       e.key.c_str(), r.note.c_str());
+          ++layoutDeclined;
         }
-        ::close(fd);
-        continue;
+        break;
+      case O::kNewer:
+        ++newer;
+        break;
+      case O::kNoSpace:
+        ++deferred;
+        deferBytes += est;
+        break;
+      case O::kFailed:
+        break;
       }
-      tp::Overlay ov = tp::buildOverlay(fm, csrc, hot);
-      ::close(fd);
-      if (!ov.error.empty()) {
-        // "Not available" is not a failure: the entry is incompletely cached,
-        // or bytes were reclaimed under the build. It retries for free on the
-        // next pass, and calling it `build failed` in the log makes a run that
-        // in fact succeeded read like a broken one.
-        // A page that failed its checksum may have been RELEASED under the
-        // build rather than rotted: a first pass converting this file frees the
-        // originals it has converted (bits cleared and the sidecar stored before
-        // the punch). The sidecar as it is now tells the two apart; a file that
-        // now has a slot store is served from it and needs no replica.
-        bool released = false, gotStore = false;
-        if (ov.transient && csrc.sawRot) {
-          gotStore = SlotStore::serving(io, key->objectDir(cfg.cacheDir), key->hashHex);
-          auto now = MetaFile::load(io, key->metaPath(cfg.cacheDir));
-          released = !now || csrc.rotPage >= now->npages() || !now->bitmap.get(csrc.rotPage);
-        }
-        std::lock_guard<std::mutex> g(outMu);
-        if (gotStore) {
-          ++already; // converted by a job's first pass while this was built
-        } else if (ov.narrowKeyEnd) {
-          // Not a failure: the file's 32-bit keys cannot address what this
-          // replica would append past its end. How long the replica is follows
-          // from what is cached, so the numbers are the explanation.
+      // Rot, or the file's own pages: a failure with a remedy, whatever else
+      // the sweep of the file did.
+      if (r.outcome == O::kFailed || r.unreadable || r.undecodable) {
+        if (r.unreadable)
           std::fprintf(stderr,
-                       "recompress: declined %s: its keys are 32-bit and cannot address past "
-                       "2 GiB; the file ends at %s and its replica would reach %s. It stays in "
-                       "the byte cache\n",
-                       e.key.c_str(), human(static_cast<uint64_t>(fm.fend)).c_str(),
-                       human(ov.narrowKeyEnd).c_str());
-          ++pastTwoGiB;
-        } else if (ov.transient && csrc.sawRot && !released) {
-          // Present-but-corrupt bytes: waiting cannot fix this one, so it is a
-          // failure with a remedy rather than a retry.
-          std::fprintf(stderr,
-                       "recompress: build failed: %s — cached bytes failed their checksum "
-                       "(run `ucache verify %s`)\n",
-                       ov.error.c_str(), e.key.c_str());
-          ++failed;
-        } else if (ov.transient) {
-          std::fprintf(stderr, "recompress: not built yet, will retry: %s: %s\n", e.key.c_str(),
-                       ov.error.c_str());
-          ++incomplete;
-        } else {
+                       "recompress: build failed: %s — cached bytes failed their checksum; %llu "
+                       "original%s not converted (run `ucache verify %s`)\n",
+                       e.key.c_str(), static_cast<unsigned long long>(r.unreadable),
+                       r.unreadable == 1 ? "" : "s", e.key.c_str());
+        else
           std::fprintf(stderr, "recompress: build failed: %s: %s\n", e.key.c_str(),
-                       ov.error.c_str());
-          ++failed;
-        }
-        continue;
-      }
-      if (!publishOverlay(ov))
+                       r.note.c_str());
         ++failed;
+      }
     }
   };
   // A throw escaping a std::thread terminates the process, and this worker
@@ -3161,39 +2974,9 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
     t.join();
   if (progress)
     std::fputs("\r\033[K", stderr);
-  // Retroactive reclaim (the scan above filled reclaimWork only under
-  // `recompress_reclaim = full`): punch the v1 byte copy of entries
-  // whose replica was built by an earlier pass. Only a replica that VALIDATES
-  // against the entry's origin metadata licenses dropping the v1 bytes.
-  uint64_t reclaimedB = 0;
-  int reclaimedN = 0;
-  if (!reclaimWork.empty()) {
-    ReplicaStore rs(io, cfg, store.stats());
-    for (size_t i = 0; i < reclaimWork.size(); ++i) {
-      if (progress)
-        std::fprintf(stderr, "\rreclaim: %zu/%zu — %s freed", i + 1, reclaimWork.size(),
-                     human(reclaimedB).c_str());
-      auto key = UrlKey::parse(reclaimWork[i].key, cfg.keepCgi);
-      if (!key)
-        continue;
-      auto cm = MetaFile::load(io, key->metaPath(cfg.cacheDir));
-      if (!cm)
-        continue;
-      if (auto view = rs.openView(*key, cm->fileSize, cm->originMtime, cm->cksumKind,
-                                  cm->originCksum))
-        if (auto entry = store.open(*key, cm->fileSize, cm->originMtime, cm->cksumKind,
-                                    cm->originCksum))
-          if (uint64_t b = punchPerReclaim(rs, *entry, view->meta(), cfg)) {
-            reclaimedB += b;
-            ++reclaimedN;
-          }
-    }
-    if (progress)
-      std::fputs("\r\033[K", stderr);
-  }
-  if (decNs.load() > 0) // calibrate from what we actually decoded
-    writeCalibration(cfg, static_cast<double>(decB.load()) * 1000.0 /
-                              static_cast<double>(decNs.load()));
+  if (totNs.load() > 0) // calibrate from what we actually converted
+    writeCalibration(cfg, static_cast<double>(totIn.load()) * 1000.0 /
+                              static_cast<double>(totNs.load()));
   std::string codecs;
   for (const auto& codec : cfg.recompressCodecs)
     codecs += (codecs.empty() ? "" : ",") + codec;
@@ -3209,7 +2992,8 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   if (declined.load())
     std::snprintf(declinedSeg, sizeof declinedSeg,
                   ", %d declined (source codec %s, not in recompress_codecs = %s)",
-                  declined.load(), seenCodecs.c_str(), codecs.c_str());
+                  declined.load(), seenCodecs.empty() ? "not converted" : seenCodecs.c_str(),
+                  codecs.c_str());
   char alreadySeg[64] = {0};
   if (already.load())
     std::snprintf(alreadySeg, sizeof alreadySeg, ", %d already recompressed", already.load());
@@ -3220,16 +3004,19 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   char deferredSeg[96] = {0};
   if (deferred.load())
     std::snprintf(deferredSeg, sizeof deferredSeg, ", %d deferred (no space)", deferred.load());
-  char pastSeg[96] = {0};
-  if (pastTwoGiB.load())
-    std::snprintf(pastSeg, sizeof pastSeg, ", %d declined (replica past 2 GiB, 32-bit keys)",
-                  pastTwoGiB.load());
+  char layoutSeg[96] = {0};
+  if (layoutDeclined.load())
+    std::snprintf(layoutSeg, sizeof layoutSeg, ", %d declined (layout, said above)",
+                  layoutDeclined.load());
+  char newerSeg[96] = {0};
+  if (newer.load())
+    std::snprintf(newerSeg, sizeof newerSeg, ", %d left to a newer uCache", newer.load());
   char summary[1024];
   std::snprintf(summary, sizeof summary,
-                "recompress: %d recompressed%s%s%s, %d nothing to do (nothing cached)%s%s, "
+                "recompress: %d recompressed%s%s%s, %d nothing to do (nothing cached)%s%s%s, "
                 "%d failed",
-                done.load(), declinedSeg, pastSeg, alreadySeg, skipped.load(), incompleteSeg,
-                deferredSeg, failed.load());
+                done.load(), declinedSeg, layoutSeg, alreadySeg, skipped.load(), incompleteSeg,
+                deferredSeg, newerSeg, failed.load());
   std::printf("%s\n", summary);
   // Declined everything and built nothing: that is a configuration mismatch,
   // not an optimal cache, and the user cannot act on it without being told
@@ -3239,20 +3026,19 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
                 "recompress_codecs = %s.\n"
                 "  to transcode it:  ucache set recompress_codecs %s\n",
                 seenCodecs.c_str(), codecs.c_str(), seenCodecs.c_str());
-  if (done.load())
-    std::printf("  overlays on disk: %s; punched %s of %s\n",
-                human(totOverlay.load()).c_str(), human(totPunched.load()).c_str(),
-                reclaimFull ? "v1 bytes (reclaim full)" : "superseded v1 pages");
-  if (reclaimedN)
-    std::printf("  reclaimed %s from %d already-recompressed entr%s "
-                "(recompress_reclaim = full)\n",
-                human(reclaimedB).c_str(), reclaimedN, reclaimedN == 1 ? "y" : "ies");
+  if (done.load() || maps.load())
+    std::printf("  converted %s of originals into %s of records; %s written to the stores, "
+                "%d map%s made; %s let go of by the byte cache%s\n",
+                human(totIn.load()).c_str(), human(totOut.load()).c_str(),
+                human(totStored.load()).c_str(), maps.load(), maps.load() == 1 ? "" : "s",
+                human(totReleased.load()).c_str(),
+                release ? "" : " (recompress_keep_originals = on)");
   // Nothing carries a deferred file forward: the next sweep finds it by
   // scanning the cache, so the one thing to say is when to run it.
   if (deferred.load())
     std::printf("  %d file%s deferred for want of space (would add up to %s; %s of headroom "
-                "above the eviction floor now) — free space (`ucache evict --to-size`, `ucache rm`) "
-                "or set recompress_reclaim = full, then run `ucache recompress` again\n",
+                "above the eviction floor now) — free space (`ucache evict --to-size`, `ucache rm`), "
+                "then run `ucache recompress` again\n",
                 deferred.load(), deferred.load() == 1 ? "" : "s",
                 human(deferBytes.load()).c_str(), human(headroomToFloor(cfg, io)).c_str());
   closeFds();
@@ -4445,13 +4231,11 @@ int cmdDoctor(const Config& cfg) {
   // memory cannot say it, and ROOT does not shrink its buffers to fit.
   if (cfg.recompress)
     std::printf("  [NOTE] recompress = on: jobs hold more memory while they read (warm passes\n"
-                "         needed about 1.8x on TTree and 2.3x on RNTuple what a replica made by\n"
-                "         `ucache recompress` needs). If they run short, set recompress off; files\n"
-                "         already recompressed this way keep their layout until removed\n"
-                "         while no job is reading them (`ucache untranspose <url>`, or\n"
-                "         `ucache clear`; a job still reading one would fail) and read again;\n"
-                "         then `ucache recompress` builds replicas that need about what a job\n"
-                "         needs without the cache\n");
+                "         needed about 1.8x on TTree and 2.3x on RNTuple what the compact\n"
+                "         replicas of earlier releases needed, about what a job needs without\n"
+                "         the cache). If they run short, set recompress off and convert what is\n"
+                "         cached with `ucache recompress` between passes: it gives each file a\n"
+                "         map, which the next pass reads at the file's real size\n");
   if (!cfg.cacheDir.empty() && cfg.recompress) {
     RealIO dio;
     const size_t replicas = anyReplicaExists(cfg.cacheDir) ? 1 : 0;

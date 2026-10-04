@@ -222,14 +222,7 @@ bool unnamedSettingCodec(const FileMeta& fm, const std::vector<uint8_t>& header,
   return true;
 }
 
-std::string declineNote(const FillLayout& L) {
-  if (L.error.empty())
-    return "";
-  if (L.codecDecline)
-    return L.error;
-  return L.error + "; `ucache recompress` can build its replica after the run, from what the run "
-                   "caches";
-}
+std::string declineNote(const FillLayout& L) { return L.error; }
 
 FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vector<uint8_t>& header,
                          const std::vector<uint8_t>& treeKeyHeader,

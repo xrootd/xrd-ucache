@@ -171,8 +171,9 @@ unpacking. Before you turn it on:
 
 > **Memory.** With it on, jobs hold more memory while they read. On the
 > analyses measured, warm passes needed about 1.8x (TTree) and 2.3x (RNTuple)
-> the memory the same job needs from a replica made by `ucache recompress`. If
-> your jobs run short of memory, turn it off. Files already converted keep
+> the memory the same job needs with no cache. If your jobs run short of
+> memory, turn it off and convert what is cached with `ucache recompress`
+> between passes. Files already converted keep
 > their layout until you remove them, while no job is reading them
 > (`ucache untranspose <url>`, or `ucache clear`; a job still reading one
 > would fail).

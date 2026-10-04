@@ -61,9 +61,8 @@ struct FillSlot {
 struct FillLayout {
   std::string error;        // non-empty => DECLINED: serve the file as it is
   // With `error`: declined for the codec the file is stored in -- one
-  // `recompress_codecs` does not name, or one not converted at all. A sweep
-  // declines such a file too; any other decline is the slot layout's own, and
-  // `ucache recompress` can still build the file's replica from the byte cache.
+  // `recompress_codecs` does not name, or one not converted at all. Any other
+  // decline is the layout's own (the file is served from the byte cache).
   bool codecDecline = false;
   // A codec decline for codecs `recompress_codecs` does not name: those the
   // file's baskets (pages) are stored in, comma-separated.
@@ -130,8 +129,8 @@ FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vecto
                          const std::string& unnamedCodec = "");
 
 // What to tell a user about a first pass the file's own content declined
-// (`L.error` set): the reason, and -- when it is not the codec -- that
-// `ucache recompress` can build the replica after the run from what it cached.
+// (`L.error` set): the reason. `ucache recompress` computes the same layout,
+// and declines the same files.
 std::string declineNote(const FillLayout& L);
 
 // A basket prepared for its slot, from its ORIGINAL record.

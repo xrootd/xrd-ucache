@@ -189,10 +189,10 @@ struct Config {
   // calibration evidence is still collected, but no longer gates builds.
   // Serving already-built replicas is governed by `transpose`, not by these.
   bool recompress = false;                       // UCACHE_RECOMPRESS
-  // With recompress = on, a file's replica is created on its first pass and the
-  // original bytes of what was converted are NOT kept in the byte cache (the
-  // cache would otherwise hold the same data twice). `on` keeps them too, for
-  // comparing the two tiers on one cache.
+  // The original bytes of what was converted -- on a first pass with
+  // recompress = on, and by `ucache recompress` -- are NOT kept in the byte
+  // cache (the cache would otherwise hold the same data twice). `on` keeps them
+  // too, for comparing the two tiers on one cache.
   bool recompressKeepOriginals = false;          // UCACHE_RECOMPRESS_KEEP_ORIGINALS
   // `mixed_maps`: a TTree file with a slot store is shown, at each open, the
   // newest MIXED map -- the baskets converted by then stated at their real
@@ -204,14 +204,6 @@ struct Config {
   // workers).
   bool mixedMaps = true;                         // UCACHE_MIXED_MAPS
   std::vector<std::string> recompressCodecs{"lzma", "zlib"}; // UCACHE_RECOMPRESS_CODECS
-  // `recompress_reclaim`: what to punch from the v1 byte cache once
-  // a valid replica exists. kSuperseded (default) frees only the ranges the
-  // overlay relocated; kFull drops the entry's ENTIRE byte copy — the replica
-  // becomes the durable form, and anything it does not cover (prefetch
-  // margin, partial branches, header/streamers) refetches from origin on
-  // demand (fail-open). For space-tight replica-primary setups.
-  enum class Reclaim { kSuperseded, kFull };
-  Reclaim recompressReclaim = Reclaim::kSuperseded; // UCACHE_RECOMPRESS_RECLAIM
   // `trace = io` writes a sampled per-operation JSON trace
   // next to the process's stats file; `trace_sample = N` records every Nth
   // read-class op (1 = everything). Off ("") by default — zero cost.

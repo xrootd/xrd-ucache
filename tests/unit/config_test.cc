@@ -45,7 +45,6 @@ TEST(Config, Defaults) {
   EXPECT_EQ(c.revalidateSeconds, 604800); // 7-day freshness window
   EXPECT_FALSE(c.recompress); // recompression is a single opt-in switch
   EXPECT_EQ(c.recompressCodecs, (std::vector<std::string>{"lzma", "zlib"}));
-  EXPECT_EQ(c.recompressReclaim, Config::Reclaim::kSuperseded); // default reclaim mode
   EXPECT_TRUE(c.transpose);
   EXPECT_TRUE(c.announce); // servers are told uCache is in the path, by default
   EXPECT_TRUE(c.copyDetect); // a copy is the origin's bytes, by default
@@ -74,7 +73,6 @@ TEST(Config, ParsesEverything) {
   ::setenv("UCACHE_ANNOUNCE", "off", 1);
   ::setenv("UCACHE_COPY_DETECT", "off", 1);
   ::setenv("UCACHE_RECOMPRESS", "on", 1);
-  ::setenv("UCACHE_RECOMPRESS_RECLAIM", "full", 1);
   ::setenv("UCACHE_RECOMPRESS_KEEP_ORIGINALS", "on", 1);
   ::setenv("UCACHE_KEEP_CGI", "a,b", 1);
   ::setenv("UCACHE_ALLOW", "*.cern.ch", 1);
@@ -99,8 +97,6 @@ TEST(Config, ParsesEverything) {
   EXPECT_EQ(c.valueOf("copy_detect"), "off");
   EXPECT_EQ(c.sources.at("copy_detect"), "env");
   EXPECT_TRUE(c.recompress);
-  EXPECT_EQ(c.recompressReclaim, Config::Reclaim::kFull);
-  EXPECT_EQ(c.valueOf("recompress_reclaim"), "full");
   EXPECT_TRUE(c.recompressKeepOriginals);
   EXPECT_EQ(c.valueOf("recompress_keep_originals"), "on");
   EXPECT_EQ(c.keepCgi, (std::vector<std::string>{"a", "b"}));
@@ -194,7 +190,7 @@ TEST(Config, PluginConfMapLayer) {
       {"recompress", "on"},
       {"recompress_codecs", "lzma,zlib"},
       {"recompress_min_share", "25"}, // retired key: warned + ignored
-      {"recompress_reclaim", "everything"}, // bad value: warned + ignored
+      {"recompress_reclaim", "full"},       // retired key: named + ignored
   };
   Config c = Config::fromEnv(&conf);
   EXPECT_EQ(c.cacheDir, "/conf/cache");
@@ -205,8 +201,10 @@ TEST(Config, PluginConfMapLayer) {
   EXPECT_EQ(c.recompressCodecs, (std::vector<std::string>{"lzma", "zlib"}));
   EXPECT_EQ(c.sources.at("dir"), "conf");
   EXPECT_EQ(c.sources.count("recompress_min_share"), 0u); // unknown keys get no source
-  EXPECT_EQ(c.recompressReclaim, Config::Reclaim::kSuperseded); // bad value kept default
   EXPECT_EQ(c.sources.count("recompress_reclaim"), 0u);
+  EXPECT_NE(Config::retiredReason("recompress_reclaim"), nullptr);
+  EXPECT_NE(Config::retiredReason("UCACHE_RECOMPRESS_RECLAIM"), nullptr);
+  EXPECT_FALSE(Config::stateSettable("recompress_reclaim"));
 
   // env overrides the plugin conf
   ::setenv("UCACHE_DIR", "/env/cache", 1);

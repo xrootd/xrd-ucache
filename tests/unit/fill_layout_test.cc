@@ -804,13 +804,16 @@ TEST(FillLayoutUnnamed, AnUnlistedCodecIsStillDeclined) {
   EXPECT_NE(L.error.find("recompress_codecs (lzma)"), std::string::npos) << L.error;
   EXPECT_TRUE(L.codecDecline);
   EXPECT_TRUE(L.slots.empty());
-  // A codec decline does not point at `ucache recompress`: a sweep declines it too.
+  EXPECT_EQ(L.declinedCodecs, "zlib"); // the codec the setting does not name
+  // The note is the reason, and only that: `ucache recompress` computes the
+  // same layout and declines the same files, for the codec or not.
   EXPECT_EQ(declineNote(L), L.error);
-  // A layout decline does: the sweep builds that file's replica from the byte cache.
   FillLayout past = layoutForFill(u.fm, u.file.size() + 1, u.header, u.treeKeyHeader, u.keysList,
                                   {"lzma", "zlib"}, 300, "zlib");
   EXPECT_FALSE(past.codecDecline);
-  EXPECT_NE(declineNote(past).find("`ucache recompress`"), std::string::npos) << declineNote(past);
+  EXPECT_TRUE(past.declinedCodecs.empty());
+  EXPECT_EQ(declineNote(past), past.error);
+  EXPECT_EQ(declineNote(past).find("`ucache recompress`"), std::string::npos);
   EXPECT_EQ(declineNote(FillLayout()), ""); // nothing declined, nothing to say
 }
 

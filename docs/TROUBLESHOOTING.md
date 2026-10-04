@@ -246,20 +246,19 @@ file: ROOT sizes its read buffers from the layout the file is shown in and does
 not shrink them to fit, and uCache keeps a table for each such file while it is
 open (about 20 MB for a large NanoAOD file). On the analyses measured, warm
 passes needed about 1.8x (TTree) and 2.3x (RNTuple) the memory of the same job
-reading a replica made by `ucache recompress`, which needs about what the job
-needs without the cache. A batch system or the kernel then stops the job
+reading the compact replicas earlier releases made, which needed about what
+the job needs without the cache. A batch system or the kernel then stops the job
 without a word from uCache (`ucache doctor` says so while recompression is
 on).
 
 - Turn recompression off for these jobs (`UCACHE_RECOMPRESS=off`, or
-  `ucache set recompress off`) and build replicas with `ucache recompress`
-  instead. The files the killed jobs already read keep their recompressed
-  layout whatever the setting, and `ucache recompress` counts them as done:
-  remove those first, while no job is reading them (a job still reading one
-  would fail) — `ucache untranspose <url>` for one file, `ucache clear` for
-  all — read them again (what was converted is fetched again), then run
-  `ucache recompress`. Until then `UCACHE_TRANSPOSE=0` serves every file as
-  stored, fetching again what was converted.
+  `ucache set recompress off`) and convert what is cached with
+  `ucache recompress` between passes instead: no pass then converts as it
+  reads, and the sweep gives each file a map, so the next pass reads the
+  converted records at their real size. The files the killed jobs already read
+  keep their replica whatever the setting; `ucache recompress` converts what
+  they left and makes their next map. `UCACHE_TRANSPOSE=0` serves every file as
+  stored meanwhile, fetching again what was converted.
 
 ## `recompress = on` but no replicas ever appear
 
@@ -282,9 +281,9 @@ reasons:
 - **its baskets are stored uncompressed**, or **compressed in a codec that is
   not converted** (the old ROOT algorithm): there is nothing to gain, and a
   sweep declines such a file as well.
-- anything else is a file structure the first pass's layout cannot hold; the
-  warning then adds that `ucache recompress` can build the file's replica after
-  the run, from what the run cached.
+- anything else is a file structure the layout cannot hold, which the warning
+  names: the file is served from the byte cache, and `ucache recompress`
+  declines it as well.
 
 A file whose compression setting names no codec — setting 1, "the global
 default", which files from older ROOT versions and `hadd -f1` carry — is
@@ -329,14 +328,13 @@ likelihood:
    still do not fit above the floor after an eviction pass are not kept
    (`ucache stats` counts them as `cold_replica_declined`), and a sweep defers
    each file that would not fit rather than pushing your cache into eviction,
-   saying so in its summary. Free some space, or set
-   `recompress_reclaim = full` so replicas replace byte copies instead of adding
-   to them. See "The cache is filling my disk".
+   saying so in its summary. Free some space. See "The cache is filling my
+   disk".
 
-4. **Nothing qualifies yet.** Only branches your jobs actually read, fully
-   cached, are eligible. A first pass that was interrupted, or a file whose
-   needed baskets were never completely fetched, is reported as `incomplete` and
-   retried on a later pass.
+4. **Nothing qualifies yet.** Only what your jobs actually read is cached, and
+   so converted by a sweep. A file whose metadata is not cached yet (a job
+   opened it and read little else) is reported as `incomplete` and retried on a
+   later pass.
 
 If replicas exist but you see no speedup, coverage is probably partial — see
 the recompression section of the User Guide: unreplicated files pace the loop,
@@ -353,24 +351,23 @@ the first two (it scans the whole cache, so it covers every file they listed);
 Only `failed` means something is wrong. The others are ordinary states with
 their own words, because conflating them made healthy runs look broken:
 
-- **`incomplete (bytes not cached)`** — the builder wanted basket bytes the cache
-  could not vouch for: not fetched yet, or reclaimed while the build was running.
-  It retries for free on the next pass and needs no action. The message reads
-  `not built yet, will retry`.
+- **`incomplete (bytes not cached)`** — the file's metadata, which its layout is
+  computed from, is not in the byte cache yet. It retries for free on the next
+  pass and needs no action. The message reads `not built yet, will retry`.
 - **`deferred (no space)`** — no headroom above the eviction floor; the file is
   left for a later `ucache recompress` once there is room. See cause 3 above.
 - **`declined (source codec …)`** — working as configured; see cause 1 above.
-- **`declined (replica past 2 GiB, 32-bit keys)`** — the file is below 2 GiB and
-  its keys are 32-bit, and the replica this sweep would append after its end
-  would reach past 2 GiB, where those keys cannot point. The line names the file
-  and both offsets. It stays in the byte cache and reads correctly; how long the
-  replica is follows from how much of the file is cached, so an analysis reading
-  fewer branches may still get one.
-- **`failed`** — a real build failure: a malformed file, a cache entry whose
-  bytes no longer match their checksum (the message then points at
-  `ucache verify`), or an entry that has gone missing. The message names the
-  branch when the failure is specific to one. A failed *build* cannot produce wrong data: a replica
-  is only ever served after it has been verified. Confirm serving is clean with
+- **`declined (layout, said above)`** — the file's own structure cannot be
+  converted (32-bit keys that cannot point past 2 GiB, an RNTuple anchor stored
+  compressed, and the like); a line above names the file and the reason. It
+  stays in the byte cache and reads correctly, and a first pass declines it the
+  same way.
+- **`failed`** — a real failure: cached bytes that no longer match their
+  checksum (the message points at `ucache verify`; the rest of the file is
+  converted, those bytes are not), a page that does not decode, or an entry that
+  has gone missing. A failure cannot produce wrong data: what does not verify is
+  never converted, and every record is checked against its checksum when it is
+  served. Confirm serving is clean with
   `ucache stats` — `crc_failures 0`, `failopen_events 0`, `validations_failed 0`.
   If failures persist for the same file and coverage never completes, report it
   with the branch name from the sweep's output.
@@ -420,9 +417,9 @@ the replica. The next recompression rebuilds it in the older layout, and the
 two versions can then take turns undoing each other's work.
 
 Nothing is lost and no wrong bytes are served — reads fall back to the byte
-cache or the origin — but the transcoding is paid for repeatedly, and with
-`recompress_reclaim = full` the byte copy was already released, so those reads
-go back to the origin.
+cache or the origin — but the transcoding is paid for repeatedly, and what the
+replica replaced was already released from the byte cache, so those reads go
+back to the origin.
 
 Point one version at a cache directory at a time. A cache directory is version
 coupled state, not a shared scratch area; separate directories cost only disk.
