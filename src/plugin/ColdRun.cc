@@ -2589,6 +2589,15 @@ Executor& commitPool() {
   return *pool;
 }
 
+// Maps are made on a pool of their own: making one (an RNTuple file's page
+// list and footer are parsed and rebuilt) must never hold up commits, or the
+// records waiting pass their cap and conversions are served without being
+// kept -- read from the origin again by the next pass.
+Executor& mapPool() {
+  static Executor* pool = new Executor(2);
+  return *pool;
+}
+
 // Records converted in this process and not yet committed, all files. Past
 // the cap the thread that converts commits itself -- back-pressure instead of
 // memory growth.
@@ -3392,9 +3401,9 @@ void ColdFill::queueMap(uint64_t delayMs) {
       g_mapCv.notify_all();
   };
   if (delayMs)
-    commitPool().postAfter(delayMs, std::move(task));
+    mapPool().postAfter(delayMs, std::move(task));
   else
-    commitPool().post(std::move(task));
+    mapPool().post(std::move(task));
 }
 
 bool ColdFill::compactValidLocked(size_t k, const InUseRecord& inUse, uint64_t now) const {
