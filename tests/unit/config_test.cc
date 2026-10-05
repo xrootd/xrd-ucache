@@ -13,10 +13,13 @@ using namespace ucache;
 
 namespace {
 struct EnvGuard {
-  // Tests are hermetic by construction: the legacy config.toml layer
-  // is retired, and the state layer only loads from an explicitly-set cache
-  // dir. Clear every UCACHE_* twin on teardown.
-  ~EnvGuard() {
+  // Tests are hermetic: the legacy config.toml layer is retired, and the state
+  // layer only loads from an explicitly-set cache dir. Every UCACHE_* twin is
+  // cleared on entry -- a caller's own UCACHE_DIR would otherwise reach the
+  // test -- and again on teardown.
+  EnvGuard() { clear(); }
+  ~EnvGuard() { clear(); }
+  static void clear() {
     for (const auto& k : Config::knownKeys())
       ::unsetenv(k.envName);
     for (const auto& r : Config::retiredKeys())
