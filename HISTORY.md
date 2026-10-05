@@ -11,6 +11,16 @@ Recompression stays off unless you turn it on. Nothing is published unless you
 run `ucache publish`. Any XRootD 5.6 or newer 5.x client works; 6.x from
 v0.21.0.
 
+## v1.4.0 — 2026-10-05
+- Recompressing files as they are first read (`recompress = on`) now makes
+  later reads as fast as recompressing them with `ucache recompress`, with
+  less memory than in 1.3; the first read takes close to what it takes with
+  the cache off, for RNTuple as for TTree.
+- Replicas built by `ucache recompress` in earlier releases are not used;
+  running it again rebuilds them from what is cached.
+- `in_use_seconds` replaces `evict_protect_seconds` and `map_expiry_seconds`;
+  `recompress_reclaim` is gone.
+
 ### v1.3.5 — 2026-09-30
 - On macOS, cached data takes no more disk space than its size. A cache
   made by an earlier version is only fixed once you clear it (`ucache clear`);
