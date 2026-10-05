@@ -88,10 +88,8 @@ TEST(UrlKey, HostGlobs) {
   EXPECT_TRUE(hostMatchesAny({"a", "b", "eos*"}, "eospublic.cern.ch"));
 }
 
-// The plugin's own cache-fill opens strip client routing directives:
-// XrdAdaptor's tried=/triedrc= exclusion list forced the
-// redirector onto unreachable data servers. Everything else must survive
-// byte-for-byte (auth tokens in particular).
+// Removing named parameters leaves everything else byte for byte (auth tokens
+// in particular).
 TEST(UrlKey, StripCgiParams) {
   const std::vector<std::string> kRouting = {"tried", "triedrc"};
   EXPECT_EQ(stripCgiParams("root://h//f.root", kRouting), "root://h//f.root");
@@ -104,4 +102,51 @@ TEST(UrlKey, StripCgiParams) {
   // 'triedx' is NOT 'tried': exact key match only.
   EXPECT_EQ(stripCgiParams("root://h//f.root?triedx=1", kRouting),
             "root://h//f.root?triedx=1");
+}
+
+// The cache's own origin opens keep the servers a reader asked to avoid
+// (tried=) and drop only a reselection request (a triedrc= whose last reason
+// is resel). Repeated tried= lists are merged into one, since only one reaches
+// the server.
+TEST(UrlKey, OwnOpenUrl) {
+  const std::string base = "root://h//f.root";
+  const auto own = [&base](const std::string& query) { return ownOpenUrl(base + "?" + query); };
+  EXPECT_EQ(ownOpenUrl(base), base);
+  // A user's list, with no reason: kept.
+  EXPECT_EQ(own("tried=a,b"), base + "?tried=a,b");
+  // A reselection request: removed, whatever came before its last reason.
+  EXPECT_EQ(own("tried=a,b&triedrc=resel"), base);
+  EXPECT_EQ(own("tried=a,b&triedrc=resel,resel"), base);
+  EXPECT_EQ(own("tried=a&triedrc=enoent,resel"), base);
+  // The last reason is the one a redirector reads: not a reselection.
+  EXPECT_EQ(own("tried=a&triedrc=resel,ioerr"), base + "?tried=a&triedrc=resel,ioerr");
+  // A user's list ahead of a reselection request survives it.
+  EXPECT_EQ(own("tried=u&tried=a,b&triedrc=resel"), base + "?tried=u");
+  // Repeated lists are merged, in order.
+  EXPECT_EQ(own("tried=u&tried=a,b"), base + "?tried=u,a,b");
+  // A list the client grew after a failure: kept with its reason.
+  EXPECT_EQ(own("tried=u,f&triedrc=ioerr"), base + "?tried=u,f&triedrc=ioerr");
+  // Empty items (a source with no known server) go.
+  EXPECT_EQ(own("tried=,a"), base + "?tried=a");
+  // Every other parameter passes byte for byte, in order.
+  EXPECT_EQ(own("authz=TOK&tried=a&xrd.wantprot=unix"),
+            base + "?authz=TOK&tried=a&xrd.wantprot=unix");
+  // 'triedx' is not 'tried': exact key match only.
+  EXPECT_EQ(own("triedx=1"), base + "?triedx=1");
+  // Host names compare without case; the first spelling is kept.
+  EXPECT_EQ(own("tried=A,a"), base + "?tried=A");
+  // The merged list sits where the first tried= was, its reason right after it.
+  EXPECT_EQ(own("tried=u&authz=TOK&tried=f&triedrc=ioerr&xrd.k=v"),
+            base + "?tried=u,f&triedrc=ioerr&authz=TOK&xrd.k=v");
+  // A user's list, then a client's reselection request behind it.
+  EXPECT_EQ(own("authz=TOK&tried=bad.example.org&tried=s1,s2&triedrc=resel"),
+            base + "?authz=TOK&tried=bad.example.org");
+  // Nothing left to avoid: the query goes with it.
+  EXPECT_EQ(own("tried=,"), base);
+  // A reselection request with no list: removed.
+  EXPECT_EQ(own("triedrc=resel"), base);
+  // Any other reason with no host to follow stays, as the reader wrote it.
+  EXPECT_EQ(own("triedrc=ioerr"), base + "?triedrc=ioerr");
+  EXPECT_EQ(own("tried=,&triedrc=ioerr"), base + "?triedrc=ioerr");
+  EXPECT_EQ(own("authz=TOK&triedrc=enoent&xrd.k=v"), base + "?authz=TOK&triedrc=enoent&xrd.k=v");
 }

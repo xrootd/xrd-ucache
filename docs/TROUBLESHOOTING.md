@@ -227,6 +227,28 @@ To fail sooner, shorten the client's reconnect policy for the job, for example
 about 15 seconds. Files already in the cache and inside the freshness window
 need no server at all, so a warm pass over them is not affected.
 
+## One server refuses or fails and stops the job
+
+Reading through a federation (a redirector that picks one of several servers
+holding the file), one bad server can be enough to stop a job: it refuses
+opens (for example `permission denied`), or serves a damaged copy. Through
+uCache this often shows as a **read** error rather than an open error, because
+the file was opened from the cache and uCache opened the origin only when it
+needed bytes it did not hold; the redirector then picked the bad server for
+that open.
+
+Find the server's full host name in the error, or in the client's log
+(`XRD_LOGLEVEL=Debug`, the host the open was redirected to), and add it to the
+file's URL as `?tried=<full host name>` (comma separated for several; `&tried=`
+if the URL already has a query without a `tried=`). If the URL already carries
+a `tried=`, add the name to that list with a comma instead: XRootD keeps only
+the last of several `tried=` parameters, so a second one would undo the first
+for the open that goes straight to the origin. The redirector then chooses
+another server, and uCache's own origin opens for that file carry the same
+list, so they avoid it too (releases up to 1.4.0 dropped `tried=` from those
+opens). If every copy is on the servers you name, the redirector answers that
+no server has the file.
+
 ## The cache is filling my disk
 
 By default uCache uses the disk and evicts LRU to keep a free-space floor

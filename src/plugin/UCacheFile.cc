@@ -375,14 +375,16 @@ bool HandleState::ensureInnerOpen() {
     return false; // recent failure: rate-limit re-attempts, keep the error
   const Config& cfg = globalConfig();
   using OF = XrdCl::OpenFlags;
-  // The lazy open is the PLUGIN'S cache-fill connection, not the client's:
-  // strip client routing directives (XrdAdaptor's tried=/triedrc= exclusion
-  // list) — inheriting them forced the origin to reselect data servers this
-  // host cannot route to, on EVERY re-attempt (found under cmsRun).
-  // Everything else (auth tokens, xrd.* options) passes through untouched.
-  // The relayed (non-trusted) open path keeps the client URL verbatim: there
-  // the inner connection IS the client's connection.
-  const std::string fillUrl = stripCgiParams(url, {"tried", "triedrc"});
+  // This open is the cache's own (a trusted handle's first miss, a degraded
+  // handle, or a forked child starting over), so it gets the reader's URL with
+  // one change. Servers the reader asked to avoid (tried=) stay avoided. A
+  // reselection request (triedrc ending in "resel", which a client sends to get
+  // a second server beside the ones it uses) is not passed on: inheriting it
+  // pushed these opens onto servers this host could not reach, on every
+  // re-attempt. Auth tokens and xrd.* options pass through untouched. The
+  // relayed open (an untrusted handle) sends the reader's URL verbatim, since
+  // there the inner connection is the reader's own.
+  const std::string fillUrl = ownOpenUrl(url);
   XRootDStatus s = inner->Open(faultOpenUrl(fillUrl, ++lazyOpenAttempt), OF::Read,
                                XrdCl::Access::None, static_cast<ucache::XrdTimeout>(0));
   // Case B: bounded synchronous retry of a TRANSIENT lazy
@@ -446,9 +448,11 @@ bool HandleState::ensureInnerOpen() {
     // now so the post-cool-down re-attempt doesn't replay the cached error.
     if (innerOps == 0)
       resetInner();
+    // This line leaves out the query, which can carry an access token. Other
+    // log lines that name the reader's URL still print it whole.
     UCACHE_WARN("lazy origin open failed for %s (%s); cache miss fails with that error, "
                 "re-attempt after cool-down",
-                url.c_str(), s.ToString().c_str());
+                url.substr(0, url.find('?')).c_str(), s.ToString().c_str());
   }
   return innerOpenOk;
 }

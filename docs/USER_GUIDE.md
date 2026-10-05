@@ -710,6 +710,21 @@ it.
   `UCACHE_VALIDATE=size+mtime`, its mtime); a changed file is re-cached. Set
   `revalidate_seconds = 0` to re-check on every open.
 - **Fail-open.** Every failure path degrades to a normal uncached read.
+- **Servers to avoid (`?tried=`).** A reader can keep a redirector from
+  sending it to a given server by adding `?tried=<full host name>` (a comma
+  separated list for several) to the file's URL. uCache honours it on every
+  origin open it makes for that file, its own included: when a file opened
+  from the cache needs bytes the cache does not hold, uCache opens the origin
+  itself, and that open carries the same `tried=`. Write one `tried=` and
+  extend it with commas; do not add a second one. The open that goes straight
+  through to the origin (no fresh cache entry) sends your URL exactly as
+  written, and XRootD keeps only the last of several `tried=` parameters, so
+  that open avoids only the servers in the last one. uCache's own opens merge
+  them into one list. One form is not passed on to uCache's own opens: a
+  reselection request, a `triedrc=` whose last reason is `resel`, which a
+  client sends to get a second server beside the ones it already reads from
+  (CMSSW does this). uCache's own open does not need a second server, and
+  inheriting that request could send it to one this host cannot reach.
 - **Many processes, one cache.** Processes started separately, and workers a
   process forks after it has read through the cache (Python's `multiprocessing`
   and `concurrent.futures` process pools, ROOT's `TProcessExecutor`), fill and

@@ -153,4 +153,115 @@ std::string stripCgiParams(const std::string& url, const std::vector<std::string
   return kept.empty() ? url.substr(0, q) : url.substr(0, q) + "?" + kept;
 }
 
+namespace {
+
+std::string cgiKey(const std::string& param) {
+  return param.substr(0, param.find('='));
+}
+std::string cgiValue(const std::string& param) {
+  const auto eq = param.find('=');
+  return eq == std::string::npos ? std::string() : param.substr(eq + 1);
+}
+
+// Rewrites the tried=/triedrc= parameters of `url` and keeps every other
+// parameter byte for byte, in order. Every tried= host is merged into one
+// tried= at the position of the first, in order of appearance, with empty
+// items and case-insensitive duplicates dropped.
+//   dropReselection: a triedrc= whose last reason is "resel" removes itself,
+//     every other triedrc=, and the last tried= before it.
+//   keepReason: the last remaining triedrc= follows the merged tried=, or
+//     stays in its own place when no host remains; otherwise every triedrc=
+//     is removed.
+// A URL with neither key comes back unchanged.
+std::string mergeTriedParams(const std::string& url, bool dropReselection, bool keepReason) {
+  const auto q = url.find('?');
+  if (q == std::string::npos)
+    return url;
+  std::vector<std::string> params;
+  {
+    std::istringstream in(url.substr(q + 1));
+    std::string param;
+    while (std::getline(in, param, '&'))
+      if (!param.empty())
+        params.push_back(param);
+  }
+  constexpr size_t kNone = static_cast<size_t>(-1);
+  size_t lastReason = kNone;
+  bool anyTried = false;
+  for (size_t i = 0; i < params.size(); ++i) {
+    const std::string k = cgiKey(params[i]);
+    if (k == "triedrc")
+      lastReason = i;
+    else if (k == "tried")
+      anyTried = true;
+  }
+  if (!anyTried && lastReason == kNone)
+    return url;
+
+  // A reselection request is recognised by its last reason, the only one a
+  // redirector reads.
+  bool reselection = false;
+  size_t droppedTried = kNone;
+  if (dropReselection && lastReason != kNone) {
+    const std::string v = cgiValue(params[lastReason]);
+    const auto comma = v.rfind(',');
+    reselection = (comma == std::string::npos ? v : v.substr(comma + 1)) == "resel";
+    if (reselection)
+      for (size_t i = 0; i < lastReason; ++i)
+        if (cgiKey(params[i]) == "tried")
+          droppedTried = i;
+  }
+
+  std::vector<std::string> hosts, seen;
+  for (size_t i = 0; i < params.size(); ++i) {
+    if (i == droppedTried || cgiKey(params[i]) != "tried")
+      continue;
+    std::istringstream in(cgiValue(params[i]));
+    std::string host;
+    while (std::getline(in, host, ',')) {
+      if (host.empty())
+        continue;
+      std::string lower = toLower(host);
+      if (std::find(seen.begin(), seen.end(), lower) != seen.end())
+        continue;
+      seen.push_back(std::move(lower));
+      hosts.push_back(host);
+    }
+  }
+  const bool keptReason = keepReason && !reselection && lastReason != kNone;
+
+  std::string kept;
+  const auto add = [&kept](const std::string& p) { kept += (kept.empty() ? "" : "&") + p; };
+  bool merged = false;
+  for (size_t i = 0; i < params.size(); ++i) {
+    const std::string k = cgiKey(params[i]);
+    if (k == "tried") {
+      if (merged)
+        continue;
+      merged = true;
+      if (hosts.empty())
+        continue;
+      std::string list;
+      for (const auto& h : hosts)
+        list += (list.empty() ? "" : ",") + h;
+      add("tried=" + list);
+      if (keptReason)
+        add(params[lastReason]);
+    } else if (k == "triedrc") {
+      // Placed after the merged list; kept in place only with no host to follow.
+      if (keptReason && i == lastReason && hosts.empty())
+        add(params[i]);
+    } else {
+      add(params[i]);
+    }
+  }
+  return kept.empty() ? url.substr(0, q) : url.substr(0, q) + "?" + kept;
+}
+
+} // namespace
+
+std::string ownOpenUrl(const std::string& url) {
+  return mergeTriedParams(url, /*dropReselection=*/true, /*keepReason=*/true);
+}
+
 } // namespace ucache

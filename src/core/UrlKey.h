@@ -34,11 +34,32 @@ struct UrlKey {
 bool hostMatchesAny(const std::vector<std::string>& globs, const std::string& host);
 
 // Remove the named CGI parameters from a URL, preserving everything else
-// (auth tokens, xrd.* options) byte-for-byte. Used for the plugin's OWN
-// origin connections (lazy cache-fill opens): client routing directives like
-// tried=/triedrc= poison them — CMSSW's XrdAdaptor passes an exclusion list
-// meant for ITS source diversity, and inheriting it forced the redirector to
-// reselect unreachable data servers on every re-attempt.
+// (auth tokens, xrd.* options) byte-for-byte.
 std::string stripCgiParams(const std::string& url, const std::vector<std::string>& names);
+
+// The URL for an origin open the cache makes on its own behalf (a trusted
+// handle's open on its first miss, a degraded handle's open, the open a forked
+// child makes afresh), derived from the reader's URL.
+//
+// A reader names servers to avoid with tried=<host>[,<host>...], optionally
+// followed by triedrc=<reason>; the redirector skips those hosts. That list is
+// kept, so the cache's own opens avoid the same servers. One form is dropped:
+// a reselection request, i.e. a triedrc= whose last reason is "resel" (the
+// redirector reads only the last one). A client such as CMSSW's XrdAdaptor
+// sends it to ask for a second server BESIDE the ones it already reads from;
+// it says nothing about those servers being bad, and an open that inherited
+// it was pushed onto servers this host could not reach. For that form every
+// triedrc= is removed, with the last tried= before it.
+//
+// The remaining tried= hosts are merged into ONE tried= parameter, because a
+// repeated key reaches the server only once (the client keeps the last copy):
+// in order of appearance, empty items and case-insensitive duplicates dropped,
+// at the position of the first tried=, followed by the last remaining
+// triedrc=. When no host remains, that triedrc= stays where it was, as the
+// reader wrote it (unless it is a reselection request). Every other parameter
+// (auth tokens, xrd.* options) is kept byte for byte, in order. A URL without
+// tried=/triedrc= is returned unchanged.
+// Pure.
+std::string ownOpenUrl(const std::string& url);
 
 } // namespace ucache

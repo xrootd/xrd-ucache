@@ -56,6 +56,11 @@ jobs:
           # A cache of its own: the probe needs one that does not hold the file yet.
           mkdir -p /tmp/cache-copy
           XRD_PLUGINCONFDIR=/tmp/conf UCACHE_DIR=/tmp/cache-copy ./build/tests/ucache-copy-probe root://127.0.0.1:10940//bench/data/f.bin /bench/data/f.bin
+      - name: the cache's own origin open keeps the reader's tried=
+        run: |
+          # A cache of its own: the first open must find the file uncached.
+          mkdir -p /tmp/cache-tried
+          XRD_PLUGINCONFDIR=/tmp/conf UCACHE_DIR=/tmp/cache-tried ./build/tests/ucache-tried-probe root://127.0.0.1:10940//bench/data/f.bin
 
   # macOS: keep the tree compiling under AppleClang and run the hermetic tests.
   # Build-and-test only, deliberately: reading root:// through the plugin needs a
