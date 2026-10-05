@@ -223,8 +223,13 @@ TEST(StoreSweep, AnEarlierReplicaFormIsRemoved) {
 }
 
 TEST(StoreSweep, ACachedOriginalThatRottedIsCaughtAndCounted) {
+  // 4 KiB pages on every platform: with 16 KiB ones (the macOS default) every
+  // basket of this small file shares a page with what the layout reads, and
+  // no basket could rot alone.
+  constexpr uint32_t kPage = 4096;
   // The layout first, to know where the baskets lie.
   Fixture ref("unnamed_codec_fixture.root", {"lzma", "zlib"});
+  ref.cfg.pageSize = kPage;
   ref.cache(ref.file.size());
   ASSERT_EQ(ref.sweep().outcome, SweepResult::Outcome::kConverted);
   StoredLayout lay;
@@ -237,6 +242,7 @@ TEST(StoreSweep, ACachedOriginalThatRottedIsCaughtAndCounted) {
   for (size_t k = lay.L.slots.size(); k-- > 0 && !seen;) {
     const FillSlot& sl = lay.L.slots[k];
     Fixture f("unnamed_codec_fixture.root", {"lzma", "zlib"});
+    f.cfg.pageSize = kPage;
     f.cache(f.file.size());
     {
       std::fstream d(f.key.dataPath(f.cfg.cacheDir), std::ios::in | std::ios::out | std::ios::binary);
