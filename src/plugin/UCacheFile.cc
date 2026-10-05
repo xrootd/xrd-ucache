@@ -1690,9 +1690,11 @@ void dropEarlierReplica(const UrlKey& key, const Config& cfg) {
     UCACHE_INFO("%s had a replica an earlier uCache made (.tdata); removed", key.key.c_str());
 }
 
+#ifdef UCACHE_HAVE_COLDRUN
 // A request the truncated-copy guard refused (CopyGuard.h): the copy fails
 // here, loudly, instead of coming out corrupt. Not a cache error -- never
-// counted as a fail-open, never trips the handle.
+// counted as a fail-open, never trips the handle. (Only a file shown in
+// another layout has a copy to guard.)
 XrdCl::XRootDStatus refuseCopy(const std::shared_ptr<HandleState>& st) {
   static std::atomic<bool> said{false};
   if (st->store)
@@ -1705,6 +1707,7 @@ XrdCl::XRootDStatus refuseCopy(const std::shared_ptr<HandleState>& st) {
     UCACHE_WARN("%s", msg.c_str());
   return XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errNotSupported, 0, msg);
 }
+#endif
 
 // A read through an inherited handle whose layout is gone (ensureEntry).
 XrdCl::XRootDStatus lostLayoutError(const std::shared_ptr<HandleState>& st) {
@@ -1715,6 +1718,7 @@ XrdCl::XRootDStatus lostLayoutError(const std::shared_ptr<HandleState>& st) {
                                  "forked; open the file again");
 }
 
+#ifdef UCACHE_HAVE_COLDRUN
 bool guardAllowsChunks(const std::shared_ptr<HandleState>& st, uint64_t originSize,
                        uint64_t shownSize, const XrdCl::ChunkList& chunks) {
   std::vector<CopyGuard::Range> r;
@@ -1723,6 +1727,7 @@ bool guardAllowsChunks(const std::shared_ptr<HandleState>& st, uint64_t originSi
     r.emplace_back(c.offset, c.length);
   return st->copyGuard.allowRanges(originSize, shownSize, r.data(), r.size());
 }
+#endif
 } // namespace
 
 std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uint64_t>* firstRead) {
