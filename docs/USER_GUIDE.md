@@ -250,13 +250,14 @@ dir = /path/on/a/local/disk/ucache
 # With it on, a ROOT file read for the first time is converted, as it is read,
 # into a form that is faster to decode -- no separate step.
 #
-# MEMORY: with it on, a job holds more memory while it reads. On the analyses
-# measured, warm passes needed about 1.8x (TTree) and 2.3x (RNTuple) the memory
-# the same job needs with no cache. If your jobs run short of memory, leave it
-# off and convert what is cached with `ucache recompress` between passes
-# instead. Turning it off later does not change files already recompressed
-# this way: remove those first, while no job is reading them (`ucache
-# untranspose <url>`, or `ucache clear`; a job still reading one would fail).
+# MEMORY: a job reading a recompressed file holds more memory while it reads.
+# On the analyses measured, warm passes needed about 1.4x (TTree) and 1.3x
+# (RNTuple) the memory the same job needs with no cache, however the file was
+# recompressed. If your jobs run short of memory, leave it off and do not run
+# `ucache recompress`: the byte cache alone needs about what a job needs with
+# no cache. Turning it off later does not change files already recompressed:
+# remove those first, while no job is reading them (`ucache untranspose <url>`,
+# or `ucache clear`; a job still reading one would fail).
 # recompress = on
 ```
 
@@ -953,14 +954,12 @@ be slower than a pass with recompression off.
 **It also costs memory, on every pass that reads such a file.** ROOT sizes its
 read buffers from the layout described below and does not shrink them to fit
 the memory there is, and uCache keeps a table for each such file while it is
-open (about 20 MB for a large NanoAOD file). On the analyses measured (32
-threads), warm passes needed about 1.8x the memory on TTree and 2.3x on RNTuple
-of the same job reading the compact replicas earlier releases made, which
-needed about what the job needs with no cache at all. A job that runs short of
-memory is killed by the system, not warned: if yours are near their memory
-limit, leave recompression off and convert what is cached with
-`ucache recompress` between passes instead. Turning it off later does not change files already recompressed this
-way; `docs/TROUBLESHOOTING.md` ("Jobs are killed for memory") says how to get
+open (a few MB for a large NanoAOD file). On the analyses measured (64
+threads), warm passes needed about 1.4x the memory on TTree and 1.3x on RNTuple
+of the same job with no cache, however the file was recompressed. A job that
+runs short of memory is killed by the system, not warned: if yours are near
+their memory limit, leave recompression off and use the byte cache alone.
+Turning it off later does not change files already recompressed this way; `docs/TROUBLESHOOTING.md` ("Jobs are killed for memory") says how to get
 them back. `ucache doctor` repeats this note whenever recompression is on.
 
 While a file is recompressed this way your jobs see it in a layout of its own,

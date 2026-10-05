@@ -244,21 +244,19 @@ free-disk floor is the hard guard against actually filling the volume.
 With recompression on, a job holds more memory while it reads a recompressed
 file: ROOT sizes its read buffers from the layout the file is shown in and does
 not shrink them to fit, and uCache keeps a table for each such file while it is
-open (about 20 MB for a large NanoAOD file). On the analyses measured, warm
-passes needed about 1.8x (TTree) and 2.3x (RNTuple) the memory of the same job
-reading the compact replicas earlier releases made, which needed about what
-the job needs without the cache. A batch system or the kernel then stops the job
-without a word from uCache (`ucache doctor` says so while recompression is
-on).
+open (a few MB for a large NanoAOD file). On the analyses measured, warm passes
+needed about 1.4x (TTree) and 1.3x (RNTuple) the memory of the same job with no
+cache, whether the file was recompressed as it was read or by
+`ucache recompress`. A batch system or the kernel then stops the job without a
+word from uCache (`ucache doctor` says so while recompression is on).
 
-- Turn recompression off for these jobs (`UCACHE_RECOMPRESS=off`, or
-  `ucache set recompress off`) and convert what is cached with
-  `ucache recompress` between passes instead: no pass then converts as it
-  reads, and the sweep gives each file a map, so the next pass reads the
-  converted records at their real size. The files the killed jobs already read
-  keep their replica whatever the setting; `ucache recompress` converts what
-  they left and makes their next map. `UCACHE_TRANSPOSE=0` serves every file as
-  stored meanwhile, fetching again what was converted.
+- Use the byte cache alone for these jobs: turn recompression off
+  (`UCACHE_RECOMPRESS=off`, or `ucache set recompress off`) and do not run
+  `ucache recompress`; the byte cache needs about what a job needs with no
+  cache. Files that already have a replica keep it whatever the setting:
+  `UCACHE_TRANSPOSE=0` serves every file as stored meanwhile, fetching again
+  what was converted, and `ucache untranspose <url>` removes a file's replica
+  while no job is reading it.
 
 ## `recompress = on` but no replicas ever appear
 

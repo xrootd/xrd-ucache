@@ -4010,12 +4010,11 @@ int cmdDoctor(const Config& cfg) {
   // Not a problem, a cost the user chose: said here because a job killed for
   // memory cannot say it, and ROOT does not shrink its buffers to fit.
   if (cfg.recompress)
-    std::printf("  [NOTE] recompress = on: jobs hold more memory while they read (warm passes\n"
-                "         needed about 1.8x on TTree and 2.3x on RNTuple what the compact\n"
-                "         replicas of earlier releases needed, about what a job needs without\n"
-                "         the cache). If they run short, set recompress off and convert what is\n"
-                "         cached with `ucache recompress` between passes: it gives each file a\n"
-                "         map, which the next pass reads at the file's real size\n");
+    std::printf("  [NOTE] recompress = on: jobs hold more memory while they read a recompressed\n"
+                "         file (warm passes needed about 1.4x on TTree and 1.3x on RNTuple what\n"
+                "         the same job needs with no cache). If they run short, set recompress\n"
+                "         off and do not run `ucache recompress`; `ucache untranspose <url>`\n"
+                "         removes a file's replica while no job is reading it\n");
   if (!cfg.cacheDir.empty())
     if (const size_t n = countEarlierReplicas(cfg.cacheDir))
       std::printf("  [NOTE] %zu replica%s an earlier uCache made %s in the cache. This one does not\n"
