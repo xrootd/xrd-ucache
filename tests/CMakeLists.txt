@@ -50,6 +50,7 @@ add_executable(ucache-unit-tests
   ${CMAKE_SOURCE_DIR}/src/plugin/OpenRetry.cc  # pure policy TU (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/OpenPolicy.cc # what an open's answer says (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/Executor.cc   # thread pool (no XrdCl)
+  ${CMAKE_SOURCE_DIR}/src/plugin/OriginInFlight.cc # per-server read counts (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/cli/RunLog.cc        # run reader (pure file parsing)
   ${CMAKE_SOURCE_DIR}/src/cli/HistoryJson.cc   # the history emitter (pure)
   ${CMAKE_SOURCE_DIR}/src/cli/CpuBench.cc      # the publish CPU workload

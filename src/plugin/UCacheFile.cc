@@ -272,11 +272,14 @@ struct OpenAttempt {
 // handle's current one; on success its stat is the one the open answered with
 // (no request is sent). The reader's open handlers call it on XrdCl's callback
 // thread, with null; openAndWait calls it on the waiting thread, which holds
-// innerOpenMu, with its own File. It never blocks in either. An open
-// XrdCl refuses at once (no answer will come) does not reach it. Nothing may
-// leave it: a record lost for want of memory is a lost record, never a job.
-void noteOriginOpenOrThrow(const OpenAttempt& a, const XRootDStatus* status,
-                           const HostList* hosts, XrdCl::File* f) {
+// innerOpenMu, with its own File. It never blocks in either. An open XrdCl
+// refuses at once (Open returns the error, and no answer will come) is
+// recorded the same way, by the code that issued it, with no hosts and
+// `refusedAt`: the host:port of the URL it was asked to open, since no server
+// answered. Nothing may leave it: a record lost for want of memory is a lost
+// record, never a job.
+void noteOriginOpenOrThrow(const OpenAttempt& a, const XRootDStatus* status, const HostList* hosts,
+                           XrdCl::File* f, const std::string& refusedAt) {
   HandleState& st = *a.st;
   if (!st.store)
     return;
@@ -301,6 +304,9 @@ void noteOriginOpenOrThrow(const OpenAttempt& a, const XRootDStatus* status,
   if (v.last >= 0) {
     host = hops[static_cast<size_t>(v.last)].host;
     server = host + ":" + std::to_string(hops[static_cast<size_t>(v.last)].port);
+  } else if (!ok && !refusedAt.empty()) {
+    server = refusedAt;
+    host = server.substr(0, server.rfind(':'));
   }
   if (ok && !server.empty()) {
     std::lock_guard<std::mutex> g(st.mu);
@@ -356,9 +362,30 @@ void noteOriginOpenOrThrow(const OpenAttempt& a, const XRootDStatus* status,
   st.store->enqueueRecord(std::move(line));
 }
 void noteOriginOpen(const OpenAttempt& a, const XRootDStatus* status, const HostList* hosts,
-                    XrdCl::File* f) {
+                    XrdCl::File* f, const std::string& refusedAt = std::string()) {
   try {
-    noteOriginOpenOrThrow(a, status, hosts, f);
+    noteOriginOpenOrThrow(a, status, hosts, f, refusedAt);
+  } catch (...) {
+  }
+}
+// Whether an open about to be issued on `f` goes to the client's request path:
+// false when an earlier open on `f` was sent. The client then answers from that
+// File's own state (in progress, already open, or its stored error) and asks no
+// server. An open the client refused at once leaves its File closed, so the
+// next open on it is a new attempt. Read before the open; sentOpenOn after one
+// that returned OK.
+bool firstOpenOn(const HandleState& st, XrdCl::File* f) {
+  return st.openSentOn.load() != f;
+}
+void sentOpenOn(HandleState& st, XrdCl::File* f) {
+  st.openSentOn.store(f);
+}
+// An open XrdCl refused at once, recorded against the URL's server; only when
+// firstOpenOn said it was a new attempt.
+void noteRefusedOpen(const OpenAttempt& a, const XRootDStatus& status, const std::string& url) {
+  try {
+    const XrdCl::URL u(url);
+    noteOriginOpen(a, &status, nullptr, nullptr, u.IsValid() ? hostPortOf(u) : std::string());
   } catch (...) {
   }
 }
@@ -388,6 +415,14 @@ class ReaderOpenHandler : public ResponseHandler {
     ResponseHandler* real = real_;
     delete this;
     real->HandleResponse(status, response);
+  }
+  // XrdCl refused the open of `url` at once: no completion will come, so the
+  // attempt is recorded here (when `fresh`: the first open issued on its File),
+  // and this handler goes. The reader gets the error from Open itself.
+  void refused(const XRootDStatus& status, const std::string& url, bool fresh) {
+    if (fresh)
+      noteRefusedOpen(a_, status, url);
+    delete this;
   }
 
  private:
@@ -445,12 +480,16 @@ XRootDStatus openAndWait(XrdCl::File* f, const std::string& url, std::string& se
   auto r = std::make_shared<OpenResult>();
   auto* h = new OpenWaitHandler(r);
   a.t0 = nowUs();
+  const bool fresh = firstOpenOn(*a.st, f);
   const XRootDStatus s = f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h,
                                  static_cast<ucache::XrdTimeout>(0));
   if (!s.IsOK()) {
     delete h;
+    if (fresh)
+      noteRefusedOpen(a, s, url);
     return s;
   }
+  sentOpenOn(*a.st, f);
   std::unique_lock<std::mutex> lk(r->mu);
   r->cv.wait(lk, [&r] { return r->done; });
   lk.unlock(); // the handler writes nothing more once done is set
@@ -498,7 +537,15 @@ class RetryingOpenHandler : public ResponseHandler {
     ++attempt_;
     a_.attempt = attempt_;
     a_.t0 = nowUs();
-    return f->Open(faultOpenUrl(url_, attempt_), flags_, mode_, this, timeout_);
+    const std::string url = faultOpenUrl(url_, attempt_);
+    const bool fresh = firstOpenOn(*st_, f);
+    const std::shared_ptr<HandleState> st = st_; // once sent, `this` may be gone at any time
+    XRootDStatus s = f->Open(url, flags_, mode_, this, timeout_);
+    if (s.IsOK())
+      sentOpenOn(*st, f);
+    else if (record_ && fresh) // refused at once: no completion will record it
+      noteRefusedOpen(a_, s, url);
+    return s;
   }
 
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
@@ -622,6 +669,26 @@ std::string answeredBy(HandleState& st, const HostList* hosts) noexcept {
     return st.dataServer;
   } catch (...) {
     return std::string();
+  }
+}
+
+std::string issueServer(HandleState& st, XrdCl::File* f) noexcept {
+  try {
+    std::string server = answeredBy(st, nullptr);
+    if (server.empty() && f && f->GetProperty("DataServer", server))
+      server = serverOfHostId(std::move(server));
+    return server;
+  } catch (...) {
+    return std::string();
+  }
+}
+
+std::string wireTraceFields(const std::string& ds, uint64_t t0, uint64_t nc) noexcept {
+  try {
+    return "\"ds\":\"" + escapeForJson(ds) + "\",\"t0\":" + std::to_string(t0) +
+           ",\"nc\":" + std::to_string(nc);
+  } catch (...) {
+    return std::string(); // the record is written without them
   }
 }
 
@@ -1175,7 +1242,7 @@ struct RelayHandler : XrdCl::ResponseHandler {
       const uint64_t rt = nowUs() - t0;
       st->store->stats().relayRtUs.add(rt);
       st->relayRtUs.add(rt);
-      st->relayServers.add(answeredBy(*st, h), answerBytes(r), rt, inflight.atIssue);
+      st->relayServers.add(answeredBy(*st, h), answerBytes(r), rt, inflight.nc);
       if (readLen && r)
         learnSizeFrom(r);
     } else if (st->store && s && !s->IsOK()) {
@@ -1200,8 +1267,9 @@ struct RelayHandler : XrdCl::ResponseHandler {
 };
 
 // Every relay is issued the same way: take the guard as the request goes out,
-// so it spans the read rather than the handler's lifetime.
-static RelayHandler* newRelay(const std::shared_ptr<HandleState>& st,
+// so it spans the read rather than the handler's lifetime. `f`: the file the
+// request goes out on, whose server it is counted against.
+static RelayHandler* newRelay(const std::shared_ptr<HandleState>& st, XrdCl::File* f,
                               XrdCl::ResponseHandler* user, uint64_t off = 0, uint64_t len = 0) {
   auto* relay = new RelayHandler;
   relay->st = st;
@@ -1209,7 +1277,7 @@ static RelayHandler* newRelay(const std::shared_ptr<HandleState>& st,
   relay->off = off;
   relay->len = len;
   if (st->store) {
-    relay->inflight = OriginInFlight(&st->store->stats());
+    relay->inflight = OriginInFlight(&st->store->stats(), issueServer(*st, f));
     relay->t0 = nowUs();
   }
   return relay;
@@ -1225,7 +1293,7 @@ static XrdCl::XRootDStatus relayToInner(const std::shared_ptr<HandleState>& st,
                                         uint64_t len = 0) {
   noteWaitTier(user, ReaderWait::kOrigin);
   if (XrdCl::File* f = st->acquireInner()) {
-    auto* relay = newRelay(st, user, off, len);
+    auto* relay = newRelay(st, f, user, off, len);
     relay->readLen = readLen;
     XrdCl::XRootDStatus s = issue(f, static_cast<XrdCl::ResponseHandler*>(relay));
     if (!s.IsOK()) {
@@ -1408,15 +1476,17 @@ class MissReadHandler : public ResponseHandler {
   // gateLen != 0: this fetch owns the (wireOff, gateLen) fetch-gate slot
   // (fetch dedup) and must release it on every exit — after staging on success,
   // immediately on failure (waiters then fetch for themselves).
-  MissReadHandler(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
-                  uint64_t userOff, uint32_t userLen, void* userBuf,
+  // `f`: the file the read is issued on, whose server it is counted against.
+  MissReadHandler(std::shared_ptr<HandleState> st, XrdCl::File* f,
+                  std::shared_ptr<FileEntry> entry, uint64_t userOff, uint32_t userLen,
+                  void* userBuf,
                   ResponseHandler* user, uint64_t wireOff,
                   std::shared_ptr<std::vector<char>> wireBuf, uint64_t t0,
                   uint64_t gateLen = 0)
       : st_(std::move(st)), entry_(std::move(entry)), userOff_(userOff), userLen_(userLen),
         userBuf_(userBuf), user_(user), wireOff_(wireOff), wireBuf_(std::move(wireBuf)),
         t0_(t0), gateLen_(gateLen),
-        inflight_(st_->store ? &st_->store->stats() : nullptr) {
+        inflight_(st_->store ? &st_->store->stats() : nullptr, issueServer(*st_, f)) {
     noteWaitTier(user_, ReaderWait::kOrigin);
   }
 
@@ -1451,7 +1521,7 @@ class MissReadHandler : public ResponseHandler {
         entry_->endFetch(wireOff_, gateLen_); // waiters refetch on their own
       st_->noteCacheError(globalConfig());
       if (XrdCl::File* f = st_->acquireInner()) {
-        auto* relay = newRelay(st_, user_, userOff_, userLen_);
+        auto* relay = newRelay(st_, f, user_, userOff_, userLen_);
         XRootDStatus s2 = f->Read(userOff_, userLen_, userBuf_, relay, 0);
         if (s2.IsOK()) {
           delete this;
@@ -1481,9 +1551,11 @@ class MissReadHandler : public ResponseHandler {
       const uint64_t rt = nowUs() - t0_;
       stats.originRtUs.add(rt);
       entry_->obs().originRtUs.add(rt);
-      entry_->obs().servers.add(answeredBy(*st_, h.get()), got, rt, inflight_.atIssue);
+      const std::string server = answeredBy(*st_, h.get());
+      entry_->obs().servers.add(server, got, rt, inflight_.nc);
       if (stats.tracer)
-        stats.tracer->rec("wire", entry_->key().key, wireOff_, got, nowUs() - t0_);
+        stats.tracer->rec("wire", entry_->key().key, wireOff_, got, nowUs() - t0_, true,
+                          wireTraceFields(server, inflight_.t0, inflight_.nc));
     }
     st_->noteCacheOk();
     // Reserve the persist slot BEFORE completing the user, so a Close on the
@@ -1564,7 +1636,7 @@ void redispatchRead(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> 
   }
   auto wireBuf = std::make_shared<std::vector<char>>(we - ws);
   if (XrdCl::File* f = st->acquireInner()) {
-    auto* mh = new MissReadHandler(st, entry, offset, size, buffer, handler, ws, wireBuf,
+    auto* mh = new MissReadHandler(st, f, entry, offset, size, buffer, handler, ws, wireBuf,
                                    nowUs(), we - ws);
     XRootDStatus s = issueWireRead(f, ws, we - ws, wireBuf->data(), mh, 0);
     if (!s.IsOK()) {
@@ -1590,13 +1662,15 @@ class MissVReadHandler : public ResponseHandler {
  public:
   // `direct`: the file's rule when it is read directly -- its data is served
   // and not kept, only pages holding none of it are.
-  MissVReadHandler(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
-                   ChunkList userChunks, std::vector<size_t> missIdx,
+  MissVReadHandler(std::shared_ptr<HandleState> st, XrdCl::File* f,
+                   std::shared_ptr<FileEntry> entry, ChunkList userChunks,
+                   std::vector<size_t> missIdx,
                    std::vector<WireElem> wire, ResponseHandler* user, uint64_t t0,
                    std::shared_ptr<ReadRule> direct = nullptr)
       : st_(std::move(st)), entry_(std::move(entry)), userChunks_(std::move(userChunks)),
         missIdx_(std::move(missIdx)), wire_(std::move(wire)), user_(user), t0_(t0),
-        direct_(std::move(direct)), inflight_(st_->store ? &st_->store->stats() : nullptr) {
+        direct_(std::move(direct)),
+        inflight_(st_->store ? &st_->store->stats() : nullptr, issueServer(*st_, f)) {
     noteWaitTier(user_, ReaderWait::kOrigin);
   }
 
@@ -1624,7 +1698,8 @@ class MissVReadHandler : public ResponseHandler {
                         answeredBy(*st_, h.get()));
       st_->noteCacheError(globalConfig());
       if (XrdCl::File* f = st_->acquireInner()) {
-        auto* relay = newRelay(st_, user_, chunksFirst(userChunks_), chunksBytes(userChunks_));
+        auto* relay =
+            newRelay(st_, f, user_, chunksFirst(userChunks_), chunksBytes(userChunks_));
         XRootDStatus s2 = f->VectorRead(userChunks_, nullptr, relay, 0);
         if (s2.IsOK()) {
           delete this;
@@ -1687,10 +1762,11 @@ class MissVReadHandler : public ResponseHandler {
       const uint64_t rt = nowUs() - t0_;
       stats.originRtUs.add(rt);
       entry_->obs().originRtUs.add(rt);
-      entry_->obs().servers.add(answeredBy(*st_, h.get()), wireBytes, rt, inflight_.atIssue);
+      const std::string server = answeredBy(*st_, h.get());
+      entry_->obs().servers.add(server, wireBytes, rt, inflight_.nc);
       if (stats.tracer)
-        stats.tracer->rec("wire", entry_->key().key, wire_.front().off, wireBytes,
-                          nowUs() - t0_);
+        stats.tracer->rec("wire", entry_->key().key, wire_.front().off, wireBytes, nowUs() - t0_,
+                          true, wireTraceFields(server, inflight_.t0, inflight_.nc));
     }
     st_->noteCacheOk();
     if (direct_) {
@@ -1826,7 +1902,7 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
     complete(user, new XRootDStatus(st->missError()), nullptr);
     return;
   }
-  auto* mh = new MissVReadHandler(st, entry, std::move(userChunks), std::move(missIdx),
+  auto* mh = new MissVReadHandler(st, f, entry, std::move(userChunks), std::move(missIdx),
                                   std::move(wire), user, nowUs(), std::move(direct));
   XRootDStatus s;
   if (readFaultFire()) // test hook: wire vector read dies mid-stream
@@ -2040,16 +2116,20 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // Otherwise a cached handle's read open passes through ReaderOpenHandler,
   // which hands the reader XrdCl's own completion; every other open forwards
   // the reader's handler unchanged. An error XrdCl returns at once (no
-  // completion will come) is the reader's answer, as without the wrapper.
+  // completion will come) is the reader's answer, as without the wrapper; a
+  // watched open records it as a failed attempt first.
   ResponseHandler* h = handler;
+  ReaderOpenHandler* watched = nullptr;
   if (!passthroughOnly_ && handler)
-    h = new ReaderOpenHandler(handler, st_, static_cast<int>(timeout));
+    h = watched = new ReaderOpenHandler(handler, st_, static_cast<int>(timeout));
   XrdCl::File* f = st_->inner.load();
-  const XRootDStatus s = openFaultFirstN() > 0 // test hook only; inert in production
-                             ? f->Open(faultOpenUrl(url, 1), flags, mode, h, timeout)
-                             : f->Open(url, flags, mode, h, timeout);
-  if (!s.IsOK() && h != handler)
-    delete h;
+  const std::string openUrl = faultOpenUrl(url, 1); // test hook only; `url` in production
+  const bool fresh = firstOpenOn(*st_, f);
+  const XRootDStatus s = f->Open(openUrl, flags, mode, h, timeout);
+  if (s.IsOK())
+    sentOpenOn(*st_, f);
+  else if (watched)
+    watched->refused(s, openUrl, fresh);
   return s;
 }
 
@@ -2674,7 +2754,7 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
       auto [ws, we] = roundChunk(*entry, offset, size);
       auto wireBuf = std::make_shared<std::vector<char>>(we - ws);
       if (XrdCl::File* f = st->acquireInner()) {
-        auto* mh = new MissReadHandler(st, entry, offset, size, buffer, handler, ws,
+        auto* mh = new MissReadHandler(st, f, entry, offset, size, buffer, handler, ws,
                                        wireBuf, nowUs());
         XRootDStatus s = issueWireRead(f, ws, we - ws, wireBuf->data(), mh, 0);
         if (!s.IsOK()) {
@@ -2728,7 +2808,7 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
   }
   auto wireBuf = std::make_shared<std::vector<char>>(we - ws);
   if (XrdCl::File* f = st_->acquireInner()) {
-    auto* mh = new MissReadHandler(st_, entry, offset, size, buffer, handler, ws, wireBuf,
+    auto* mh = new MissReadHandler(st_, f, entry, offset, size, buffer, handler, ws, wireBuf,
                                    nowUs(), we - ws);
     XRootDStatus s = issueWireRead(f, ws, we - ws, wireBuf->data(), mh, timeout);
     if (!s.IsOK()) {

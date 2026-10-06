@@ -382,7 +382,15 @@ can hold an access token, and `file` is the cache key, which has none.
 - `msg`: the error's text, at most 200 bytes as written (escapes included);
   `""` on success.
 
-An open the client refuses at once, before it reaches any server, has no line.
+An open the client refuses at once, before it reaches any server (the open
+call itself returns the error, and no answer comes), has a line as well:
+`status` `error` with the client's code, an empty `chain`, and as
+`data_server` the host:port of the URL it was asked to open, since no server
+answered; `site` is that host's. Such a refusal leaves the file closed, so a
+later open of it is a new attempt with a line of its own. An open issued again
+on a file whose earlier open was sent (in progress, open, or failed in its
+answer), which the client answers from that file's own state, asks nothing of
+any server and has no line.
 
 **`"kind":"origin_failure"`, v1** — one line per failed origin request:
 

@@ -73,6 +73,7 @@ function(ucache_add_plugin target include_dir library suffix)
     Executor.cc
     OpenPolicy.cc
     OpenRetry.cc
+    OriginInFlight.cc
     UCacheFactory.cc
     UCacheFile.cc
   )

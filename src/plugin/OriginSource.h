@@ -10,8 +10,10 @@
 
 #include "CacheStore.h"
 #include "FileEntry.h"
+#include "OriginInFlight.h"
 #include "PluginSupport.h"
 #include "ReadRounding.h"
+#include "Trace.h"
 #include "TreeMeta.h"
 #include "UCacheFile.h"
 #include "XrdClTimeout.h"
@@ -64,17 +66,21 @@ struct OriginSource : transpose::Source {
       return false;
     uint32_t got = 0;
     const uint64_t t0 = nowUs();
-    // The origin reads in flight as this one goes out, itself included (this
-    // read is synchronous and not counted among them).
-    const uint64_t inFlight =
-        (st->store ? st->store->stats().originReadsInFlight.load(std::memory_order_relaxed) : 0) +
-        1;
+    // Counted among the reads in flight to its server for as long as it is
+    // out, as the asynchronous ones are (inFlight: those once it was counted,
+    // itself included), but not among all of the process's origin reads,
+    // which have only ever counted the asynchronous ones. Its answer names no
+    // host, so it is put down to the server it was sent to.
+    const std::string server = issueServer(*st, f);
+    std::atomic<uint64_t>* srv = st->store ? serverInFlight(server) : nullptr;
+    const uint64_t inFlight = srv ? srv->fetch_add(1, std::memory_order_relaxed) + 1 : 0;
     XrdCl::XRootDStatus s = f->Read(ws, static_cast<uint32_t>(we - ws), buf.data(), got,
                                     static_cast<ucache::XrdTimeout>(0));
+    if (srv)
+      srv->fetch_sub(1, std::memory_order_relaxed);
     st->releaseInner();
     if (!s.IsOK())
-      noteOriginFailure(*st, &entry->obs().servers, "records", ws, we - ws, s,
-                        answeredBy(*st, nullptr));
+      noteOriginFailure(*st, &entry->obs().servers, "records", ws, we - ws, s, server);
     if (!s.IsOK() || got < off + n - ws)
       return false;
     if (st->store) {
@@ -84,7 +90,10 @@ struct OriginSource : transpose::Source {
       const uint64_t rt = nowUs() - t0;
       stats.originRtUs.add(rt);
       entry->obs().originRtUs.add(rt);
-      entry->obs().servers.add(answeredBy(*st, nullptr), got, rt, inFlight);
+      entry->obs().servers.add(server, got, rt, inFlight);
+      if (stats.tracer)
+        stats.tracer->rec("wire", entry->key().key, ws, got, rt, true,
+                          wireTraceFields(server, t0, inFlight));
     }
     entry->writePages(ws, got, buf.data());
     if (n)

@@ -9,7 +9,11 @@
 // slot id (`t` is the timestamp), assigned on that thread's first record. Slot ids (not OS tids) are
 // what make a trace replayable — reconstructing a thread's timeline needs the
 // records grouped by worker, and the gaps between one worker's completion and
-// its next issue ARE that worker's compute.
+// its next issue ARE that worker's compute. Records of origin requests
+// ("wire", "swire") also carry the server ("ds"), the issue time ("t0") and
+// the requests in flight, at the issue, to the server the request was sent to
+// ("nc"; it differs from "ds" only when the client redirects or recovers the
+// request); docs/STATS.md.
 //
 // Thread-safety: the sampling counter is a relaxed atomic; file writes and
 // the legend set are guarded by an internal mutex. Trace loss on IO error is
@@ -38,9 +42,12 @@ class Tracer {
   // op: short verb ("open","hit","ram","replica","wire","readv","flush",
   // "meta"). us = operation span; off/len describe the byte range (for
   // "readv", off = first chunk offset, len = total bytes). sampled=false
-  // bypasses sampling (rare, individually meaningful ops).
+  // bypasses sampling (rare, individually meaningful ops). `extra`: further
+  // members for this record, already JSON (`"name":value,...`, no leading
+  // comma), written after the common ones; an origin request's carry its
+  // server, issue time and the requests in flight to that server.
   void rec(const char* op, const std::string& key, uint64_t off, uint64_t len, uint64_t us,
-           bool sampled = true);
+           bool sampled = true, const std::string& extra = std::string());
 
   // This thread's slot id in THIS tracer, assigned on first use and stable for
   // the thread's life. Public so the fill/serve paths can attribute without a

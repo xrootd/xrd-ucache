@@ -19,6 +19,7 @@
 #include "SlotStore.h"
 #include "SlotTable.h"
 #include "StoreLayout.h"
+#include "Trace.h"
 #include "Transposer.h"
 #include "UCacheFile.h"
 #include "XrdClTimeout.h"
@@ -1456,10 +1457,13 @@ withoutData(const std::vector<std::pair<uint64_t, uint64_t>>& runs, const ReadRu
 
 class PartHandler : public ResponseHandler {
  public:
-  PartHandler(std::shared_ptr<ColdRequest> req, std::vector<PartItem> items,
+  // `f`: the file the read is issued on, whose server it is counted against.
+  PartHandler(std::shared_ptr<ColdRequest> req, XrdCl::File* f, std::vector<PartItem> items,
               std::vector<WireElem> wire)
       : req_(std::move(req)), items_(std::move(items)), wire_(std::move(wire)),
-        t0_(nowUs()), inflight_(req_->st->store ? &req_->st->store->stats() : nullptr) {}
+        t0_(nowUs()),
+        inflight_(req_->st->store ? &req_->st->store->stats() : nullptr,
+                  issueServer(*req_->st, f)) {}
 
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
@@ -1494,7 +1498,11 @@ class PartHandler : public ResponseHandler {
       const uint64_t rt = nowUs() - t0_;
       stats.originRtUs.add(rt);
       req_->entry->obs().originRtUs.add(rt);
-      req_->entry->obs().servers.add(answeredBy(*st, h.get()), bytes, rt, inflight_.atIssue);
+      const std::string server = answeredBy(*st, h.get());
+      req_->entry->obs().servers.add(server, bytes, rt, inflight_.nc);
+      if (stats.tracer)
+        stats.tracer->rec("wire", req_->entry->key().key, wire_.empty() ? 0 : wire_.front().off,
+                          bytes, rt, true, wireTraceFields(server, inflight_.t0, inflight_.nc));
     }
     req_->cf->wireBytes.fetch_add(bytes, std::memory_order_relaxed);
     for (const auto& it : items_) {
@@ -1593,7 +1601,7 @@ void issuePart(const std::shared_ptr<ColdRequest>& req, std::vector<PartItem> it
     req->done();
     return;
   }
-  auto* h = new PartHandler(req, std::move(items), std::move(wire));
+  auto* h = new PartHandler(req, f, std::move(items), std::move(wire));
   XRootDStatus s;
   if (readFaultFire()) // test hook: the origin's vector read dies mid-stream
     Executor::instance().post([h] {

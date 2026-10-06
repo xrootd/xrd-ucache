@@ -164,6 +164,14 @@ struct HandleState {
   std::unique_ptr<XrdCl::File> innerOwned;
   std::atomic<XrdCl::File*> inner{nullptr};
   std::vector<std::unique_ptr<XrdCl::File>> retired;
+  // The last File an origin open was sent on (the open call returned OK). An
+  // open issued again on that File (a failed one that could not be replaced
+  // while a call was inside it, or a reader opening one File twice) is answered
+  // at once from the File's own state (in progress, open, or failed in its
+  // answer) and reaches no server, so it is not recorded as refused. An open
+  // the client refused at once leaves its File closed and is not stored here:
+  // the next open on that File is a new attempt and is recorded.
+  std::atomic<XrdCl::File*> openSentOn{nullptr};
   int innerOps = 0;
   bool innerValid = false;
   std::condition_variable innerCv;
@@ -316,6 +324,21 @@ class UCacheFile : public XrdCl::FilePlugIn {
 // server the handle's origin open reached; "" when neither is known (or the
 // name could not be built).
 std::string answeredBy(HandleState& st, const XrdCl::HostList* hosts) noexcept;
+// The server an origin read is sent to, as host:port, for its in-flight count
+// (OriginInFlight), by one rule at every issue: the server the handle's origin
+// open reached when its answer named one, and otherwise `f`'s current data
+// server as the client reports it (`f`: the file the read goes out on; a
+// pass-through handle, whose open is not watched, and an open answered with no
+// host list both take this). "" when neither is known: the read is then not
+// counted for any server. The client chooses the connection as it sends, so
+// this is the server the read goes to unless the client redirects or recovers
+// it.
+std::string issueServer(HandleState& st, XrdCl::File* f) noexcept;
+// A trace record's members for one origin request: its server ("ds",
+// host:port), when it was issued ("t0", steady clock µs) and the requests in
+// flight to the server it was sent to then, itself included ("nc"). "" if
+// they cannot be built: the record is then written without them.
+std::string wireTraceFields(const std::string& ds, uint64_t t0, uint64_t nc) noexcept;
 // One failed origin request: counted by its provisional class, put on
 // `tally` (the file's account of its servers, when there is one), and recorded
 // as an `origin_failure` line, at most 16 per file, server and class in a

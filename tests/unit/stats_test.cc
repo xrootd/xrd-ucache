@@ -1,9 +1,13 @@
 #include "Stats.h"
 
+#include "IOBackend.h"
 #include "TestUtil.h"
+#include "Trace.h"
 #include <fstream>
 #include <gtest/gtest.h>
+#include <string>
 #include <sys/stat.h>
+#include <vector>
 
 using namespace ucache;
 
@@ -223,4 +227,36 @@ TEST(StatsAggregate, MissingDirIsZero) {
   StatsTotals t = aggregateStats("/nonexistent/ucache/stats");
   EXPECT_EQ(t.files, 0);
   EXPECT_EQ(t.opens, 0u);
+}
+
+// A trace record with further members keeps every common member as it was and
+// in the same order, so a reader of the older records reads it unchanged; one
+// too long for its line is not written at all, never cut.
+TEST(Tracer, FurtherMembersFollowTheCommonOnes) {
+  test::TempDir d;
+  const std::string path = d.path() + "/t.trace.jsonl";
+  {
+    RealIO io;
+    Tracer t(io, path, 1);
+    t.rec("hit", "root://h//f", 1, 2, 3);
+    t.rec("wire", "root://h//f", 4, 5, 6, true, "\"ds\":\"h:1094\",\"t0\":7,\"nc\":2");
+    t.rec("wire", "root://h//f", 8, 9, 10, true, "\"ds\":\"" + std::string(600, 'x') + "\"");
+  }
+  std::ifstream in(path);
+  std::vector<std::string> lines;
+  for (std::string l; std::getline(in, l);)
+    lines.push_back(l);
+  ASSERT_EQ(lines.size(), 4u) << "meta, the key's legend, two records; the long one is dropped";
+  EXPECT_EQ(lines[0], "{\"op\":\"meta\",\"sample\":1}");
+  auto endsWith = [](const std::string& l, const std::string& tail) {
+    return l.size() >= tail.size() && l.compare(l.size() - tail.size(), tail.size(), tail) == 0;
+  };
+  EXPECT_EQ(lines[2].rfind("{\"t\":", 0), 0u);
+  EXPECT_NE(lines[2].find(",\"op\":\"hit\",\"k\":\""), std::string::npos);
+  EXPECT_TRUE(endsWith(lines[2], ",\"off\":1,\"len\":2,\"us\":3}")) << lines[2];
+  EXPECT_EQ(lines[3].rfind("{\"t\":", 0), 0u);
+  EXPECT_NE(lines[3].find(",\"op\":\"wire\",\"k\":\""), std::string::npos);
+  EXPECT_TRUE(endsWith(lines[3],
+                       ",\"off\":4,\"len\":5,\"us\":6,\"ds\":\"h:1094\",\"t0\":7,\"nc\":2}"))
+      << lines[3];
 }

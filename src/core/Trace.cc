@@ -59,23 +59,25 @@ uint32_t Tracer::slot() {
 }
 
 void Tracer::rec(const char* op, const std::string& key, uint64_t off, uint64_t len,
-                 uint64_t us, bool sampled) {
+                 uint64_t us, bool sampled, const std::string& extra) {
   if (sampled && sample_ > 1 &&
       n_.fetch_add(1, std::memory_order_relaxed) % static_cast<uint64_t>(sample_) != 0)
     return;
   const uint64_t h = std::hash<std::string>{}(key);
-  char line[192];
+  char line[512];
   // `w` is this thread's worker slot. Recorded on every line because a replay
   // reconstructs per-worker timelines, and the gap between one worker's
-  // completion and its next issue is that worker's compute.
+  // completion and its next issue is that worker's compute. A record too long
+  // for the line (a server name of hundreds of bytes) is not written.
   int n = std::snprintf(line, sizeof line,
                         "{\"t\":%llu,\"w\":%u,\"op\":\"%s\",\"k\":\"%016llx\","
-                        "\"off\":%llu,\"len\":%llu,\"us\":%llu}\n",
+                        "\"off\":%llu,\"len\":%llu,\"us\":%llu%s%s}\n",
                         static_cast<unsigned long long>(wallUs()), slot(), op,
                         static_cast<unsigned long long>(h),
                         static_cast<unsigned long long>(off),
                         static_cast<unsigned long long>(len),
-                        static_cast<unsigned long long>(us));
+                        static_cast<unsigned long long>(us), extra.empty() ? "" : ",",
+                        extra.c_str());
   if (n <= 0 || n >= static_cast<int>(sizeof line))
     return;
 

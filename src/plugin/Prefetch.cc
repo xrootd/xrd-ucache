@@ -693,12 +693,13 @@ struct Shard {
   // file; a failed read is dropped silently and never trips the breaker.
   class WireHandler : public XrdCl::ResponseHandler {
    public:
-    WireHandler(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
-                std::shared_ptr<PrefetchHandle> h, std::vector<Elem> elems, Shard* owner,
-                uint64_t wireBytes)
+    // `f`: the file the read is issued on, whose server it is counted against.
+    WireHandler(std::shared_ptr<HandleState> st, XrdCl::File* f,
+                std::shared_ptr<FileEntry> entry, std::shared_ptr<PrefetchHandle> h,
+                std::vector<Elem> elems, Shard* owner, uint64_t wireBytes)
         : st_(std::move(st)), entry_(std::move(entry)), h_(std::move(h)),
           elems_(std::move(elems)), stats_(st_->store ? &st_->store->stats() : nullptr),
-          inflight_(stats_), owner_(owner), wireBytes_(wireBytes),
+          inflight_(stats_, issueServer(*st_, f)), owner_(owner), wireBytes_(wireBytes),
           issuedUs_(std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
                         .count()) {}
@@ -722,6 +723,9 @@ struct Shard {
       // Give the inner file back and let go of the handle in the same breath:
       // the plugin destructor waits for the former and must not find this
       // handler still holding the latter afterwards. The store outlives us.
+      // The server that answered is named first, for the trace.
+      const std::string server =
+          stats_ && stats_->tracer ? answeredBy(*st_, hosts) : std::string();
       st_->releaseInner();
       st_.reset();
       inflight_.release();
@@ -765,7 +769,8 @@ struct Shard {
                   std::chrono::steady_clock::now().time_since_epoch())
                   .count());
           stats->tracer->rec("swire", entry_->key().key, elems_.front().off, wire,
-                             now - issuedUs_, /*sampled=*/false);
+                             now - issuedUs_, /*sampled=*/false,
+                             wireTraceFields(server, inflight_.t0, inflight_.nc));
         }
         if (late)
           stats->prefetchLateBytes.fetch_add(late, std::memory_order_relaxed);
@@ -882,7 +887,7 @@ struct Shard {
       for (const auto& el : part)
         for (const auto& r : el.stage)
           j.entry->noteFetchInFlight(r.first, r.second);
-      auto* wh = new WireHandler(j.st, j.entry, hp, std::move(part), this, partBytes);
+      auto* wh = new WireHandler(j.st, f, j.entry, hp, std::move(part), this, partBytes);
       XrdCl::XRootDStatus s = f->VectorRead(wire, nullptr, wh, 0);
       if (!s.IsOK()) {
         delete wh; // its destructor gives the in-flight bytes back

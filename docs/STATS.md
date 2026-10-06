@@ -199,7 +199,11 @@ ones included, so a run with caching disabled shows its origin failures too.
   cache serves (each retry with `open_retries` counts again), and the cache's
   own opens (a trusted handle's first miss, a handle whose trusted entry was
   gone, a forked child opening a handle again). An open the client refuses at
-  once, before it reaches any server, is not counted.
+  once, before it reaches any server, counts as a failed attempt too, and so
+  does each later open of that file the client refuses again. An open issued
+  again on a file whose earlier open was sent (in progress, open, or failed in
+  its answer), which the client answers from that file's own state, is not an
+  attempt.
 - `hist_origin_open_us` — each attempt's time from issue to answer (log2 µs).
 - `origin_failures_client`, `_site`, `_notfound`, `_data`, `_expired`,
   `_other` — failed origin requests, opens and reads alike, by a first reading
@@ -567,10 +571,12 @@ reading was re-reading, and what the cache disk was asked to do.
     servers, most bytes first, at most 8 named and then `+N` for the others.
     `bytes` are what the server delivered, `reqs` the requests it answered,
     `rt_sum_us` and `rt_max_us` their answer times (issue to completion) summed
-    and at most, `nc_max` the most origin reads in flight when one of them was
-    issued (this version counts them over all of the process's origin servers,
-    which with a single origin server are that server's own), and `fails` the reads that failed
-    (every one; the failure lines are capped; a failed open is in the `open`
+    and at most, `nc_max` the most origin reads this process had in flight to
+    that server when one of them was issued (itself included; the client keeps
+    one connection per server in a process, so these are the reads on that
+    connection; a read is counted against the server the file's handle was
+    using when it was sent, and 0 when none was known), and `fails` the reads
+    that failed (every one; the failure lines are capped; a failed open is in the `open`
     lines, not here). The server is the last host of the request's answer, so
     a read the client recovered elsewhere is put down to the server that
     answered it; one whose answer names no host is put down to the server the
@@ -682,4 +688,13 @@ reading was re-reading, and what the cache disk was asked to do.
   completion and its next issue is that worker's compute. The first record for
   each key is a legend line
   `{"op": "key", "k": "<hash>", "url": "<full url>"}` mapping the hash back
-  to the URL.
+  to the URL. A record of an origin request (`wire`: the byte cache's fetches,
+  a replica's first pass and the reads of a file's own records; `swire`: a
+  read-ahead fetch) has three more members after `us`: `ds`, the server that
+  answered it (`host:port`, as in `data_servers` above; `""` when none is
+  known), `t0`, when it was issued (µs of a steady clock, comparable between
+  the records of one process only), and `nc`, the origin requests this process
+  had in flight to that server at the issue, itself included (0 when the
+  server was not known then). `nc` is counted against the server the file's
+  handle was using when the request was sent, which differs from `ds` only
+  when the client redirects or recovers the request.
