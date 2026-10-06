@@ -416,10 +416,13 @@ bool HandleState::ensureInnerOpen() {
     if (ss.IsOK() && si && si->GetSize() != want) {
       std::string server;
       inner->GetProperty("DataServer", server);
+      // The message goes to the log and back to the reader as its error, so it
+      // names the file without the URL's query, which can carry an access token.
+      const std::string shown = url.substr(0, url.find('?'));
       char msg[512];
       std::snprintf(msg, sizeof msg,
                     "%s: %s serves %llu bytes, the cached file has %llu; not mixing them",
-                    url.c_str(), server.empty() ? "the origin" : server.c_str(),
+                    shown.c_str(), server.empty() ? "the origin" : server.c_str(),
                     static_cast<unsigned long long>(si->GetSize()),
                     static_cast<unsigned long long>(want));
       UCACHE_WARN("%s (the read fails; the next open checks the origin again)", msg);
