@@ -50,16 +50,30 @@ std::atomic<uint64_t> gFailures{0};
 // tracerouteRedirections) iterate it unconditionally — a null list from a
 // synthesized cache-served completion SEGVs cmsRun on warm opens. Every
 // fuzz open goes through this handler so the contract is enforced on both
-// cold (relayed) and warm (locally completed) paths.
+// cold (relayed) and warm (locally completed) paths. It also counts the
+// completions, of which there must be exactly one, and flags one that arrives
+// through plain HandleResponse: a client that reads the HostList never sees it.
 struct StrictOpenHandler : XrdCl::ResponseHandler {
   std::mutex mu;
   std::condition_variable cv;
   bool done = false;
   bool ok = false;     // of the first completion
   int completions = 0; // the contract: exactly one
+  bool viaPlain = false;
+  bool openRefused = false; // Open() returned an error: no completion may come
+  std::string answer;       // the first completion's status
+  void HandleResponse(XrdCl::XRootDStatus* status, XrdCl::AnyObject* response) override {
+    std::fprintf(stderr, "OPEN CONTRACT VIOLATION: completion through HandleResponse\n");
+    {
+      std::lock_guard<std::mutex> g(mu);
+      viaPlain = true;
+    }
+    HandleResponseWithHosts(status, response, nullptr);
+  }
   void HandleResponseWithHosts(XrdCl::XRootDStatus* status, XrdCl::AnyObject* response,
                                XrdCl::HostList* hostList) override {
     bool good = status && status->IsOK();
+    const std::string said = status ? status->ToString() : "(no status)";
     if (hostList == nullptr) {
       std::fprintf(stderr, "OPEN CONTRACT VIOLATION: null HostList in completion\n");
       good = false;
@@ -70,13 +84,15 @@ struct StrictOpenHandler : XrdCl::ResponseHandler {
     delete status;
     delete response;
     delete hostList;
-    // Notify UNDER the lock: the waiter destroys this stack-allocated handler
-    // as soon as it observes done, so the signal must complete before the
-    // mutex is released (condvar-destruction race, TSan-caught).
+    // Handlers live for the process, so a late completion is counted rather
+    // than written into freed memory. Notifying under the lock keeps done, the
+    // count and the first completion's fields consistent for the waiter.
     {
       std::lock_guard<std::mutex> g(mu);
-      if (++completions == 1)
+      if (++completions == 1) {
         ok = good;
+        answer = said;
+      }
       done = true;
       cv.notify_all();
     }
@@ -95,7 +111,24 @@ struct StrictOpenHandler : XrdCl::ResponseHandler {
     std::lock_guard<std::mutex> g(mu);
     return completions;
   }
+  bool exactlyOne() {
+    std::lock_guard<std::mutex> g(mu);
+    return completions == (openRefused ? 0 : 1) && !viaPlain;
+  }
 };
+
+// Every handler strictOpen used, kept for the process's life, so a second
+// completion is counted rather than landing in freed memory; the run checks
+// them all at its end.
+std::mutex gOpenHandlersMu;
+std::vector<StrictOpenHandler*>* gOpenHandlers = new std::vector<StrictOpenHandler*>();
+int openHandlersBad() {
+  std::lock_guard<std::mutex> g(gOpenHandlersMu);
+  int bad = 0;
+  for (auto* h : *gOpenHandlers)
+    bad += h->exactlyOne() ? 0 : 1;
+  return bad;
+}
 
 // Async open through the strict handler; returns false on any failure --
 // including a property-contract violation. After a successful open, cold or
@@ -106,12 +139,26 @@ struct StrictOpenHandler : XrdCl::ResponseHandler {
 // DataServer, and uproot died in client.URL(None) on the second open of every
 // cached file.
 bool strictOpen(XrdCl::File& file, const char* url) {
-  StrictOpenHandler oh;
-  auto st = file.Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, &oh);
-  if (!st.IsOK())
+  auto* oh = new StrictOpenHandler();
+  {
+    std::lock_guard<std::mutex> g(gOpenHandlersMu);
+    gOpenHandlers->push_back(oh);
+  }
+  // What Open() returned, and what the handler was answered: after an error
+  // from Open() no completion may come, so the handler is waited for only
+  // after an OK.
+  const XrdCl::XRootDStatus st = file.Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, oh);
+  if (!st.IsOK()) {
+    std::fprintf(stderr, "open: Open() returned %s\n", st.ToString().c_str());
+    std::lock_guard<std::mutex> g(oh->mu);
+    oh->openRefused = true;
     return false;
-  if (!oh.wait())
+  }
+  if (!oh->wait()) {
+    std::lock_guard<std::mutex> g(oh->mu);
+    std::fprintf(stderr, "open: the handler was answered %s\n", oh->answer.c_str());
     return false;
+  }
   std::string v;
   if (!file.GetProperty("LastURL", v) || v.empty()) {
     std::fprintf(stderr, "LastURL unset after open\n");
@@ -598,7 +645,7 @@ int runInnerRace(const char* url, const char* local, uint64_t cycles, int racers
   std::this_thread::sleep_for(std::chrono::seconds(2)); // room for a late second completion
   int bad = 0;
   for (auto* h : handlers)
-    bad += h->count() == 1 ? 0 : 1;
+    bad += h->exactlyOne() ? 0 : 1;
   std::printf("%s: %llu cycles, %llu concurrent calls (%llu while the open was under way), "
               "%d open(s) without exactly one completion\n",
               mode, (unsigned long long)cycles, (unsigned long long)calls,
@@ -662,6 +709,11 @@ int main(int argc, char** argv) {
   delete ctx.file;
   if (!cs.IsOK())
     std::fprintf(stderr, "close: %s\n", cs.ToString().c_str());
+  std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a late second completion
+  if (const int bad = openHandlersBad()) {
+    std::fprintf(stderr, "FAIL: %d open(s) without exactly one completion\n", bad);
+    ++gFailures;
+  }
   if (gFailures) {
     std::fprintf(stderr, "FAIL seed=%llu failures=%llu\n", (unsigned long long)seed,
                  (unsigned long long)gFailures.load());

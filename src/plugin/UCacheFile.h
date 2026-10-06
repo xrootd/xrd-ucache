@@ -187,7 +187,7 @@ struct HandleState {
   std::atomic<uint64_t> expectedOriginSize{0};
   std::string trustMarker;              // the entry's .val path, removed on such a refusal
   std::atomic<bool> sizeRefused{false}; // set: no origin read of this handle reaches that source
-  bool ensureInnerOpen(); // lazy synchronous origin open on first miss
+  bool ensureInnerOpen(); // lazy origin open on first miss; the caller waits for it
   // The status a cache miss should fail with when the inner file is
   // unavailable: the recorded lazy-open failure if there is one, else
   // errInvalidOp (genuinely invalid handle states).

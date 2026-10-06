@@ -237,10 +237,12 @@ the file was opened from the cache and uCache opened the origin only when it
 needed bytes it did not hold; the redirector then picked the bad server for
 that open.
 
-Find the server's full host name in the error, or in the client's log
-(`XRD_LOGLEVEL=Debug`, the host the open was redirected to), and add it to the
-file's URL as `?tried=<full host name>` (comma separated for several; `&tried=`
-if the URL already has a query without a `tried=`). If the URL already carries
+Find the server's full host name in the error, in uCache's warning when it is
+uCache's own open that failed (`<file>: opening it at <host>:<port> failed
+(...)`), or in the client's log (`XRD_LOGLEVEL=Debug`, the host the open was
+redirected to), and add it to the file's URL as `?tried=<full host name>`
+(comma separated for several; `&tried=` if the URL already has a query without
+a `tried=`). If the URL already carries
 a `tried=`, add the name to that list with a comma instead: XRootD keeps only
 the last of several `tried=` parameters, so a second one would undo the first
 for the open that goes straight to the origin. The redirector then chooses

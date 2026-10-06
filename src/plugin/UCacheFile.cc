@@ -180,6 +180,103 @@ std::string faultOpenUrl(const std::string& url, int attempt) {
   return (n > 0 && attempt <= n) ? rewritePortTo1(url) : url;
 }
 
+// Each origin open attempt the plugin watches ends here with XrdCl's status
+// and the hosts the open went through (null when none came with the answer).
+// The place where each attempt is to be recorded; it does nothing yet. The
+// reader's open handlers call it on XrdCl's callback thread; openAndWait calls
+// it on the waiting thread, which holds innerOpenMu. It must never block in
+// either. An open XrdCl refuses at once (no answer will come) does not reach it.
+void noteOriginOpen(const XRootDStatus* /*status*/, const HostList* /*hosts*/) {}
+
+// The reader's open of a cached handle: XrdCl's own completion is passed to
+// the reader unchanged -- status, response and hosts -- through the same call,
+// on the thread XrdCl called back on. Nothing is created or destroyed there
+// but this object.
+class ReaderOpenHandler : public ResponseHandler {
+ public:
+  explicit ReaderOpenHandler(ResponseHandler* real) : real_(real) {}
+  void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
+                               HostList* hostList) override {
+    noteOriginOpen(status, hostList);
+    ResponseHandler* real = real_;
+    delete this;
+    real->HandleResponseWithHosts(status, response, hostList);
+  }
+  void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    noteOriginOpen(status, nullptr);
+    ResponseHandler* real = real_;
+    delete this;
+    real->HandleResponse(status, response);
+  }
+
+ private:
+  ResponseHandler* real_;
+};
+
+// The cache's own origin open, waited for. The asynchronous open is used
+// because its answer carries the hosts the open went through, which the
+// synchronous form drops. The handler and the waiting thread share the result,
+// and the handler deletes itself, so neither can outlive what the other uses.
+struct OpenResult {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool done = false;
+  XRootDStatus status;
+  std::unique_ptr<HostList> hosts;
+};
+class OpenWaitHandler : public ResponseHandler {
+ public:
+  explicit OpenWaitHandler(std::shared_ptr<OpenResult> r) : r_(std::move(r)) {}
+  void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
+                               HostList* hostList) override {
+    finish(status, response, hostList);
+  }
+  void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    finish(status, response, nullptr);
+  }
+
+ private:
+  void finish(XRootDStatus* status, AnyObject* response, HostList* hostList) {
+    std::unique_ptr<XRootDStatus> s(status);
+    delete response;
+    std::shared_ptr<OpenResult> r = std::move(r_);
+    delete this;
+    std::lock_guard<std::mutex> g(r->mu);
+    r->status = s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal);
+    r->hosts.reset(hostList);
+    r->done = true;
+    r->cv.notify_all();
+  }
+  std::shared_ptr<OpenResult> r_;
+};
+// Opens `f` for reading and waits for the answer, as the synchronous open did:
+// with no bound of its own (XrdCl's request timeout ends it), and an error
+// XrdCl returns at once, when no answer will come, returned as it is.
+// `server` gets the host:port of the last host the answer names, the server
+// the attempt reached (empty when none), taken from the answer rather than from
+// `f`, and without any user name or password the URL carries.
+XRootDStatus openAndWait(XrdCl::File* f, const std::string& url, std::string& server) {
+  server.clear();
+  auto r = std::make_shared<OpenResult>();
+  auto* h = new OpenWaitHandler(r);
+  const XRootDStatus s = f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h,
+                                 static_cast<ucache::XrdTimeout>(0));
+  if (!s.IsOK()) {
+    delete h;
+    return s;
+  }
+  std::unique_lock<std::mutex> lk(r->mu);
+  r->cv.wait(lk, [&r] { return r->done; });
+  lk.unlock(); // the handler writes nothing more once done is set
+  if (r->hosts && !r->hosts->empty()) {
+    const XrdCl::URL& u = r->hosts->back().url;
+    server = u.GetHostName() + ":" + std::to_string(u.GetPort());
+  }
+  noteOriginOpen(&r->status, r->hosts.get());
+  r->hosts.reset();
+  return r->status;
+}
+
 // ---- Case A: retrying open handler -----------------------------------------
 // Wraps ROOT's open handler to retry a TRANSIENT open failure on a FRESH inner
 // file (a failed open is terminal on the object), with full-jitter backoff
@@ -218,6 +315,7 @@ class RetryingOpenHandler : public ResponseHandler {
     std::unique_ptr<XRootDStatus> s(status);
     std::unique_ptr<AnyObject> r(response);
     std::unique_ptr<HostList> h(hostList);
+    noteOriginOpen(s.get(), h.get());
     if (s && s->IsOK()) { // transparent on success: forward exactly what we got
       real_->HandleResponseWithHosts(s.release(), r.release(), h.release());
       delete this;
@@ -349,10 +447,10 @@ bool cacheFresh(const UrlKey& key, const std::string& cacheDir, int revalidateSe
 
 //------------------------------------------------------------------ state --
 
-// Lazy synchronous origin open (cache-freshness path only): a trusted-cache
-// handle deferred the remote open; a genuine miss needs it now. Serialized by
+// Lazy origin open (cache-freshness path only): a trusted-cache handle
+// deferred the remote open; a genuine miss needs it now. Serialized by
 // innerOpenMu, off the fast path; runs on a caller/executor thread (never an
-// XrdCl callback thread), so the blocking Open here is allowed (§5.3).
+// XrdCl callback thread), so waiting here for the open is allowed.
 // Failed attempts re-arm after a cool-down instead of latching (a transient
 // dead-server reselection must not kill the handle for the rest of the job).
 constexpr uint64_t kLazyOpenRetryCooldownUs = 1'000'000;
@@ -370,7 +468,6 @@ bool HandleState::ensureInnerOpen() {
   if (lazyOpenFailUs && nowUs() - lazyOpenFailUs < kLazyOpenRetryCooldownUs)
     return false; // recent failure: rate-limit re-attempts, keep the error
   const Config& cfg = globalConfig();
-  using OF = XrdCl::OpenFlags;
   // This open is the cache's own (a trusted handle's first miss, a degraded
   // handle, or a forked child starting over), so it gets the reader's URL with
   // one change. Servers the reader asked to avoid (tried=) stay avoided. A
@@ -382,8 +479,8 @@ bool HandleState::ensureInnerOpen() {
   // there the inner connection is the reader's own.
   const std::string fillUrl = ownOpenUrl(url);
   XrdCl::File* f = inner.load();
-  XRootDStatus s = f->Open(faultOpenUrl(fillUrl, ++lazyOpenAttempt), OF::Read,
-                           XrdCl::Access::None, static_cast<ucache::XrdTimeout>(0));
+  std::string reached; // the server the last attempt reached
+  XRootDStatus s = openAndWait(f, faultOpenUrl(fillUrl, ++lazyOpenAttempt), reached);
   // Case B: bounded synchronous retry of a TRANSIENT lazy
   // open on a FRESH inner file (a failed open is terminal). The sleeps run on
   // this caller/executor thread under innerOpenMu — the deliberate asymmetry
@@ -399,8 +496,7 @@ bool HandleState::ensureInnerOpen() {
     if (!fresh)
       break; // the handle is shut down: the last failure stands
     f = fresh;
-    s = f->Open(faultOpenUrl(fillUrl, ++lazyOpenAttempt), OF::Read, XrdCl::Access::None,
-                static_cast<ucache::XrdTimeout>(0));
+    s = openAndWait(f, faultOpenUrl(fillUrl, ++lazyOpenAttempt), reached);
   }
   if (!s.IsOK() && retry > 1 && store) // retried at least once and still failed
     store->stats().openRetriesExhausted.fetch_add(1, std::memory_order_relaxed);
@@ -455,11 +551,13 @@ bool HandleState::ensureInnerOpen() {
     // A failed open is TERMINAL on the object: install a fresh file
     // now so the post-cool-down re-attempt doesn't replay the cached error.
     resetInner(/*leakOld=*/false, /*onlyIfIdle=*/true);
-    // This line leaves out the query, which can carry an access token. Other
-    // log lines that name the reader's URL still print it whole.
-    UCACHE_WARN("lazy origin open failed for %s (%s); cache miss fails with that error, "
-                "re-attempt after cool-down",
-                url.substr(0, url.find('?')).c_str(), s.ToString().c_str());
+    // Named by its cache key, which carries no query (a query can carry an
+    // access token). Other log lines that name the reader's URL print it whole.
+    const auto key = UrlKey::parse(url, cfg.keepCgi);
+    UCACHE_WARN("%s: opening it at %s failed (%s); reads that need the origin fail with that "
+                "error, and the next one tries again in a second",
+                key ? key->key.c_str() : url.substr(0, url.find('?')).c_str(),
+                reached.empty() ? "the origin" : reached.c_str(), s.ToString().c_str());
   }
   return innerOpenOk;
 }
@@ -1628,14 +1726,25 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // The cache entry is created lazily on the first read (ensureEntry). With
   // open-retry enabled (opt-in) wrap the app handler so a TRANSIENT open failure
   // is retried on a fresh inner file (Case A); write-opens and
-  // the null-handler case are never wrapped. Otherwise Open forwards unchanged.
+  // the null-handler case are never wrapped.
   if (cfg.openRetries > 0 && !writey && handler) {
     auto* rh = new RetryingOpenHandler(st_, url, flags, mode, timeout, handler, cfg);
     return rh->start();
   }
-  if (openFaultFirstN() > 0) // test hook only; inert (byte-identical) in production
-    return st_->inner.load()->Open(faultOpenUrl(url, 1), flags, mode, handler, timeout);
-  return st_->inner.load()->Open(url, flags, mode, handler, timeout);
+  // Otherwise a cached handle's read open passes through ReaderOpenHandler,
+  // which hands the reader XrdCl's own completion; every other open forwards
+  // the reader's handler unchanged. An error XrdCl returns at once (no
+  // completion will come) is the reader's answer, as without the wrapper.
+  ResponseHandler* h = handler;
+  if (!passthroughOnly_ && handler)
+    h = new ReaderOpenHandler(handler);
+  XrdCl::File* f = st_->inner.load();
+  const XRootDStatus s = openFaultFirstN() > 0 // test hook only; inert in production
+                             ? f->Open(faultOpenUrl(url, 1), flags, mode, h, timeout)
+                             : f->Open(url, flags, mode, h, timeout);
+  if (!s.IsOK() && h != handler)
+    delete h;
+  return s;
 }
 
 // Runs on the caller's (app/IMT) thread — never an XrdCl callback thread —
