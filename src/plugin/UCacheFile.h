@@ -46,6 +46,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 namespace ucache {
 
@@ -144,11 +145,19 @@ struct HandleState {
   bool tripped = false;
 
   // The inner XrdCl::File lives HERE (owned by HandleState, not the plugin
-  // object) so a posted retry task can swap it while capturing only `st_`
-  // `inner` is the guarded raw pointer
-  // into `innerOwned`, repointed by resetInner().
+  // object) so a posted retry task can swap it while capturing only `st_`.
+  // `inner` points into `innerOwned` and is repointed by resetInner(). It is
+  // atomic because some calls (GetProperty, IsOpen, Stat, Close, the write
+  // calls) read it without `mu`; such a call may still be inside the File it
+  // loaded when a retry replaces it, so a replaced File is never destroyed
+  // while the handle lives: it moves to `retired` (under `mu`), and
+  // shutdownInner destroys those once no call can be in them. The cost: a
+  // handle keeps every File it replaced until it closes, at most
+  // open_retries + 1 per lazy-open cool-down (1 s) while its opens keep
+  // failing and its reader keeps missing, plus open_retries per reader open.
   std::unique_ptr<XrdCl::File> innerOwned;
-  XrdCl::File* inner = nullptr;
+  std::atomic<XrdCl::File*> inner{nullptr};
+  std::vector<std::unique_ptr<XrdCl::File>> retired;
   int innerOps = 0;
   bool innerValid = false;
   std::condition_variable innerCv;
@@ -199,10 +208,14 @@ struct HandleState {
   // in flight, and read-ahead's are not the application's to lose a close
   // over. Bounded, because a hung origin request must not hang a close.
   void waitInnerIdle(std::chrono::milliseconds max);
-  // Destroy the terminally-failed inner file and install a fresh one; returns
-  // the new raw pointer. Retry only; precondition innerOps==0. `leakOld`: the
-  // old file is not destroyed (a forked child's inherited one).
-  XrdCl::File* resetInner(bool leakOld = false);
+  // Install a fresh inner file in place of a terminally-failed (or refused)
+  // one, which moves to `retired`; returns the fresh one. Returns nullptr,
+  // changing nothing, once the handle is shut down, or with `onlyIfIdle` while
+  // the cache's own requests are on the inner file (after a failed or refused
+  // open; between the attempts of an open none can be, as no request of the
+  // cache's goes to a File whose open has not succeeded). `leakOld`: the old
+  // file is left alone instead (a forked child's inherited one, the parent's).
+  XrdCl::File* resetInner(bool leakOld = false, bool onlyIfIdle = false);
   // A forked child has yet to open this handle's origin file afresh.
   bool reopenPending();
 

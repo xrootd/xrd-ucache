@@ -199,7 +199,7 @@ class RetryingOpenHandler : public ResponseHandler {
   // forwarded failure), so the XrdCl sync wrapper waits for our handler instead
   // of short-circuiting on a sync error.
   XRootDStatus start() {
-    XRootDStatus s = issueOn(st_->inner);
+    XRootDStatus s = issueOn(st_->inner.load());
     if (!s.IsOK()) { // sync issue error: no callback will come
       lastStatus_ = s;
       decideRetryOrForward();
@@ -248,16 +248,11 @@ class RetryingOpenHandler : public ResponseHandler {
   // Runs on the pool (off the XrdCl callback thread): swap in a fresh file and
   // re-issue. If the handle shut down mid-retry, forward the last failure.
   void doRetry() {
-    bool valid;
-    {
-      std::lock_guard<std::mutex> g(st_->mu);
-      valid = st_->innerValid;
-    }
-    if (!valid) {
+    XrdCl::File* fresh = st_->resetInner(); // checks the handle under the same lock
+    if (!fresh) {
       forwardFailure();
       return;
     }
-    XrdCl::File* fresh = st_->resetInner();
     XRootDStatus s = issueOn(fresh);
     if (!s.IsOK()) { // sync re-issue error: classify again, never drop a completion
       lastStatus_ = s;
@@ -367,7 +362,8 @@ bool HandleState::ensureInnerOpen() {
   if (innerOpened)
     return innerOpenOk;
   if (innerStale) { // see startOverAfterFork; innerOps is 0 in the child
-    resetInner(/*leakOld=*/true);
+    if (!resetInner(/*leakOld=*/true))
+      return false; // the handle is shut down
     innerStale = false;
     lazyOpenFailUs = 0;
   }
@@ -385,8 +381,9 @@ bool HandleState::ensureInnerOpen() {
   // relayed open (an untrusted handle) sends the reader's URL verbatim, since
   // there the inner connection is the reader's own.
   const std::string fillUrl = ownOpenUrl(url);
-  XRootDStatus s = inner->Open(faultOpenUrl(fillUrl, ++lazyOpenAttempt), OF::Read,
-                               XrdCl::Access::None, static_cast<ucache::XrdTimeout>(0));
+  XrdCl::File* f = inner.load();
+  XRootDStatus s = f->Open(faultOpenUrl(fillUrl, ++lazyOpenAttempt), OF::Read,
+                           XrdCl::Access::None, static_cast<ucache::XrdTimeout>(0));
   // Case B: bounded synchronous retry of a TRANSIENT lazy
   // open on a FRESH inner file (a failed open is terminal). The sleeps run on
   // this caller/executor thread under innerOpenMu — the deliberate asymmetry
@@ -399,8 +396,11 @@ bool HandleState::ensureInnerOpen() {
       store->stats().openRetries.fetch_add(1, std::memory_order_relaxed);
     std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs(retry, cfg)));
     XrdCl::File* fresh = resetInner();
-    s = fresh->Open(faultOpenUrl(fillUrl, ++lazyOpenAttempt), OF::Read, XrdCl::Access::None,
-                    static_cast<ucache::XrdTimeout>(0));
+    if (!fresh)
+      break; // the handle is shut down: the last failure stands
+    f = fresh;
+    s = f->Open(faultOpenUrl(fillUrl, ++lazyOpenAttempt), OF::Read, XrdCl::Access::None,
+                static_cast<ucache::XrdTimeout>(0));
   }
   if (!s.IsOK() && retry > 1 && store) // retried at least once and still failed
     store->stats().openRetriesExhausted.fetch_add(1, std::memory_order_relaxed);
@@ -411,11 +411,11 @@ bool HandleState::ensureInnerOpen() {
   // nothing more of it.
   if (const uint64_t want = expectedOriginSize.load(std::memory_order_relaxed); s.IsOK() && want) {
     XrdCl::StatInfo* si = nullptr;
-    const XRootDStatus ss = inner->Stat(false, si);
+    const XRootDStatus ss = f->Stat(false, si);
     std::unique_ptr<XrdCl::StatInfo> sip(si);
     if (ss.IsOK() && si && si->GetSize() != want) {
       std::string server;
-      inner->GetProperty("DataServer", server);
+      f->GetProperty("DataServer", server);
       // The message goes to the log and back to the reader as its error, so it
       // names the file without the URL's query, which can carry an access token.
       const std::string shown = url.substr(0, url.find('?'));
@@ -435,8 +435,13 @@ bool HandleState::ensureInnerOpen() {
       innerOpenOk = false;
       sizeRefused = true; // before the latch: acquireInner reads them in this order
       innerOpened = true; // latch: the same source would answer the same
-      if (innerOps == 0)
-        resetInner(); // let go of the refused source's open file
+      // Let go of the refused source's open file: closed now without waiting,
+      // the asynchronous close its destructor made, but kept until the handle
+      // closes (a call may still be in it).
+      if (resetInner(/*leakOld=*/false, /*onlyIfIdle=*/true)) {
+        const XRootDStatus cs = f->Close(nullptr, static_cast<ucache::XrdTimeout>(0));
+        (void)cs;
+      }
       return false;
     }
   }
@@ -449,8 +454,7 @@ bool HandleState::ensureInnerOpen() {
     lazyOpenFailUs = nowUs();
     // A failed open is TERMINAL on the object: install a fresh file
     // now so the post-cool-down re-attempt doesn't replay the cached error.
-    if (innerOps == 0)
-      resetInner();
+    resetInner(/*leakOld=*/false, /*onlyIfIdle=*/true);
     // This line leaves out the query, which can carry an access token. Other
     // log lines that name the reader's URL still print it whole.
     UCACHE_WARN("lazy origin open failed for %s (%s); cache miss fails with that error, "
@@ -487,7 +491,7 @@ XrdCl::File* HandleState::acquireInnerIfOpen() {
   if (sizeRefused.load(std::memory_order_acquire))
     return nullptr;
   std::lock_guard<std::mutex> g(mu);
-  if (!innerValid || !inner->IsOpen())
+  if (!innerValid || !inner.load()->IsOpen())
     return nullptr;
   ++innerOps;
   return inner;
@@ -885,9 +889,10 @@ void HandleState::startOverAfterFork(uint64_t gen) {
     std::shared_ptr<ColdFill> cold;
     std::shared_ptr<ReadRule> rule;
     std::unique_ptr<XrdCl::StatInfo> statInfo;
+    std::vector<std::unique_ptr<XrdCl::File>> retired;
   };
-  new LeftBehind{std::move(entry), std::move(cold), std::move(rule),
-                 std::move(statInfo)}; // leaked on purpose: the parent's
+  new LeftBehind{std::move(entry), std::move(cold), std::move(rule), std::move(statInfo),
+                 std::move(retired)}; // leaked on purpose: the parent's
   setupDone = closed || tripped || layoutLost; // nothing to set up again
   prefetchSeen.store(false, std::memory_order_relaxed);
   // This process's own account of the handle starts here.
@@ -908,37 +913,41 @@ void HandleState::waitInnerIdle(std::chrono::milliseconds max) {
 }
 
 void HandleState::shutdownInner(bool leak) {
+  // Runs only from ~UCacheFile: no call of the reader's into this handle can
+  // still be live, so this is where the replaced Files can go too. (A lazy
+  // open the cache itself is running on another thread is not waited for
+  // here; that holds for the current File as much as for the replaced ones.)
   std::unique_ptr<XrdCl::File> dead;
+  std::vector<std::unique_ptr<XrdCl::File>> old;
   {
     std::unique_lock<std::mutex> lk(mu);
     innerValid = false;
     innerCv.wait(lk, [this] { return innerOps == 0; });
     inner = nullptr;
     dead = std::move(innerOwned);
+    old.swap(retired);
   }
   if (leak)
     (void)dead.release();
-  // `dead`'s File dtor (a synchronous Close) runs here with mu released —
-  // matching the old by-value member, destroyed after shutdownInner unlocked.
+  // The File dtors (an asynchronous Close of an open one) run here with mu
+  // released; the replaced ones failed or were closed already.
 }
 
-XrdCl::File* HandleState::resetInner(bool leakOld) {
-  // Swap the terminally-failed inner file for a fresh one — a failed open is
-  // terminal on the object, so retry needs a new File.
-  // Precondition innerOps == 0: no legitimate inner op is in flight before the
-  // open has succeeded.
-  std::unique_ptr<XrdCl::File> dead;
-  XrdCl::File* fresh;
-  {
-    std::lock_guard<std::mutex> g(mu);
-    dead = std::move(innerOwned);
-    innerOwned = std::make_unique<XrdCl::File>(false); // plugins disabled (no recursion)
-    inner = innerOwned.get();
-    fresh = inner;
-  }
+XrdCl::File* HandleState::resetInner(bool leakOld, bool onlyIfIdle) {
+  // A failed open is terminal on the object, so a retry needs a new File. The
+  // old one is kept, not destroyed: a call that read `inner` without the lock
+  // may still be inside it. The validity check sits in the same section as the
+  // swap, so a handle shut down meanwhile gets no File that nothing destroys.
+  std::lock_guard<std::mutex> g(mu);
+  if (!innerValid || (onlyIfIdle && innerOps != 0))
+    return nullptr;
   if (leakOld)
-    (void)dead.release(); // the parent's file, which calls without the lock may still use
-  return fresh; // `dead` (terminal Error — its Close is a no-op) destroyed here
+    (void)innerOwned.release(); // the parent's file, which calls without the lock may still use
+  else
+    retired.push_back(std::move(innerOwned));
+  innerOwned = std::make_unique<XrdCl::File>(false); // plugins disabled (no recursion)
+  inner = innerOwned.get();
+  return innerOwned.get();
 }
 
 bool HandleState::reopenPending() {
@@ -1625,8 +1634,8 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
     return rh->start();
   }
   if (openFaultFirstN() > 0) // test hook only; inert (byte-identical) in production
-    return st_->inner->Open(faultOpenUrl(url, 1), flags, mode, handler, timeout);
-  return st_->inner->Open(url, flags, mode, handler, timeout);
+    return st_->inner.load()->Open(faultOpenUrl(url, 1), flags, mode, handler, timeout);
+  return st_->inner.load()->Open(url, flags, mode, handler, timeout);
 }
 
 // Runs on the caller's (app/IMT) thread — never an XrdCl callback thread —
@@ -1879,7 +1888,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
     if (degraded)
       st_->ensureInnerOpen();
     XrdCl::StatInfo* si = nullptr;
-    XRootDStatus s = st_->inner->Stat(false, si); // synchronous — caller thread
+    XRootDStatus s = st_->inner.load()->Stat(false, si); // synchronous — caller thread
     std::unique_ptr<XrdCl::StatInfo> sip(si);
     if (s.IsOK() && si && allowed) {
       statClone = std::make_unique<XrdCl::StatInfo>(*si);
@@ -2053,12 +2062,14 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
   // there is nothing to close remotely (UCACHE_REVALIDATE_S). Nor has a forked
   // child that never opened afresh the handle it inherited: that file is the
   // parent's.
-  if (st_->reopenPending() || !st_->inner->IsOpen()) {
+  const bool pending = st_->reopenPending();
+  XrdCl::File* in = st_->inner.load(); // one File for the check and the close
+  if (pending || !in->IsOpen()) {
     if (handler)
       complete(handler, okStatus(), nullptr);
     return XRootDStatus();
   }
-  return st_->inner->Close(handler, timeout);
+  return in->Close(handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
@@ -2090,7 +2101,7 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
   // reading, and a handle shown a slot layout must report its size from the
   // very first answer -- forced or not, and for a handle a forked child is
   // setting up again as much as for a new one.
-  if (st_->inner->IsOpen() || cacheOpen_ || st_->reopenPending())
+  if (st_->inner.load()->IsOpen() || cacheOpen_ || st_->reopenPending())
     ensureEntry();
   if (st_->layoutLost.load(std::memory_order_acquire))
     return lostLayoutError(st_);
@@ -2132,14 +2143,14 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
     auto* relay = new SizeRelay;
     relay->user = handler;
     relay->vsize = vsize;
-    XRootDStatus s = st_->inner->Stat(force, relay, timeout);
+    XRootDStatus s = st_->inner.load()->Stat(force, relay, timeout);
     if (!s.IsOK())
       delete relay;
     return s;
   }
   if (st_->reopenPending() && !st_->ensureInnerOpen())
     return st_->missError();
-  return st_->inner->Stat(force, handler, timeout);
+  return st_->inner.load()->Stat(force, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffer,
@@ -2649,63 +2660,63 @@ XrdCl::XRootDStatus UCacheFile::Write(uint64_t offset, uint32_t size, const void
                                       ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
   invalidateOnWrite();
-  return st_->inner->Write(offset, size, buffer, handler, timeout);
+  return st_->inner.load()->Write(offset, size, buffer, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Write(uint64_t offset, XrdCl::Buffer&& buffer,
                                       ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
   invalidateOnWrite();
-  return st_->inner->Write(offset, std::move(buffer), handler, timeout);
+  return st_->inner.load()->Write(offset, std::move(buffer), handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::VectorWrite(const ChunkList& chunks,
                                             ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
   invalidateOnWrite();
-  return st_->inner->VectorWrite(chunks, handler, timeout);
+  return st_->inner.load()->VectorWrite(chunks, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::WriteV(uint64_t offset, const struct iovec* iov, int iovcnt,
                                        ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
   invalidateOnWrite();
-  return st_->inner->WriteV(offset, iov, iovcnt, handler, timeout);
+  return st_->inner.load()->WriteV(offset, iov, iovcnt, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Sync(ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
-  return st_->inner->Sync(handler, timeout);
+  return st_->inner.load()->Sync(handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Truncate(uint64_t size, ResponseHandler* handler,
                                          ucache::XrdTimeout timeout) {
   st_->syncFork();
   invalidateOnWrite();
-  return st_->inner->Truncate(size, handler, timeout);
+  return st_->inner.load()->Truncate(size, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Fcntl(const XrdCl::Buffer& arg, ResponseHandler* handler,
                                       ucache::XrdTimeout timeout) {
   st_->syncFork();
-  return st_->inner->Fcntl(arg, handler, timeout);
+  return st_->inner.load()->Fcntl(arg, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Visa(ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
-  return st_->inner->Visa(handler, timeout);
+  return st_->inner.load()->Visa(handler, timeout);
 }
 
-bool UCacheFile::IsOpen() const { return cacheOpen_ || st_->inner->IsOpen(); }
+bool UCacheFile::IsOpen() const { return cacheOpen_ || st_->inner.load()->IsOpen(); }
 
 bool UCacheFile::SetProperty(const std::string& name, const std::string& value) {
   st_->syncFork();
-  return st_->inner->SetProperty(name, value);
+  return st_->inner.load()->SetProperty(name, value);
 }
 
 bool UCacheFile::GetProperty(const std::string& name, std::string& value) const {
   st_->syncFork();
-  if (st_->inner->GetProperty(name, value) && !value.empty())
+  if (st_->inner.load()->GetProperty(name, value) && !value.empty())
     return true;
   // Trusted cache-only handles never opened a transport, so the properties
   // clients act on are unset. Native XrdCl has a contract for exactly this

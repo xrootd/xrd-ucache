@@ -3,14 +3,23 @@
 // environment) against an origin-served file, byte-compared on every
 // operation against the same file read directly from disk.
 //
-//   plugin_fuzz <root-url> <local-path> [ops=100000] [threads=1] [seed=random]
+//   plugin_fuzz <root-url> <local-path> [ops=100000] [threads=1] [seed=random] [mode=fuzz]
 //
 // exit 0 = clean; 1 = mismatch/error (seed printed). Multi-thread mode
 // shares one File across threads (the IMT pattern) — run under TSan for the
 // §13 TSan requirement. Single-thread mode also cycles the handle (~0.5% of
 // ops close + reopen a FRESH File), fuzzing the whole plugin open/setup/
 // drain/close lifecycle, not just steady-state reads.
+//
+// Two more modes race the calls that use a handle's origin File without
+// waiting for anything against the retries of an origin open, which replace
+// that File (see runInnerRace for what they need and check):
+//   inner-race         retries of the cache's own open (a trusted handle's
+//                      first miss); `ops` = handle cycles, `threads` = racers
+//   inner-race-relay   retries of the reader's own open (an untrusted handle),
+//                      raced from the moment Open() returns until it completes
 #include <XrdCl/XrdClFile.hh>
+#include <XrdCl/XrdClURL.hh>
 #ifdef UCACHE_FUZZ_HAVE_TRANSPOSE
 #include "TreeMeta.h"
 #endif
@@ -23,9 +32,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <random>
+#include <string>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -44,7 +55,8 @@ struct StrictOpenHandler : XrdCl::ResponseHandler {
   std::mutex mu;
   std::condition_variable cv;
   bool done = false;
-  bool ok = false;
+  bool ok = false;     // of the first completion
+  int completions = 0; // the contract: exactly one
   void HandleResponseWithHosts(XrdCl::XRootDStatus* status, XrdCl::AnyObject* response,
                                XrdCl::HostList* hostList) override {
     bool good = status && status->IsOK();
@@ -63,15 +75,25 @@ struct StrictOpenHandler : XrdCl::ResponseHandler {
     // mutex is released (condvar-destruction race, TSan-caught).
     {
       std::lock_guard<std::mutex> g(mu);
+      if (++completions == 1)
+        ok = good;
       done = true;
-      ok = good;
-      cv.notify_one();
+      cv.notify_all();
     }
   }
   bool wait() {
     std::unique_lock<std::mutex> l(mu);
     cv.wait(l, [&] { return done; });
     return ok;
+  }
+  // The first completion's verdict, or false if none came within `max`.
+  bool succeededWithin(std::chrono::seconds max) {
+    std::unique_lock<std::mutex> l(mu);
+    return cv.wait_for(l, max, [&] { return done; }) && ok;
+  }
+  int count() {
+    std::lock_guard<std::mutex> g(mu);
+    return completions;
   }
 };
 
@@ -330,15 +352,288 @@ void worker(Ctx* ctx, const Source& src, const Walk* walk, uint64_t seed, uint64
   }
 }
 
+// A File destroyed under a call that is still in it mostly shows as a call
+// that never returns (the thread waits on a mutex in freed memory), so the
+// race modes run a watchdog: no progress for kStuckS seconds ends the run
+// with exit 3 and a line naming the cycle.
+constexpr int kStuckS = 120;
+constexpr uint64_t kInSetup = ~uint64_t(0);
+struct Watchdog {
+  // Leaked: the watchdog thread may still be reading them when main returns.
+  std::atomic<uint64_t>* progress = new std::atomic<uint64_t>{0};
+  std::atomic<uint64_t>* where = new std::atomic<uint64_t>{kInSetup}; // the cycle
+  explicit Watchdog(const char* mode) {
+    auto* p = progress;
+    auto* w = where;
+    std::thread([p, w, mode] {
+      uint64_t last = p->load(), still = 0;
+      for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        const uint64_t now = p->load();
+        if (now != last) {
+          last = now;
+          still = 0;
+        } else if (++still >= kStuckS) {
+          const uint64_t at = w->load();
+          const std::string place = at == kInSetup ? "setup" : "cycle " + std::to_string(at);
+          std::printf("%s: FAIL: stuck: %s made no progress for %d s (step %llu): "
+                      "a call into the handle never returned\n",
+                      mode, place.c_str(), kStuckS, (unsigned long long)now);
+          std::fflush(stdout);
+          std::_Exit(3);
+        }
+      }
+    }).detach();
+  }
+  void step() { ++*progress; }
+};
+
+// `n` threads call GetProperty("DataServer"), IsOpen() and Stat(false) on `f`
+// in a loop -- calls that use the handle's origin File without waiting for
+// anything -- from the moment the constructor returns (every racer running)
+// until stop(). `inFlight`, when given, says whether the open raced against is
+// still under way; the rounds begun while it said so are counted apart.
+class Racers {
+ public:
+  Racers(XrdCl::File* f, int n, std::function<bool()> inFlight = nullptr)
+      : f_(f), inFlight_(std::move(inFlight)) {
+    for (int t = 0; t < n; ++t)
+      ts_.emplace_back([this] { run(); });
+    std::unique_lock<std::mutex> l(mu_);
+    cv_.wait(l, [&] { return running_ == static_cast<int>(ts_.size()); });
+  }
+  // Joins them; the rounds they made, and of those the ones begun in flight.
+  std::pair<uint64_t, uint64_t> stop() {
+    stop_.store(true);
+    for (auto& t : ts_)
+      t.join();
+    return {made_.load(), madeInFlight_.load()};
+  }
+
+ private:
+  void run() {
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      ++running_;
+      cv_.notify_all();
+    }
+    std::string v;
+    uint64_t k = 0, kf = 0;
+    do {
+      const bool fl = inFlight_ && inFlight_();
+      f_->GetProperty("DataServer", v);
+      (void)f_->IsOpen();
+      XrdCl::StatInfo* si = nullptr;
+      const XrdCl::XRootDStatus ss = f_->Stat(false, si);
+      (void)ss;
+      delete si;
+      ++k;
+      kf += fl ? 1 : 0;
+    } while (!stop_.load());
+    made_ += k;
+    madeInFlight_ += kf;
+  }
+  XrdCl::File* f_;
+  std::function<bool()> inFlight_;
+  std::vector<std::thread> ts_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  int running_ = 0;
+  std::atomic<bool> stop_{false};
+  std::atomic<uint64_t> made_{0}, madeInFlight_{0};
+};
+
+int envInt(const char* name, int dflt) {
+  const char* v = ::getenv(name);
+  return v ? ::atoi(v) : dflt;
+}
+
+// Modes inner-race and inner-race-relay: `racers` threads (Racers) call into
+// a handle while retries of an origin open replace its origin File. Run it
+// under a sanitizer: a File destroyed under a call still in it is a use after
+// free, or a hang the watchdog stops. Needs UCACHE_TEST_OPEN_FAIL_N=N and
+// UCACHE_OPEN_RETRIES>=N (each open's first N attempts fail, and each failure
+// puts in a fresh File), a cache directory without this file, and
+// <local-path> the file the URL names.
+//  - inner-race, the cache's own open, with the default trust window: a
+//    relayed open reads the first 64 KiB, so the file's entry exists and is
+//    trusted; then `cycles` times: open (answered from the entry, without the
+//    origin), start the racers, read 64 KiB the entry does not hold -- the miss
+//    opens the origin, through its retries -- and compare it with the local
+//    file, stop the racers, close.
+//  - inner-race-relay, the reader's own open: UCACHE_REVALIDATE_S=0, so that
+//    no open is answered from the entry. `cycles` times: open, run the racers
+//    until the open's completion arrives, read 64 KiB and compare it, close.
+// Each cycle checks that its racers ran, that the open was answered the way
+// the mode needs, and after its read that the handle names the origin's
+// server (its port, never port 1, where the test fault sends the failed
+// attempts). Every open must get exactly one completion.
+int runInnerRace(const char* url, const char* local, uint64_t cycles, int racers, bool relay) {
+  const char* mode = relay ? "inner-race-relay" : "inner-race";
+  const int failN = envInt("UCACHE_TEST_OPEN_FAIL_N", 0);
+  if (failN < 1 || envInt("UCACHE_OPEN_RETRIES", 0) < failN) {
+    std::printf("%s: SETUP: needs UCACHE_TEST_OPEN_FAIL_N=N and UCACHE_OPEN_RETRIES>=N\n", mode);
+    return 2;
+  }
+  if (relay && envInt("UCACHE_REVALIDATE_S", -1) != 0) {
+    std::printf("%s: SETUP: needs UCACHE_REVALIDATE_S=0 (no open answered from the entry)\n",
+                mode);
+    return 2;
+  }
+  const int fd = ::open(local, O_RDONLY);
+  if (fd < 0) {
+    std::printf("%s: SETUP: cannot open the local file\n", mode);
+    return 2;
+  }
+  const uint64_t size = static_cast<uint64_t>(::lseek(fd, 0, SEEK_END));
+  const uint32_t len = 65536;
+  if (cycles == 0 || racers < 1 || size < (cycles + 2) * 2ull * len) {
+    std::printf("%s: SETUP: the file is too small for %llu cycles\n", mode,
+                (unsigned long long)cycles);
+    return 2;
+  }
+  const std::string originPort = ":" + std::to_string(XrdCl::URL(url).GetPort());
+  // Leaked, with their Files' completions: a late second completion is then
+  // counted rather than landing in freed memory.
+  std::vector<StrictOpenHandler*> handlers;
+  auto startOpen = [&](XrdCl::File*& f, StrictOpenHandler*& oh) {
+    f = new XrdCl::File();
+    oh = new StrictOpenHandler();
+    handlers.push_back(oh);
+    return f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, oh).IsOK();
+  };
+  auto readCheck = [&](XrdCl::File* f, uint64_t off) {
+    std::vector<char> got(len), ref(len);
+    uint32_t n = 0;
+    const XrdCl::XRootDStatus st = f->Read(off, len, got.data(), n);
+    return st.IsOK() && n == len &&
+           ::pread(fd, ref.data(), len, static_cast<off_t>(off)) == static_cast<ssize_t>(len) &&
+           std::memcmp(got.data(), ref.data(), len) == 0;
+  };
+  auto closeOne = [](XrdCl::File*& f) {
+    const XrdCl::XRootDStatus cs = f->Close();
+    (void)cs; // the reads were checked; a close error alone is not a defect here
+    delete f;
+    f = nullptr;
+  };
+  // Longer than the watchdog's limit, so an open whose completion never comes
+  // always ends as "stuck", never as a failed open.
+  const std::chrono::seconds openMax(2 * kStuckS);
+  Watchdog dog(mode);
+
+  XrdCl::File* f = nullptr;
+  StrictOpenHandler* oh = nullptr;
+  if (!relay) {
+    if (!startOpen(f, oh) || !oh->succeededWithin(openMax) || !readCheck(f, 0)) {
+      std::printf("%s: FAIL: the relayed open and first read of the setup\n", mode);
+      return 1;
+    }
+    closeOne(f);
+    dog.step();
+  }
+
+  const uint64_t stride = ((size - len) / (cycles + 1)) & ~uint64_t(0xFFFF);
+  uint64_t calls = 0, callsInFlight = 0;
+  for (uint64_t c = 0; c < cycles; ++c) {
+    dog.where->store(c);
+    const auto fail = [&](const std::string& what) {
+      std::printf("%s: FAIL: cycle %llu: %s\n", mode, (unsigned long long)c, what.c_str());
+      return 1;
+    };
+    if (!startOpen(f, oh))
+      return fail("Open() returned an error");
+    dog.step();
+    const uint64_t off = stride * (c + 1);
+    bool readOk = false, fromEntry = false;
+    std::pair<uint64_t, uint64_t> made;
+    // Asked once the open has its answer, before any read: an open answered
+    // from the entry names a local file until a miss opens the origin.
+    auto fromTheEntry = [&] {
+      std::string lastUrl;
+      return f->GetProperty("LastURL", lastUrl) && lastUrl.rfind("file://", 0) == 0;
+    };
+    if (relay) {
+      StrictOpenHandler* h = oh;
+      Racers r(f, racers, [h] { return h->count() == 0; });
+      const bool opened = oh->succeededWithin(openMax);
+      dog.step();
+      made = r.stop();
+      dog.step();
+      if (!opened)
+        return fail("the open");
+      fromEntry = fromTheEntry();
+      readOk = readCheck(f, off);
+    } else {
+      if (!oh->succeededWithin(openMax))
+        return fail("the open");
+      fromEntry = fromTheEntry();
+      Racers r(f, racers);
+      readOk = readCheck(f, off); // the miss: the cache opens the origin, with its retries
+      dog.step();
+      made = r.stop();
+      dog.step();
+    }
+    std::string server;
+    f->GetProperty("DataServer", server);
+    calls += made.first;
+    callsInFlight += made.second;
+    closeOne(f);
+    dog.step();
+    if (!readOk)
+      return fail("the read at " + std::to_string(off) + " failed or read other bytes");
+    if (made.first == 0)
+      return fail("the racers made no call");
+    if (server.size() < originPort.size() ||
+        server.compare(server.size() - originPort.size(), originPort.size(), originPort) != 0)
+      return fail("after the read the handle names \"" + server +
+                  "\" as its server, not the origin: the read did not reach it through the "
+                  "retried open");
+    // The cache's own open needs one answered from the entry; the reader's
+    // open needs one that was not.
+    if (fromEntry == relay)
+      return fail(std::string("the open was ") + (fromEntry ? "" : "not ") +
+                  "answered from the entry, so the open under test was not the one raced");
+  }
+  ::close(fd);
+  std::this_thread::sleep_for(std::chrono::seconds(2)); // room for a late second completion
+  int bad = 0;
+  for (auto* h : handlers)
+    bad += h->count() == 1 ? 0 : 1;
+  std::printf("%s: %llu cycles, %llu concurrent calls (%llu while the open was under way), "
+              "%d open(s) without exactly one completion\n",
+              mode, (unsigned long long)cycles, (unsigned long long)calls,
+              (unsigned long long)callsInFlight, bad);
+  if (relay && callsInFlight == 0) {
+    std::printf("%s: FAIL: no call was made while an open was under way\n", mode);
+    return 1;
+  }
+  if (bad) {
+    std::printf("%s: FAIL: the open completion contract\n", mode);
+    return 1;
+  }
+  std::printf("%s: clean\n", mode);
+  return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    std::fprintf(stderr, "usage: %s <root-url> <local-path> [ops] [threads] [seed]\n",
+    std::fprintf(stderr,
+                 "usage: %s <root-url> <local-path> [ops] [threads] [seed] "
+                 "[fuzz|inner-race|inner-race-relay]\n",
                  argv[0]);
     return 2;
   }
   const char* url = argv[1];
+  const std::string mode = argc > 6 ? argv[6] : "fuzz";
+  if (mode == "inner-race" || mode == "inner-race-relay")
+    return runInnerRace(url, argv[2], argc > 3 ? ::strtoull(argv[3], nullptr, 10) : 200,
+                        argc > 4 ? ::atoi(argv[4]) : 4, mode == "inner-race-relay");
+  if (mode != "fuzz") {
+    std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
+    return 2;
+  }
   Source src(argv[2]);
   std::unique_ptr<Walk> walk = buildWalk(argv[2]);
   if (walk)
