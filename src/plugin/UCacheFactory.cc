@@ -2,7 +2,9 @@
 #include "ColdRun.h"
 #endif
 #include <cstdio>
+#include <cctype>
 #include <cstdlib>
+#include <cstring>
 // Plugin factory + entry point. XrdCl resolves XrdClGetPlugIn
 // from the library named in the plugin conf and calls it with the conf's
 // key/value map; the returned factory produces per-file plugins.
@@ -22,6 +24,7 @@
 #include "ReadRule.h"
 #endif
 
+#include <XrdCl/XrdClConstants.hh>
 #include <XrdCl/XrdClDefaultEnv.hh>
 #include <XrdCl/XrdClLog.hh>
 #include <XrdVersion.hh>
@@ -44,6 +47,7 @@ namespace {
 std::once_flag gInitFlag;
 Config* gConfig = nullptr;
 std::shared_ptr<CacheStore>* gStore = nullptr;
+std::atomic<int> gRequestTimeoutS{XrdCl::DefaultRequestTimeout};
 
 // ---- the XRootD client's log ----------------------------------------------
 // uCache is part of the client a job runs, so it logs where the client does:
@@ -223,6 +227,41 @@ void announceIdentity(const Config& cfg) {
                 informed ? "= 'ucache/...'" : "kept from the environment");
 }
 
+// The run line's `run_settings` (docs/STATS.md): the settings that decide how
+// the origin is reached, with where each value came from. The XRootD client's
+// connection and timeout settings are read as the plugin finds them at load;
+// an application that changes one later is not seen. Its source is "env" when
+// the XRD_<NAME> variable is set, "default" when it is the client's built-in
+// value, and "client" otherwise (a client.conf, or the application).
+std::string runSettings(const Config& cfg) {
+  struct Knob {
+    const char* name;
+    int dflt;
+  };
+  const Knob knobs[] = {{"ConnectionWindow", XrdCl::DefaultConnectionWindow},
+                        {"ConnectionRetry", XrdCl::DefaultConnectionRetry},
+                        {"StreamErrorWindow", XrdCl::DefaultStreamErrorWindow},
+                        {"RequestTimeout", XrdCl::DefaultRequestTimeout},
+                        {"StreamTimeout", XrdCl::DefaultStreamTimeout},
+                        {"TimeoutResolution", XrdCl::DefaultTimeoutResolution}};
+  std::string out = "v1 check_origin_integrity=";
+  out += cfg.checkOriginIntegrity ? "on" : "off";
+  XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv();
+  for (const Knob& k : knobs) {
+    int v = k.dflt;
+    if (env)
+      env->GetInt(k.name, v);
+    std::string var = "XRD_";
+    for (const char* c = k.name; *c; ++c)
+      var += static_cast<char>(std::toupper(static_cast<unsigned char>(*c)));
+    const char* src = ::getenv(var.c_str()) ? "env" : v == k.dflt ? "default" : "client";
+    out += std::string(" xrdcl.") + k.name + "=" + std::to_string(v) + "/" + src;
+    if (std::strcmp(k.name, "RequestTimeout") == 0)
+      gRequestTimeoutS.store(v, std::memory_order_relaxed);
+  }
+  return out;
+}
+
 // Re-armed from itself every meta_flush_seconds. A process that _exit()s -- a
 // multiprocessing worker, which is how Python's process pools end -- runs
 // neither destructors nor the atexit dump below, and used to leave the pages
@@ -307,6 +346,11 @@ void initGlobals() {
       gConfig->cacheDir.empty()
           ? nullptr
           : std::make_shared<CacheStore>(RealIO::instance(), *gConfig));
+  {
+    const std::string settings = runSettings(*gConfig); // before any thread can dump stats
+    if (*gStore)
+      (*gStore)->setRunSettings(settings);
+  }
   Executor::instance(static_cast<unsigned>(
       gConfig->threads > 0 ? gConfig->threads : 0));
   if (*gStore)
@@ -332,6 +376,8 @@ std::shared_ptr<CacheStore> globalStore() {
   std::call_once(gInitFlag, initGlobals);
   return *gStore;
 }
+
+int defaultRequestTimeoutS() { return gRequestTimeoutS.load(std::memory_order_relaxed); }
 
 void resumeAfterFork() {
   if (!gResume.load(std::memory_order_acquire) || !gResume.exchange(false))

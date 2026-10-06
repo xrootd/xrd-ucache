@@ -26,10 +26,12 @@
 #include "ReadFootprint.h"
 #include "FileEntry.h"
 #include "IOBackend.h"
+#include "ServerTally.h"
 #include "Stats.h"
 #include "UrlKey.h"
 
 #include <atomic>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -244,9 +246,31 @@ class CacheStore {
   // readout matches later cached runs against it by key. `originRt`: the
   // answer times of the reads this handle relayed (only its own, so records
   // of one file sum), written as `origin_rt_us` when not empty.
+  // `servers`: the data servers those reads went to, written as `data_server`
+  // and `data_servers` (ServerTally.h) at the end of the line.
   void recordRelayObs(const std::string& url, uint64_t bytes, const char* mode = "relay",
                       uint64_t spanUs = 0, uint64_t originSize = 0,
-                      const Histogram* originRt = nullptr);
+                      const Histogram* originRt = nullptr, const ServerTally* servers = nullptr);
+
+  // Record lines of the newer kinds (an origin open, an origin failure:
+  // docs/FORMAT.md), one complete JSON line each. They are written from the
+  // client library's callback threads, where no disk I/O may happen, so this
+  // only queues the line: under a mutex held for the push alone, never
+  // blocking. A full queue drops the line and counts records_dropped. A
+  // non-empty `capKey` admits at most kRecordsPerCapKey lines with that key in
+  // this process (the failure lines of one file, server and class), the rest
+  // being dropped uncounted (the per-file record counts every failure).
+  static constexpr size_t kRecordQueueMax = 4096;
+  static constexpr uint32_t kRecordsPerCapKey = 16;
+  void enqueueRecord(std::string line, const std::string& capKey = std::string());
+  // Writes the queued lines to the per-file record file, in queue order. The
+  // periodic checkpoint and the final dump call it, and nothing else does: a
+  // process that ends without either (an _exit) loses the lines queued since
+  // its last checkpoint, as it loses its counters.
+  void drainRecords();
+  // The run line's `run_settings` (docs/STATS.md), set once before any
+  // thread that dumps stats exists; immutable afterwards.
+  void setRunSettings(std::string s) { runSettings_ = std::move(s); }
 
   // The read footprint of one file, shared by every handle on it for as long
   // as this process lives. Both routes need that lifetime: a relayed file has
@@ -403,6 +427,12 @@ class CacheStore {
   std::set<std::string> seenKeys_; // under regMu_
   std::shared_ptr<FileEntry::ObsSink> obsSink_;
   std::unique_ptr<Tracer> tracer_;
+  // The record queue (enqueueRecord): the lines, and the lines admitted per
+  // cap key.
+  std::mutex recMu_;
+  std::deque<std::string> records_;
+  std::map<std::string, uint32_t> recordCaps_;
+  std::string runSettings_;
   // A forked child that has not claimed its own stats file yet (see
   // afterForkChild). Set in the child handler, cleared by ensureOwnIdentity.
   std::atomic<bool> forkStale_{false};

@@ -2008,3 +2008,169 @@ TEST(CacheStore, AForkedChildsCounterLineStartsWithItsOwnStore) {
 #endif
   }
 }
+
+// ---- Record lines of the newer kinds: queued, written by the checkpoint ----
+
+namespace {
+std::string kindLine(int n) {
+  return "{\"kind\":\"open\",\"v\":1,\"file\":\"root://h//f\",\"seq\":" + std::to_string(n) +
+         "}\n";
+}
+size_t countWith(const std::vector<std::string>& recs, const std::string& s) {
+  return static_cast<size_t>(std::count_if(recs.begin(), recs.end(), [&](const std::string& r) {
+    return r.find(s) != std::string::npos;
+  }));
+}
+} // namespace
+
+TEST(CacheStore, QueuedRecordsAreWrittenOnceByTheCheckpointInOrder) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  store.disableStatsDump();
+  for (int i = 0; i < 10; ++i)
+    store.enqueueRecord(kindLine(i));
+  EXPECT_EQ(countWith(fileRecords(io, td.path()), "\"kind\""), 0u)
+      << "queued lines wait for the checkpoint";
+  store.checkpoint();
+  EXPECT_EQ(countWith(fileRecords(io, td.path()), "\"kind\""), 10u)
+      << "the checkpoint itself writes the queue (a worker that _exit()s has no final dump)";
+  store.checkpoint(); // a second drain has nothing to write
+  store.drainRecords();
+  const auto recs = fileRecords(io, td.path());
+  ASSERT_EQ(recs.size(), 10u);
+  for (int i = 0; i < 10; ++i)
+    EXPECT_EQ(recs[static_cast<size_t>(i)] + "\n", kindLine(i));
+  EXPECT_EQ(store.stats().recordsDropped.load(), 0u);
+}
+
+TEST(CacheStore, AFullRecordQueueDropsAndCountsAndNeverBlocks) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  store.disableStatsDump();
+  const size_t extra = 5;
+  for (size_t i = 0; i < CacheStore::kRecordQueueMax + extra; ++i)
+    store.enqueueRecord(kindLine(static_cast<int>(i)));
+  EXPECT_EQ(store.stats().recordsDropped.load(), extra);
+  store.drainRecords();
+  const auto recs = fileRecords(io, td.path());
+  ASSERT_EQ(recs.size(), CacheStore::kRecordQueueMax);
+  EXPECT_EQ(recs.back() + "\n", kindLine(static_cast<int>(CacheStore::kRecordQueueMax - 1)))
+      << "the first lines are kept, the newest dropped";
+  // Drained, the queue takes lines again.
+  store.enqueueRecord(kindLine(-1));
+  store.drainRecords();
+  EXPECT_EQ(fileRecords(io, td.path()).size(), CacheStore::kRecordQueueMax + 1);
+  EXPECT_EQ(store.stats().recordsDropped.load(), extra);
+}
+
+TEST(CacheStore, ACapKeyAdmitsAFixedNumberOfLinesPerProcess) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  store.disableStatsDump();
+  for (int i = 0; i < 40; ++i) {
+    store.enqueueRecord("{\"kind\":\"origin_failure\",\"v\":1,\"k\":\"a\"}\n", "a");
+    store.enqueueRecord("{\"kind\":\"origin_failure\",\"v\":1,\"k\":\"b\"}\n", "b");
+    if (i == 10)
+      store.drainRecords(); // a drain does not reset the cap
+  }
+  store.drainRecords();
+  const auto recs = fileRecords(io, td.path());
+  EXPECT_EQ(countWith(recs, "\"k\":\"a\""), CacheStore::kRecordsPerCapKey);
+  EXPECT_EQ(countWith(recs, "\"k\":\"b\""), CacheStore::kRecordsPerCapKey);
+  EXPECT_EQ(store.stats().recordsDropped.load(), 0u) << "the cap is not the queue's bound";
+}
+
+TEST(CacheStore, TheFinalDumpWritesQueuedRecordsAndRunSettings) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  {
+    CacheStore store(io, cfg);
+    store.setRunSettings("v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default");
+    store.enqueueRecord(kindLine(1));
+  } // the destructor's final dump
+  const auto recs = fileRecords(io, td.path());
+  ASSERT_EQ(recs.size(), 1u);
+  EXPECT_EQ(recs[0] + "\n", kindLine(1));
+  const auto lines = completeLines(counterFile(io, td.path()));
+  ASSERT_EQ(lines.size(), 1u);
+  EXPECT_EQ(fieldOf(lines[0], "run_settings"),
+            "\"v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default\"");
+  EXPECT_EQ(lines[0].back(), '}');
+}
+
+TEST(CacheStore, PerFileRecordsNameTheirDataServersAtTheEnd) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  {
+    CacheStore store(io, cfg);
+    {
+      auto e = store.open(keyN(1), 1 << 20);
+      ASSERT_TRUE(e);
+      e->obs().servers.add("disk1.example.org:1094", 100, 10, 1);
+      e->obs().servers.add("disk2.example.org:1095", 300, 20, 2);
+      e->obs().servers.fail("disk1.example.org:1094");
+      auto warm = store.open(keyN(2), 1 << 20);
+      ASSERT_TRUE(warm);
+    }
+    ServerTally relayed;
+    relayed.add("disk3.example.org:1094", 4096, 7, 3);
+    store.recordRelayObs("root://h//data/relayed.root", 4096, "relay", 10, 8192, nullptr,
+                         &relayed);
+    store.recordRelayObs("root://h//data/older.root", 4096, "relay", 10, 8192);
+  }
+  const auto recs = fileRecords(io, td.path());
+  ASSERT_EQ(recs.size(), 4u);
+  auto recordOf = [&](const std::string& path) -> std::string {
+    for (const auto& r : recs)
+      if (r.find(path) != std::string::npos)
+        return r;
+    return "";
+  };
+  const std::string fetched = recordOf("/data/file1.root");
+  EXPECT_EQ(fieldOf(fetched, "data_server"), "\"disk2.example.org\"") << fetched;
+  EXPECT_EQ(fieldOf(fetched, "data_servers"),
+            "\"disk2.example.org:1095=300:1:20:20:2:0;disk1.example.org:1094=100:1:10:10:1:1\"");
+  // At the end of the line, after every field an older reader knows.
+  EXPECT_LT(fetched.find("\"mode\":"), fetched.find("\"data_server\":"));
+  EXPECT_EQ(fetched.back(), '}');
+  EXPECT_EQ(fieldOf(recordOf("/data/file2.root"), "data_server"), "\"\"");
+  EXPECT_EQ(fieldOf(recordOf("/data/file2.root"), "data_servers"), "\"\"");
+  EXPECT_EQ(fieldOf(recordOf("/data/relayed.root"), "data_server"), "\"disk3.example.org\"");
+  EXPECT_EQ(fieldOf(recordOf("/data/relayed.root"), "data_servers"),
+            "\"disk3.example.org:1094=4096:1:7:7:3:0\"");
+  EXPECT_EQ(fieldOf(recordOf("/data/older.root"), "data_server"), "\"\"");
+}
+
+TEST(CacheStore, AForkedChildWritesOnlyTheRecordsItQueued) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  store.disableStatsDump();
+  store.enqueueRecord("{\"kind\":\"open\",\"v\":1,\"who\":\"parent\"}\n");
+  const std::string r = forkedReport([&] {
+    store.afterForkChild();
+    store.enqueueRecord("{\"kind\":\"open\",\"v\":1,\"who\":\"child\"}\n");
+    store.checkpoint();
+    return std::string("done");
+  });
+  ASSERT_NE(r.find("done"), std::string::npos) << r;
+  store.drainRecords();
+  const auto recs = fileRecords(io, td.path());
+  EXPECT_EQ(countWith(recs, "\"who\":\"parent\""), 1u) << "written by the parent alone";
+  EXPECT_EQ(countWith(recs, "\"who\":\"child\""), 1u);
+}

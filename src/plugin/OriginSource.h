@@ -64,9 +64,17 @@ struct OriginSource : transpose::Source {
       return false;
     uint32_t got = 0;
     const uint64_t t0 = nowUs();
+    // The origin reads in flight as this one goes out, itself included (this
+    // read is synchronous and not counted among them).
+    const uint64_t inFlight =
+        (st->store ? st->store->stats().originReadsInFlight.load(std::memory_order_relaxed) : 0) +
+        1;
     XrdCl::XRootDStatus s = f->Read(ws, static_cast<uint32_t>(we - ws), buf.data(), got,
                                     static_cast<ucache::XrdTimeout>(0));
     st->releaseInner();
+    if (!s.IsOK())
+      noteOriginFailure(*st, &entry->obs().servers, "records", ws, we - ws, s,
+                        answeredBy(*st, nullptr));
     if (!s.IsOK() || got < off + n - ws)
       return false;
     if (st->store) {
@@ -76,6 +84,7 @@ struct OriginSource : transpose::Source {
       const uint64_t rt = nowUs() - t0;
       stats.originRtUs.add(rt);
       entry->obs().originRtUs.add(rt);
+      entry->obs().servers.add(answeredBy(*st, nullptr), got, rt, inFlight);
     }
     entry->writePages(ws, got, buf.data());
     if (n)

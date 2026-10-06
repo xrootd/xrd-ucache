@@ -9,6 +9,7 @@
 #include "CopyDetect.h"
 #include "Executor.h"
 #include "Log.h"
+#include "OpenPolicy.h"
 #include "OpenRetry.h"
 #ifdef UCACHE_HAVE_COLDRUN
 #include "OriginSource.h"
@@ -54,6 +55,29 @@ static_assert(XrdCl::errConnectionError == 108 && XrdCl::errErrorResponse == 400
               "XrdCl status codes drifted from OpenRetry.cc");
 static_assert(kXR_ItExists == 3018 && kXR_Overloaded == 3024,
               "kXR wire codes drifted from OpenRetry.cc");
+// The same for OpenPolicy.h's failure classes.
+static_assert(XrdCl::errDataError == xrdwire::kErrDataError &&
+                  XrdCl::errSocketError == xrdwire::kErrSocketError &&
+                  XrdCl::errSocketTimeout == xrdwire::kErrSocketTimeout &&
+                  XrdCl::errSocketDisconnected == xrdwire::kErrSocketDisconnected &&
+                  XrdCl::errStreamDisconnect == xrdwire::kErrStreamDisconnect &&
+                  XrdCl::errConnectionError == xrdwire::kErrConnectionError &&
+                  XrdCl::errInvalidSession == xrdwire::kErrInvalidSession &&
+                  XrdCl::errTlsError == xrdwire::kErrTlsError &&
+                  XrdCl::errAuthFailed == xrdwire::kErrAuthFailed &&
+                  XrdCl::errOperationExpired == xrdwire::kErrOperationExpired &&
+                  XrdCl::errNotFound == xrdwire::kErrNotFound &&
+                  XrdCl::errRedirectLimit == xrdwire::kErrRedirectLimit &&
+                  XrdCl::errErrorResponse == xrdwire::kErrErrorResponse,
+              "XrdCl status codes drifted from OpenPolicy.h");
+static_assert(kXR_FileLocked == xrdwire::kXrFileLocked && kXR_FSError == xrdwire::kXrFSError &&
+                  kXR_IOError == xrdwire::kXrIOError &&
+                  kXR_NotAuthorized == xrdwire::kXrNotAuthorized &&
+                  kXR_NotFound == xrdwire::kXrNotFound &&
+                  kXR_ServerError == xrdwire::kXrServerError &&
+                  kXR_noserver == xrdwire::kXrNoServer && kXR_Cancelled == xrdwire::kXrCancelled &&
+                  kXR_ItExists == xrdwire::kXrItExists && kXR_Overloaded == xrdwire::kXrOverloaded,
+              "kXR wire codes drifted from OpenPolicy.h");
 
 // Test-only wire-read fault (PluginSupport.h): the origin dying mid-stream
 // after a healthy open, so the fail-open contract -- the reader still gets the
@@ -180,30 +204,187 @@ std::string faultOpenUrl(const std::string& url, int attempt) {
   return (n > 0 && attempt <= n) ? rewritePortTo1(url) : url;
 }
 
+// ---- Records of the origin's answers (docs/FORMAT.md) ---------------------
+// Lines are built where the answer arrives, often on XrdCl's callback thread,
+// and only queued there (CacheStore::enqueueRecord): the periodic checkpoint
+// and the final dump write them. Nothing here blocks or touches the disk.
+
+// A status's text for a record, escaped (OpenPolicy.h recordText).
+std::string recordMsg(const XRootDStatus& s) {
+  return s.IsOK() ? std::string() : recordText(s.ToString());
+}
+
+// The file a record names: its cache key, which carries no query.
+std::string recordFile(const std::string& url) {
+  const auto key = UrlKey::parse(url, globalConfig().keepCgi);
+  return key ? key->key : url.substr(0, url.find('?'));
+}
+
+uint64_t wallMs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count());
+}
+
+std::string hostPortOf(const XrdCl::URL& u) {
+  return u.GetHostName() + ":" + std::to_string(u.GetPort());
+}
+
+// A failed status's provisional class; never kNone, since it failed.
+FailureClass failureClassOf(const XRootDStatus& s) {
+  const FailureClass c = classifyFailure(s.code, static_cast<int>(s.errNo));
+  return c == FailureClass::kNone ? FailureClass::kOther : c;
+}
+
+// Stats::originFailures is client, site, notfound, data, expired, other (its
+// published names are checked in the unit tests): the classes must stay in
+// that order, from 1.
+static_assert(static_cast<int>(FailureClass::kClient) == 1 &&
+                  static_cast<int>(FailureClass::kSite) == 2 &&
+                  static_cast<int>(FailureClass::kNotFound) == 3 &&
+                  static_cast<int>(FailureClass::kData) == 4 &&
+                  static_cast<int>(FailureClass::kExpired) == 5 &&
+                  static_cast<int>(FailureClass::kOther) == 6,
+              "FailureClass order differs from Stats::originFailures");
+void countFailure(Stats& stats, FailureClass c) {
+  const int i = static_cast<int>(c) - 1; // Stats::originFailures starts at kClient
+  if (i >= 0 && i < 6)
+    stats.originFailures[i].fetch_add(1, std::memory_order_relaxed);
+}
+
+// The number of an origin open and its retries, unique in the process.
+std::atomic<uint64_t> gOpenSeq{0};
+
+// One origin open attempt, as the code that issued it knows it.
+struct OpenAttempt {
+  HandleState* st = nullptr;
+  OpenRoute route = OpenRoute::kRelay;
+  uint64_t seq = 0;
+  int attempt = 1;
+  uint64_t t0 = 0;  // issued, steady µs
+  int timeoutS = 0; // the request's own timeout; 0 = XrdCl's default
+};
+
 // Each origin open attempt the plugin watches ends here with XrdCl's status
-// and the hosts the open went through (null when none came with the answer).
-// The place where each attempt is to be recorded; it does nothing yet. The
-// reader's open handlers call it on XrdCl's callback thread; openAndWait calls
-// it on the waiting thread, which holds innerOpenMu. It must never block in
-// either. An open XrdCl refuses at once (no answer will come) does not reach it.
-void noteOriginOpen(const XRootDStatus* /*status*/, const HostList* /*hosts*/) {}
+// and the hosts the open went through (null when none came with the answer):
+// it is counted and recorded, and a successful one tells the handle which
+// server it reached. `f` is the File the attempt opened, or null for the
+// handle's current one; on success its stat is the one the open answered with
+// (no request is sent). The reader's open handlers call it on XrdCl's callback
+// thread, with null; openAndWait calls it on the waiting thread, which holds
+// innerOpenMu, with its own File. It never blocks in either. An open
+// XrdCl refuses at once (no answer will come) does not reach it. Nothing may
+// leave it: a record lost for want of memory is a lost record, never a job.
+void noteOriginOpenOrThrow(const OpenAttempt& a, const XRootDStatus* status,
+                           const HostList* hosts, XrdCl::File* f) {
+  HandleState& st = *a.st;
+  if (!st.store)
+    return;
+  Stats& stats = st.store->stats();
+  const uint64_t us = nowUs() - a.t0;
+  stats.originOpenAttempts.fetch_add(1, std::memory_order_relaxed);
+  stats.originOpenUs.add(us);
+  const XRootDStatus s = status ? *status : XRootDStatus(XrdCl::stError, XrdCl::errInternal);
+  const bool ok = s.IsOK();
+  const FailureClass cls = ok ? FailureClass::kNone : failureClassOf(s);
+  if (!ok) {
+    stats.originOpenFailures.fetch_add(1, std::memory_order_relaxed);
+    countFailure(stats, cls);
+  }
+  std::vector<Hop> hops;
+  if (hosts)
+    for (const auto& h : *hosts)
+      hops.push_back(makeHop(h.url.GetHostName(), h.url.GetPort(), h.flags, h.loadBalancer,
+                             h.url.GetParamsAsString()));
+  const ChainView v = readChain(hops);
+  std::string server, host;
+  if (v.last >= 0) {
+    host = hops[static_cast<size_t>(v.last)].host;
+    server = host + ":" + std::to_string(hops[static_cast<size_t>(v.last)].port);
+  }
+  if (ok && !server.empty()) {
+    std::lock_guard<std::mutex> g(st.mu);
+    st.dataServer = server;
+  }
+  long long statFlags = -1, size = -1;
+  if (ok) {
+    // The reader's open handlers pass no File: the reader may be destroying
+    // its handle while the open completes, so the File is held as the read
+    // paths hold it (the handle's shutdown waits for innerOps) and skipped
+    // once the handle has shut it down. Stat(false) answers from the stat
+    // the open stored; it sends no request.
+    struct Held {
+      HandleState* st = nullptr;
+      ~Held() {
+        if (st)
+          st->releaseInner();
+      }
+    } held;
+    if (!f) {
+      std::lock_guard<std::mutex> g(st.mu);
+      if (st.innerValid && st.inner.load()) {
+        f = st.inner.load();
+        ++st.innerOps;
+        held.st = &st;
+      }
+    }
+    if (f) {
+      XrdCl::StatInfo* si = nullptr;
+      if (f->Stat(false, si).IsOK() && si) {
+        statFlags = static_cast<long long>(si->GetFlags());
+        size = static_cast<long long>(si->GetSize());
+      }
+      delete si;
+    }
+  }
+  const int timeoutS = a.timeoutS > 0 ? a.timeoutS : defaultRequestTimeoutS();
+  std::string line;
+  line.reserve(512);
+  line += "{\"kind\":\"open\",\"v\":1,\"ts_ms\":" + std::to_string(wallMs());
+  line += ",\"file\":\"" + escapeForJson(recordFile(st.url)) + '"';
+  line += ",\"seq\":" + std::to_string(a.seq) + ",\"attempt\":" + std::to_string(a.attempt);
+  line += std::string(",\"route\":\"") + openRouteName(a.route) + '"';
+  line += std::string(",\"status\":\"") + (ok ? "ok" : "error") + '"';
+  line += ",\"code\":" + std::to_string(s.code) + ",\"errno\":" + std::to_string(s.errNo);
+  line += std::string(",\"class\":\"") + failureClassName(cls) + '"';
+  line += ",\"chain\":\"" + escapeForJson(chainText(hops)) + '"';
+  line += ",\"data_server\":\"" + escapeForJson(server) + '"';
+  line += ",\"site\":\"" + escapeForJson(siteOf(host)) + "\",\"site_src\":\"domain\"";
+  line += ",\"stat_flags\":" + std::to_string(statFlags) + ",\"size\":" + std::to_string(size);
+  line += ",\"us\":" + std::to_string(us) + ",\"timeout_s\":" + std::to_string(timeoutS);
+  line += ",\"msg\":\"" + recordMsg(s) + "\"}\n";
+  st.store->enqueueRecord(std::move(line));
+}
+void noteOriginOpen(const OpenAttempt& a, const XRootDStatus* status, const HostList* hosts,
+                    XrdCl::File* f) {
+  try {
+    noteOriginOpenOrThrow(a, status, hosts, f);
+  } catch (...) {
+  }
+}
 
 // The reader's open of a cached handle: XrdCl's own completion is passed to
 // the reader unchanged -- status, response and hosts -- through the same call,
-// on the thread XrdCl called back on. Nothing is created or destroyed there
-// but this object.
+// on the thread XrdCl called back on, once the attempt is recorded. Nothing is
+// created or destroyed there but this object.
 class ReaderOpenHandler : public ResponseHandler {
  public:
-  explicit ReaderOpenHandler(ResponseHandler* real) : real_(real) {}
+  ReaderOpenHandler(ResponseHandler* real, std::shared_ptr<HandleState> st, int timeoutS)
+      : real_(real), st_(std::move(st)) {
+    a_.st = st_.get();
+    a_.seq = gOpenSeq.fetch_add(1, std::memory_order_relaxed) + 1;
+    a_.t0 = nowUs();
+    a_.timeoutS = timeoutS;
+  }
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
-    noteOriginOpen(status, hostList);
+    noteOriginOpen(a_, status, hostList, nullptr);
     ResponseHandler* real = real_;
     delete this;
     real->HandleResponseWithHosts(status, response, hostList);
   }
   void HandleResponse(XRootDStatus* status, AnyObject* response) override {
-    noteOriginOpen(status, nullptr);
+    noteOriginOpen(a_, status, nullptr, nullptr);
     ResponseHandler* real = real_;
     delete this;
     real->HandleResponse(status, response);
@@ -211,6 +392,8 @@ class ReaderOpenHandler : public ResponseHandler {
 
  private:
   ResponseHandler* real_;
+  std::shared_ptr<HandleState> st_;
+  OpenAttempt a_;
 };
 
 // The cache's own origin open, waited for. The asynchronous open is used
@@ -254,11 +437,14 @@ class OpenWaitHandler : public ResponseHandler {
 // XrdCl returns at once, when no answer will come, returned as it is.
 // `server` gets the host:port of the last host the answer names, the server
 // the attempt reached (empty when none), taken from the answer rather than from
-// `f`, and without any user name or password the URL carries.
-XRootDStatus openAndWait(XrdCl::File* f, const std::string& url, std::string& server) {
+// `f`, and without any user name or password the URL carries. `a` is the
+// attempt, as recorded.
+XRootDStatus openAndWait(XrdCl::File* f, const std::string& url, std::string& server,
+                         OpenAttempt a) {
   server.clear();
   auto r = std::make_shared<OpenResult>();
   auto* h = new OpenWaitHandler(r);
+  a.t0 = nowUs();
   const XRootDStatus s = f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h,
                                  static_cast<ucache::XrdTimeout>(0));
   if (!s.IsOK()) {
@@ -268,11 +454,9 @@ XRootDStatus openAndWait(XrdCl::File* f, const std::string& url, std::string& se
   std::unique_lock<std::mutex> lk(r->mu);
   r->cv.wait(lk, [&r] { return r->done; });
   lk.unlock(); // the handler writes nothing more once done is set
-  if (r->hosts && !r->hosts->empty()) {
-    const XrdCl::URL& u = r->hosts->back().url;
-    server = u.GetHostName() + ":" + std::to_string(u.GetPort());
-  }
-  noteOriginOpen(&r->status, r->hosts.get());
+  if (r->hosts && !r->hosts->empty())
+    server = hostPortOf(r->hosts->back().url);
+  noteOriginOpen(a, &r->status, r->hosts.get(), f);
   r->hosts.reset();
   return r->status;
 }
@@ -287,9 +471,14 @@ class RetryingOpenHandler : public ResponseHandler {
  public:
   RetryingOpenHandler(std::shared_ptr<HandleState> st, std::string url,
                       XrdCl::OpenFlags::Flags flags, XrdCl::Access::Mode mode,
-                      ucache::XrdTimeout timeout, ResponseHandler* real, const Config& cfg)
+                      ucache::XrdTimeout timeout, ResponseHandler* real, const Config& cfg,
+                      bool record)
       : st_(std::move(st)), url_(std::move(url)), flags_(flags), mode_(mode),
-        timeout_(timeout), real_(real), cfg_(cfg) {}
+        timeout_(timeout), real_(real), cfg_(cfg), record_(record) {
+    a_.st = st_.get();
+    a_.seq = gOpenSeq.fetch_add(1, std::memory_order_relaxed) + 1;
+    a_.timeoutS = static_cast<int>(timeout);
+  }
 
   // Issue the first attempt on the ctor-created inner file. Always returns stOK:
   // `real_` will receive exactly one completion (now, after a retry, or a
@@ -307,6 +496,8 @@ class RetryingOpenHandler : public ResponseHandler {
  private:
   XRootDStatus issueOn(XrdCl::File* f) {
     ++attempt_;
+    a_.attempt = attempt_;
+    a_.t0 = nowUs();
     return f->Open(faultOpenUrl(url_, attempt_), flags_, mode_, this, timeout_);
   }
 
@@ -315,7 +506,8 @@ class RetryingOpenHandler : public ResponseHandler {
     std::unique_ptr<XRootDStatus> s(status);
     std::unique_ptr<AnyObject> r(response);
     std::unique_ptr<HostList> h(hostList);
-    noteOriginOpen(s.get(), h.get());
+    if (record_)
+      noteOriginOpen(a_, s.get(), h.get(), nullptr);
     if (s && s->IsOK()) { // transparent on success: forward exactly what we got
       real_->HandleResponseWithHosts(s.release(), r.release(), h.release());
       delete this;
@@ -372,8 +564,10 @@ class RetryingOpenHandler : public ResponseHandler {
   ucache::XrdTimeout timeout_;
   ResponseHandler* real_;
   const Config& cfg_;
+  const bool record_; // a handle the cache serves: its attempts are recorded
   int attempt_ = 0;
   XRootDStatus lastStatus_;
+  OpenAttempt a_; // the attempt in flight, as recorded
 };
 
 } // namespace
@@ -418,6 +612,49 @@ AnyObject* vreadResponse(const ChunkList& chunks) {
   return obj;
 }
 
+std::string answeredBy(HandleState& st, const HostList* hosts) noexcept {
+  // Evaluated in completion handlers as an argument, outside any callee's
+  // catch: nothing may leave it, and an unnamed server is a lost count.
+  try {
+    if (hosts && !hosts->empty())
+      return hostPortOf(hosts->back().url);
+    std::lock_guard<std::mutex> g(st.mu);
+    return st.dataServer;
+  } catch (...) {
+    return std::string();
+  }
+}
+
+void noteOriginFailure(HandleState& st, ServerTally* tally, const char* op, uint64_t off,
+                       uint64_t len, const XRootDStatus& s, const std::string& server,
+                       const std::string& codec) try {
+  if (!st.store)
+    return;
+  const FailureClass cls = failureClassOf(s);
+  countFailure(st.store->stats(), cls);
+  if (tally)
+    tally->fail(server);
+  const std::string file = recordFile(st.url);
+  std::string line;
+  line.reserve(384);
+  line += "{\"kind\":\"origin_failure\",\"v\":1,\"ts_ms\":" + std::to_string(wallMs());
+  line += ",\"file\":\"" + escapeForJson(file) + "\",\"op\":\"" + op + '"';
+  line += ",\"off\":" + std::to_string(off) + ",\"len\":" + std::to_string(len);
+  line += ",\"code\":" + std::to_string(s.code) + ",\"errno\":" + std::to_string(s.errNo);
+  line += std::string(",\"class\":\"") + failureClassName(cls) + '"';
+  line += ",\"data_server\":\"" + escapeForJson(server) + '"';
+  if (!codec.empty())
+    line += ",\"codec\":\"" + escapeForJson(codec) + '"';
+  line += ",\"msg\":\"" + recordMsg(s) + "\"}\n";
+  // At most kRecordsPerCapKey lines per file, server and class: a server that
+  // fails every request must not fill the queue (the per-file record counts
+  // every failure).
+  st.store->enqueueRecord(std::move(line),
+                          file + '\n' + server + '\n' + failureClassName(cls));
+} catch (...) {
+  // a completion handler of the client library: nothing may leave it
+}
+
 namespace {
 
 // Cache-freshness marker (UCACHE_REVALIDATE_S): objects/<aa>/<hash>.val, whose
@@ -459,6 +696,15 @@ bool HandleState::ensureInnerOpen() {
   std::lock_guard<std::mutex> g(innerOpenMu);
   if (innerOpened)
     return innerOpenOk;
+  // Which of the cache's own opens this is, for its records: a forked child's
+  // open afresh, a trusted handle's at its first miss, or one whose trusted
+  // entry was gone (ensureEntry clears cacheOnly before it asks).
+  OpenAttempt a;
+  a.st = this;
+  {
+    std::lock_guard<std::mutex> m(mu);
+    a.route = innerStale ? OpenRoute::kFork : cacheOnly ? OpenRoute::kLazy : OpenRoute::kDegraded;
+  }
   if (innerStale) { // see startOverAfterFork; innerOps is 0 in the child
     if (!resetInner(/*leakOld=*/true))
       return false; // the handle is shut down
@@ -480,7 +726,8 @@ bool HandleState::ensureInnerOpen() {
   const std::string fillUrl = ownOpenUrl(url);
   XrdCl::File* f = inner.load();
   std::string reached; // the server the last attempt reached
-  XRootDStatus s = openAndWait(f, faultOpenUrl(fillUrl, ++lazyOpenAttempt), reached);
+  a.seq = gOpenSeq.fetch_add(1, std::memory_order_relaxed) + 1;
+  XRootDStatus s = openAndWait(f, faultOpenUrl(fillUrl, ++lazyOpenAttempt), reached, a);
   // Case B: bounded synchronous retry of a TRANSIENT lazy
   // open on a FRESH inner file (a failed open is terminal). The sleeps run on
   // this caller/executor thread under innerOpenMu — the deliberate asymmetry
@@ -496,7 +743,8 @@ bool HandleState::ensureInnerOpen() {
     if (!fresh)
       break; // the handle is shut down: the last failure stands
     f = fresh;
-    s = openAndWait(f, faultOpenUrl(fillUrl, ++lazyOpenAttempt), reached);
+    ++a.attempt;
+    s = openAndWait(f, faultOpenUrl(fillUrl, ++lazyOpenAttempt), reached, a);
   }
   if (!s.IsOK() && retry > 1 && store) // retried at least once and still failed
     store->stats().openRetriesExhausted.fetch_add(1, std::memory_order_relaxed);
@@ -750,6 +998,17 @@ static void noteAppChunks(const std::shared_ptr<HandleState>& st,
                      [&](uint64_t off, uint64_t len) { noteAppRead(st, entry, off, len, cold); });
 }
 
+// A vector read's first offset and its bytes, for a failure's record.
+static uint64_t chunksFirst(const XrdCl::ChunkList& chunks) {
+  return chunks.empty() ? 0 : chunks.front().offset;
+}
+static uint64_t chunksBytes(const XrdCl::ChunkList& chunks) {
+  uint64_t n = 0;
+  for (const auto& c : chunks)
+    n += c.length;
+  return n;
+}
+
 // Vector relay: the byte total and the footprint come from the same walk.
 static void noteRelayChunks(const std::shared_ptr<HandleState>& st,
                             const XrdCl::ChunkList& chunks) {
@@ -770,8 +1029,10 @@ static void emitRelayObs(const std::shared_ptr<HandleState>& st,
   // A handle with an entry relays too (a file read directly, a fail-open): its
   // answer times are this file's, and go in the entry's record, which is
   // written only once the entry's last handle has let go of it.
-  if (entry)
+  if (entry) {
     entry->obs().originRtUs.addFrom(st->relayRtUs);
+    entry->obs().servers.addFrom(st->relayServers);
+  }
   const uint64_t n = st->relayedBytes.load(std::memory_order_relaxed);
   if (!entry && st->store && n) {
     const uint64_t a = st->relayFirstUs.load(std::memory_order_relaxed);
@@ -814,7 +1075,7 @@ static void emitRelayObs(const std::shared_ptr<HandleState>& st,
       st->releaseInner();
     }
     st->store->recordRelayObs(st->url, n, "relay", b > a ? b - a : 0, originSize,
-                              &st->relayRtUs);
+                              &st->relayRtUs, &st->relayServers);
   }
 }
 
@@ -864,6 +1125,24 @@ struct RelayHandler : XrdCl::ResponseHandler {
   OriginInFlight inflight;
   uint64_t t0 = 0;      // when the read was issued
   uint64_t readLen = 0; // a plain read's length (Read, PgRead), else 0
+  uint64_t off = 0, len = 0; // what was asked, for a failure's record
+  // The bytes an answer carries: a plain read's, a page read's or a vector
+  // read's; 0 for anything else.
+  static uint64_t answerBytes(XrdCl::AnyObject* r) {
+    if (!r)
+      return 0;
+    XrdCl::ChunkInfo* ci = nullptr;
+    r->Get(ci); // checked against the type held: null for any other answer
+    if (ci)
+      return ci->length;
+    XrdCl::PageInfo* pi = nullptr;
+    r->Get(pi);
+    if (pi)
+      return pi->GetLength();
+    XrdCl::VectorReadInfo* vi = nullptr;
+    r->Get(vi);
+    return vi ? vi->GetSize() : 0;
+  }
   void learnSizeFrom(XrdCl::AnyObject* r) {
     uint64_t off = 0, got = 0;
     XrdCl::ChunkInfo* ci = nullptr;
@@ -896,8 +1175,16 @@ struct RelayHandler : XrdCl::ResponseHandler {
       const uint64_t rt = nowUs() - t0;
       st->store->stats().relayRtUs.add(rt);
       st->relayRtUs.add(rt);
+      st->relayServers.add(answeredBy(*st, h), answerBytes(r), rt, inflight.atIssue);
       if (readLen && r)
         learnSizeFrom(r);
+    } else if (st->store && s && !s->IsOK()) {
+      // A pass-through handle's open is not watched, so it knows no server
+      // of its own: then the server its reads went to is named.
+      std::string server = answeredBy(*st, h);
+      if (server.empty())
+        server = st->relayServers.topServer();
+      noteOriginFailure(*st, &st->relayServers, "relay", off, len, *s, server);
     }
     st->releaseInner();
     inflight.release();
@@ -915,10 +1202,12 @@ struct RelayHandler : XrdCl::ResponseHandler {
 // Every relay is issued the same way: take the guard as the request goes out,
 // so it spans the read rather than the handler's lifetime.
 static RelayHandler* newRelay(const std::shared_ptr<HandleState>& st,
-                              XrdCl::ResponseHandler* user) {
+                              XrdCl::ResponseHandler* user, uint64_t off = 0, uint64_t len = 0) {
   auto* relay = new RelayHandler;
   relay->st = st;
   relay->user = user;
+  relay->off = off;
+  relay->len = len;
   if (st->store) {
     relay->inflight = OriginInFlight(&st->store->stats());
     relay->t0 = nowUs();
@@ -928,14 +1217,15 @@ static RelayHandler* newRelay(const std::shared_ptr<HandleState>& st,
 
 // `readLen`: the length of a plain read (Read, PgRead) of a handle with no
 // entry, whose short answer tells its footprint where the file ends; 0 for
-// anything else.
+// anything else. `off` and `len`: what is asked, for a failure's record.
 template <typename Issue>
 static XrdCl::XRootDStatus relayToInner(const std::shared_ptr<HandleState>& st,
                                         XrdCl::ResponseHandler* user, Issue issue,
-                                        uint64_t readLen = 0) {
+                                        uint64_t readLen = 0, uint64_t off = 0,
+                                        uint64_t len = 0) {
   noteWaitTier(user, ReaderWait::kOrigin);
   if (XrdCl::File* f = st->acquireInner()) {
-    auto* relay = newRelay(st, user);
+    auto* relay = newRelay(st, user, off, len);
     relay->readLen = readLen;
     XrdCl::XRootDStatus s = issue(f, static_cast<XrdCl::ResponseHandler*>(relay));
     if (!s.IsOK()) {
@@ -998,6 +1288,8 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   relayFirstUs.store(0, std::memory_order_relaxed);
   relayLastUs.store(0, std::memory_order_relaxed);
   relayRtUs.clear();
+  new (&relayServers) ServerTally; // its lock may be held by a thread left in the parent
+  new (&dataServer) std::string;
   cpu0Us = 0;
   cpuBlended = true; // a span that began in the parent cannot be attributed here
   forkGen.store(gen, std::memory_order_release);
@@ -1151,11 +1443,15 @@ class MissReadHandler : public ResponseHandler {
       // Wire failure or short read on the rounded span: fail open — retry
       // the exact user request as pure pass-through, completing the user
       // from that operation faithfully (§5.2 step 5).
+      if (!s || !s->IsOK())
+        noteOriginFailure(*st_, &entry_->obs().servers, "read", wireOff_, wireBuf_->size(),
+                          s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal),
+                          answeredBy(*st_, h.get()));
       if (gateLen_)
         entry_->endFetch(wireOff_, gateLen_); // waiters refetch on their own
       st_->noteCacheError(globalConfig());
       if (XrdCl::File* f = st_->acquireInner()) {
-        auto* relay = newRelay(st_, user_);
+        auto* relay = newRelay(st_, user_, userOff_, userLen_);
         XRootDStatus s2 = f->Read(userOff_, userLen_, userBuf_, relay, 0);
         if (s2.IsOK()) {
           delete this;
@@ -1185,6 +1481,7 @@ class MissReadHandler : public ResponseHandler {
       const uint64_t rt = nowUs() - t0_;
       stats.originRtUs.add(rt);
       entry_->obs().originRtUs.add(rt);
+      entry_->obs().servers.add(answeredBy(*st_, h.get()), got, rt, inflight_.atIssue);
       if (stats.tracer)
         stats.tracer->rec("wire", entry_->key().key, wireOff_, got, nowUs() - t0_);
     }
@@ -1319,9 +1616,15 @@ class MissVReadHandler : public ResponseHandler {
     if (!s || !s->IsOK()) {
       // Wire failure: fail open — reissue the FULL original chunk list as
       // pure pass-through (hits included; wasteful but simple and faithful).
+      uint64_t wireBytes = 0;
+      for (const auto& w : wire_)
+        wireBytes += w.len;
+      noteOriginFailure(*st_, &entry_->obs().servers, "readv", wire_.front().off, wireBytes,
+                        s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal),
+                        answeredBy(*st_, h.get()));
       st_->noteCacheError(globalConfig());
       if (XrdCl::File* f = st_->acquireInner()) {
-        auto* relay = newRelay(st_, user_);
+        auto* relay = newRelay(st_, user_, chunksFirst(userChunks_), chunksBytes(userChunks_));
         XRootDStatus s2 = f->VectorRead(userChunks_, nullptr, relay, 0);
         if (s2.IsOK()) {
           delete this;
@@ -1384,6 +1687,7 @@ class MissVReadHandler : public ResponseHandler {
       const uint64_t rt = nowUs() - t0_;
       stats.originRtUs.add(rt);
       entry_->obs().originRtUs.add(rt);
+      entry_->obs().servers.add(answeredBy(*st_, h.get()), wireBytes, rt, inflight_.atIssue);
       if (stats.tracer)
         stats.tracer->rec("wire", entry_->key().key, wire_.front().off, wireBytes,
                           nowUs() - t0_);
@@ -1728,7 +2032,9 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // is retried on a fresh inner file (Case A); write-opens and
   // the null-handler case are never wrapped.
   if (cfg.openRetries > 0 && !writey && handler) {
-    auto* rh = new RetryingOpenHandler(st_, url, flags, mode, timeout, handler, cfg);
+    // Recorded for a handle the cache serves only, as without retries.
+    auto* rh = new RetryingOpenHandler(st_, url, flags, mode, timeout, handler, cfg,
+                                       !passthroughOnly_);
     return rh->start();
   }
   // Otherwise a cached handle's read open passes through ReaderOpenHandler,
@@ -1737,7 +2043,7 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // completion will come) is the reader's answer, as without the wrapper.
   ResponseHandler* h = handler;
   if (!passthroughOnly_ && handler)
-    h = new ReaderOpenHandler(handler);
+    h = new ReaderOpenHandler(handler, st_, static_cast<int>(timeout));
   XrdCl::File* f = st_->inner.load();
   const XRootDStatus s = openFaultFirstN() > 0 // test hook only; inert in production
                              ? f->Open(faultOpenUrl(url, 1), flags, mode, h, timeout)
@@ -2331,7 +2637,7 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
         [=](XrdCl::File* f, ResponseHandler* rh) {
           return f->Read(offset, size, buffer, rh, timeout);
         },
-        entry ? 0 : size);
+        entry ? 0 : size, offset, size);
   }
   // Past EOF is a SHORT read, and it must still be cached. Relaying it here
   // was correct in what it returned — the origin has the same file — but relay
@@ -2390,9 +2696,12 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
     one.emplace_back(offset, size, buffer);
     if (auto rule = directRule(st_, entry, one); ruleReadsData(rule, offset, size)) {
       noteDirectBytes(st_, entry, size);
-      return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
-        return f->Read(offset, size, buffer, rh, timeout);
-      });
+      return relayToInner(
+          st_, handler,
+          [=](XrdCl::File* f, ResponseHandler* rh) {
+            return f->Read(offset, size, buffer, rh, timeout);
+          },
+          0, offset, size);
     }
   }
 
@@ -2541,7 +2850,7 @@ XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void
       [=](XrdCl::File* f, ResponseHandler* rh) {
         return f->PgRead(offset, size, buffer, rh, timeout);
       },
-      entry ? 0 : size);
+      entry ? 0 : size, offset, size);
 }
 
 // The plain byte-cache vector-read serve, as a free function so a request that
@@ -2707,9 +3016,12 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
   // The combined-buffer variant is legacy and rare: pass through unchanged.
   if (!entry || buffer || chunks.empty()) {
     noteRelayChunks(st_, chunks);
-    return relayToInner(st_, handler, [&](XrdCl::File* f, ResponseHandler* rh) {
-      return f->VectorRead(chunks, buffer, rh, timeout);
-    });
+    return relayToInner(
+        st_, handler,
+        [&](XrdCl::File* f, ResponseHandler* rh) {
+          return f->VectorRead(chunks, buffer, rh, timeout);
+        },
+        0, chunksFirst(chunks), chunksBytes(chunks));
   }
 
 #ifdef UCACHE_HAVE_COLDRUN
@@ -2736,9 +3048,12 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
   for (const auto& c : chunks)
     if (c.length == 0 || c.offset + c.length > entry->fileSize()) {
       noteRelayChunks(st_, chunks);
-      return relayToInner(st_, handler, [&](XrdCl::File* f, ResponseHandler* rh) {
-        return f->VectorRead(chunks, buffer, rh, timeout);
-      });
+      return relayToInner(
+          st_, handler,
+          [&](XrdCl::File* f, ResponseHandler* rh) {
+            return f->VectorRead(chunks, buffer, rh, timeout);
+          },
+          0, chunksFirst(chunks), chunksBytes(chunks));
     }
 
   servePlainVectorRead(st_, entry, chunks, handler, /*mayPark=*/true);

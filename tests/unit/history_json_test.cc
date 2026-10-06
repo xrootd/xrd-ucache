@@ -150,6 +150,35 @@ TEST(HistoryJson, OriginTimingsGoByDomainWhenPublishedAndByHostLocally) {
                                                     {"root://xrootd.example.org", V{"3"}}}));
 }
 
+// A file opened through a redirector is published under the domain of the
+// data server its reads went to (the record's data_server), not the
+// redirector's; a record without one keeps the URL's host. Neither host is
+// published, only domains.
+TEST(HistoryJson, OriginsAreTheDataServersDomainsWhenTheRecordsNameThem) {
+  test::TempDir td;
+  writeLines(td.path(), "h-1-1000-0",
+             {"{\"ts\":1100,\"pid\":1,\"opens\":2,\"origin_bytes\":10,\"served_bytes\":10}"},
+             {fileLine("root://redirector.example.org//store/a.root", 5000,
+                       "\"origin_rt_us\":[2],\"data_server\":\"disk3.fnal.gov\","
+                       "\"data_servers\":\"disk3.fnal.gov:1094=10:1:9:9:1:0\""),
+              fileLine("root://eos1.cern.ch//store/b.root", 5000, "\"origin_rt_us\":[1]"),
+              "{\"kind\":\"open\",\"v\":1,\"file\":\"root://x.example.com//c\","
+              "\"data_server\":\"y.example.com:1094\"}"});
+  const Json pub = firstRun(history(td.path(), /*redacted=*/true));
+  const Json* origins = pub.get("origins");
+  ASSERT_TRUE(origins && origins->isArray());
+  std::vector<std::string> got;
+  for (const auto& o : origins->arr)
+    got.push_back(o.s);
+  EXPECT_EQ(got, (std::vector<std::string>{"root://cern.ch", "root://fnal.gov"}));
+  const Json* rt = pub.get("origins_rt");
+  ASSERT_TRUE(rt && rt->isArray() && rt->arr.size() == 2);
+  EXPECT_EQ(rt->arr[1].str("origin"), "root://fnal.gov");
+  const std::string text = historyJson(loadRuns(td.path()), 10, /*redacted=*/true, true);
+  for (const char* leak : {"disk3", "redirector", "example.com"})
+    EXPECT_EQ(text.find(leak), std::string::npos) << leak << " in " << text;
+}
+
 TEST(HistoryJson, ThePublishedFormNamesNoHostNoPathAndNoProcess) {
   test::TempDir td;
   currentRun(td.path());

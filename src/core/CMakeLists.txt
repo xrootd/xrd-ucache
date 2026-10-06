@@ -5,6 +5,7 @@ add_library(ucache-core STATIC
   CpuCounters.cc
   ReadFootprint.cc
   ReaderWait.cc
+  ServerTally.cc
   Config.cc
   FileEntry.cc
   InUse.cc

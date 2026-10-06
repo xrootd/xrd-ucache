@@ -106,6 +106,10 @@ struct Run {
                              // origin coordinates; empty when unknown (a
                              // replica built before the map existed)
     std::string mode;        // cached | fill | relay ("" = pre-span record)
+    // The host (no port) that delivered most of this file's origin bytes, from
+    // the newest record that names one; "" when none does (a warm run, or a
+    // record from before the field existed).
+    std::string dataServer;
     uint64_t tsMs = 0;       // newest record's epoch milliseconds, 0 if none
 
     // What the application read of this file, in ORIGINAL-file coordinates

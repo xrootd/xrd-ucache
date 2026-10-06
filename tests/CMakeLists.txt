@@ -34,6 +34,7 @@ add_executable(ucache-unit-tests
   unit/concurrency_test.cc
   unit/fault_test.cc
   unit/open_retry_test.cc
+  unit/open_policy_test.cc
   unit/executor_test.cc
   unit/copyguard_test.cc
   unit/runlog_test.cc
@@ -47,6 +48,7 @@ add_executable(ucache-unit-tests
   ${CMAKE_SOURCE_DIR}/src/plugin/CopyDetect.cc # copy tools and copy engines (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/CopyGuard.cc  # the truncated-copy guard (pure policy)
   ${CMAKE_SOURCE_DIR}/src/plugin/OpenRetry.cc  # pure policy TU (no XrdCl)
+  ${CMAKE_SOURCE_DIR}/src/plugin/OpenPolicy.cc # what an open's answer says (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/Executor.cc   # thread pool (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/cli/RunLog.cc        # run reader (pure file parsing)
   ${CMAKE_SOURCE_DIR}/src/cli/HistoryJson.cc   # the history emitter (pure)
@@ -92,7 +94,9 @@ if (TARGET ucache-transpose) # learner + seek-width + hole-verification contract
   target_include_directories(ucache-unit-tests PRIVATE ${UCACHE_LZMA_INC} ${UCACHE_ZSTD_INC})
 endif()
 
-add_executable(ucache-crash-harness crash/crash_harness.cc)
+add_executable(ucache-crash-harness crash/crash_harness.cc
+                                    ${CMAKE_SOURCE_DIR}/src/cli/RunLog.cc) # records mode's reader
+target_include_directories(ucache-crash-harness PRIVATE ${CMAKE_SOURCE_DIR}/src/cli)
 target_link_libraries(ucache-crash-harness PRIVATE ucache-core)
 
 # Multi-process eviction soak. Long-running; LABEL "soak" so the
@@ -108,6 +112,9 @@ gtest_discover_tests(ucache-unit-tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 6
 # Crash suite as a ctest entry; iterations via UCACHE_CRASH_ITERS (default 200).
 add_test(NAME crash-suite COMMAND ucache-crash-harness)
 set_tests_properties(crash-suite PROPERTIES TIMEOUT 1800)
+# The same for the per-file record file (torn lines, older readers).
+add_test(NAME crash-suite-records COMMAND ucache-crash-harness records)
+set_tests_properties(crash-suite-records PROPERTIES TIMEOUT 1800)
 
 add_test(NAME soak-suite COMMAND ucache-soak-harness)
 set_tests_properties(soak-suite PROPERTIES TIMEOUT 2400 LABELS soak)

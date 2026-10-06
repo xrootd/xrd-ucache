@@ -183,6 +183,42 @@ TEST(StatsAggregate, MixedSchemaIsFlagged) {
   EXPECT_EQ(t.replicaReadBytes, 655360u);
 }
 
+// The origin open and failure counters: written by toJsonBody under their
+// names, summed back by aggregateStats, and absent (zero) in older files.
+TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
+  Stats s;
+  s.originOpenAttempts = 7;
+  s.originOpenFailures = 2;
+  for (int i = 0; i < 6; ++i)
+    s.originFailures[i] = static_cast<uint64_t>(10 + i);
+  s.recordsDropped = 3;
+  s.originOpenUs.add(1000); // bucket 9
+  const std::string body = s.toJsonBody();
+  for (const char* f :
+       {"\"origin_open_attempts\":7", "\"origin_open_failures\":2",
+        "\"origin_failures_client\":10", "\"origin_failures_site\":11",
+        "\"origin_failures_notfound\":12", "\"origin_failures_data\":13",
+        "\"origin_failures_expired\":14", "\"origin_failures_other\":15",
+        "\"records_dropped\":3", "\"hist_origin_open_us\":[0,0,0,0,0,0,0,0,0,1]"})
+    EXPECT_NE(body.find(f), std::string::npos) << f;
+  EXPECT_EQ(("{" + body + "}").find(",}"), std::string::npos);
+  test::TempDir td;
+  std::string dir = td.path() + "/stats";
+  ::mkdir(dir.c_str(), 0700);
+  { std::ofstream(dir + "/a.jsonl") << "{\"ts\":1," << body << "}\n"; }
+  { std::ofstream(dir + "/b.jsonl") << "{\"ts\":1," << body << "}\n"; }
+  { std::ofstream(dir + "/old.jsonl") << "{\"ts\":1,\"opens\":4}\n"; } // before the counters
+  const StatsTotals t = aggregateStats(dir);
+  EXPECT_EQ(t.files, 3);
+  EXPECT_EQ(t.originOpenAttempts, 14u);
+  EXPECT_EQ(t.originOpenFailures, 4u);
+  for (int i = 0; i < 6; ++i)
+    EXPECT_EQ(t.originFailures[i], static_cast<uint64_t>(2 * (10 + i))) << i;
+  EXPECT_EQ(t.recordsDropped, 6u);
+  EXPECT_EQ(t.histOriginOpen, (std::vector<uint64_t>{0, 0, 0, 0, 0, 0, 0, 0, 0, 2}));
+  EXPECT_EQ(t.opens, 4u) << "no new counter collides with an older one's name";
+}
+
 TEST(StatsAggregate, MissingDirIsZero) {
   StatsTotals t = aggregateStats("/nonexistent/ucache/stats");
   EXPECT_EQ(t.files, 0);

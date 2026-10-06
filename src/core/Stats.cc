@@ -9,6 +9,11 @@
 
 namespace ucache {
 namespace {
+// Stats::originFailures, in its order.
+const char* const kOriginFailureFields[6] = {
+    "origin_failures_client",  "origin_failures_site",    "origin_failures_notfound",
+    "origin_failures_data",    "origin_failures_expired", "origin_failures_other"};
+
 // Extract an integer field from one flat stats JSON line: matches the exact
 // `"<key>":<digits>` Stats::toJsonBody writes (arrays/strings are skipped).
 uint64_t extractU64(const std::string& line, const char* key) {
@@ -167,7 +172,14 @@ std::string Stats::toJsonBody() const {
   os << "\"hist_slot_read_us\":" << slotReadUs.toJson() << ',';
   os << "\"hist_cold_request_us\":" << coldRequestUs.toJson() << ',';
   os << "\"hist_pool_queue_us\":" << poolQueueUs.toJson() << ',';
-  os << "\"hist_relay_rt_us\":" << relayRtUs.toJson();
+  os << "\"hist_relay_rt_us\":" << relayRtUs.toJson() << ',';
+  // Appended at the end, as every newer field is.
+  f("origin_open_attempts", originOpenAttempts);
+  f("origin_open_failures", originOpenFailures);
+  for (int i = 0; i < 6; ++i)
+    f(kOriginFailureFields[i], originFailures[i]);
+  f("records_dropped", recordsDropped);
+  os << "\"hist_origin_open_us\":" << originOpenUs.toJson();
   return os.str();
 }
 
@@ -291,6 +303,12 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     extractHist(last, "hist_req_read_bytes", t.histReqRead);
     extractHist(last, "hist_hit_read_bytes", t.histHitReadSize);
     extractHist(last, "hist_replica_read_bytes", t.histReplicaReadSize);
+    t.originOpenAttempts += extractU64(last, "origin_open_attempts");
+    t.originOpenFailures += extractU64(last, "origin_open_failures");
+    for (int i = 0; i < 6; ++i)
+      t.originFailures[i] += extractU64(last, kOriginFailureFields[i]);
+    t.recordsDropped += extractU64(last, "records_dropped");
+    extractHist(last, "hist_origin_open_us", t.histOriginOpen);
   }
   ::closedir(d);
   return t;

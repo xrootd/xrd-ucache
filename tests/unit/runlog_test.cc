@@ -494,6 +494,46 @@ TEST(Signature, OriginHostComesFromTheUrl) {
   EXPECT_EQ(runs[0].originHosts.size(), 2u);
 }
 
+// A file opened through a redirector: its record names the data server the
+// reads went to, and that is the origin, not the redirector in the URL. A
+// record without the field (an older writer, or a file that read nothing from
+// the origin) still falls back to the URL's host. Lines of the newer kinds
+// (an open, a failure) carry no "key" and are not files.
+TEST(Signature, OriginHostComesFromTheDataServerWhenTheRecordNamesOne) {
+  test::TempDir d;
+  const std::string stem = d.path() + "/h-1-1000-0";
+  {
+    std::ofstream o(stem + ".jsonl");
+    o << "{\"ts\":1100,\"pid\":1," << fillCounters(kGiB) << "}\n";
+  }
+  {
+    std::ofstream o(stem + ".files.jsonl");
+    o << "{\"ts\":1100,\"key\":\"root://redirector.example.org:1094//a\",\"wire_bytes\":5,"
+         "\"origin_rt_us\":[0,0,3],\"mode\":\"fill\",\"data_server\":\"disk1.site.example.org\","
+         "\"data_servers\":\"disk1.site.example.org:1094=5:1:10:10:1:0\"}\n";
+    o << "{\"ts\":1100,\"key\":\"root://redirector.example.org:1094//b\",\"wire_bytes\":5,"
+         "\"mode\":\"fill\"}\n"; // an older record: no data_server
+    o << "{\"ts\":1100,\"key\":\"root://redirector.example.org:1094//c\",\"served_bytes\":5,"
+         "\"mode\":\"cached\",\"data_server\":\"\",\"data_servers\":\"\"}\n"; // a warm file
+    o << "{\"kind\":\"open\",\"v\":1,\"ts_ms\":1100000,\"file\":\"root://x//d\","
+         "\"data_server\":\"other.example.org:1094\"}\n";
+    o << "{\"kind\":\"origin_failure\",\"v\":1,\"ts_ms\":1100000,\"file\":\"root://x//e\","
+         "\"op\":\"read\",\"data_server\":\"other.example.org:1094\"}\n";
+  }
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  const ucache::Run& r = runs[0];
+  EXPECT_EQ(r.files.size(), 3u) << "kind lines are not files";
+  EXPECT_EQ(r.files.at("root://redirector.example.org:1094//a").dataServer,
+            "disk1.site.example.org");
+  ASSERT_EQ(r.originHosts.size(), 2u);
+  EXPECT_EQ(r.originHosts.at("disk1.site.example.org"), 1u);
+  EXPECT_EQ(r.originHosts.at("redirector.example.org"), 2u); // the two without a server
+  EXPECT_EQ(r.originHosts.count("other.example.org"), 0u);
+  ASSERT_EQ(r.originRtByHost.count("disk1.site.example.org"), 1u);
+  EXPECT_EQ(r.originRtByHost.at("disk1.site.example.org"), (std::vector<uint64_t>{0, 0, 3}));
+}
+
 TEST(Baseline, OriginShareIsWeightedByOriginSize) {
   test::TempDir d;
   // One big file from the origin, one small one served from cache: by FILE

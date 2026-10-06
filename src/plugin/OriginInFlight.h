@@ -15,11 +15,16 @@ namespace ucache {
 // threads with a read each reported a handful.
 struct OriginInFlight {
   Stats* s = nullptr;
+  // The origin reads in flight once this one was counted (itself included),
+  // kept after release for the per-file record's per-server maximum; 0
+  // without stats.
+  uint64_t atIssue = 0;
   OriginInFlight() = default;
   explicit OriginInFlight(Stats* st) : s(st) {
     if (!s)
       return;
     const uint64_t n = s->originReadsInFlight.fetch_add(1, std::memory_order_relaxed) + 1;
+    atIssue = n;
     uint64_t hw = s->originReadsInFlightHighWater.load(std::memory_order_relaxed);
     while (n > hw && !s->originReadsInFlightHighWater.compare_exchange_weak(
                          hw, n, std::memory_order_relaxed))
@@ -27,12 +32,13 @@ struct OriginInFlight {
   }
   OriginInFlight(const OriginInFlight&) = delete;
   OriginInFlight& operator=(const OriginInFlight&) = delete;
-  OriginInFlight(OriginInFlight&& o) noexcept : s(o.s) { o.s = nullptr; }
+  OriginInFlight(OriginInFlight&& o) noexcept : s(o.s), atIssue(o.atIssue) { o.s = nullptr; }
   OriginInFlight& operator=(OriginInFlight&& o) noexcept {
     if (this != &o) {
       if (s)
         s->originReadsInFlight.fetch_sub(1, std::memory_order_relaxed);
       s = o.s;
+      atIssue = o.atIssue;
       o.s = nullptr;
     }
     return *this;

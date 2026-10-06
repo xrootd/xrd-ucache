@@ -71,6 +71,7 @@ function(ucache_add_plugin target include_dir library suffix)
     CopyDetect.cc
     CopyGuard.cc
     Executor.cc
+    OpenPolicy.cc
     OpenRetry.cc
     UCacheFactory.cc
     UCacheFile.cc

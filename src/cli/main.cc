@@ -390,6 +390,20 @@ void printStats(const StatsTotals& t) {
     row("origin_checks_failed", t.originChecksFailed);
     row("origin_checks_none", t.originChecksNone);
   }
+  // Origin opens and failures: shown when there were any (a warm run has none).
+  const uint64_t failures = t.originFailures[0] + t.originFailures[1] + t.originFailures[2] +
+                            t.originFailures[3] + t.originFailures[4] + t.originFailures[5];
+  if (t.originOpenAttempts || failures || t.recordsDropped) {
+    row("origin_open_attempts", t.originOpenAttempts);
+    row("origin_open_failures", t.originOpenFailures);
+    row("origin_failures_client", t.originFailures[0]);
+    row("origin_failures_site", t.originFailures[1]);
+    row("origin_failures_notfound", t.originFailures[2]);
+    row("origin_failures_data", t.originFailures[3]);
+    row("origin_failures_expired", t.originFailures[4]);
+    row("origin_failures_other", t.originFailures[5]);
+    row("records_dropped", t.recordsDropped);
+  }
 
   // The derived workflow picture — the divisions a human would do.
   std::printf("workflow:\n");
@@ -491,6 +505,8 @@ void printStats(const StatsTotals& t) {
     std::printf("  replica read       %s\n", pctiles(t.histReplicaRead).c_str());
   if (!t.histOpen.empty())
     std::printf("  entry setup        %s\n", pctiles(t.histOpen).c_str());
+  if (!t.histOriginOpen.empty())
+    std::printf("  origin open        %s\n", pctiles(t.histOriginOpen).c_str());
   if (!t.histFlushWrite.empty())
     std::printf("  flush write        %s\n", pctiles(t.histFlushWrite).c_str());
 }

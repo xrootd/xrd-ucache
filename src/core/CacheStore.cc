@@ -128,6 +128,8 @@ void CacheStore::afterForkChild() {
     std::set<std::string> seen;
     std::shared_ptr<FileEntry::ObsSink> sink;
     std::unique_ptr<Tracer> tracer;
+    std::deque<std::string> records;
+    std::map<std::string, uint32_t> recordCaps;
   };
   auto* left = new LeftBehind; // leaked on purpose
   new (&relayFpMu_) std::mutex;
@@ -136,6 +138,10 @@ void CacheStore::afterForkChild() {
   new (&evictMu_) std::mutex;
   new (&dumpMu_) std::mutex;
   new (&identityMu_) std::mutex;
+  new (&recMu_) std::mutex;
+  // The parent's queued record lines are the parent's to write.
+  left->records.swap(records_);
+  left->recordCaps.swap(recordCaps_);
   left->relayFp.swap(relayFp_);
   left->registry.swap(registry_);
   left->summaries.swap(entrySummaries_);
@@ -1152,7 +1158,7 @@ ReadFootprint& CacheStore::relayFootprint(const std::string& url) {
 
 void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const char* mode,
                                 uint64_t spanUs, uint64_t originSize,
-                                const Histogram* originRt) {
+                                const Histogram* originRt, const ServerTally* servers) {
   ensureOwnIdentity();
   ReadFootprint* fp = footprintFor(url);
   // No size means no way to tell content from a reader's overshoot: ROOT asks
@@ -1221,12 +1227,42 @@ void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const ch
     os << ",\"orig_bytes\":" << reads.origBytes;
   if (reads.uniqueKnown)
     os << ",\"unique_bytes\":" << reads.uniqueBytes;
-  os << ",\"mode\":\""
-     << mode << "\"}\n";
+  os << ",\"mode\":\"" << mode << '"';
+  // Appended at the end, as every newer field is.
+  os << ",\"data_server\":\"" << jsonEscape(servers ? servers->top() : std::string())
+     << "\",\"data_servers\":\"" << jsonEscape(servers ? servers->text() : std::string())
+     << "\"}\n";
   obsSink_->append(os.str());
 }
 
+void CacheStore::enqueueRecord(std::string line, const std::string& capKey) {
+  std::lock_guard<std::mutex> g(recMu_);
+  if (!capKey.empty() && ++recordCaps_[capKey] > kRecordsPerCapKey)
+    return;
+  if (records_.size() >= kRecordQueueMax) {
+    stats_.recordsDropped.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  records_.push_back(std::move(line));
+}
+
+void CacheStore::drainRecords() {
+  std::deque<std::string> lines;
+  {
+    std::lock_guard<std::mutex> g(recMu_);
+    lines.swap(records_);
+  }
+  if (lines.empty())
+    return;
+  ensureOwnIdentity(); // a forked child's lines go to its own file
+  if (!obsSink_)
+    return;
+  for (const std::string& l : lines)
+    obsSink_->append(l);
+}
+
 void CacheStore::checkpoint() {
+  drainRecords();
   if (forkStale_.load(std::memory_order_acquire))
     return; // a forked child that has not used the store: nothing of its own yet
   std::vector<std::shared_ptr<FileEntry>> live;
@@ -1244,6 +1280,8 @@ void CacheStore::checkpoint() {
 }
 
 void CacheStore::dumpStats(bool finalDump) {
+  if (finalDump)
+    drainRecords();
   // A forked child that never used the store did no work of its own through
   // it, and the counters and entries it inherited were the parent's to report.
   if (forkStale_.load(std::memory_order_acquire))
@@ -1298,7 +1336,11 @@ void CacheStore::dumpStats(bool finalDump) {
            << '}';
     }
   }
-  line << "]}\n";
+  line << ']';
+  // Appended at the end, as every newer field is.
+  if (!runSettings_.empty())
+    line << ",\"run_settings\":\"" << jsonEscape(runSettings_) << '"';
+  line << "}\n";
   int fd = io_.open(statsPath_, O_WRONLY | O_CREAT, 0600);
   if (fd < 0)
     return; // stats loss is acceptable; job health is not (fail-open)

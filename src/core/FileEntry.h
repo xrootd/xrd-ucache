@@ -53,6 +53,7 @@
 #include "IOBackend.h"
 #include "MetaFile.h"
 #include "ReadFootprint.h"
+#include "ServerTally.h"
 #include "Stats.h"
 #include "UrlKey.h"
 
@@ -243,6 +244,9 @@ class FileEntry {
     // past the cache (a file read directly, fail-open), which the plugin adds
     // as each handle closes (their process-wide account is hist_relay_rt_us).
     Histogram originRtUs;
+    // The data servers this file's origin requests went to (the same requests
+    // as originRtUs), with their bytes, requests, answer times and failures.
+    ServerTally servers;
     // Wall span this entry was live and doing work for, in µs of a steady
     // clock: first activity to last. In a slot-based analysis (one worker per
     // file at a time) this is that thread's FULL cost for the file — waits

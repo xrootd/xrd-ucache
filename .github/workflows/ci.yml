@@ -189,6 +189,8 @@ jobs:
       - run: cd build && ctest --output-on-failure -E crash-suite
       - name: crash suite under sanitizer (30 iters)
         run: UCACHE_CRASH_ITERS=30 ./build/tests/ucache-crash-harness
+      - name: record file crash suite under sanitizer (30 iters)
+        run: UCACHE_CRASH_ITERS=30 ./build/tests/ucache-crash-harness records
 
   coverage-gate:
     runs-on: ubuntu-24.04
@@ -212,6 +214,8 @@ jobs:
       - run: cmake --build build -j"$(nproc)"
       - name: 200 kill -9 iterations
         run: UCACHE_CRASH_ITERS=200 ./build/tests/ucache-crash-harness
+      - name: 200 kill -9 iterations of the record file (torn lines, older readers)
+        run: UCACHE_CRASH_ITERS=200 ./build/tests/ucache-crash-harness records
 
   nightly-long:
     if: github.event_name == 'schedule'
@@ -224,3 +228,4 @@ jobs:
         run: |
           UCACHE_TEST_OPS=1000000 ./build/tests/ucache-unit-tests --gtest_filter='Differential.*'
           UCACHE_CRASH_ITERS=1000 ./build/tests/ucache-crash-harness
+          UCACHE_CRASH_ITERS=1000 ./build/tests/ucache-crash-harness records

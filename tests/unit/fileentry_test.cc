@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <memory>
@@ -1547,4 +1548,58 @@ TEST(FileEntry, ASiblingsPageWithCrcZeroIsNotAdopted) {
   ASSERT_TRUE(after);
   EXPECT_FALSE(after->bitmap.get(5));
   EXPECT_EQ(after->bitmap.count(), 9u);
+}
+
+// The per-file record names the data servers this file's origin requests went
+// to: `data_server`, the host (no port) that delivered the most bytes, and
+// `data_servers`, each server's bytes, requests, answer time sum and maximum,
+// most reads in flight and failures, most bytes first, at most eight named.
+TEST(FileEntry, TheRecordNamesItsDataServersAndCutsTheListAtEight) {
+  Fixture fx;
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  const std::string path = fx.td.path() + "/records.files.jsonl";
+  e->setObsSink(std::make_shared<FileEntry::ObsSink>(fx.io, path));
+  e->obs().opens = 1; // what CacheStore::open counts; an entry never opened writes none
+  for (int i = 0; i < 10; ++i) // s0 delivers least, s9 most
+    e->obs().servers.add("s" + std::to_string(i) + ".example.org:1094",
+                         static_cast<uint64_t>(100 * (i + 1)), 5, 1);
+  e->obs().servers.add("s9.example.org:1094", 1, 50, 4); // a second request to s9
+  e->obs().servers.fail("s9.example.org:1094");
+  e->obs().servers.fail("s0.example.org:1094");
+  e->emitObsRecord();
+  std::ifstream in(path);
+  std::string line;
+  ASSERT_TRUE(std::getline(in, line));
+  EXPECT_NE(line.find(",\"data_server\":\"s9.example.org\","), std::string::npos) << line;
+  const std::string want =
+      ",\"data_servers\":\"s9.example.org:1094=1001:2:55:50:4:1;"
+      "s8.example.org:1094=900:1:5:5:1:0;s7.example.org:1094=800:1:5:5:1:0;"
+      "s6.example.org:1094=700:1:5:5:1:0;s5.example.org:1094=600:1:5:5:1:0;"
+      "s4.example.org:1094=500:1:5:5:1:0;s3.example.org:1094=400:1:5:5:1:0;"
+      "s2.example.org:1094=300:1:5:5:1:0;+2\"}";
+  EXPECT_NE(line.find(want), std::string::npos) << line;
+  EXPECT_EQ(line.substr(line.size() - want.size()), want) << "appended at the end";
+}
+
+TEST(FileEntry, ServerTallyEdges) {
+  ServerTally t;
+  EXPECT_TRUE(t.empty());
+  EXPECT_EQ(t.top(), "");
+  EXPECT_EQ(t.text(), "");
+  t.add("", 10, 1, 1); // no server known: nothing to name
+  EXPECT_TRUE(t.empty());
+  t.fail("[2001:db8::7]:1094"); // a failure only: named, but delivered nothing
+  EXPECT_EQ(t.top(), "");
+  EXPECT_EQ(t.text(), "[2001:db8::7]:1094=0:0:0:0:0:1");
+  t.add("[2001:db8::7]:1094", 10, 3, 2);
+  EXPECT_EQ(t.top(), "[2001:db8::7]");
+  ServerTally u;
+  u.add("[2001:db8::7]:1094", 5, 9, 1);
+  u.add("h.example.org:1094", 20, 1, 1);
+  t.addFrom(u);
+  EXPECT_EQ(t.text(), "h.example.org:1094=20:1:1:1:1:0;[2001:db8::7]:1094=15:2:12:9:2:1");
+  EXPECT_EQ(t.top(), "h.example.org");
+  EXPECT_EQ(t.topServer(), "h.example.org:1094"); // the port kept
+  EXPECT_EQ(ServerTally().topServer(), "");
 }

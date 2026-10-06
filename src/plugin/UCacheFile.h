@@ -123,8 +123,14 @@ struct HandleState {
   // Answer times of the reads this handle relayed (RelayHandler), for its own
   // per-file record: only this handle's, so a file's records sum.
   Histogram relayRtUs;
+  // The data servers of those reads, for the same record.
+  ServerTally relayServers;
 
   std::mutex mu;
+  // The server (host:port) the handle's last successful origin open reached,
+  // from that open's answer; "" before one. Under mu. A read whose answer
+  // names no host is put down to it.
+  std::string dataServer;
   std::shared_ptr<FileEntry> entry;            // null until setup completes
   // Slot run (ColdRun.h): the layout this handle was shown at setup,
   // HANDLE-STABLE thereafter: its addresses do not exist at the origin, so a
@@ -301,9 +307,31 @@ class UCacheFile : public XrdCl::FilePlugIn {
   bool cacheOpen_ = false;       // trusted-cache Open succeeded without the remote
 };
 
+// Records of the origin's answers (docs/FORMAT.md). Both take only what a
+// completion handler already holds and queue their line (CacheStore::
+// enqueueRecord), so they may run on a client callback thread.
+//
+// The server an answer came from, as host:port: the last host of its HostList
+// (right even when the client recovered the connection elsewhere), else the
+// server the handle's origin open reached; "" when neither is known (or the
+// name could not be built).
+std::string answeredBy(HandleState& st, const XrdCl::HostList* hosts) noexcept;
+// One failed origin request: counted by its provisional class, put on
+// `tally` (the file's account of its servers, when there is one), and recorded
+// as an `origin_failure` line, at most 16 per file, server and class in a
+// process. `op` names the request: read, readv, first_pass, records or relay.
+// `codec`, when not empty, is the compression of a basket that failed its
+// checksum.
+void noteOriginFailure(HandleState& st, ServerTally* tally, const char* op, uint64_t off,
+                       uint64_t len, const XrdCl::XRootDStatus& s, const std::string& server,
+                       const std::string& codec = std::string());
+
 // Process-wide config/store accessors (UCacheFactory.cc).
 const Config& globalConfig();
 std::shared_ptr<CacheStore> globalStore();
+// XrdCl's RequestTimeout as the plugin found it at load: what an origin
+// request given no timeout of its own is allowed.
+int defaultRequestTimeoutS();
 // A forked child's first cache work: re-arms what lived only in the parent's
 // timer queue (the periodic checkpoint). Cheap when there is nothing to do.
 void resumeAfterFork();

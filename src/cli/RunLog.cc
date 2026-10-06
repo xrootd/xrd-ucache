@@ -294,6 +294,8 @@ void loadFiles(const std::string& path, Run& r) {
     // for the same reason in reverse: it did serve them, eventually.
     if (!m.empty() && (f.mode.empty() || m == "relay"))
       f.mode = m;
+    if (const std::string ds = fieldStr(line, "data_server"); !ds.empty())
+      f.dataServer = ds;
   }
 }
 
@@ -344,8 +346,12 @@ std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiv
     // Identity: which files this run opened, and where they came from.
     r.sig = signatureOf(r.files);
     r.readSig = readSignatureOf(r.files);
+    // Where the bytes came from: the data server a record names, which for a
+    // file opened through a redirector is the server it sent the reads to;
+    // else, for older records and files that read nothing from the origin,
+    // the host the file was asked of.
     for (const auto& [k, f] : r.files) {
-      const std::string h = hostOf(k);
+      const std::string h = f.dataServer.empty() ? hostOf(k) : f.dataServer;
       if (h.empty())
         continue;
       ++r.originHosts[h];

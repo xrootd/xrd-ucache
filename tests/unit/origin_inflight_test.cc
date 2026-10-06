@@ -112,3 +112,20 @@ TEST(OriginInFlight, HighWaterIsTheConcurrentPeakNotATotal) {
   EXPECT_EQ(s.originReadsInFlight.load(), 0u);
   EXPECT_EQ(s.originReadsInFlightHighWater.load(), 3u);
 }
+
+TEST(OriginInFlight, KeepsTheCountItWasIssuedAtAfterRelease) {
+  // The per-file record's per-server maximum reads it once the read has
+  // landed and the guard has been given back.
+  Stats s;
+  OriginInFlight a(&s);
+  OriginInFlight b(&s);
+  EXPECT_EQ(a.atIssue, 1u);
+  EXPECT_EQ(b.atIssue, 2u);
+  b.release();
+  EXPECT_EQ(b.atIssue, 2u);
+  OriginInFlight moved(std::move(a));
+  EXPECT_EQ(moved.atIssue, 1u);
+  moved.release();
+  EXPECT_EQ(s.originReadsInFlight.load(), 0u);
+  EXPECT_EQ(OriginInFlight(nullptr).atIssue, 0u);
+}

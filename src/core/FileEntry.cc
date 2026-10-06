@@ -300,7 +300,10 @@ void FileEntry::writeObsRecord(uint64_t tsMs) {
      << (v(obs_.directBytes) > v(obs_.servedBytes) + v(obs_.replicaBytes) ? "relay"
          : v(obs_.wireBytes) > v(obs_.servedBytes)                        ? "fill"
                                                                             : "cached")
-     << "\"}\n";
+     << '"';
+  // Appended at the end, as every newer field is.
+  os << ",\"data_server\":\"" << jsonEscapeMin(obs_.servers.top()) << "\",\"data_servers\":\""
+     << jsonEscapeMin(obs_.servers.text()) << "\"}\n";
   obsSink_->append(os.str());
 }
 

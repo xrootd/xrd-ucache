@@ -13,7 +13,8 @@ $UCACHE_DIR/                         (0700)
   objects/<hh>/<sha256(key)>.slots   # slot store: a replica built as the file is read
   objects/<hh>/<sha256(key)>.slots.tmp.<pid>.<n>  # transient during its creation
   stats/<host>-<pid>-<start_ts>-<seq>.jsonl  # per-process stats dumps (docs/STATS.md)
-  stats/<stem>.files.jsonl           # per-file lifetime records (docs/STATS.md)
+  stats/<stem>.files.jsonl           # per-file lifetime records (docs/STATS.md), and
+                                     #  origin open and failure lines (below)
   stats/<stem>.trace.jsonl           # sampled IO trace, `trace = io` (docs/STATS.md)
   LOCK                               # cache-wide flock for eviction
   objects.cleared.<pid>-<ms>/        # an objects/ tree `ucache clear` set aside,
@@ -330,3 +331,77 @@ entry and skips the remote open+stat entirely — serving from the
 byte cache / replica, touching the origin only on a genuine miss (fail-open).
 Advisory: a missing/stale marker just triggers a normal revalidation; the
 per-page CRC guarantees still hold regardless.
+
+## Record lines of other kinds in `stats/<stem>.files.jsonl`
+
+Beside the per-file records ([STATS.md](STATS.md)), the per-file record file
+holds lines of other kinds, one complete JSON object per line. Each carries
+`"kind"` and a version `"v"`, and never `"key"`: readers of per-file records
+take only lines with a `"key"` string, so they skip these, and a reader of
+these takes only the kinds and versions it knows. A newer field is added at
+the end of a line under a name no other field uses; a different meaning gets a
+new `"v"`. No other companion file is used, because older readers count every
+other `*.jsonl` in `stats/` as a counter file. The lines are queued in memory
+(at most 4096) and written at the periodic checkpoint and at exit; a process
+that ends without either loses those queued since its last checkpoint, as it
+loses its counters. The last line can be torn by a crash; readers skip a line
+that does not end in `}`. A message never carries a URL's query (`?…`), which
+can hold an access token, and `file` is the cache key, which has none.
+
+**`"kind":"open"`, v1** — one line per origin open attempt the plugin watched:
+
+```json
+{"kind":"open","v":1,"ts_ms":0,"file":"root://h:1094/p","seq":7,"attempt":1,
+ "route":"relay","status":"ok","code":0,"errno":0,"class":"none",
+ "chain":"g:1094/0x102*,r:1094/0x2,d:1094/0x1","data_server":"d:1094",
+ "site":"dom.ain","site_src":"domain","stat_flags":16,"size":123,"us":812,
+ "timeout_s":1800,"msg":""}
+```
+
+- `seq` numbers one open of one handle, its retries included (unique in the
+  process); `attempt` counts from 1 within it.
+- `route`: `relay` (the reader's own open of a file the cache serves),
+  `lazy` (a trusted handle's open at its first miss), `degraded` (a trusted
+  handle whose cached entry was gone at its first read), `fork` (a forked
+  child's open afresh of a handle it inherited).
+- `status` `ok` or `error`, with the client's `code` and `errno` (the server's
+  error code when `code` is 400) and the provisional `class` of a failure
+  (`none` on success; the classes are the `origin_failures_*` counters'
+  in [STATS.md](STATS.md)).
+- `chain`: the hosts the open went through, as the client lists them, each
+  `host:port/0x<login flags>` (flags 0 for a host that never answered), `*`
+  after the host the client uses as its load balancer, `^` after a data server
+  reached with an EOS capability. `data_server` is the last of them, the
+  server that answered; `site` its name without the first label (no DNS: an
+  address, or a name without a dot, is its own site), `site_src` how the site
+  was found (`domain`).
+- `stat_flags` and `size`: the file's stat as the open answered it; -1 on
+  failure.
+- `us`: issue to answer; `timeout_s`: the timeout the request carried (the
+  client's `RequestTimeout` when it carried none).
+- `msg`: the error's text, at most 200 bytes as written (escapes included);
+  `""` on success.
+
+An open the client refuses at once, before it reaches any server, has no line.
+
+**`"kind":"origin_failure"`, v1** — one line per failed origin request:
+
+```json
+{"kind":"origin_failure","v":1,"ts_ms":0,"file":"root://h:1094/p","op":"read",
+ "off":0,"len":0,"code":108,"errno":0,"class":"client","data_server":"d:1094",
+ "msg":""}
+```
+
+- `op`: `read` and `readv` (the byte cache's fetches), `first_pass` (a
+  replica's first pass, and a basket or page there that failed its checksum),
+  `records` (the file's own records, read to set up its layout), `relay` (a
+  request passed straight to the origin).
+- `off`, `len`: the span asked for (a vector read's first offset and its
+  bytes); `data_server`: the last host of the failed answer, else the server
+  the file's open reached (for a pass-through handle, whose open is not
+  watched, the server that delivered most of its bytes; `""` when none is
+  known); `codec`, after `data_server`, on a checksum failure
+  whose compression is known.
+- At most 16 lines per file, server and class in a process; the per-file
+  record's `data_servers` counts every failed read. Open failures are in the
+  `open` lines only.

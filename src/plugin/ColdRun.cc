@@ -1242,7 +1242,7 @@ void ColdRequest::finish() {
 // it, reported with where they came from, and are never kept or served.
 void failOriginCheck(const std::shared_ptr<ColdRequest>& req, uint64_t pos, uint32_t len,
                      const std::string& what, const char* why, bool fromCache, uint64_t rStart,
-                     uint64_t rLen) {
+                     uint64_t rLen, const std::string& codec = std::string()) {
   if (fromCache) {
     req->entry->releaseRanges({{rStart, rStart + rLen}});
     req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError));
@@ -1261,8 +1261,11 @@ void failOriginCheck(const std::shared_ptr<ColdRequest>& req, uint64_t pos, uint
   UCACHE_WARN("%s", msg);
   if (req->st->store)
     req->st->store->stats().originChecksFailed.fetch_add(1, std::memory_order_relaxed);
+  const XRootDStatus refused(XrdCl::stError, XrdCl::errDataError, 0, msg);
+  noteOriginFailure(*req->st, &req->entry->obs().servers, "first_pass", pos, len, refused,
+                    answeredBy(*req->st, nullptr), codec);
   req->checkFailed.store(true);
-  req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, msg));
+  req->fail(refused);
 }
 
 // Convert one claimed basket and stage it. `rounded` holds the page-rounded
@@ -1352,7 +1355,7 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     if (c.check == tp::ConvertedBasket::kFailed) {
       failOriginCheck(req, slot.origSeek, recLen,
                       c.codec.empty() ? std::string("a basket") : "a basket (" + c.codec + ")",
-                      c.checkWhy, fromCache, rStart, rounded->size());
+                      c.checkWhy, fromCache, rStart, rounded->size(), c.codec);
       req->done();
       return;
     }
@@ -1468,7 +1471,14 @@ class PartHandler : public ResponseHandler {
     if (!s || !s->IsOK()) {
       if (req_->st->store)
         req_->st->store->stats().coldOriginFailures.fetch_add(1, std::memory_order_relaxed);
-      req_->fail(s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal));
+      const XRootDStatus failed = s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal);
+      uint64_t asked = 0;
+      for (const auto& w : wire_)
+        asked += w.len;
+      noteOriginFailure(*req_->st, &req_->entry->obs().servers, "first_pass",
+                        wire_.empty() ? 0 : wire_.front().off, asked, failed,
+                        answeredBy(*req_->st, h.get()));
+      req_->fail(failed);
       req_->done();
       delete this;
       return;
@@ -1484,6 +1494,7 @@ class PartHandler : public ResponseHandler {
       const uint64_t rt = nowUs() - t0_;
       stats.originRtUs.add(rt);
       req_->entry->obs().originRtUs.add(rt);
+      req_->entry->obs().servers.add(answeredBy(*st, h.get()), bytes, rt, inflight_.atIssue);
     }
     req_->cf->wireBytes.fetch_add(bytes, std::memory_order_relaxed);
     for (const auto& it : items_) {
@@ -1596,6 +1607,12 @@ void issuePart(const std::shared_ptr<ColdRequest>& req, std::vector<PartItem> it
     req->st->releaseInner();
     if (req->st->store)
       req->st->store->stats().coldOriginFailures.fetch_add(1, std::memory_order_relaxed);
+    uint64_t asked = 0;
+    for (const auto& c : chunks)
+      asked += c.length;
+    noteOriginFailure(*req->st, &req->entry->obs().servers, "first_pass",
+                      chunks.empty() ? 0 : chunks.front().offset, asked, s,
+                      answeredBy(*req->st, nullptr));
     req->fail(s);
     req->done();
   }

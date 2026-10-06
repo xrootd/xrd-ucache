@@ -99,6 +99,16 @@ struct Stats {
   // Open-retry (docs/STATS.md):
   std::atomic<uint64_t> openRetries{0};          // transient open failures re-attempted
   std::atomic<uint64_t> openRetriesExhausted{0}; // opens that gave up after the budget
+  // Origin opens (docs/STATS.md): every attempt the plugin watched -- the
+  // reader's relayed opens and the cache's own -- and how many failed.
+  std::atomic<uint64_t> originOpenAttempts{0};
+  std::atomic<uint64_t> originOpenFailures{0};
+  // Origin failures, opens and reads, by their provisional class (OpenPolicy.h
+  // FailureClass, kClient first): client, site, notfound, data, expired, other.
+  std::atomic<uint64_t> originFailures[6] = {};
+  // Record lines (origin opens and failures) dropped because the queue that
+  // holds them until the next checkpoint was full.
+  std::atomic<uint64_t> recordsDropped{0};
   // Replica tier (docs/STATS.md):
   // Of earlier releases' compact replicas, no longer made or served: always 0.
   std::atomic<uint64_t> replicaOpens{0};
@@ -238,6 +248,7 @@ struct Stats {
   Histogram slotReadUs;       // per stored slot record read (pread and check)
   Histogram coldRequestUs;    // per first-pass request, arrival to answer
   Histogram poolQueueUs;      // per serving-pool task, time waiting in the queue
+  Histogram originOpenUs;     // per origin open attempt, issue to completion
 
   // Set once at store init when `trace = io`; null = off.
   // Not dumped; carried here so every path that has Stats& can trace.
@@ -278,8 +289,11 @@ struct StatsTotals {
            replicaReadBytes = 0, relayBytes = 0,
            readvChunks = 0, readvCalls = 0, readvMixed = 0, flushRuns = 0, flushRunBytes = 0,
            bufferStalls = 0, bufferStallUs = 0;
+  uint64_t originOpenAttempts = 0, originOpenFailures = 0, recordsDropped = 0;
+  uint64_t originFailures[6] = {}; // client, site, notfound, data, expired, other
   // Histogram bucket sums (log2 µs), for CLI percentile rendering:
-  std::vector<uint64_t> histHitRead, histOriginRt, histOpen, histReplicaRead, histFlushWrite;
+  std::vector<uint64_t> histHitRead, histOriginRt, histOpen, histReplicaRead, histFlushWrite,
+      histOriginOpen;
   // … and log2 bytes, for the read-shape block:
   std::vector<uint64_t> histReqRead, histHitReadSize, histReplicaReadSize;
   // True when the summed files do NOT all use the same counter vocabulary —

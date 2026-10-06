@@ -86,9 +86,18 @@ the consumers together.
  "hist_req_read_bytes": [..], "hist_hit_read_bytes": [..],
  "hist_replica_read_bytes": [..],
  "hist_slot_read_us": [..], "hist_cold_request_us": [..], "hist_pool_queue_us": [..],
+ "origin_open_attempts": 0, "origin_open_failures": 0,
+ "origin_failures_client": 0, "origin_failures_site": 0, "origin_failures_notfound": 0,
+ "origin_failures_data": 0, "origin_failures_expired": 0, "origin_failures_other": 0,
+ "records_dropped": 0, "hist_origin_open_us": [..],
  "entries": [{"key": "root://host:1094/path", "file_size": 0,
-              "cached_bytes": 0, "page_size": 4096}]}
+              "cached_bytes": 0, "page_size": 4096}],
+ "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ..."}
 ```
+
+Fields are added at the end of a line, never in the middle, and under names
+no other field uses: the readers find a field by its name, so an older reader
+skips a field it does not know.
 
 ## Field notes
 
@@ -175,6 +184,52 @@ not to cache, and says the cache is under pressure rather than broken.
   transient inner-open failures re-attempted (`UCACHE_OPEN_RETRIES`), and opens
   that ultimately gave up after retrying. Uncounted when caching is off (retry
   still works, just unrecorded — no store to hold the counters).
+
+### Origin opens and failures
+
+What the origin answered, as raw counts; each is also recorded line by line
+in the per-file record file (below), with the server and the error. Nothing is
+counted when there is no cache directory. Opens are counted for a file the
+cache serves only; a pass-through handle's open (`UCACHE_DISABLE=1`, a write,
+a copy) is not. Failed reads are counted for every read handle, pass-through
+ones included, so a run with caching disabled shows its origin failures too.
+
+- `origin_open_attempts` / `origin_open_failures` — origin open attempts the
+  plugin watched, and how many failed: the reader's own open of a file the
+  cache serves (each retry with `open_retries` counts again), and the cache's
+  own opens (a trusted handle's first miss, a handle whose trusted entry was
+  gone, a forked child opening a handle again). An open the client refuses at
+  once, before it reaches any server, is not counted.
+- `hist_origin_open_us` — each attempt's time from issue to answer (log2 µs).
+- `origin_failures_client`, `_site`, `_notfound`, `_data`, `_expired`,
+  `_other` — failed origin requests, opens and reads alike, by a first reading
+  of the error alone; what a failure means often depends on what else happened
+  at the time, so the records keep the raw code and error number too. `client`:
+  this machine could not reach or talk to the server (socket, connection and
+  TLS errors, failed authentication, a refused authorization). `site`: the
+  server or its storage failed the request, or the redirectors sent it on past
+  the redirect limit. `notfound`: no server holds the file. `data`: bytes
+  refused (a basket or page that failed its checksum). `expired`: a request
+  that outlived its timeout, whose timeout not said. `other`: the rest, among
+  them a server's report that it could not reach a server behind it, which can
+  be that site's network as well as this machine's. A read the cache fails open
+  on (and relays) is counted when its first attempt fails, and again, as a
+  `relay` failure, if the relayed request fails too.
+- `records_dropped` — record lines (an origin open, an origin failure) dropped
+  because the 4096 lines waiting for the next checkpoint were already queued.
+  The counters above still count them.
+
+`run_settings`, on the counter line, is the settings that decide how the
+origin is reached, as the plugin found them at load, one string:
+`v1 check_origin_integrity=on|off` and then
+`xrdcl.<name>=<value>/<source>` for the XRootD client's `ConnectionWindow`,
+`ConnectionRetry`, `StreamErrorWindow`, `RequestTimeout`, `StreamTimeout` and
+`TimeoutResolution`. The source is `env` when the `XRD_<NAME>` variable is
+set, `default` when the value is the client's built-in one, and `client` when
+it differs and no variable is set (a `client.conf`, or the application). An
+application that changes a value after the plugin has loaded is not seen. A
+token missing from the string means the build that wrote it did not have that
+setting; tokens may be added at the end.
 
 ### Compact replicas of earlier releases
 
@@ -472,8 +527,17 @@ reading was re-reading, and what the cache disk was asked to do.
    "replica_bytes": 0, "disk_reads": 0, "disk_seq": 0, "disk_bytes": 0,
    "first_touch_bytes": 0, "wire_bytes": 0, "direct_bytes": 0, "span_us": 0,
    "origin_size": 0, "read_sig": "", "read_buckets": 0, "mode": "cached",
-   "orig_bytes": 0, "unique_bytes": 0, "origin_rt_us": [..]}
+   "orig_bytes": 0, "unique_bytes": 0, "origin_rt_us": [..],
+   "data_server": "disk7.site.example", "data_servers": "disk7.site.example:1094=…"}
   ```
+
+  The same file holds lines of newer kinds, which carry `"kind"` and no
+  `"key"`: one per origin open attempt (`"kind":"open"`) and one per failed
+  origin request (`"kind":"origin_failure"`); [FORMAT.md](FORMAT.md) gives
+  their fields. They are written at the periodic checkpoint and at exit, never
+  from the client's callback threads. A reader of per-file records skips them
+  by the absence of `"key"`, as `ucache stats --files`, `summary` and
+  `history` do.
 
   The fields from `orig_bytes` on are recorded for the report service
   (`ucache publish`); `summary` and `history` do not interpret them. Recording
@@ -495,6 +559,31 @@ reading was re-reading, and what the cache disk was asked to do.
   - `ts_ms` — when the record was written, in milliseconds; for a record the
     final dump writes (a file still open at exit), the moment the dump began,
     like the counter line it goes with.
+  - `data_server` — the host, without its port, that delivered the most of
+    this file's origin bytes in this process; `""` when nothing came from the
+    origin (a file served from the cache).
+  - `data_servers` — every server this file's origin requests went to, as
+    `host:port=bytes:reqs:rt_sum_us:rt_max_us:nc_max:fails`, `;` between
+    servers, most bytes first, at most 8 named and then `+N` for the others.
+    `bytes` are what the server delivered, `reqs` the requests it answered,
+    `rt_sum_us` and `rt_max_us` their answer times (issue to completion) summed
+    and at most, `nc_max` the most origin reads in flight when one of them was
+    issued (this version counts them over all of the process's origin servers,
+    which with a single origin server are that server's own), and `fails` the reads that failed
+    (every one; the failure lines are capped; a failed open is in the `open`
+    lines, not here). The server is the last host of the request's answer, so
+    a read the client recovered elsewhere is put down to the server that
+    answered it; one whose answer names no host is put down to the server the
+    file's open reached (on a pass-through handle, whose open is not watched,
+    a failed one to the server that delivered most of its bytes). The same requests as `origin_rt_us`; read-ahead's are
+    in neither.
+
+  `ucache summary`, `history` and `publish` take a file's origin from
+  `data_server` when it names one, and from the host in the file's URL
+  otherwise (older records, and files that read nothing from the origin). For
+  a file opened through a redirector, the origin is therefore the data server
+  the reads went to, and `history --json` and `publish` show that server's
+  domain under `origins` and `origins_rt`, not the redirector's.
 
   **`orig_bytes` and `unique_bytes` are exact or absent**, never estimated:
   absent means unknown, and a file opened and not read has 0. How each route
