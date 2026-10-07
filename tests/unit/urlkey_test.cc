@@ -150,3 +150,93 @@ TEST(UrlKey, OwnOpenUrl) {
   EXPECT_EQ(own("tried=,&triedrc=ioerr"), base + "?triedrc=ioerr");
   EXPECT_EQ(own("authz=TOK&triedrc=enoent&xrd.k=v"), base + "?authz=TOK&triedrc=enoent&xrd.k=v");
 }
+
+// With adaptive_federation on, of the hosts in a reselection request the cache's
+// own open keeps exactly those this process saw fail for the file, and sends
+// them with triedrc=ioerr; the others (servers the reader reads from without
+// trouble) and the resel go.
+TEST(UrlKey, OwnOpenUrlKeepsFailedServersOfAReselection) {
+  const std::string base = "root://h//f.root";
+  const auto own = [&base](const std::string& query, const std::vector<std::string>& failed) {
+    return ownOpenUrl(base + "?" + query, failed);
+  };
+  EXPECT_EQ(own("tried=a.x.org,b.x.org&triedrc=resel", {"a.x.org"}),
+            base + "?tried=a.x.org&triedrc=ioerr");
+  EXPECT_EQ(own("tried=a.x.org,b.x.org&triedrc=resel", {"a.x.org", "b.x.org"}),
+            base + "?tried=a.x.org,b.x.org&triedrc=ioerr");
+  // None of them failed here: dropped whole, as without the switch.
+  EXPECT_EQ(own("tried=a.x.org,b.x.org&triedrc=resel", {}), base);
+  EXPECT_EQ(own("tried=a.x.org,b.x.org&triedrc=resel", {"c.x.org"}), base);
+  // Compared without a port and without case; the reader's spelling is kept.
+  EXPECT_EQ(own("tried=A.X.org:1094,b.x.org&triedrc=resel", {"a.x.org"}),
+            base + "?tried=A.X.org:1094&triedrc=ioerr");
+  // A user's list ahead of the request is kept as it is, the failed host after it.
+  EXPECT_EQ(own("tried=u.x.org&tried=a.x.org,b.x.org&triedrc=resel", {"b.x.org"}),
+            base + "?tried=u.x.org,b.x.org&triedrc=ioerr");
+  EXPECT_EQ(own("tried=u.x.org&tried=a.x.org&triedrc=resel", {}), base + "?tried=u.x.org");
+  // Every other parameter passes byte for byte.
+  EXPECT_EQ(own("authz=TOK&tried=a.x.org,b.x.org&triedrc=resel&xrd.k=v", {"a.x.org"}),
+            base + "?authz=TOK&tried=a.x.org&triedrc=ioerr&xrd.k=v");
+  // Not a reselection request: the list does not change.
+  EXPECT_EQ(own("tried=a.x.org,b.x.org&triedrc=enoent", {"c.x.org"}),
+            base + "?tried=a.x.org,b.x.org&triedrc=enoent");
+  EXPECT_EQ(own("tried=a.x.org", {"a.x.org"}), base + "?tried=a.x.org");
+}
+
+// The base of a retry of the reader's own open: every host kept, the
+// reselection request's included, and no triedrc.
+TEST(UrlKey, MergeTriedKeepsEveryReaderHost) {
+  const std::string base = "root://h//f.root";
+  EXPECT_EQ(mergeTried(base), base);
+  EXPECT_EQ(mergeTried(base + "?tried=a,b&triedrc=resel"), base + "?tried=a,b");
+  EXPECT_EQ(mergeTried(base + "?tried=u&tried=a,b&triedrc=resel"), base + "?tried=u,a,b");
+  EXPECT_EQ(mergeTried(base + "?authz=T&tried=a&triedrc=ioerr&xrd.k=v"),
+            base + "?authz=T&tried=a&xrd.k=v");
+  EXPECT_EQ(mergeTried(base + "?triedrc=enoent&x=1"), base + "?x=1");
+}
+
+TEST(UrlKey, WithExclusions) {
+  const std::string base = "root://h:1094//store/f.root";
+  // Ours after the reader's, with the reason; a URL without a query gets one.
+  EXPECT_EQ(withExclusions(base, {"c.site.org"}, "ioerr"),
+            base + "?tried=c.site.org&triedrc=ioerr");
+  EXPECT_EQ(withExclusions(base + "?tried=a,b", {"c.site.org"}, "ioerr"),
+            base + "?tried=a,b,c.site.org&triedrc=ioerr");
+  // The reader's reason is replaced (a redirector reads only one); never resel.
+  EXPECT_EQ(withExclusions(base + "?tried=a&triedrc=resel", {"c.site.org"}, "enoent"),
+            base + "?tried=a,c.site.org&triedrc=enoent");
+  EXPECT_EQ(withExclusions(base + "?tried=a&triedrc=resel", {}, "ioerr"),
+            base + "?tried=a&triedrc=ioerr");
+  // Only the two reasons of a failure: anything else, a reselection included,
+  // is sent as ioerr. (Managers, the first hop and EOS data servers are left
+  // out where the names are chosen: OpenPolicy's exclusionNames, covered in
+  // open_policy_test.)
+  EXPECT_EQ(withExclusions(base, {"c.site.org"}, "resel"), base + "?tried=c.site.org&triedrc=ioerr");
+  EXPECT_EQ(withExclusions(base + "?tried=a", {}, "resel"), base + "?tried=a&triedrc=ioerr");
+  // Lower-cased, the root dot gone; duplicates (of the reader's too) dropped.
+  EXPECT_EQ(withExclusions(base + "?tried=C.Site.Org", {"c.site.org", "D.Site.Org."}, "ioerr"),
+            base + "?tried=C.Site.Org,d.site.org&triedrc=ioerr");
+  EXPECT_EQ(withExclusions(base, {"c.site.org", "c.site.org"}, "ioerr"),
+            base + "?tried=c.site.org&triedrc=ioerr");
+  // Addresses and names without a dot mask nothing: never added.
+  EXPECT_EQ(withExclusions(base, {"127.0.0.1", "[::1]", "2001:db8::7", "localhost"}, "ioerr"),
+            base);
+  EXPECT_EQ(withExclusions(base + "?tried=a", {"127.0.0.1", "localhost"}, "ioerr"),
+            base + "?tried=a&triedrc=ioerr");
+  // At most 4 of ours, the newest; the reader's are never dropped.
+  EXPECT_EQ(withExclusions(base + "?tried=r",
+                           {"s1.x.org", "s2.x.org", "s3.x.org", "s4.x.org", "s5.x.org"}, "ioerr"),
+            base + "?tried=r,s2.x.org,s3.x.org,s4.x.org,s5.x.org&triedrc=ioerr");
+  // At most 1024 bytes for the list: our oldest go first, the reader's stay.
+  const std::string longReader(1000, 'r');
+  EXPECT_EQ(withExclusions(base + "?tried=" + longReader, {"aaaaaaaaaa.x.org", "b.x.org"}, "ioerr"),
+            base + "?tried=" + longReader + ",b.x.org&triedrc=ioerr");
+  const std::string huge(1100, 'h');
+  EXPECT_EQ(withExclusions(base + "?tried=" + huge, {"b.x.org"}, "ioerr"),
+            base + "?tried=" + huge + "&triedrc=ioerr");
+  // Every other parameter is kept in order; the list sits where tried= was.
+  EXPECT_EQ(withExclusions(base + "?authz=TOK&tried=a&triedrc=ioerr&xrd.k=v", {"c.x.org"}, "ioerr"),
+            base + "?authz=TOK&tried=a,c.x.org&triedrc=ioerr&xrd.k=v");
+  EXPECT_EQ(withExclusions(base + "?authz=TOK", {"c.x.org"}, "ioerr"),
+            base + "?authz=TOK&tried=c.x.org&triedrc=ioerr");
+}

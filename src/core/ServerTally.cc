@@ -78,6 +78,15 @@ std::string ServerTally::top() const {
   return best;
 }
 
+std::vector<std::string> ServerTally::failedHosts() const {
+  std::vector<std::string> out;
+  std::lock_guard<std::mutex> g(mu_);
+  for (const auto& [server, a] : m_)
+    if (a.fails)
+      out.push_back(server.substr(0, server.rfind(':')));
+  return out;
+}
+
 std::string ServerTally::text() const {
   std::vector<std::pair<std::string, Agg>> v;
   {

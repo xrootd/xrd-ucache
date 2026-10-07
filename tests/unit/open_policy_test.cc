@@ -182,3 +182,231 @@ TEST(OpenPolicy, OpenDeadline) {
   EXPECT_EQ(openDeadlineS(3, 5), 3);
   EXPECT_EQ(openDeadlineS(0, -5), 60) << "only a positive value replaces the deadline";
 }
+
+// ---- Opening a file at another site --------------------------------------
+
+namespace {
+// A regional redirector, then a data server: the federation's usual chain.
+ChainView regionalThen(uint32_t serverFlags) {
+  return readChain({hop("regional.example.org", kManager), hop("d.site.org", serverFlags)});
+}
+const ChainView kDirect = readChain({hop("d.site.org", kServer)});
+// The redirector answered itself (or never answered).
+const ChainView kRedirectorOnly = readChain({hop("regional.example.org", kManager)});
+OpenStep step(const ChainView& v, int code, int errNo = 0, bool excluded = false) {
+  return stepAfter(v, code, errNo, false, false, excluded);
+}
+} // namespace
+
+TEST(OpenPolicy, ChainReadsTheEffectiveServerAndTheRegional) {
+  const std::vector<Hop> fed = {hop("global.example.org", kMeta, true),
+                                hop("regional.example.org", kManager),
+                                hop("data.site.example.org", kServer)};
+  ChainView v = readChain(fed);
+  EXPECT_TRUE(v.viaRedirector);
+  EXPECT_EQ(v.regional, 1) << "the first redirector that is not a global one";
+  EXPECT_EQ(v.effective, 2);
+  // A server that never answered (flags 0) is still the one to name.
+  v = readChain({hop("regional.example.org", kManager), makeHop("a.site.org", 1094, 0, false, "")});
+  EXPECT_EQ(v.effective, 1);
+  // A data server that sent the open on to another is the client's choice.
+  v = readChain({hop("regional.example.org", kManager), hop("pool.site.org", kServer),
+                 hop("disk.site.org", kServer)});
+  EXPECT_EQ(v.effective, 1);
+  EXPECT_EQ(v.last, 2);
+  // The last host a redirector: no server to name.
+  EXPECT_EQ(kRedirectorOnly.effective, -1);
+  EXPECT_TRUE(kRedirectorOnly.viaRedirector);
+  EXPECT_EQ(kRedirectorOnly.regional, 0);
+  // Only a global redirector: no regional.
+  EXPECT_EQ(readChain({hop("global.example.org", kMeta, true), hop("d.site.org", kServer)}).regional,
+            -1);
+  EXPECT_FALSE(kDirect.viaRedirector);
+  EXPECT_EQ(kDirect.effective, 0);
+  EXPECT_EQ(readChain({}).effective, -1);
+}
+
+// Every row of the table of what follows an attempt.
+TEST(OpenPolicy, StepAfterAnAttempt) {
+  const ChainView v = regionalThen(kServer);
+  // Any failure with no redirector in the chain is final: a direct URL has no
+  // other copy to go to, and a redirector that never answered shows no flags.
+  for (int code : {kErrConnectionError, kErrOperationExpired, kErrRedirectLimit, kErrNotFound})
+    EXPECT_EQ(step(kDirect, code), OpenStep::kFinal) << code;
+  for (int errNo : {kXrNotAuthorized, kXrNotFound, kXrServerError})
+    EXPECT_EQ(step(kDirect, kErrErrorResponse, errNo), OpenStep::kFinal) << errNo;
+  const ChainView unanswered = readChain({makeHop("regional.example.org", 1094, 0, false, "")});
+  EXPECT_EQ(step(unanswered, kErrConnectionError), OpenStep::kFinal);
+  EXPECT_EQ(step(unanswered, kErrOperationExpired), OpenStep::kFinal);
+  // The redirector itself refused, stalled or failed: no other redirector to ask.
+  for (int code : {kErrConnectionError, kErrSocketTimeout, kErrOperationExpired, kErrSocketError,
+                   kErrTlsError, kErrStreamDisconnect})
+    EXPECT_EQ(step(kRedirectorOnly, code), OpenStep::kFinal) << code;
+  EXPECT_EQ(step(kRedirectorOnly, kErrErrorResponse, kXrNotAuthorized), OpenStep::kFinal);
+  EXPECT_EQ(step(kRedirectorOnly, kErrErrorResponse, kXrServerError), OpenStep::kFinal);
+  // A refusal at a site: another site may take this client.
+  EXPECT_EQ(step(v, kErrErrorResponse, kXrNotAuthorized), OpenStep::kFailOver);
+  // Not found by the redirector itself, nothing of ours named: no site has it.
+  EXPECT_EQ(step(kRedirectorOnly, kErrErrorResponse, kXrNotFound), OpenStep::kFinal);
+  EXPECT_EQ(step(kRedirectorOnly, kErrNotFound), OpenStep::kFinal);
+  // Not found with servers of ours named, or at a site: asking where the copies
+  // are (not done in this version).
+  EXPECT_EQ(step(kRedirectorOnly, kErrErrorResponse, kXrNotFound, true), OpenStep::kLocate);
+  EXPECT_EQ(step(v, kErrErrorResponse, kXrNotFound), OpenStep::kLocate);
+  EXPECT_EQ(step(v, kErrNotFound), OpenStep::kLocate);
+  // Bounced past the redirect limit: anywhere in a federation.
+  EXPECT_EQ(step(v, kErrRedirectLimit), OpenStep::kFailOver);
+  EXPECT_EQ(step(kRedirectorOnly, kErrRedirectLimit), OpenStep::kFailOver);
+  // A site that stalled or could not be reached.
+  for (int code : {kErrOperationExpired, kErrSocketTimeout, kErrConnectionError})
+    EXPECT_EQ(step(v, code), OpenStep::kFailOver) << code;
+  // A server's or its storage's failure.
+  for (int errNo : {kXrFileLocked, kXrFSError, kXrIOError, kXrServerError, kXrNoServer,
+                    kXrCancelled, kXrItExists, kXrOverloaded})
+    EXPECT_EQ(step(v, kErrErrorResponse, errNo), OpenStep::kFailOver) << errNo;
+  // Anything else is final.
+  for (int code : {kErrSocketError, kErrSocketDisconnected, kErrStreamDisconnect, kErrTlsError,
+                   kErrAuthFailed, kErrInvalidSession, kErrDataError, 101, 7})
+    EXPECT_EQ(step(v, code), OpenStep::kFinal) << code;
+  EXPECT_EQ(step(v, kErrErrorResponse, 3013), OpenStep::kFinal); // unsupported
+  // A success is final where it lands, unless it serves another size than the
+  // cache holds or its copy is on tape -- and only through a redirector.
+  EXPECT_EQ(step(v, 0), OpenStep::kFinal);
+  EXPECT_EQ(stepAfter(v, 0, 0, true, false, false), OpenStep::kFailOver);
+  EXPECT_EQ(stepAfter(v, 0, 0, false, true, false), OpenStep::kFailOver);
+  EXPECT_EQ(stepAfter(kDirect, 0, 0, true, false, false), OpenStep::kFinal);
+  EXPECT_EQ(stepAfter(kDirect, 0, 0, false, true, false), OpenStep::kFinal);
+}
+
+// What a retry's tried= may carry for a hop.
+TEST(OpenPolicy, ExclusionNames) {
+  const std::vector<Hop> hops = {
+      hop("regional.example.org", kManager),       // 0: the first host
+      hop("Site-Redirector.Example.ORG", kManager), // 1: a redirector
+      hop("Data1.Site.Org.", kServer),             // 2: a full name
+      hop("127.0.0.1", kServer),                   // 3: an address
+      hop("localhost", kServer),                   // 4: no dot
+      hop("[2001:db8::7]", kServer),               // 5: an address
+      hop("fst.site.org", kServer, false, "cap.msg=x&cap.sym=y"), // 6: behind an EOS front end
+      makeHop("stalled.site.org", 1094, 0, false, ""),            // 7: never answered
+  };
+  EXPECT_EQ(exclusionName(hops, 0), "");
+  EXPECT_EQ(exclusionName(hops, 1), "");
+  EXPECT_EQ(exclusionName(hops, 2), "data1.site.org");
+  EXPECT_EQ(exclusionName(hops, 3), "");
+  EXPECT_EQ(exclusionName(hops, 4), "");
+  EXPECT_EQ(exclusionName(hops, 5), "");
+  EXPECT_EQ(exclusionName(hops, 6), "");
+  EXPECT_EQ(exclusionName(hops, 7), "stalled.site.org");
+  EXPECT_EQ(exclusionName(hops, -1), "");
+  EXPECT_EQ(exclusionName(hops, 8), "");
+  // The first host is never named, even a data server reached directly.
+  EXPECT_EQ(exclusionName({hop("d.site.org", kServer)}, 0), "");
+}
+
+// An EOS site: the global, the regional, the EOS front end (a redirector) and a
+// data server reached with the front end's capability. Its failure names
+// nothing of ours, so the next landing on that site is a repeat; with the
+// front end logged in as a data server, the front end is the site's entry.
+TEST(OpenPolicy, EosChain) {
+  std::vector<Hop> hops = {hop("global.example.org", kMeta, true),
+                           hop("regional.example.org", kManager),
+                           hop("eos.site.org", kManager),
+                           hop("fst.site.org", kServer, false, "cap.msg=x&cap.sym=y")};
+  ChainView v = readChain(hops);
+  EXPECT_EQ(step(v, kErrErrorResponse, kXrIOError), OpenStep::kFailOver);
+  EXPECT_EQ(v.effective, 3);
+  EXPECT_EQ(exclusionName(hops, v.effective), "");
+  std::vector<SiteFailure> failed;
+  EXPECT_EQ(afterFailure(failed, {"fst.site.org:1094", "site.org", "", "e"}, 4, false),
+            AfterFailure::kRetry);
+  EXPECT_TRUE(exclusionNames(failed).empty());
+  // The next attempt lands on another data server of that site.
+  EXPECT_EQ(afterFailure(failed, {"fst2.site.org:1094", "site.org", "", "e"}, 4, false),
+            AfterFailure::kRepeat);
+  hops[2].flags = kServer;
+  v = readChain(hops);
+  EXPECT_EQ(v.effective, 2);
+  EXPECT_EQ(exclusionName(hops, v.effective), "eos.site.org");
+}
+
+// The budget of one open's attempts, and when nothing more may be issued.
+TEST(OpenPolicy, BudgetAndStopRule) {
+  EXPECT_EQ(kFailoverMaxS, 180);
+  EXPECT_EQ(kFailoverMaxSites, 4);
+  EXPECT_EQ(budgetS(0, 1800, 15), 180); // the client's defaults
+  EXPECT_EQ(budgetS(0, 180, 15), 160);  // the switch's error window: ends before it
+  EXPECT_EQ(budgetS(10, 1800, 15), 10); // a reader's own timeout
+  EXPECT_EQ(budgetS(30, 1800, 15), 30);
+  EXPECT_EQ(budgetS(10, 180, 15), 10);
+  EXPECT_EQ(budgetS(0, 180, 1, 8), 8); // a test's bound
+  EXPECT_EQ(budgetS(0, 10, 15), 1) << "never below 1";
+  // Nothing new once less than one attempt's deadline (capped at 30 s) is left.
+  EXPECT_FALSE(budgetSpent(30000, 60, 0));
+  EXPECT_TRUE(budgetSpent(29999, 60, 0));
+  EXPECT_FALSE(budgetSpent(10000, 10, 0));
+  EXPECT_TRUE(budgetSpent(9999, 10, 0));
+  EXPECT_TRUE(budgetSpent(4000, 5, 0));
+  // A reader with a short timeout of its own: half of it, so that a reader
+  // that gives every open 30 s still gets a second attempt.
+  EXPECT_FALSE(budgetSpent(15000, openDeadlineS(30), 30));
+  EXPECT_TRUE(budgetSpent(14999, openDeadlineS(30), 30));
+  EXPECT_FALSE(budgetSpent(5000, openDeadlineS(10), 10));
+  EXPECT_TRUE(budgetSpent(4999, openDeadlineS(10), 10));
+  EXPECT_TRUE(budgetSpent(-1, 60, 0));
+}
+
+// What follows a fail-over outcome.
+TEST(OpenPolicy, AfterFailure) {
+  std::vector<SiteFailure> failed;
+  const SiteFailure a{"a.one.org:1094", "one.org", "a.one.org", "[ERROR] refused"};
+  const SiteFailure a2{"a2.one.org:1094", "one.org", "a2.one.org", "[ERROR] refused"};
+  const SiteFailure b{"b.two.org:1094", "two.org", "b.two.org", "[ERROR] refused"};
+  const SiteFailure c{"127.0.0.1:1095", "127.0.0.1", "", "[ERROR] refused"};
+  EXPECT_EQ(afterFailure(failed, a, 4, false), AfterFailure::kRetry);
+  EXPECT_EQ(afterFailure(failed, b, 4, false), AfterFailure::kRetry);
+  EXPECT_EQ(failed.size(), 2u);
+  // Landed on a server that failed already: the names did not keep it away.
+  EXPECT_EQ(afterFailure(failed, a, 4, false), AfterFailure::kRepeat);
+  EXPECT_EQ(failed.size(), 2u) << "a server is listed once";
+  // Or on another server of a site that failed: added, and a repeat.
+  EXPECT_EQ(afterFailure(failed, a2, 4, false), AfterFailure::kRepeat);
+  EXPECT_EQ(failed.size(), 3u);
+  EXPECT_EQ(exclusionNames(failed), (std::vector<std::string>{"a.one.org", "b.two.org", "a2.one.org"}));
+  // A server that cannot be named adds no name.
+  EXPECT_EQ(afterFailure(failed, c, 4, false), AfterFailure::kRetry);
+  EXPECT_EQ(exclusionNames(failed).size(), 3u);
+  // The bound of sites: three distinct ones here.
+  std::vector<SiteFailure> f3 = failed;
+  EXPECT_EQ(afterFailure(f3, {"d.four.org:1094", "four.org", "d.four.org", "e"}, 4, false),
+            AfterFailure::kStop);
+  std::vector<SiteFailure> one;
+  EXPECT_EQ(afterFailure(one, a, 1, false), AfterFailure::kStop) << "one site allowed";
+  std::vector<SiteFailure> two;
+  EXPECT_EQ(afterFailure(two, a, 2, false), AfterFailure::kRetry);
+  EXPECT_EQ(afterFailure(two, b, 2, false), AfterFailure::kStop);
+  // The budget spent: stop, whatever else holds.
+  std::vector<SiteFailure> late;
+  EXPECT_EQ(afterFailure(late, a, 4, true), AfterFailure::kStop);
+  EXPECT_EQ(late.size(), 1u) << "the failure is still named";
+}
+
+// The error of an open that failed at every site it tried.
+TEST(OpenPolicy, AllSitesFailedText) {
+  const std::vector<SiteFailure> failed = {
+      {"a.one.org:1094", "one.org", "a.one.org", "[ERROR] Server responded with an error: [3010] no"},
+      {"b.two.org:1094", "two.org", "", "[ERROR] at root://b.two.org:1094//f?authz=SECRET denied"}};
+  const std::string t = allSitesFailedText("root://r:1094//store/f.root", failed);
+  EXPECT_EQ(t, "uCache: root://r:1094//store/f.root: no site could open it: one.org "
+               "(a.one.org:1094): [ERROR] Server responded with an error: [3010] no; two.org "
+               "(b.two.org:1094): [ERROR] at root://b.two.org:1094//f denied");
+  EXPECT_EQ(t.find("SECRET"), std::string::npos);
+  EXPECT_EQ(t.substr(t.find("one.org (")), sitesFailedList(failed)) << "the list alone, for the log";
+  // Each error at most 160 bytes, the whole at most 1024.
+  std::vector<SiteFailure> many(20, {"s.x.org:1094", "x.org", "s.x.org", std::string(500, 'e')});
+  const std::string m = allSitesFailedText("root://r//f", many);
+  EXPECT_LE(m.size(), 1024u);
+  EXPECT_NE(m.find(std::string(160, 'e') + ";"), std::string::npos);
+  EXPECT_EQ(m.find(std::string(161, 'e')), std::string::npos);
+  EXPECT_STREQ(openRouteName(OpenRoute::kFailover), "failover");
+}

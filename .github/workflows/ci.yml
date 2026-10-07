@@ -111,6 +111,22 @@ jobs:
           n2=$(grep -c '\[127.0.0.1:1\] Unable to send the message kXR_open' /tmp/or2.log)
           echo "opens refused at once: $n1 and $n2"
           [ "$n1" = 1 ] && [ "$n2" = 3 ]
+      - name: a property the reader sets while its open is retried reaches the new file
+        run: |
+          # The first attempt goes to a refused port and is retried after a
+          # second; ReadRecovery, set right after Open returns, must still read
+          # false once the retry has opened the file.
+          export XRD_CONNECTIONRETRY=1 XRD_PLUGINCONFDIR=/tmp/conf XRD_LOGLEVEL=Debug
+          F=/bench/data/f.bin; U=root://127.0.0.1:10940/$F
+          mkdir -p /tmp/cache-op
+          XRD_LOGFILE=/tmp/op.log UCACHE_DIR=/tmp/cache-op UCACHE_ADAPTIVE_FEDERATION=on \
+            UCACHE_REVALIDATE_S=0 UCACHE_OPEN_RETRIES=1 UCACHE_TEST_OPEN_FAIL_N=1 \
+            UCACHE_OPEN_RETRY_BASE_MS=1000 ./build/tests/ucache-plugin-fuzz "$U" $F 1 1 1 open-property
+          # The first attempt went to the refused port: without it the mode
+          # would pass without testing anything.
+          n=$(grep '\[127.0.0.1:1\] MsgHandler created' /tmp/op.log | grep -c 'kXR_open (file:')
+          echo "first attempts at the refused port: $n"
+          [ "$n" -ge 1 ]
 
   # macOS: keep the tree compiling under AppleClang and run the hermetic tests.
   # Build-and-test only, deliberately: reading root:// through the plugin needs a

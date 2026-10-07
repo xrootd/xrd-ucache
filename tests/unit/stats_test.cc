@@ -197,13 +197,19 @@ TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
     s.originFailures[i] = static_cast<uint64_t>(10 + i);
   s.recordsDropped = 3;
   s.originOpenUs.add(1000); // bucket 9
+  s.openFailovers = 5;
+  s.opensRecovered = 4;
+  s.opensFailedEverywhere = 1;
+  s.openDeadlineExpiries = 2;
   const std::string body = s.toJsonBody();
   for (const char* f :
        {"\"origin_open_attempts\":7", "\"origin_open_failures\":2",
         "\"origin_failures_client\":10", "\"origin_failures_site\":11",
         "\"origin_failures_notfound\":12", "\"origin_failures_data\":13",
         "\"origin_failures_expired\":14", "\"origin_failures_other\":15",
-        "\"records_dropped\":3", "\"hist_origin_open_us\":[0,0,0,0,0,0,0,0,0,1]"})
+        "\"records_dropped\":3", "\"hist_origin_open_us\":[0,0,0,0,0,0,0,0,0,1]",
+        "\"open_failovers\":5", "\"opens_recovered\":4", "\"opens_failed_everywhere\":1",
+        "\"open_deadline_expiries\":2"})
     EXPECT_NE(body.find(f), std::string::npos) << f;
   EXPECT_EQ(("{" + body + "}").find(",}"), std::string::npos);
   test::TempDir td;
@@ -219,6 +225,10 @@ TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
   for (int i = 0; i < 6; ++i)
     EXPECT_EQ(t.originFailures[i], static_cast<uint64_t>(2 * (10 + i))) << i;
   EXPECT_EQ(t.recordsDropped, 6u);
+  EXPECT_EQ(t.openFailovers, 10u);
+  EXPECT_EQ(t.opensRecovered, 8u);
+  EXPECT_EQ(t.opensFailedEverywhere, 2u);
+  EXPECT_EQ(t.openDeadlineExpiries, 4u);
   EXPECT_EQ(t.histOriginOpen, (std::vector<uint64_t>{0, 0, 0, 0, 0, 0, 0, 0, 0, 2}));
   EXPECT_EQ(t.opens, 4u) << "no new counter collides with an older one's name";
 }

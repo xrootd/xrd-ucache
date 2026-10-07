@@ -90,6 +90,8 @@ the consumers together.
  "origin_failures_client": 0, "origin_failures_site": 0, "origin_failures_notfound": 0,
  "origin_failures_data": 0, "origin_failures_expired": 0, "origin_failures_other": 0,
  "records_dropped": 0, "hist_origin_open_us": [..],
+ "open_failovers": 0, "opens_recovered": 0, "opens_failed_everywhere": 0,
+ "open_deadline_expiries": 0,
  "entries": [{"key": "root://host:1094/path", "file_size": 0,
               "cached_bytes": 0, "page_size": 4096}],
  "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ... adaptive_federation=off"}
@@ -226,6 +228,18 @@ ones included, so a run with caching disabled shows its origin failures too.
 - `records_dropped` — record lines (an origin open, an origin failure) dropped
   because the 4096 lines waiting for the next checkpoint were already queued.
   The counters above still count them.
+- `open_failovers`, `opens_recovered`, `opens_failed_everywhere` — with
+  `adaptive_federation = on` (USER_GUIDE.md): attempts made at another site
+  after an open failed at one, opens that succeeded after at least one such
+  attempt, and opens that ended with every site they tried failing (stopped by
+  the bound of sites or time, or by the redirector sending the open back to a
+  server or site that failed already). An open whose first failure is final (no
+  copy anywhere, a redirector that refuses the client itself) is in none of
+  them.
+- `open_deadline_expiries` — with `adaptive_federation = on`, open attempts
+  that expired at their timeout: the open deadline, the job's own shorter open
+  timeout, or what was left of an open's time budget (also counted in
+  `origin_failures_expired`).
 
 `run_settings`, on the counter line, is the settings that decide how the
 origin is reached, as the plugin found them at load, one string:

@@ -253,6 +253,10 @@ is given up by the client after its connection window times its retries, 31 s
 twice with the switch on, which is past the deadline: such an open fails at the
 deadline, 60 s, with the same `operation expired` error and the same warning.
 
+Through a redirector, an open that passes the deadline at one site is made
+again at another (next entry); the warning is then followed by
+`trying another site`.
+
 With the switch off (the default) there is no deadline: the job's own open
 passes the job's own timeout, or none, exactly as without uCache, and the opens
 uCache makes of the origin carry none (they wait for the client's
@@ -283,6 +287,33 @@ another server, and uCache's own origin opens for that file carry the same
 list, so they avoid it too (releases up to 1.4.0 dropped `tried=` from those
 opens). If every copy is on the servers you name, the redirector answers that
 no server has the file.
+
+With `adaptive_federation = on`, uCache does this itself for each open (next
+entry).
+
+## uCache opened the file at another site
+
+With `adaptive_federation = on`, an open through a redirector that fails at
+one site (the server refused this client, stalled past the open deadline, could
+not be reached, or failed with a server or storage error) is made again through
+the redirector, with the servers that failed named in `tried=`. The log shows
+each step:
+
+- `<file>: <host>:<port> (<site>) could not open it (<error>); trying another site`
+- `<file>: opened at <host>:<port> (<site>) after <n> failed attempt(s)`, when
+  another site opened it;
+- `<file>: no site could open it: <site> (<host>:<port>): <error>; ...`, when
+  none did. The job gets that error, with the code of the last one.
+
+An open stops after 4 sites, or after 180 s in all (160 s with the switch's
+error window, less with a shorter open timeout of the job's own), and when the
+redirector sends it back to a server or site that failed already. A server the
+redirector names by its address, or by a name without a dot, cannot be named
+in `tried=` (a redirector masks servers by full host name), so the redirector
+may send the next attempt to it again; the open then ends with the error.
+The counters `open_failovers`, `opens_recovered` and `opens_failed_everywhere`
+(STATS.md) count these, and the per-file record file has a line per attempt
+(FORMAT.md, route `failover`).
 
 ## The cache is filling my disk
 

@@ -50,6 +50,11 @@ constexpr int kXrNoServer = 3014;
 constexpr int kXrCancelled = 3017;
 constexpr int kXrItExists = 3018;
 constexpr int kXrOverloaded = 3024;
+// Login flags of a host (XProtocol.hh), and the stat flag of a file on tape.
+constexpr uint32_t kIsServer = 0x1;
+constexpr uint32_t kIsManager = 0x2;  // a redirector
+constexpr uint32_t kAttrMeta = 0x100; // a redirector over redirectors (a global one)
+constexpr uint32_t kStatOffline = 8;
 } // namespace xrdwire
 
 // One host an open went through.
@@ -69,10 +74,15 @@ struct Hop {
 Hop makeHop(const std::string& host, int port, uint32_t flags, bool loadBalancer,
             const std::string& query);
 
-// What a chain of hops says. Which hop is a redirector, and which server the
-// client itself would name on a retry, is left to the reading of the records.
+// What a chain of hops says.
 struct ChainView {
   int last = -1; // the host that answered last (the client's DataServer); -1 for none
+  // The server the client itself names when it retries (in tried=): the last
+  // data server that sent the open on to another host, else the last host;
+  // -1 when the last host is a redirector.
+  int effective = -1;
+  int regional = -1;          // the first redirector that is not a global one; -1 for none
+  bool viaRedirector = false; // a redirector is in the chain
   size_t hops = 0;
 };
 ChainView readChain(const std::vector<Hop>& hops);
@@ -111,8 +121,9 @@ enum class OpenRoute : uint8_t {
   kLazy,     // a trusted handle's open at its first miss
   kDegraded, // a trusted handle whose entry was gone at its first read
   kFork,     // a forked child's open afresh of a handle it inherited
+  kFailover, // with adaptive_federation on, an open of any of these at another site
 };
-const char* openRouteName(OpenRoute r); // "relay", "lazy", "degraded", "fork"
+const char* openRouteName(OpenRoute r); // "relay", "lazy", "degraded", "fork", "failover"
 
 // With adaptive_federation on, the deadline of every read open of a handle
 // the cache serves: the reader's own open, and the cache's own opens of the
@@ -141,6 +152,82 @@ static_assert(kOpenDeadlineS >= 30, "an open deadline below 30 s expires healthy
 // replaces kOpenDeadlineS when positive: a test's value, which may be below
 // the 30 s floor.
 int openDeadlineS(int readerTimeoutS, int deadlineS = 0);
+
+// ---- Opening a file at another site (adaptive_federation on) --------------
+// When an open through a redirector fails at one site in a way another site
+// may not share, the open is made again through the redirector, with the
+// failed servers named in tried= so that it sends the open elsewhere; a
+// success is taken wherever it lands. Each such sequence of attempts has one
+// absolute time budget and a bound on the sites it tries.
+
+// What follows one attempt of an open.
+enum class OpenStep : uint8_t {
+  kFinal,    // the outcome is the open's (a success, or an error no site would change)
+  kFailOver, // try another site
+  kLocate,   // a file not found where a copy may yet exist: asking the regional
+             // redirector where the copies are is not done in this version, so the
+             // caller ends the open with its error
+};
+// The step after an attempt whose chain is `v`, which failed with (code, errNo)
+// -- code 0 for a success -- and, on success, served a file of another size
+// than the one the cache holds (`sizeDiffers`, the cache's own opens only) or
+// one on tape (`offline`). `excluded`: the attempt named servers of ours in
+// tried=, so a copy may have been hidden by them. Only a chain through a
+// redirector can go elsewhere; a failure of the first host itself (the
+// redirector down, stalled or refusing) is final, as there is no other
+// redirector to ask.
+OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bool offline,
+                   bool excluded);
+
+// The host name a retry's tried= may carry for hop `i` of a chain, or "" when
+// it may not: never a redirector, nor the first host, nor an address or a
+// name without a dot (neither masks a server at a redirector), nor a data
+// server reached with an EOS capability (behind an EOS front end, the front
+// end is the site's entry). Lower-cased.
+std::string exclusionName(const std::vector<Hop>& hops, int i);
+
+// The open's budget, in seconds, read at its start: at most kFailoverMaxS, at
+// most the reader's own open timeout when it gave one, and short enough to end
+// before the client's stream error window (`sewS`), less its timeout
+// resolution (`trS`) and 5 s, runs out: a reader that waits that window for
+// a reopen after a failed read gets an answer before it gives up. `maxS`
+// replaces kFailoverMaxS when positive (a test's value). At least 1.
+inline constexpr int kFailoverMaxS = 180; // a first value, to be revisited with measurements
+inline constexpr int kFailoverMaxSites = 4;
+int budgetS(int readerTimeoutS, int sewS, int trS, int maxS = 0);
+// True when nothing more may be issued with `remainingMs` of the budget left:
+// less than one attempt's deadline, capped at 30 s, and for a reader with a
+// timeout of its own, at half that timeout (a reader that gives 30 s would
+// otherwise never have a second attempt).
+bool budgetSpent(int64_t remainingMs, int attemptDeadlineS, int readerTimeoutS = 0);
+
+// One site an open failed at, as the final error and the next attempt see it.
+struct SiteFailure {
+  std::string server; // host:port
+  std::string site;
+  std::string name;  // what tried= may carry for it (exclusionName), "" for none
+  std::string error; // the error's text
+};
+// What the sequence does after a fail-over outcome, given the sites that
+// failed before (`failed`, to which `f` is added unless its server is there):
+//   kStop    the bound of `maxSites` distinct sites is reached, or the budget is
+//            spent (`spent`)
+//   kRepeat  the attempt landed on a server or site that had failed already:
+//            the names did not keep the redirector from it, or it could not be
+//            named. Asking the regional redirector for another copy is not done
+//            in this version, so the caller ends the open.
+//   kRetry   open again through the redirector, naming the failed servers
+enum class AfterFailure : uint8_t { kRetry, kStop, kRepeat };
+AfterFailure afterFailure(std::vector<SiteFailure>& failed, const SiteFailure& f, int maxSites,
+                          bool spent);
+// The names of `failed` a retry's tried= carries, oldest first.
+std::vector<std::string> exclusionNames(const std::vector<SiteFailure>& failed);
+// The error an open that failed at every site it tried ends with: "uCache:
+// <file>: no site could open it: <site> (<server>): <error>; ...", each error
+// cut to 160 bytes and without URL queries, the whole at most 1024 bytes.
+std::string allSitesFailedText(const std::string& file, const std::vector<SiteFailure>& failed);
+// Its list alone: "<site> (<server>): <error>; ...", each error cut likewise.
+std::string sitesFailedList(const std::vector<SiteFailure>& failed);
 
 // A JSON string's contents: quote and backslash escaped, control bytes as
 // \u00XX, so a server's text can never break a record line.

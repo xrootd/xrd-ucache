@@ -22,6 +22,12 @@
 // open-refused checks that an open the client refuses at once still reaches
 // the reader through its handler (see runOpenRefused).
 //
+// Two more cover an open made again, with adaptive_federation on:
+//   open-property      a property set while the open is retried reaches the
+//                      File that replaces the first (see runOpenProperty)
+//   open-failover [N]  N opens through a redirector where a server refuses
+//                      the file: exactly one completion each (see runOpenFailover)
+//
 // And one checks check_origin_integrity's key-position check of byte-cache
 // misses against a copy with one basket zeroed (see runKeyCheck):
 //   key-check <off> <len>   <root-url> serves that copy, <local-path> is the
@@ -1137,13 +1143,102 @@ int runKeyCheck(const char* url, const char* local, uint64_t off, uint32_t len) 
 #endif
 }
 
+// open-property: a property the reader sets while its open is under way
+// reaches the File that a retry puts in place of the first. The first
+// attempt is faulted (UCACHE_TEST_OPEN_FAIL_N=1) and retried after a backoff
+// (UCACHE_OPEN_RETRIES=1, UCACHE_OPEN_RETRY_BASE_MS of 1000 or more, so the
+// property is set before the File is replaced), with adaptive_federation on.
+// ReadRecovery is set to false right after Open returns; after the open it
+// must read false. A plugin that sets it on the first File only reads the
+// new File's default, true.
+int runOpenProperty(const char* url) {
+  const char* mode = "open-property";
+  if (envInt("UCACHE_OPEN_RETRIES", 0) != 1 || envInt("UCACHE_TEST_OPEN_FAIL_N", 0) != 1 ||
+      envInt("UCACHE_OPEN_RETRY_BASE_MS", 0) < 1000 || envInt("UCACHE_REVALIDATE_S", -1) != 0) {
+    std::printf("%s: SETUP: needs UCACHE_OPEN_RETRIES=1, UCACHE_TEST_OPEN_FAIL_N=1, "
+                "UCACHE_OPEN_RETRY_BASE_MS>=1000 and UCACHE_REVALIDATE_S=0\n",
+                mode);
+    return 2;
+  }
+  auto* f = new XrdCl::File(); // leaked with its handler: a late completion lands safely
+  auto* h = new StrictOpenHandler();
+  const XrdCl::XRootDStatus st = f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h);
+  const bool set = f->SetProperty("ReadRecovery", "false");
+  if (!st.IsOK() || !h->succeededWithin(std::chrono::seconds(60))) {
+    std::printf("%s: FAIL: the open (Open() %s, %d completion(s))\n", mode, st.ToString().c_str(),
+                h->count());
+    return 1;
+  }
+  std::string v;
+  const bool got = f->GetProperty("ReadRecovery", v);
+  std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a second completion
+  std::printf("%s: SetProperty %s, ReadRecovery after the open: %s, %d completion(s)\n", mode,
+              set ? "ok" : "refused", got ? v.c_str() : "(none)", h->count());
+  const bool good = set && got && v == "false" && h->exactlyOne();
+  std::printf(good ? "%s: clean\n" : "%s: FAIL\n", mode);
+  return good ? 0 : 1;
+}
+
+// open-failover N: N opens, one after another, each with its own handler,
+// through a redirector where a server refuses the file (the gate's fault):
+// every open must get exactly one completion, a success, with a host list,
+// and read the file's first 64 KiB right. Which opens failed over is in the
+// records of the cache directory.
+int runOpenFailover(const char* url, const char* local, int n) {
+  const char* mode = "open-failover";
+  const int fd = ::open(local, O_RDONLY);
+  if (fd < 0) {
+    std::printf("%s: SETUP: cannot read %s\n", mode, local);
+    return 2;
+  }
+  const uint32_t len = 65536;
+  std::vector<char> ref(len), got(len);
+  if (::pread(fd, ref.data(), len, 0) != static_cast<ssize_t>(len)) {
+    std::printf("%s: SETUP: %s is shorter than 64 KiB\n", mode, local);
+    return 2;
+  }
+  ::close(fd);
+  std::vector<StrictOpenHandler*> hs;
+  int bad = 0;
+  for (int i = 0; i < n; ++i) {
+    auto* f = new XrdCl::File(); // leaked with its handler: a late completion lands safely
+    auto* h = new StrictOpenHandler();
+    hs.push_back(h);
+    const XrdCl::XRootDStatus st = f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h);
+    if (!st.IsOK() || !h->succeededWithin(std::chrono::seconds(200))) {
+      std::printf("%s: open %d: FAIL: Open() %s, answer '%s'\n", mode, i + 1,
+                  st.ToString().c_str(), h->answer.c_str());
+      ++bad;
+      continue;
+    }
+    uint32_t bytes = 0;
+    const XrdCl::XRootDStatus rs = f->Read(0, len, got.data(), bytes);
+    if (!rs.IsOK() || bytes != len || std::memcmp(got.data(), ref.data(), len) != 0) {
+      std::printf("%s: open %d: FAIL: the read (%s, %u bytes)\n", mode, i + 1,
+                  rs.ToString().c_str(), bytes);
+      ++bad;
+    }
+    const XrdCl::XRootDStatus cs = f->Close();
+    (void)cs;
+  }
+  std::this_thread::sleep_for(std::chrono::seconds(2)); // room for a late second completion
+  int notOne = 0;
+  for (auto* h : hs)
+    notOne += h->exactlyOne() ? 0 : 1;
+  std::printf("%s: %d open(s), %d failed, %d without exactly one completion\n", mode, n, bad,
+              notOne);
+  std::printf(bad || notOne ? "%s: FAIL\n" : "%s: clean\n", mode);
+  return bad || notOne ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
   if (argc < 3) {
     std::fprintf(stderr,
                  "usage: %s <root-url> <local-path> [ops] [threads] [seed] "
-                 "[fuzz|inner-race|inner-race-relay|open-refused|key-check <off> <len>]\n",
+                 "[fuzz|inner-race|inner-race-relay|open-refused|open-property|open-failover|"
+                 "key-check <off> <len>]\n",
                  argv[0]);
     return 2;
   }
@@ -1158,6 +1253,10 @@ int main(int argc, char** argv) {
                         argc > 4 ? ::atoi(argv[4]) : 4, mode == "inner-race-relay");
   if (mode == "open-refused")
     return runOpenRefused(url);
+  if (mode == "open-property")
+    return runOpenProperty(url);
+  if (mode == "open-failover")
+    return runOpenFailover(url, argv[2], argc > 3 ? ::atoi(argv[3]) : 12);
   if (mode != "fuzz") {
     std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 2;

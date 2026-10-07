@@ -61,5 +61,33 @@ std::string stripCgiParams(const std::string& url, const std::vector<std::string
 // tried=/triedrc= is returned unchanged.
 // Pure.
 std::string ownOpenUrl(const std::string& url);
+// The same, but of the hosts a reselection request names, those in
+// `failedHosts` are kept (host names, compared without a port and ignoring
+// case), followed by triedrc=ioerr: a reader that asks for another server
+// beside the ones it uses names both the servers it reads from without
+// trouble and the ones it gave up on, and the URL does not say which is
+// which. The ones this process saw fail for the file are the reader's own
+// reason for the request, so the cache's own open avoids them too; the others
+// are not passed on (with every holder of the file named, a redirector finds
+// no server at all). Used with adaptive_federation on.
+std::string ownOpenUrl(const std::string& url, const std::vector<std::string>& failedHosts);
+
+// The reader's URL as the base of a retry of its own open at another site:
+// every tried= host merged into one tried= list as ownOpenUrl does, a
+// reselection request's hosts included (they are servers the reader is
+// already reading from), and every triedrc= removed. Pure.
+std::string mergeTried(const std::string& url);
+
+// `base` (a URL with at most one tried=, as mergeTried and ownOpenUrl make it)
+// with the host names `ours` added to its tried= list, after the hosts already
+// there, which are never dropped, and followed by triedrc=`triedrc` in place
+// of any triedrc= (a redirector reads only one): `enoent`, or `ioerr` for
+// any other value (never a reselection request). Of ours, only full host
+// names are added: an address or a name without a dot keeps the redirector
+// from nothing. Duplicates (ignoring case) are dropped, and of ours at most
+// the 4 newest are kept, fewer when the list would pass 1024 bytes. Without
+// any host to list, `base` is returned unchanged. Pure.
+std::string withExclusions(const std::string& base, const std::vector<std::string>& ours,
+                           const std::string& triedrc);
 
 } // namespace ucache

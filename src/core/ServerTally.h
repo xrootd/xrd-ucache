@@ -16,6 +16,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace ucache {
 
@@ -40,6 +41,8 @@ class ServerTally {
   // first, at most kMaxNamed servers, then "+N" for the N not named; "" when
   // empty.
   std::string text() const;
+  // The hosts (without their port) with at least one failed request.
+  std::vector<std::string> failedHosts() const;
 
  private:
   struct Agg {

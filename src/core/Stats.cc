@@ -179,7 +179,11 @@ std::string Stats::toJsonBody() const {
   for (int i = 0; i < 6; ++i)
     f(kOriginFailureFields[i], originFailures[i]);
   f("records_dropped", recordsDropped);
-  os << "\"hist_origin_open_us\":" << originOpenUs.toJson();
+  os << "\"hist_origin_open_us\":" << originOpenUs.toJson() << ',';
+  f("open_failovers", openFailovers);
+  f("opens_recovered", opensRecovered);
+  f("opens_failed_everywhere", opensFailedEverywhere);
+  os << "\"open_deadline_expiries\":" << openDeadlineExpiries.load(std::memory_order_relaxed);
   return os.str();
 }
 
@@ -309,6 +313,10 @@ StatsTotals aggregateStats(const std::string& statsDir) {
       t.originFailures[i] += extractU64(last, kOriginFailureFields[i]);
     t.recordsDropped += extractU64(last, "records_dropped");
     extractHist(last, "hist_origin_open_us", t.histOriginOpen);
+    t.openFailovers += extractU64(last, "open_failovers");
+    t.opensRecovered += extractU64(last, "opens_recovered");
+    t.opensFailedEverywhere += extractU64(last, "opens_failed_everywhere");
+    t.openDeadlineExpiries += extractU64(last, "open_deadline_expiries");
   }
   ::closedir(d);
   return t;

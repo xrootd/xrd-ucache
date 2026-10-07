@@ -49,6 +49,7 @@ std::once_flag gInitFlag;
 Config* gConfig = nullptr;
 std::shared_ptr<CacheStore>* gStore = nullptr;
 std::atomic<int> gRequestTimeoutS{XrdCl::DefaultRequestTimeout};
+std::atomic<bool> gExiting{false}; // the process has begun to exit (processExiting)
 
 // ---- the XRootD client's log ----------------------------------------------
 // uCache is part of the client a job runs, so it logs where the client does:
@@ -417,6 +418,7 @@ void initGlobals() {
   if (*gStore && gConfig->metaFlushSeconds > 0)
     scheduleCheckpoint();
   ::atexit([] {
+    gExiting.store(true, std::memory_order_release); // first: no open is issued from here on
     if (gStore && *gStore)
       (*gStore)->dumpStats(/*finalDump=*/true); // + Layer-2 records of live entries
     Log::flushHeldBack();
@@ -437,6 +439,8 @@ std::shared_ptr<CacheStore> globalStore() {
 }
 
 int defaultRequestTimeoutS() { return gRequestTimeoutS.load(std::memory_order_relaxed); }
+
+bool processExiting() { return gExiting.load(std::memory_order_acquire); }
 
 void resumeAfterFork() {
   if (!gResume.load(std::memory_order_acquire) || !gResume.exchange(false))

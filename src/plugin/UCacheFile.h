@@ -174,6 +174,10 @@ struct HandleState {
   std::unique_ptr<XrdCl::File> innerOwned;
   std::atomic<XrdCl::File*> inner{nullptr};
   std::vector<std::unique_ptr<XrdCl::File>> retired;
+  // With adaptive_federation on, the properties the reader set (SetProperty),
+  // in order, given again to every File resetInner makes: an open made again
+  // at another site would otherwise lose them. Under mu.
+  std::vector<std::pair<std::string, std::string>> readerProps;
   // The last File an origin open was sent on (the open call returned OK). An
   // open issued again on that File (a failed one that could not be replaced
   // while a call was inside it, or a reader opening one File twice) is answered
@@ -184,6 +188,10 @@ struct HandleState {
   std::atomic<XrdCl::File*> openSentOn{nullptr};
   int innerOps = 0;
   bool innerValid = false;
+  // Under mu: the handle shut down while the cache's own open of the origin was
+  // in flight (shutdownInner does not wait for it). An open of that sequence that
+  // succeeds afterwards is closed, not adopted.
+  bool seqAbandoned = false;
   std::condition_variable innerCv;
 
   // Cache-freshness (UCACHE_REVALIDATE_S): when a recent local entry is
@@ -239,9 +247,15 @@ struct HandleState {
   // open; between the attempts of an open none can be, as no request of the
   // cache's goes to a File whose open has not succeeded). `leakOld`: the old
   // file is left alone instead (a forked child's inherited one, the parent's).
-  XrdCl::File* resetInner(bool leakOld = false, bool onlyIfIdle = false);
+  // `closeOld`: the old one is open (an open refused its copy) and is closed
+  // without waiting, as it moves to `retired`.
+  XrdCl::File* resetInner(bool leakOld = false, bool onlyIfIdle = false, bool closeOld = false);
   // A forked child has yet to open this handle's origin file afresh.
   bool reopenPending();
+  // As reopenPending, but with adaptive_federation on false at once while
+  // another thread is opening the origin. Only for Close and the handle's
+  // destruction: a call that needs the open waits for it (reopenPending).
+  bool reopenPendingNoWait();
 
   // Async page-persist accounting. Persists are posted off the read path
   // (§5.2 step 4), but Close/destruction must wait for them so short-lived
@@ -365,6 +379,10 @@ std::shared_ptr<CacheStore> globalStore();
 // XrdCl's RequestTimeout as the plugin found it at load: what an origin
 // request given no timeout of its own is allowed.
 int defaultRequestTimeoutS();
+// True once the process has begun to exit (the plugin's exit handler has
+// started): an open trying other sites issues nothing more and ends with its
+// last error.
+bool processExiting();
 // A forked child's first cache work: re-arms what lived only in the parent's
 // timer queue (the periodic checkpoint). Cheap when there is nothing to do.
 void resumeAfterFork();

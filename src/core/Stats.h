@@ -109,6 +109,13 @@ struct Stats {
   // Record lines (origin opens and failures) dropped because the queue that
   // holds them until the next checkpoint was full.
   std::atomic<uint64_t> recordsDropped{0};
+  // Opens at another site (adaptive_federation, docs/STATS.md): attempts made
+  // at another site, opens that succeeded after one, opens that failed at
+  // every site they tried, and attempts that passed the open deadline.
+  std::atomic<uint64_t> openFailovers{0};
+  std::atomic<uint64_t> opensRecovered{0};
+  std::atomic<uint64_t> opensFailedEverywhere{0};
+  std::atomic<uint64_t> openDeadlineExpiries{0};
   // Replica tier (docs/STATS.md):
   // Of earlier releases' compact replicas, no longer made or served: always 0.
   std::atomic<uint64_t> replicaOpens{0};
@@ -290,6 +297,8 @@ struct StatsTotals {
            readvChunks = 0, readvCalls = 0, readvMixed = 0, flushRuns = 0, flushRunBytes = 0,
            bufferStalls = 0, bufferStallUs = 0;
   uint64_t originOpenAttempts = 0, originOpenFailures = 0, recordsDropped = 0;
+  uint64_t openFailovers = 0, opensRecovered = 0, opensFailedEverywhere = 0,
+           openDeadlineExpiries = 0;
   uint64_t originFailures[6] = {}; // client, site, notfound, data, expired, other
   // Histogram bucket sums (log2 µs), for CLI percentile rendering:
   std::vector<uint64_t> histHitRead, histOriginRt, histOpen, histReplicaRead, histFlushWrite,

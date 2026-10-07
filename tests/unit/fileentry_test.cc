@@ -1602,4 +1602,7 @@ TEST(FileEntry, ServerTallyEdges) {
   EXPECT_EQ(t.top(), "h.example.org");
   EXPECT_EQ(t.topServer(), "h.example.org:1094"); // the port kept
   EXPECT_EQ(ServerTally().topServer(), "");
+  // The hosts with a failure, without their port.
+  EXPECT_EQ(t.failedHosts(), std::vector<std::string>{"[2001:db8::7]"});
+  EXPECT_TRUE(ServerTally().failedHosts().empty());
 }

@@ -724,7 +724,11 @@ it.
   reselection request, a `triedrc=` whose last reason is `resel`, which a
   client sends to get a second server beside the ones it already reads from
   (CMSSW does this). uCache's own open does not need a second server, and
-  inheriting that request could send it to one this host cannot reach.
+  inheriting that request could send it to one this host cannot reach. With
+  `adaptive_federation = on`, the servers in such a request that this process
+  has seen fail a request for the file are kept (with `triedrc=ioerr`): they
+  are the reason the client asked, and the others are servers it reads from
+  without trouble.
 - **Many processes, one cache.** Processes started separately, and workers a
   process forks after it has read through the cache (Python's `multiprocessing`
   and `concurrent.futures` process pools, ROOT's `TProcessExecutor`), fill and
@@ -762,7 +766,7 @@ overriding your defaults. Common keys:
 | `open_retries = 0`  | `UCACHE_OPEN_RETRIES`   | retry a transient open failure this many times (0 = off); backoff via `open_retry_base_ms`/`open_retry_max_ms` |
 | `recompress = off`  | `UCACHE_RECOMPRESS`     | `on` = the files your jobs read get fast-to-decode replicas **automatically**, created on their first pass (default off — opt-in CPU/disk). Flip it with `ucache set recompress on` |
 | `check_origin_integrity = off` | `UCACHE_CHECK_ORIGIN_INTEGRITY` | `on` = check what arrives from the origin by the file's own checksums before it is cached or served; a basket that fails is never kept or served and the read fails with "data is corrupted", naming the server. **Forced on by `recompress = on`**, which decodes what it converts anyway (`ucache settings` says "forced by recompress"), and by `adaptive_federation = on`. It covers what a first pass converts, by the baskets' checksums, and the byte cache's fetches from the origin, by key position: each basket of a TTree that starts in the fetched bytes must say in its key that it sits where the tree's record puts it (ROOT itself refuses a basket whose key does not; bytes that are not the basket, zeros among them, fail it). A read that holds such a basket fails with "failed its check ... not served", and nothing of that fetch is kept. Bytes already in the cache (among them the pages of the file's own records, which uCache reads to find the baskets), single reads of a file read straight from the origin (`max_read_fraction`), reads the cache relays to the origin, read-ahead, and a key header split between two pieces of one fetch are not checked yet. To find the baskets, the first read of a file that misses waits, before its own fetch, for uCache's own reads of its records, each with that read's own timeout (a stalled origin can hold it for several of them); other handles of the file do not wait for those reads, and what they miss meanwhile is not checked. When one of those reads fails, misses go unchecked until one a second later or more reads the records again. See STATS.md for the counters |
-| `adaptive_federation = off` | `UCACHE_ADAPTIVE_FEDERATION` | the switch for reading through a federation of sites (a redirector in front of many sites' servers). `on` = the XRootD client gives up on a server it cannot reach sooner: connection window 31 s, 2 connection retries, error window 180 s (its own defaults are 120 s, 5 and 1800 s), each only where neither an `XRD_*` variable nor a `client.conf` has set it; every read open of a file uCache serves gets a deadline of 60 s (below); and `check_origin_integrity` is **forced on** (`ucache settings` says "forced by adaptive_federation"). The values in force are in `run_settings` (STATS.md) and in `ucache doctor` |
+| `adaptive_federation = off` | `UCACHE_ADAPTIVE_FEDERATION` | the switch for reading through a federation of sites (a redirector in front of many sites' servers). `on` = the XRootD client gives up on a server it cannot reach sooner: connection window 31 s, 2 connection retries, error window 180 s (its own defaults are 120 s, 5 and 1800 s), each only where neither an `XRD_*` variable nor a `client.conf` has set it; every read open of a file uCache serves gets a deadline of 60 s (below); an open through a redirector that fails at one site is made again at another (below); and `check_origin_integrity` is **forced on** (`ucache settings` says "forced by adaptive_federation"). The values in force are in `run_settings` (STATS.md) and in `ucache doctor` |
 | `recompress_keep_originals = off` | `UCACHE_RECOMPRESS_KEEP_ORIGINALS` | `on` = when baskets are converted into a replica, keep their original bytes in the byte cache too (by default they are not kept, and a copy held from before is released: the cache would hold the same data twice) |
 | `mixed_maps = on` | `UCACHE_MIXED_MAPS` | with `recompress = on`: each open of a TTree or RNTuple file is shown its newest map, the baskets or pages converted by then back to back at their real size (see "Recompression"); `off` = every open sees the first-pass layout, every basket at the size of its room and every RNTuple page decoded — for jobs that hand basket positions to workers on other machines with caches of their own |
 | `recompress_codecs = lzma,zlib` | `UCACHE_RECOMPRESS_CODECS` | which **source** codecs are worth recompressing (comma list); branches in other codecs are served as-is |
@@ -794,6 +798,36 @@ An open that passes it fails with the client's `operation expired` error
 it would without uCache (the job's own open timeout, or the client's
 `RequestTimeout`), and the opens uCache makes of the origin wait for the
 client's `RequestTimeout`.
+
+**Opening a file at another site (part of `adaptive_federation`).** With
+`adaptive_federation = on`, when an open through a redirector fails at the
+site it was sent to, in a way another site may not share -- the server refused
+this client (`[3010]`), stalled past the deadline, could not be reached, or
+failed the request with a server or storage error -- uCache opens the file again
+through the redirector, naming the servers that failed in `tried=` so that the
+redirector sends it elsewhere. This holds for the job's own open and for the
+opens uCache makes of the origin. A success is taken wherever it lands; for the
+opens uCache makes of a file it holds, only a copy of the size it holds; a
+copy on tape (the server's answer to the open says `Offline`) is passed over
+for another site's; when no other site opens the file, it is opened once more
+as the job asked for it and that answer stands, so a file that is readable
+without uCache stays readable. Each open tries
+at most 4 sites, within 180 s in all (less when the job's own open timeout is
+shorter, and with the switch's error window of 180 s, 160 s), and an open that
+fails at every site it tries ends with an error naming each site and its
+error. A file the redirector finds nowhere, a
+redirector that is down or refuses the client itself, and a direct URL to a
+server are final, as without uCache. The servers named are full host names
+only: an address or a name without a dot keeps a redirector from nothing, so
+a server known by one is not named, and when the redirector sends the open
+back to a server or site that failed already, the open ends with its error
+(asking the regional redirector for the other copies is not done in this
+version). A job's own `tried=` list is kept ahead of uCache's names. An open
+that uCache makes of the origin holds one of its worker threads while it tries
+sites, so with a stalled site and every worker so held, the next step of a
+job's own open waits for a free one. With the
+switch off nothing of this happens: an open's failure is the job's, as without
+uCache.
 
 **Put the cache on local disk.** `dir` has **no default** — an unset cache
 location is a loud condition (`doctor` FAILs, the plugin passes through

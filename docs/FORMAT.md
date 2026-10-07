@@ -363,7 +363,9 @@ can hold an access token, and `file` is the cache key, which has none.
 - `route`: `relay` (the reader's own open of a file the cache serves),
   `lazy` (a trusted handle's open at its first miss), `degraded` (a trusted
   handle whose cached entry was gone at its first read), `fork` (a forked
-  child's open afresh of a handle it inherited).
+  child's open afresh of a handle it inherited), `failover` (with
+  `adaptive_federation = on`, an attempt of any of these at another site after
+  the open failed at one; its `seq` is the first attempt's).
 - `status` `ok` or `error`, with the client's `code` and `errno` (the server's
   error code when `code` is 400) and the provisional `class` of a failure
   (`none` on success; the classes are the `origin_failures_*` counters'
@@ -387,6 +389,11 @@ can hold an access token, and `file` is the cache key, which has none.
   has the `RequestTimeout`: uCache's own opens carry no timeout then.
 - `msg`: the error's text, at most 200 bytes as written (escapes included);
   `""` on success.
+- With `adaptive_federation = on`, the line of the attempt that decided how
+  the open ended has, after `msg`, `"outcome"` (`ok` or `error`) and
+  `"budget_s"`, the time the open's attempts were allowed in all, in seconds.
+  An open that ended because its handle was closed before a next attempt was
+  issued has no such line.
 
 An open the client refuses at once, before it reaches any server (the open
 call itself returns the error, and no answer comes), has a line as well:
@@ -420,3 +427,17 @@ any server and has no line.
 - At most 16 lines per file, server and class in a process; the per-file
   record's `data_servers` counts every failed read. Open failures are in the
   `open` lines only.
+
+**`"kind":"size_disagreement"`, v1** — with `adaptive_federation = on`, one
+line each time an open uCache made of a file it holds landed on a copy of
+another size through a redirector, whether it was then made again at another
+site or refused:
+
+```json
+{"kind":"size_disagreement","v":1,"ts_ms":0,"file":"root://h:1094/p",
+ "site":"dom.ain","server":"d:1094","sizes":"1000000/4247184"}
+```
+
+- `site` and `server`: where that copy is (`server` host:port, `site` its
+  domain); `sizes`: the copy's size, then the size of the file uCache holds.
+  The `size_disagreements` counter (STATS.md) counts these too.
