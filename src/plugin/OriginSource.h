@@ -78,8 +78,8 @@ struct OriginSource : transpose::Source {
     const std::string server = issueServer(*st, f);
     std::atomic<uint64_t>* srv = st->store ? serverInFlight(server) : nullptr;
     const uint64_t inFlight = srv ? srv->fetch_add(1, std::memory_order_relaxed) + 1 : 0;
-    XrdCl::XRootDStatus s = f->Read(ws, static_cast<uint32_t>(we - ws), buf.data(), got,
-                                    timeout);
+    XrdCl::XRootDStatus s =
+        f->Read(ws, static_cast<uint32_t>(we - ws), buf.data(), got, st->originTimeout(timeout));
     if (srv)
       srv->fetch_sub(1, std::memory_order_relaxed);
     st->releaseInner();

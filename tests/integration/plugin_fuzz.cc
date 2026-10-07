@@ -35,6 +35,11 @@
 // misses against a copy with one basket zeroed (see runKeyCheck):
 //   key-check <off> <len>   <root-url> serves that copy, <local-path> is the
 //                      undamaged file; ops, threads and seed are ignored
+//
+// read-failover <case> checks that a read an origin failure was injected into
+// (UCACHE_TEST_READ_FAIL_N, UCACHE_TEST_READ_FAIL_KIND) is answered with the
+// right bytes, once, with adaptive_federation on and the file's copies behind a
+// redirector (see runReadFailover). The caller checks the records.
 #include <XrdCl/XrdClFile.hh>
 #include <XrdCl/XrdClURL.hh>
 #ifdef UCACHE_FUZZ_HAVE_TRANSPOSE
@@ -1255,15 +1260,196 @@ int runOpenDenied(const char* url) {
   return good ? 0 : 1;
 }
 
+// read-failover <case>: every read below is asynchronous, with its own handler,
+// and must be answered exactly once (through HandleResponseWithHosts, with a
+// non-null HostList) with the file's own bytes, whatever was injected into it.
+// Each line printed is a verdict; the data servers a handle read from are
+// printed as "SERVERS", for the caller to check against the records.
+//   miss      two misses fail (UCACHE_TEST_READ_FAIL_N=2): a Read, then a
+//             VectorRead. The handle is read from another server after each; its
+//             ReadRecovery property is "false" and a SetProperty of "true" does
+//             not change that
+//   relay     (KIND=relay, N=2) a PgRead and a VectorRead into one buffer, which
+//             are relayed to the origin, fail and are answered
+//   refuse    (KIND=refuse, N=3) a Read, a PgRead and a VectorRead are refused
+//             at once by the client (the handle may be read from the same server
+//             after, which a refusal does not exclude)
+//   final     (KIND=final, N=2) a Read and a VectorRead fail with an error no
+//             other site would answer differently: the handle stays where it is
+//   off       (N=2, the switch off) a Read and a VectorRead fail: the handle stays
+//             where it is, and the client's own read recovery is on
+//   many      (N=8, KIND unset or late) 8 threads read 4 pages each at once,
+//             8 of them failing: all are exact
+struct ReadCase {
+  const Source& src;
+  XrdCl::File* file;
+  std::vector<ReadWait*>& handlers;
+  int& fails;
+  std::string prop(const char* name) const {
+    std::string v;
+    return file->GetProperty(name, v) ? v : "(none)";
+  }
+  void verdict(bool ok, const std::string& what) const { // called by the threads of `many`
+    static std::mutex mu;
+    std::lock_guard<std::mutex> g(mu);
+    std::printf("%s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
+    fails += ok ? 0 : 1;
+  }
+  // kind: 'r' Read, 'p' PgRead, 'v' VectorRead of two chunks (a part of one page
+  // each, two pages apart), 'b' VectorRead into one buffer
+  bool read(char kind, uint64_t off, const char* what) const {
+    auto* w = new ReadWait();
+    {
+      static std::mutex mu;
+      std::lock_guard<std::mutex> g(mu);
+      handlers.push_back(w);
+    }
+    const uint32_t n = 65536;
+    std::vector<std::vector<char>> bufs(2, std::vector<char>(n, 0x5A));
+    XrdCl::ChunkList chunks{XrdCl::ChunkInfo(off, n, bufs[0].data()),
+                            XrdCl::ChunkInfo(off + 3 * n, n, bufs[1].data())};
+    std::vector<char> both(2 * n, 0x5A);
+    XrdCl::XRootDStatus s;
+    switch (kind) {
+    case 'r':
+      s = file->Read(off, n, bufs[0].data(), w);
+      break;
+    case 'p':
+      s = file->PgRead(off, n, bufs[0].data(), w);
+      break;
+    case 'v':
+      s = file->VectorRead(chunks, nullptr, w);
+      break;
+    default:
+      s = file->VectorRead(chunks, both.data(), w);
+      break;
+    }
+    bool ok = s.IsOK() && w->wait();
+    {
+      std::lock_guard<std::mutex> g(w->mu);
+      ok = ok && w->status.IsOK();
+    }
+    const char* ref = src.bytes.data();
+    if (kind == 'r' || kind == 'p')
+      ok = ok && std::memcmp(bufs[0].data(), ref + off, n) == 0;
+    else if (kind == 'v')
+      ok = ok && std::memcmp(bufs[0].data(), ref + off, n) == 0 &&
+           std::memcmp(bufs[1].data(), ref + off + 3 * n, n) == 0;
+    else
+      ok = ok && std::memcmp(both.data(), ref + off, n) == 0 &&
+           std::memcmp(both.data() + n, ref + off + 3 * n, n) == 0;
+    verdict(ok, std::string(what) +
+                    (ok ? "" : " (" + (s.IsOK() ? w->status.ToStr() : s.ToString()) + ")"));
+    return ok;
+  }
+};
+
+int runReadFailover(const char* url, const char* local, const std::string& which) {
+  const char* mode = "read-failover";
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
+  Source src(local);
+  if (src.bytes.size() < 8 * 1024 * 1024) {
+    std::printf("%s: SETUP: %s is shorter than 8 MiB\n", mode, local);
+    return 2;
+  }
+  int fails = 0;
+  std::vector<ReadWait*> handlers;
+  auto file = std::make_unique<XrdCl::File>(); // plugins enabled
+  if (!strictOpen(*file, url)) {
+    std::printf("%s: SETUP: open failed\n", mode);
+    return 2;
+  }
+  ReadCase rc{src, file.get(), handlers, fails};
+  std::vector<std::string> servers{rc.prop("DataServer")};
+  const auto moved = [&](const char* what) {
+    servers.push_back(rc.prop("DataServer"));
+    rc.verdict(servers.back() != servers[servers.size() - 2], std::string(what) + ": read from " +
+                                                                  servers.back() + " now, was " +
+                                                                  servers[servers.size() - 2]);
+  };
+  const auto stayed = [&](const char* what) {
+    servers.push_back(rc.prop("DataServer"));
+    rc.verdict(servers.back() == servers[servers.size() - 2],
+               std::string(what) + ": still read from " + servers.back());
+  };
+  constexpr uint64_t M = 1 << 20;
+  if (which == "miss") {
+    rc.read('r', 1 * M, "a Read whose origin read failed is exact");
+    moved("after the Read");
+    rc.verdict(rc.prop("ReadRecovery") == "false",
+               "ReadRecovery is false: " + rc.prop("ReadRecovery"));
+    rc.read('v', 2 * M, "a VectorRead whose origin read failed is exact");
+    moved("after the VectorRead");
+    rc.read('r', 3 * M, "a Read after the moves is exact");
+    stayed("after it");
+    const bool set = file->SetProperty("ReadRecovery", "true");
+    rc.verdict(set && rc.prop("ReadRecovery") == "false",
+               "SetProperty(ReadRecovery, true) is accepted and ReadRecovery stays false: " +
+                   rc.prop("ReadRecovery"));
+    rc.read('r', 3 * M + 262144, "a Read after it is exact");
+  } else if (which == "relay") {
+    rc.read('r', 1 * M, "(first, to arm the handle) a Read is exact");
+    rc.read('p', 2 * M, "a PgRead that failed is exact");
+    moved("after the PgRead");
+    rc.read('b', 3 * M, "a VectorRead into one buffer that failed is exact");
+    moved("after the VectorRead");
+  } else if (which == "refuse") {
+    // A refusal at once says nothing of the server (a session lost on a healthy one), so the
+    // move may land on it again: that it moved is for the caller to check in the records.
+    rc.read('r', 1 * M, "a Read the client refused at once is exact");
+    servers.push_back(rc.prop("DataServer"));
+    rc.read('p', 2 * M, "a PgRead the client refused is exact");
+    rc.read('v', 3 * M, "a VectorRead the client refused is exact");
+  } else if (which == "final" || which == "off") {
+    rc.read('r', 1 * M, "a Read whose origin read failed is exact");
+    stayed("after the Read");
+    rc.read('v', 2 * M, "a VectorRead whose origin read failed is exact");
+    stayed("after the VectorRead");
+    if (which == "off")
+      rc.verdict(rc.prop("ReadRecovery") == "true",
+                 "ReadRecovery is true: " + rc.prop("ReadRecovery"));
+  } else if (which == "many") {
+    rc.read('r', 0, "(first, to arm the handle) a Read is exact");
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 8; ++t)
+      ts.emplace_back([&, t] {
+        for (int k = 0; k < 4; ++k) // page-distinct: no two of them share a fetch
+          rc.read('r', (2 + t * 4 + k) * 131072ull, "a concurrent Read is exact");
+      });
+    for (auto& t : ts)
+      t.join();
+    moved("after the 32 reads");
+  } else {
+    std::printf("%s: unknown case %s\n", mode, which.c_str());
+    return 2;
+  }
+  const XrdCl::XRootDStatus cs = file->Close();
+  if (!cs.IsOK())
+    std::printf("INFO  close: %s\n", cs.ToString().c_str());
+  std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a late second completion
+  bool kept = true;
+  for (auto* w : handlers)
+    kept = kept && w->contractKept();
+  rc.verdict(kept, "every read had exactly one completion, through HandleResponseWithHosts, "
+                   "with a non-null HostList");
+  rc.verdict(openHandlersBad() == 0, "every open had exactly one completion");
+  std::string all;
+  for (const auto& sv : servers)
+    all += (all.empty() ? "" : " ") + sv;
+  std::printf("SERVERS %s\n", all.c_str());
+  std::printf("%s %s: %s\n", mode, which.c_str(), fails ? "FAILED" : "clean");
+  return fails ? 1 : 0;
+}
 } // namespace
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    std::fprintf(stderr,
-                 "usage: %s <root-url> <local-path> [ops] [threads] [seed] "
-                 "[fuzz|inner-race|inner-race-relay|open-refused|open-property|open-failover|open-denied|"
-                 "key-check <off> <len>]\n",
-                 argv[0]);
+    std::fprintf(
+        stderr,
+        "usage: %s <root-url> <local-path> [ops] [threads] [seed] "
+        "[fuzz|inner-race|inner-race-relay|open-refused|open-property|open-failover|open-denied|"
+        "key-check <off> <len>|read-failover <case>]\n",
+        argv[0]);
     return 2;
   }
   const char* url = argv[1];
@@ -1283,6 +1469,8 @@ int main(int argc, char** argv) {
     return runOpenFailover(url, argv[2], argc > 3 ? ::atoi(argv[3]) : 12);
   if (mode == "open-denied")
     return runOpenDenied(url);
+  if (mode == "read-failover")
+    return argc > 7 ? runReadFailover(url, argv[2], argv[7]) : 2;
   if (mode != "fuzz") {
     std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 2;

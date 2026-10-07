@@ -888,7 +888,7 @@ struct Shard {
         for (const auto& r : el.stage)
           j.entry->noteFetchInFlight(r.first, r.second);
       auto* wh = new WireHandler(j.st, f, j.entry, hp, std::move(part), this, partBytes);
-      XrdCl::XRootDStatus s = f->VectorRead(wire, nullptr, wh, 0);
+      XrdCl::XRootDStatus s = f->VectorRead(wire, nullptr, wh, j.st->originTimeout(0));
       if (!s.IsOK()) {
         delete wh; // its destructor gives the in-flight bytes back
         j.st->releaseInner();

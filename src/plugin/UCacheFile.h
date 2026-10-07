@@ -34,6 +34,7 @@
 #include "Config.h"
 #include "CopyGuard.h"
 #include "Executor.h"
+#include "OpenPolicy.h"
 #include "XrdClTimeout.h"
 
 #include <XrdCl/XrdClFile.hh>
@@ -44,6 +45,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -178,6 +180,28 @@ struct HandleState {
   // in order, given again to every File resetInner makes: an open made again
   // at another site would otherwise lose them. Under mu.
   std::vector<std::pair<std::string, std::string>> readerProps;
+  // adaptive_federation: a handle that moves its reads to another site (OpenPolicy.h
+  // armedForReads) is armed once it is set up and an open of it went through a
+  // redirector (`viaRedirector`, under mu). The client's own recovery of a read is
+  // off on every File of an armed handle, and a read that fails in a way another
+  // site may not share is issued again at another site (UCacheFile.cc moveOn).
+  std::atomic<bool> moveOnReads{false};
+  bool viaRedirector = false;
+  // Under mu: the server and site the current File was opened at; where reads
+  // of the handle failed, the 3 newest (the next open names them in tried= and
+  // takes them last); a move in flight, which holds innerOpenMu, the reads waiting
+  // for it, and the reads waiting between attempts, which Close waits for.
+  SiteFailure source;
+  std::vector<SiteFailure> readFailed;
+  bool moveInFlight = false;
+  std::vector<std::function<void(bool)>> moveWaiters;
+  int parkedReads = 0;
+  void applyReadPolicy();
+  void unpark();
+  // The timeout of an origin read of this handle (OpenPolicy.h readAttemptTimeoutS),
+  // `startUs` after the request began (`again`: this is a later attempt); the
+  // reader's own, as given, when the handle is not armed.
+  ucache::XrdTimeout originTimeout(int readerTimeoutS, uint64_t startUs = 0, bool again = false);
   // The last File an origin open was sent on (the open call returned OK). An
   // open issued again on that File (a failed one that could not be replaced
   // while a call was inside it, or a reader opening one File twice) is answered
@@ -250,6 +274,9 @@ struct HandleState {
   // `closeOld`: the old one is open (an open refused its copy) and is closed
   // without waiting, as it moves to `retired`.
   XrdCl::File* resetInner(bool leakOld = false, bool onlyIfIdle = false, bool closeOld = false);
+  // A File of this handle's: plugins off, the reader's properties given again in
+  // order and, on an armed handle, the client's read recovery off. Under mu.
+  std::unique_ptr<XrdCl::File> makeInner();
   // A forked child has yet to open this handle's origin file afresh.
   bool reopenPending();
   // As reopenPending, but with adaptive_federation on false at once while

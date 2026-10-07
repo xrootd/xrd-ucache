@@ -30,6 +30,18 @@
 #                          sends no locate and the regional logs none for the file; the
 #                          positive controls are the first leg's client log and an
 #                          xrdfs locate of the leg's own
+#   reads                  a read whose origin read is made to fail (UCACHE_TEST_READ_FAIL_N,
+#                          and _KIND for where and how) is read again at another site,
+#                          with adaptive_federation on, and answered with the file's own
+#                          bytes, once: misses (a Read, then a VectorRead), relayed reads
+#                          (a PgRead, a VectorRead into one buffer), reads the client
+#                          refuses at once, eight failures of threads at one handle (also
+#                          failing late), and a failure no other site would change, which
+#                          stays at its server. Each case checks the records: the failed
+#                          reads, each followed by an open with route read at another
+#                          server, and open_failovers equal to those opens. With the
+#                          switch off the failed reads are relayed on the same file and
+#                          the client's read recovery stays on
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD=$(cd "${1:?usage: fed_ci.sh BUILD_DIR}" && pwd)
@@ -191,5 +203,68 @@ if [ "$DEF" = off ]; then
 else
   echo "    the default is on: this leg's expectations follow the switch-on legs"
 fi
+echo; echo "=== reads: a failed origin read is read again at another site"
+head -c 8388608 /dev/urandom > "$W/f8.bin"; chmod 644 "$W/f8.bin"
+place8() { # LFN server... (8 MiB)
+  local lfn=$1 s; shift
+  for s in "$@"; do
+    install -d -m 777 "$W/data/$s/$(dirname "$lfn" | sed 's|^/||')"
+    cp "$W/f8.bin" "$W/data/$s$lfn"; chmod 666 "$W/data/$s$lfn"
+  done
+}
+# CACHE -> the lines of one kind of its per-file records
+recs() { cat "$1"/stats/*.files.jsonl 2>/dev/null | grep "\"kind\":\"$2\""; }
+field() { sed -n "s/.*\"$1\":\"\{0,1\}\([^\",}]*\).*/\1/p"; } # a field of each line
+# rf CASE N SWITCH [KIND]: the case on a file of its own; sets RES, RC (its cache), SV (the servers it read from)
+rf() {
+  local c=$1 n=$2 sw=$3 kind=${4:-}
+  local l=/store/ci/rf-$c-${kind:-x}.bin
+  place8 $l a b c
+  RC="$W/c-rf-$c-${kind:-x}"
+  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=$sw UCACHE_TEST_READ_FAIL_N=$n ${kind:+UCACHE_TEST_READ_FAIL_KIND=$kind})
+  RES=$(fuzz "$RC" "$W/rf-$c-${kind:-x}.log" "root://127.0.0.1:$RX/$l" "$W/f8.bin" 1 1 1 read-failover $c)
+  echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-220
+  SV=($(echo "$RES" | sed -n 's/^SERVERS //p'))
+  FL=($(recs "$RC" origin_failure | field data_server))   # the server of each failed read
+  MV=($(recs "$RC" open | grep '"route":"read"' | grep '"outcome":"ok"' | field data_server)) # where each move landed
+  NRA=$(recs "$RC" open | grep -c '"route":"read"')       # open attempts of moves
+}
+clean() { echo "$RES" | grep -q "^read-failover $1: clean\$"; }
+
+rf miss 2 on
+clean miss; verdict "miss: a Read and a VectorRead whose origin read failed are exact, once, and move the handle" $?
+[ "${#FL[@]}" = 2 ] && [ "${FL[0]}" = "${SV[0]}" ] && [ "${FL[1]}" = "${SV[1]}" ]; verdict "miss: the failed reads name the servers the handle was at (${FL[*]})" $?
+[ "${#MV[@]}" = 2 ] && [ "${MV[0]}" = "${SV[1]}" ] && [ "${MV[1]}" = "${SV[2]}" ]; verdict "miss: a move of route read after each landed at the next server (${MV[*]})" $?
+[ "$(counter "$RC" open_failovers)" = "$NRA" ]; verdict "miss: open_failovers $(counter "$RC" open_failovers) equals the attempts of route read ($NRA)" $?
+
+rf relay 2 on relay
+clean relay; verdict "relay: a PgRead and a VectorRead into one buffer that failed are exact, once, and move the handle" $?
+[ "$(recs "$RC" origin_failure | field op | tr '\n' ' ')" = "relay relay " ] && [ "${#MV[@]}" = 2 ]; verdict "relay: two failed relayed reads, two moves (${MV[*]})" $?
+
+rf refuse 3 on refuse
+clean refuse; verdict "refuse: reads the client refused at once are exact, once" $?
+[ "$(recs "$RC" origin_failure | grep -c '"code":109')" = 3 ] && [ "${#MV[@]}" -ge 1 ]; verdict "refuse: three refusals recorded with 109, each followed by a move (${#MV[@]} moves)" $?
+
+rf final 2 on final
+clean final; verdict "final: reads that failed with an error no other site would change are exact, once, and stay put" $?
+[ "$(recs "$RC" origin_failure | grep -c '"code":303')" = 2 ] && [ "$NRA" = 0 ]; verdict "final: two failures recorded with 303, no open of route read" $?
+
+for kind in "" late; do
+  rf many 8 on $kind
+  clean many; verdict "many${kind:+ ($kind)}: 32 reads at once at one handle, up to 8 of them failing, are exact, once" $?
+  # The first failure is the arming read's, alone. The others (how many depends on how many of the reads missed: at most 7)
+  # were issued at the server it moved to and share one move. An injected failure carries no host, so one that is
+  # handled after that move names the server of the move's landing; late ones are all handled after the first move.
+  same=1
+  for ((i = 1; i < ${#FL[@]}; i++)); do
+    case "${FL[$i]}" in "${MV[0]:-y}") ;; "${MV[1]:-y}") [ -n "$kind" ] && same=0 ;; *) same=0 ;; esac
+  done
+  [ "${#FL[@]}" -ge 3 ] && [ "$same" = 1 ] && [ "${#MV[@]}" = 2 ]; verdict "many${kind:+ ($kind)}: of ${#FL[@]} failures the ones after the first name the server they were issued at, and one move serves them (${#MV[@]} moves in all)" $?
+done
+
+rf off 2 off
+clean off; verdict "switch off: failed reads are relayed on the same file, exact, once; the client's read recovery is on" $?
+[ "$NRA" = 0 ] && [ "${#FL[@]}" = 2 ]; verdict "switch off: two failures recorded, no open of route read" $?
+
 echo; echo "fed_ci: $FAILS failure(s)"
 exit $((FAILS > 0))

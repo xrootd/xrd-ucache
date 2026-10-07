@@ -367,7 +367,10 @@ can hold an access token, and `file` is the cache key, which has none.
   `adaptive_federation = on`, an attempt of any of these at another site after
   the open failed at one; its `seq` is the first attempt's), `candidate` (an
   attempt at a server a regional redirector listed as holding the file, opened
-  directly or through its own redirector).
+  directly or through its own redirector), `read` (with `adaptive_federation =
+  on`, every attempt of an open made because reads of the file stopped at the
+  server it was open at; the `origin_failure` line of the read that stopped it
+  comes first, and names that server in `data_server`).
 - `status` `ok` or `error`, with the client's `code` and `errno` (the server's
   error code when `code` is 400) and the provisional `class` of a failure
   (`none` on success; the classes are the `origin_failures_*` counters'

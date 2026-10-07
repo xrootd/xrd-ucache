@@ -318,6 +318,36 @@ The counters `open_failovers`, `opens_recovered`, `opens_failed_everywhere`,
 `failover_locates` and `offline_copies_skipped` (STATS.md) count these, and the per-file record file has a line per attempt
 (FORMAT.md, routes `failover` and `candidate`).
 
+## uCache read the file at another site
+
+With `adaptive_federation = on`, a read that fails at the server a file was
+opened at, in a way another site may not share (the server stopped answering,
+the connection was lost, the request ran past its deadline of 120 s, or the
+server reported a fault of its own or of its storage), is made again at another
+site, and the job gets the bytes. The log says so, once for every move:
+
+- `<file>: reads from <host>:<port> stopped (<error>); reading it from
+  <host>:<port> from now on`, when another site served it;
+- `<file>: reads from <host>:<port> stopped (<error>) and no other site could
+  serve it`, when none did: the job then gets the error of the last attempt.
+
+The per-file record file has the `origin_failure` line of each read that
+failed, then a line per open attempt with route `read` (FORMAT.md). The
+counters of an open at another site (`open_failovers`, `opens_recovered`,
+`opens_failed_everywhere`) count these attempts, and `origin_failures_*` the
+failed reads. A read stops after 4 attempts or the time it was allowed. A
+server that stalls is usually found first by the client's own check of a silent
+connection (`StreamTimeout`, 60 s, and its `TimeoutResolution`, 15 s, by
+default), which fails every read of that connection at once; the 120 s limit is
+for a server that answers other requests and not this one. A job that sets
+`StreamTimeout` above 120 s sees each of its files move after its own 120 s.
+
+A session the client lost while a file was idle (a server restarted) moves the
+file at its next read without naming the server it left. A file with the client's
+read recovery turned off by uCache fails a forced `Stat`, `Fcntl` or `Visa` on
+such a lost session at once (the next read moves the file); a plain `Stat` is
+answered from what the open returned.
+
 ## The cache is filling my disk
 
 By default uCache uses the disk and evicts LRU to keep a free-space floor
