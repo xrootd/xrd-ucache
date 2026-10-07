@@ -27,6 +27,9 @@
 //                      File that replaces the first (see runOpenProperty)
 //   open-failover [N]  N opens through a redirector where a server refuses
 //                      the file: exactly one completion each (see runOpenFailover)
+//   open-denied        one open of a file that every server refuses: Open()
+//                      returns OK and the reader gets one completion, a failure
+//                      whose text is printed (see runOpenDenied)
 //
 // And one checks check_origin_integrity's key-position check of byte-cache
 // misses against a copy with one basket zeroed (see runKeyCheck):
@@ -77,6 +80,7 @@ struct StrictOpenHandler : XrdCl::ResponseHandler {
   bool viaPlain = false;
   bool openRefused = false; // Open() returned an error: no completion may come
   std::string answer;       // the first completion's status
+  std::string message;      // and its message
   void HandleResponse(XrdCl::XRootDStatus* status, XrdCl::AnyObject* response) override {
     std::fprintf(stderr, "OPEN CONTRACT VIOLATION: completion through HandleResponse\n");
     {
@@ -89,6 +93,7 @@ struct StrictOpenHandler : XrdCl::ResponseHandler {
                                XrdCl::HostList* hostList) override {
     bool good = status && status->IsOK();
     const std::string said = status ? status->ToString() : "(no status)";
+    const std::string text = status ? status->GetErrorMessage() : std::string();
     if (hostList == nullptr) {
       std::fprintf(stderr, "OPEN CONTRACT VIOLATION: null HostList in completion\n");
       good = false;
@@ -107,6 +112,7 @@ struct StrictOpenHandler : XrdCl::ResponseHandler {
       if (++completions == 1) {
         ok = good;
         answer = said;
+        message = text;
       }
       done = true;
       cv.notify_all();
@@ -1231,13 +1237,31 @@ int runOpenFailover(const char* url, const char* local, int n) {
   return bad || notOne ? 1 : 0;
 }
 
+// open-denied: one open of a file that every server refuses. Open() returns OK
+// and the handler gets exactly one completion, a failure, with a host list; the
+// failure's text is printed for the caller to check.
+int runOpenDenied(const char* url) {
+  const char* mode = "open-denied";
+  auto* f = new XrdCl::File(); // leaked with its handler: a late completion lands safely
+  auto* h = new StrictOpenHandler();
+  const XrdCl::XRootDStatus st = f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h);
+  const bool succeeded = h->succeededWithin(std::chrono::seconds(200));
+  std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a second completion
+  std::printf("%s: Open() %s, %d completion(s), %s: %s | %s\n", mode,
+              st.IsOK() ? "ok" : st.ToString().c_str(), h->count(),
+              succeeded ? "succeeded" : "failed", h->answer.c_str(), h->message.c_str());
+  const bool good = st.IsOK() && !succeeded && h->count() == 1 && h->exactlyOne();
+  std::printf(good ? "%s: clean\n" : "%s: FAIL\n", mode);
+  return good ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
   if (argc < 3) {
     std::fprintf(stderr,
                  "usage: %s <root-url> <local-path> [ops] [threads] [seed] "
-                 "[fuzz|inner-race|inner-race-relay|open-refused|open-property|open-failover|"
+                 "[fuzz|inner-race|inner-race-relay|open-refused|open-property|open-failover|open-denied|"
                  "key-check <off> <len>]\n",
                  argv[0]);
     return 2;
@@ -1257,6 +1281,8 @@ int main(int argc, char** argv) {
     return runOpenProperty(url);
   if (mode == "open-failover")
     return runOpenFailover(url, argv[2], argc > 3 ? ::atoi(argv[3]) : 12);
+  if (mode == "open-denied")
+    return runOpenDenied(url);
   if (mode != "fuzz") {
     std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 2;

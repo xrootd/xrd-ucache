@@ -819,10 +819,16 @@ error. A file the redirector finds nowhere, a
 redirector that is down or refuses the client itself, and a direct URL to a
 server are final, as without uCache. The servers named are full host names
 only: an address or a name without a dot keeps a redirector from nothing, so
-a server known by one is not named, and when the redirector sends the open
-back to a server or site that failed already, the open ends with its error
-(asking the regional redirector for the other copies is not done in this
-version). A job's own `tried=` list is kept ahead of uCache's names. An open
+a server known by one is not named. When the redirector sends the open
+back to a server or site that failed already, or finds no copy after servers
+were left out, uCache asks the regional redirector where the file is (a
+`locate`), asks each listed copy that the job did not exclude for its state
+(a copy on tape is not opened), and opens the first that answers directly,
+or through its own redirector when it is one, naming the servers that failed
+there; hosts the cache's allow and deny lists refuse are never tried. The
+copies listed are tried within the same bounds, and when only copies at
+places that failed are left, they are tried too, the oldest failure first.
+A job's own `tried=` list is kept ahead of uCache's names. An open
 that uCache makes of the origin holds one of its worker threads while it tries
 sites, so with a stalled site and every worker so held, the next step of a
 job's own open waits for a free one. With the

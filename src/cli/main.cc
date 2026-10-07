@@ -405,11 +405,14 @@ void printStats(const StatsTotals& t) {
     row("origin_failures_other", t.originFailures[5]);
     row("records_dropped", t.recordsDropped);
   }
-  if (t.openFailovers || t.opensFailedEverywhere || t.openDeadlineExpiries) {
+  if (t.openFailovers || t.opensFailedEverywhere || t.openDeadlineExpiries || t.failoverLocates ||
+      t.offlineCopiesSkipped) {
     row("open_failovers", t.openFailovers);
     row("opens_recovered", t.opensRecovered);
     row("opens_failed_everywhere", t.opensFailedEverywhere);
     row("open_deadline_expiries", t.openDeadlineExpiries);
+    row("failover_locates", t.failoverLocates);
+    row("offline_copies_skipped", t.offlineCopiesSkipped);
   }
 
   // The derived workflow picture — the divisions a human would do.

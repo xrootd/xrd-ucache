@@ -183,6 +183,8 @@ std::string Stats::toJsonBody() const {
   f("open_failovers", openFailovers);
   f("opens_recovered", opensRecovered);
   f("opens_failed_everywhere", opensFailedEverywhere);
+  f("failover_locates", failoverLocates);
+  f("offline_copies_skipped", offlineCopiesSkipped);
   os << "\"open_deadline_expiries\":" << openDeadlineExpiries.load(std::memory_order_relaxed);
   return os.str();
 }
@@ -317,6 +319,8 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.opensRecovered += extractU64(last, "opens_recovered");
     t.opensFailedEverywhere += extractU64(last, "opens_failed_everywhere");
     t.openDeadlineExpiries += extractU64(last, "open_deadline_expiries");
+    t.failoverLocates += extractU64(last, "failover_locates");
+    t.offlineCopiesSkipped += extractU64(last, "offline_copies_skipped");
   }
   ::closedir(d);
   return t;

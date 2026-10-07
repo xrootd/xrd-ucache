@@ -240,3 +240,20 @@ TEST(UrlKey, WithExclusions) {
   EXPECT_EQ(withExclusions(base + "?authz=TOK", {"c.x.org"}, "ioerr"),
             base + "?authz=TOK&tried=c.x.org&triedrc=ioerr");
 }
+
+// A URL opened at another server, and the hosts it names to avoid.
+TEST(UrlKey, UrlAtServerAndTriedHosts) {
+  const std::string path = "//store/f.root";
+  EXPECT_EQ(urlAtServer("root://r.x.org:1094/" + path, "a.y.org:1095", false),
+            "root://a.y.org:1095/" + path);
+  EXPECT_EQ(urlAtServer("root://u@r.x.org/" + path + "?authz=T&tried=a&triedrc=ioerr&xrd.k=v",
+                        "a.y.org:1095", false),
+            "root://u@a.y.org:1095/" + path + "?authz=T&xrd.k=v");
+  EXPECT_EQ(urlAtServer("root://r.x.org/" + path + "?tried=a,b&triedrc=ioerr", "a.y.org:1", true),
+            "root://a.y.org:1/" + path + "?tried=a,b&triedrc=ioerr");
+  EXPECT_EQ(urlAtServer("root://r.x.org", "a.y.org:1", false), "root://a.y.org:1");
+  EXPECT_EQ(urlAtServer("not a url", "a.y.org:1", false), "not a url");
+  EXPECT_TRUE(triedHosts("root://r/f").empty());
+  EXPECT_EQ(triedHosts("root://r/f?tried=A.x.org,b&tried=a.X.org,c&triedrc=resel"),
+            (std::vector<std::string>{"A.x.org", "b", "c"}));
+}

@@ -182,6 +182,8 @@ const char* openRouteName(OpenRoute r) {
     return "degraded";
   case OpenRoute::kFork:
     return "fork";
+  case OpenRoute::kCandidate:
+    return "candidate";
   case OpenRoute::kFailover:
     break;
   }
@@ -302,6 +304,43 @@ AfterFailure afterFailure(std::vector<SiteFailure>& failed, const SiteFailure& f
   if (static_cast<int>(sites.size()) >= maxSites || spent)
     return AfterFailure::kStop;
   return seen || sameSite ? AfterFailure::kRepeat : AfterFailure::kRetry;
+}
+
+std::vector<Location> orderLocations(const std::vector<Location>& listed,
+                                     const std::vector<std::string>& readerTried,
+                                     const std::vector<SiteFailure>& failed) {
+  const auto lower = [](std::string s) {
+    for (char& c : s)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+  };
+  std::vector<std::string> tried;
+  for (const std::string& t : readerTried)
+    tried.push_back(lower(t.substr(0, t.find(':'))));
+  std::vector<Location> online, pending;
+  std::vector<std::pair<size_t, Location>> excluded; // with the position of its failure
+  for (const Location& l : listed) {
+    const std::string host = lower(l.host), server = host + ":" + std::to_string(l.port);
+    if (std::find(tried.begin(), tried.end(), host) != tried.end())
+      continue;
+    const bool literal = isIpv4(host) || isIpv6(host);
+    size_t age = failed.size();
+    for (size_t i = 0; i < failed.size() && age == failed.size(); ++i)
+      if (lower(failed[i].server) == server || (!literal && failed[i].site == siteOf(host)))
+        age = i;
+    if (age < failed.size())
+      excluded.emplace_back(age, l);
+    else
+      (l.pending ? pending : online).push_back(l);
+  }
+  online.insert(online.end(), pending.begin(), pending.end());
+  if (online.empty()) {
+    std::stable_sort(excluded.begin(), excluded.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& e : excluded)
+      online.push_back(e.second);
+  }
+  return online;
 }
 
 std::vector<std::string> exclusionNames(const std::vector<SiteFailure>& failed) {

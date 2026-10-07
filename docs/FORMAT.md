@@ -365,7 +365,9 @@ can hold an access token, and `file` is the cache key, which has none.
   handle whose cached entry was gone at its first read), `fork` (a forked
   child's open afresh of a handle it inherited), `failover` (with
   `adaptive_federation = on`, an attempt of any of these at another site after
-  the open failed at one; its `seq` is the first attempt's).
+  the open failed at one; its `seq` is the first attempt's), `candidate` (an
+  attempt at a server a regional redirector listed as holding the file, opened
+  directly or through its own redirector).
 - `status` `ok` or `error`, with the client's `code` and `errno` (the server's
   error code when `code` is 400) and the provisional `class` of a failure
   (`none` on success; the classes are the `origin_failures_*` counters'

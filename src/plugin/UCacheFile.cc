@@ -23,9 +23,12 @@
 #include "vendor/crc32c.h"
 
 #include <functional>
+#include <map>
+#include <pthread.h>
 #include <XProtocol/XProtocol.hh> // kXR_* wire codes for the OpenRetry drift asserts
 #include <XrdCl/XrdClConstants.hh>
 #include <XrdCl/XrdClDefaultEnv.hh>
+#include <XrdCl/XrdClFileSystem.hh>
 
 #include <cstdio>
 #include <optional>
@@ -596,6 +599,18 @@ struct FailoverSeq {
   } catch (...) {
   }
 
+  // What the attempts so far say of where to ask: the regional redirector
+  // (host:port) of the latest attempt that went through one, and whether the
+  // latest failure was NotFound.
+  void noteChain(const AttemptView& w, const XRootDStatus& s) {
+    if (w.v.regional >= 0) {
+      const Hop& h = w.hops[static_cast<size_t>(w.v.regional)];
+      regional = h.host + ":" + std::to_string(h.port);
+    }
+    lastNotFound = s.code == XrdCl::errErrorResponse ? s.errNo == kXR_NotFound
+                                                      : s.code == XrdCl::errNotFound;
+  }
+
   int budget = 0;    // s
   int deadlineS = 0; // one attempt's open deadline
   int readerT = 0;   // the reader's own open timeout; 0 for none
@@ -610,10 +625,17 @@ struct FailoverSeq {
   // not fail because another site was looked for.
   bool sawOffline = false;
   bool lastResort = false;
+  // The copies the regional redirector listed, asked for once (`located`), in
+  // the order to try them (`ci` is the next); `onCandidate`: the attempt in
+  // flight is at one of them.
+  std::string regional;
+  bool lastNotFound = false, located = false, onCandidate = false;
+  std::vector<Location> cands;
+  size_t ci = 0;
 };
 
 // What follows one attempt of an open.
-enum class Next : uint8_t { kDone, kSameSource, kElsewhere };
+enum class Next : uint8_t { kDone, kSameSource, kElsewhere, kLocate };
 // The attempt answered `s` (`w`: its reading), the `sourceAttempt`-th at its
 // source, sent to `sentUrl`; `want`: the size the cache holds (0: none). A
 // transient failure is retried at the same source first (open_retries), while
@@ -640,6 +662,9 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
   try {
     if (seq->lastResort) // the last open: whatever it answers stands
       return Next::kDone;
+    const bool onCandidate = seq->onCandidate;
+    seq->onCandidate = false;
+    seq->noteChain(w, s);
     const bool sizeDiffers = ok && want && w.size >= 0 && static_cast<uint64_t>(w.size) != want;
     const bool offline =
         ok && w.statFlags >= 0 && (static_cast<uint64_t>(w.statFlags) & xrdwire::kStatOffline);
@@ -649,13 +674,23 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
                 std::to_string(want);
     else if (offline)
       f.error = "the copy there is on tape (offline)";
-    // A redirector that hands back a server that failed already, or is of a site
-    // that did, ends the open too: asking the regional redirector for the other
-    // copies is not done in this version.
-    const bool goOn =
-        stepAfter(w.v, ok ? 0 : s.code, ok ? 0 : static_cast<int>(s.errNo), sizeDiffers, offline,
-                  seq->excluded) == OpenStep::kFailOver &&
-        afterFailure(seq->failed, f, failoverMaxSites(), seq->stopped()) == AfterFailure::kRetry;
+    // The open goes on to the regional redirector's list of copies when it was
+    // not found though a copy may exist, when the redirector handed back a
+    // server or site that failed already, and after an attempt at a listed copy
+    // that failed (it has no redirector to send it elsewhere). Without a
+    // regional redirector to ask, it ends.
+    const OpenStep step =
+        onCandidate ? (ok && !sizeDiffers && !offline ? OpenStep::kFinal : OpenStep::kLocate)
+                    : stepAfter(w.v, ok ? 0 : s.code, ok ? 0 : static_cast<int>(s.errNo),
+                                sizeDiffers, offline, seq->excluded);
+    AfterFailure af = AfterFailure::kStop;
+    if (step != OpenStep::kFinal)
+      af = afterFailure(seq->failed, f, failoverMaxSites(), seq->stopped());
+    const bool more = seq->ci < seq->cands.size() || (seq->sawOffline && !seq->lastResort);
+    const bool locate = af != AfterFailure::kStop &&
+                        (step == OpenStep::kLocate || af == AfterFailure::kRepeat) &&
+                        (!seq->regional.empty() || seq->located) && (!onCandidate || more);
+    const bool goOn = locate || (af == AfterFailure::kRetry && step == OpenStep::kFailOver);
     {
       std::lock_guard<std::mutex> g(st.mu);
       if (st.closed)
@@ -677,10 +712,222 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     UCACHE_WARN("%s: %s (%s) could not open it (%s); trying another site",
                 recordFile(st.url).c_str(), f.server.c_str(), f.site.c_str(),
                 recordText(f.error, 300).c_str());
-    return Next::kElsewhere;
+    return locate ? Next::kLocate : Next::kElsewhere;
   } catch (...) {
     return Next::kDone;
   }
+}
+
+// ---- Asking a regional redirector where a file is --------------------------
+// One call of a FileSystem on `server` (host:port), waited for: the answer's
+// status and response, or false when none came within the call's timeout (plus
+// two timeout resolutions). The FileSystem is made and destroyed here, on the
+// waiting thread, never on a callback thread; one whose call has not answered
+// is left undestroyed. The handler and the waiter share the result.
+struct FsReply {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool done = false;
+  XRootDStatus status;
+  std::unique_ptr<AnyObject> response;
+};
+class FsHandler : public ResponseHandler {
+ public:
+  explicit FsHandler(std::shared_ptr<FsReply> r) : r_(std::move(r)) {}
+  void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    std::unique_ptr<XRootDStatus> s(status);
+    std::shared_ptr<FsReply> r = std::move(r_);
+    delete this;
+    std::lock_guard<std::mutex> g(r->mu);
+    r->status = s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal);
+    r->response.reset(response);
+    r->done = true;
+    r->cv.notify_all();
+  }
+
+ private:
+  std::shared_ptr<FsReply> r_;
+};
+bool fsCall(const std::string& server, int timeoutS, int graceS,
+            const std::function<XRootDStatus(XrdCl::FileSystem&, ResponseHandler*)>& issue,
+            XRootDStatus& status, std::unique_ptr<AnyObject>& response) {
+  auto* fs = new XrdCl::FileSystem(XrdCl::URL("root://" + server), false);
+  auto r = std::make_shared<FsReply>();
+  auto* h = new FsHandler(r);
+  status = issue(*fs, h);
+  if (!status.IsOK()) {
+    delete h;
+    delete fs;
+    return true;
+  }
+  std::unique_lock<std::mutex> lk(r->mu);
+  if (!r->cv.wait_for(lk, std::chrono::seconds(timeoutS + graceS), [&r] { return r->done; })) {
+    status = XRootDStatus(XrdCl::stError, XrdCl::errOperationExpired, 0, "no answer in time");
+    return false;
+  }
+  lk.unlock();
+  status = r->status;
+  response = std::move(r->response);
+  delete fs;
+  return true;
+}
+// "host:port" (a bracketed IPv6 host too) as a Location.
+Location locationOf(const std::string& address, bool manager, bool pending) {
+  Location l;
+  const auto colon = address.rfind(':');
+  l.host = address.substr(0, colon);
+  if (l.host.size() > 1 && l.host.front() == '[' && l.host.back() == ']')
+    l.host = l.host.substr(1, l.host.size() - 2);
+  // An IPv4 address a redirector lists in its IPv6 form ("::127.0.0.1",
+  // "::ffff:127.0.0.1") is the IPv4 one.
+  if (l.host.compare(0, 7, "::ffff:") == 0)
+    l.host.erase(0, 7);
+  else if (l.host.compare(0, 2, "::") == 0 && l.host.find('.') != std::string::npos)
+    l.host.erase(0, 2);
+  l.port = colon == std::string::npos ? 1094 : std::atoi(address.c_str() + colon + 1);
+  l.manager = manager;
+  l.pending = pending;
+  return l;
+}
+// The copies `q.regional` lists for `path`, with Refresh after a NotFound. Asks
+// are coalesced: an ask for the same (regional, path, refresh) that is in
+// flight is waited for instead of repeated, and counted once. Empty when the
+// answer fails or does not come.
+std::vector<Location> locateCopies(HandleState& st, FailoverSeq& q, const std::string& path) {
+  struct Op {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    std::vector<Location> out;
+  };
+  // Never destroyed: detached threads may use them. A forked child starts with
+  // fresh ones, since a parent's thread may have held the lock at the fork.
+  using OpMap = std::map<std::string, std::shared_ptr<Op>>;
+  static std::mutex* mu = new std::mutex;
+  static OpMap* ops = [] {
+    ::pthread_atfork(nullptr, nullptr, [] { mu = new std::mutex; ops = new OpMap; });
+    return new OpMap;
+  }();
+  const std::string key = q.regional + ' ' + path + (q.lastNotFound ? " refresh" : "");
+  std::shared_ptr<Op> op;
+  bool mine = false;
+  {
+    std::lock_guard<std::mutex> g(*mu);
+    auto& slot = (*ops)[key];
+    mine = !slot;
+    if (mine)
+      slot = std::make_shared<Op>();
+    op = slot;
+  }
+  const int t = q.timeout();
+  if (mine) {
+    if (st.store)
+      st.store->stats().failoverLocates.fetch_add(1, std::memory_order_relaxed);
+    XRootDStatus s;
+    std::unique_ptr<AnyObject> resp;
+    const XrdCl::OpenFlags::Flags flags =
+        XrdCl::OpenFlags::PrefName | (q.lastNotFound ? XrdCl::OpenFlags::Refresh : XrdCl::OpenFlags::None);
+    const bool answered = fsCall(
+        q.regional, t, 2 * q.trS,
+        [&](XrdCl::FileSystem& fs, ResponseHandler* h) {
+          return fs.Locate(path, flags, h, static_cast<uint16_t>(t));
+        },
+        s, resp);
+    XrdCl::LocationInfo* info = nullptr;
+    std::vector<Location> out;
+    if (answered && s.IsOK() && resp)
+      resp->Get(info);
+    if (info)
+      for (auto l = info->Begin(); l != info->End(); ++l)
+        out.push_back(locationOf(l->GetAddress(), l->IsManager(),
+                                 l->GetType() == XrdCl::LocationInfo::ManagerPending ||
+                                     l->GetType() == XrdCl::LocationInfo::ServerPending));
+    {
+      std::lock_guard<std::mutex> g(op->mu);
+      op->out = std::move(out);
+      op->done = true;
+      op->cv.notify_all();
+    }
+    std::lock_guard<std::mutex> g(*mu);
+    ops->erase(key);
+  }
+  std::unique_lock<std::mutex> lk(op->mu);
+  op->cv.wait_for(lk, std::chrono::seconds(t + 3 * q.trS), [&op] { return op->done; });
+  return op->out;
+}
+// The URL of the next listed copy to open, or "" when there is none (or a bound
+// stops the sequence). `base`: the URL the sequence's retries start from. The
+// first call asks the regional redirector. Each copy is asked for its state
+// first: one on tape is passed over (counted), one that does not answer fails
+// (an entry of the sequence's failures). A copy that is a redirector is opened
+// with the failed servers named in tried=. When nothing is left and a copy on
+// tape was passed over, the reader's own URL is given once. Blocks; never called
+// on a client callback thread. Throws nothing.
+std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base) noexcept try {
+  const Config& cfg = globalConfig();
+  if (!q.located) {
+    q.located = true;
+    std::vector<Location> listed;
+    for (const Location& l : locateCopies(st, q, XrdCl::URL(base).GetPath()))
+      if ((cfg.allowHosts.empty() || hostMatchesAny(cfg.allowHosts, l.host)) &&
+          !hostMatchesAny(cfg.denyHosts, l.host))
+        listed.push_back(l);
+    q.cands = orderLocations(listed, triedHosts(base), q.failed);
+  }
+  const std::string file = recordFile(st.url);
+  while (q.ci < q.cands.size() && !q.stopped()) {
+    const Location c = q.cands[q.ci++];
+    const std::string server = (c.host.find(':') == std::string::npos ? c.host : "[" + c.host + "]") +
+                               ":" + std::to_string(c.port);
+    const std::string where = urlAtServer(base, server, false);
+    XRootDStatus s;
+    std::unique_ptr<AnyObject> resp;
+    const int t = q.timeout();
+    (void)fsCall(
+        server, t, 2 * q.trS,
+        [&](XrdCl::FileSystem& fs, ResponseHandler* h) {
+          return fs.Stat(XrdCl::URL(where).GetPathWithParams(), h, static_cast<uint16_t>(t));
+        },
+        s, resp);
+    XrdCl::StatInfo* si = nullptr;
+    if (s.IsOK() && resp)
+      resp->Get(si);
+    if (si) {
+      const bool offline =
+          (si->GetFlags() & XrdCl::StatInfo::Offline) ||
+          (gTestOfflineHosts && gTestOfflineHosts->find("," + server + ",") != std::string::npos);
+      if (offline) {
+        if (st.store)
+          st.store->stats().offlineCopiesSkipped.fetch_add(1, std::memory_order_relaxed);
+        q.sawOffline = true;
+        UCACHE_INFO("%s: the copy at %s is on tape (offline); not opened", file.c_str(),
+                    server.c_str());
+        continue;
+      }
+      q.onCandidate = true;
+      ++q.failovers;
+      if (st.store)
+        st.store->stats().openFailovers.fetch_add(1, std::memory_order_relaxed);
+      q.excluded = c.manager && !exclusionNames(q.failed).empty();
+      return c.manager ? withExclusions(urlAtServer(base, server, true), exclusionNames(q.failed),
+                                        "ioerr")
+                       : where;
+    }
+    SiteFailure f;
+    f.server = server;
+    f.site = server;
+    f.error = s.ToString();
+    if (afterFailure(q.failed, f, failoverMaxSites(), q.stopped()) == AfterFailure::kStop)
+      break;
+  }
+  if (q.sawOffline && !q.lastResort && !processExiting()) {
+    q.lastResort = true;
+    q.excluded = false;
+    return base;
+  }
+  return std::string();
+} catch (...) {
+  return std::string();
 }
 // Whether an open about to be issued on `f` goes to the client's request path:
 // false when an earlier open on `f` was sent. The client then answers from that
@@ -993,10 +1240,11 @@ class RetryingOpenHandler : public ResponseHandler {
     switch (n) {
     case Next::kSameSource:
       Executor::instance().postAfter(backoffMs(sourceAttempt_, cfg_),
-                                     [self] { self->doRetry(false, false); });
+                                     [self] { self->doRetry(false, false, false); });
       break;
     case Next::kElsewhere:
-      Executor::instance().post([self, ok] { self->doRetry(true, ok); });
+    case Next::kLocate:
+      Executor::instance().post([self, ok, n] { self->doRetry(true, ok, n == Next::kLocate); });
       break;
     case Next::kDone:
       forwardFailure();
@@ -1010,20 +1258,25 @@ class RetryingOpenHandler : public ResponseHandler {
   // the failed servers named. `closeOld`: the replaced file is open (refused
   // for its copy) and is closed without waiting. If the handle shut down,
   // forward the last failure.
-  void doRetry(bool elsewhere, bool closeOld) {
+  void doRetry(bool elsewhere, bool closeOld, bool locate) {
     if (processExiting()) { // the exit handler has begun: nothing more is issued
       forwardFailure();
       return;
     }
     const std::shared_ptr<HandleState> st = st_; // once sent, `this` may be gone
+    std::string listed; // the next listed copy; asking for it waits, here on the pool
+    if (locate && (listed = locateNext(*st, *seq_, base_)).empty()) {
+      forwardFailure();
+      return;
+    }
     XrdCl::File* fresh = st->resetInner(/*leakOld=*/false, /*onlyIfIdle=*/false, closeOld);
     if (!fresh) {
       forwardFailure();
       return;
     }
     if (elsewhere) {
-      source_ = seq_->next(*st, base_);
-      a_.route = OpenRoute::kFailover;
+      source_ = locate ? listed : seq_->next(*st, base_);
+      a_.route = seq_->onCandidate ? OpenRoute::kCandidate : OpenRoute::kFailover;
       sourceAttempt_ = 0;
     }
     bool isFresh = false;
@@ -1314,6 +1567,9 @@ bool HandleState::ensureInnerOpen() {
       std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs(sourceAttempt, cfg)));
     if (processExiting())
       break; // the exit handler has begun: nothing more is issued
+    std::string listed; // the next listed copy; asking for it waits, here
+    if (n == Next::kLocate && (listed = locateNext(*this, *seq, fillUrl)).empty())
+      break;
     // A copy refused after it opened (on tape) is closed without waiting, in
     // the swap.
     XrdCl::File* fresh = resetInner(/*leakOld=*/ans.unfinished, /*onlyIfIdle=*/false,
@@ -1322,9 +1578,9 @@ bool HandleState::ensureInnerOpen() {
       break; // the handle is shut down: the last answer stands
     f = fresh;
     ++a.attempt;
-    if (n == Next::kElsewhere) {
-      source = seq->next(*this, fillUrl);
-      a.route = OpenRoute::kFailover;
+    if (n == Next::kElsewhere || n == Next::kLocate) {
+      source = n == Next::kLocate ? listed : seq->next(*this, fillUrl);
+      a.route = seq->onCandidate ? OpenRoute::kCandidate : OpenRoute::kFailover;
       sourceAttempt = 0;
     }
   }

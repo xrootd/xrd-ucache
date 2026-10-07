@@ -128,6 +128,13 @@ jobs:
           echo "first attempts at the refused port: $n"
           [ "$n" -ge 1 ]
 
+      - name: a federation on loopback: servers that refuse a file, and the regional's locate
+        run: |
+          # One regional redirector and three data servers (xrootd and cmsd of the
+          # EPEL package); the script runs them as an ordinary user.
+          id xrdsrv >/dev/null 2>&1 || useradd -m xrdsrv
+          bash tests/federation/fed_ci.sh build
+
   # macOS: keep the tree compiling under AppleClang and run the hermetic tests.
   # Build-and-test only, deliberately: reading root:// through the plugin needs a
   # real client stack and a real origin, and is validated on hardware instead.

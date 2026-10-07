@@ -122,8 +122,9 @@ enum class OpenRoute : uint8_t {
   kDegraded, // a trusted handle whose entry was gone at its first read
   kFork,     // a forked child's open afresh of a handle it inherited
   kFailover, // with adaptive_federation on, an open of any of these at another site
+  kCandidate, // ... at a server a regional redirector listed as holding the file
 };
-const char* openRouteName(OpenRoute r); // "relay", "lazy", "degraded", "fork", "failover"
+const char* openRouteName(OpenRoute r); // "relay", "lazy", "degraded", "fork", "failover", "candidate"
 
 // With adaptive_federation on, the deadline of every read open of a handle
 // the cache serves: the reader's own open, and the cache's own opens of the
@@ -164,9 +165,8 @@ int openDeadlineS(int readerTimeoutS, int deadlineS = 0);
 enum class OpenStep : uint8_t {
   kFinal,    // the outcome is the open's (a success, or an error no site would change)
   kFailOver, // try another site
-  kLocate,   // a file not found where a copy may yet exist: asking the regional
-             // redirector where the copies are is not done in this version, so the
-             // caller ends the open with its error
+  kLocate,   // a file not found where a copy may yet exist: ask the regional
+             // redirector where the copies are (orderLocations)
 };
 // The step after an attempt whose chain is `v`, which failed with (code, errNo)
 // -- code 0 for a success -- and, on success, served a file of another size
@@ -214,12 +214,26 @@ struct SiteFailure {
 //            spent (`spent`)
 //   kRepeat  the attempt landed on a server or site that had failed already:
 //            the names did not keep the redirector from it, or it could not be
-//            named. Asking the regional redirector for another copy is not done
-//            in this version, so the caller ends the open.
+//            named. The caller asks the regional redirector for the copies.
 //   kRetry   open again through the redirector, naming the failed servers
 enum class AfterFailure : uint8_t { kRetry, kStop, kRepeat };
 AfterFailure afterFailure(std::vector<SiteFailure>& failed, const SiteFailure& f, int maxSites,
                           bool spent);
+// A copy a regional redirector's answer to a locate lists.
+struct Location {
+  std::string host;
+  int port = 0;
+  bool manager = false; // a redirector of its own, not a data server
+  bool pending = false; // the file is being brought online there
+};
+// Which of `listed` to open, in order. Dropped: servers the reader's own tried=
+// names (`readerTried`; never used), and the servers and the sites of `failed`
+// (a site is its domain; an address stands for its server alone). Of what is
+// left, online copies come before pending ones, each in the answer's order.
+// When nothing is left, the failed ones are given, the oldest failure first.
+std::vector<Location> orderLocations(const std::vector<Location>& listed,
+                                     const std::vector<std::string>& readerTried,
+                                     const std::vector<SiteFailure>& failed);
 // The names of `failed` a retry's tried= carries, oldest first.
 std::vector<std::string> exclusionNames(const std::vector<SiteFailure>& failed);
 // The error an open that failed at every site it tried ends with: "uCache:

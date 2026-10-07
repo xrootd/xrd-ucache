@@ -116,6 +116,9 @@ struct Stats {
   std::atomic<uint64_t> opensRecovered{0};
   std::atomic<uint64_t> opensFailedEverywhere{0};
   std::atomic<uint64_t> openDeadlineExpiries{0};
+  // Locate requests made to find another copy, and copies on tape passed over.
+  std::atomic<uint64_t> failoverLocates{0};
+  std::atomic<uint64_t> offlineCopiesSkipped{0};
   // Replica tier (docs/STATS.md):
   // Of earlier releases' compact replicas, no longer made or served: always 0.
   std::atomic<uint64_t> replicaOpens{0};
@@ -298,7 +301,7 @@ struct StatsTotals {
            bufferStalls = 0, bufferStallUs = 0;
   uint64_t originOpenAttempts = 0, originOpenFailures = 0, recordsDropped = 0;
   uint64_t openFailovers = 0, opensRecovered = 0, opensFailedEverywhere = 0,
-           openDeadlineExpiries = 0;
+           openDeadlineExpiries = 0, failoverLocates = 0, offlineCopiesSkipped = 0;
   uint64_t originFailures[6] = {}; // client, site, notfound, data, expired, other
   // Histogram bucket sums (log2 µs), for CLI percentile rendering:
   std::vector<uint64_t> histHitRead, histOriginRt, histOpen, histReplicaRead, histFlushWrite,

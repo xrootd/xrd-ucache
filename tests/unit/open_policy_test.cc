@@ -410,3 +410,48 @@ TEST(OpenPolicy, AllSitesFailedText) {
   EXPECT_EQ(m.find(std::string(161, 'e')), std::string::npos);
   EXPECT_STREQ(openRouteName(OpenRoute::kFailover), "failover");
 }
+
+// The copies a locate lists, in the order they are tried.
+TEST(OpenPolicy, OrderLocations) {
+  const auto loc = [](const char* host, int port, bool manager = false, bool pending = false) {
+    Location l;
+    l.host = host;
+    l.port = port;
+    l.manager = manager;
+    l.pending = pending;
+    return l;
+  };
+  const auto names = [](const std::vector<Location>& v) {
+    std::string s;
+    for (const Location& l : v)
+      s += l.host + ":" + std::to_string(l.port) + " ";
+    return s;
+  };
+  // Online before pending, each in the answer's order.
+  const std::vector<Location> listed = {loc("p.one.org", 1094, false, true), loc("a.two.org", 1094),
+                                        loc("m.three.org", 1094, true), loc("b.four.org", 1094)};
+  EXPECT_EQ(names(orderLocations(listed, {}, {})),
+            "a.two.org:1094 m.three.org:1094 b.four.org:1094 p.one.org:1094 ");
+  // The reader's own tried= hosts are never used, with a port or without, in any case.
+  EXPECT_EQ(names(orderLocations(listed, {"A.TWO.org", "b.four.org:1094"}, {})),
+            "m.three.org:1094 p.one.org:1094 ");
+  // A server that failed, and the other servers of its site, are left out while
+  // others remain; an address stands for its own server alone.
+  const std::vector<SiteFailure> failed = {{"x.two.org:1094", "two.org", "x.two.org", "e"},
+                                           {"127.0.0.1:12122", "127.0.0.1", "", "e"}};
+  const std::vector<Location> mixed = {loc("a.two.org", 1094), loc("127.0.0.1", 12122),
+                                       loc("127.0.0.1", 12121), loc("b.four.org", 1094)};
+  EXPECT_EQ(names(orderLocations(mixed, {}, failed)), "127.0.0.1:12121 b.four.org:1094 ");
+  // Nothing else left: the failed ones, the oldest failure first; the reader's
+  // never.
+  const std::vector<Location> only = {loc("127.0.0.1", 12122), loc("a.two.org", 1094),
+                                      loc("r.five.org", 1094)};
+  EXPECT_EQ(names(orderLocations(only, {"r.five.org"}, failed)), "a.two.org:1094 127.0.0.1:12122 ");
+  // An EOS site's front end is listed beside a data server that failed: it is
+  // of the same site, so it is tried when nothing else is left.
+  EXPECT_EQ(names(orderLocations({loc("eos.site.org", 1094, true)}, {},
+                                 {{"fst.site.org:1094", "site.org", "", "e"}})),
+            "eos.site.org:1094 ");
+  EXPECT_TRUE(orderLocations({}, {}, failed).empty());
+  EXPECT_STREQ(openRouteName(OpenRoute::kCandidate), "candidate");
+}

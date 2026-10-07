@@ -305,15 +305,18 @@ each step:
 - `<file>: no site could open it: <site> (<host>:<port>): <error>; ...`, when
   none did. The job gets that error, with the code of the last one.
 
-An open stops after 4 sites, or after 180 s in all (160 s with the switch's
-error window, less with a shorter open timeout of the job's own), and when the
-redirector sends it back to a server or site that failed already. A server the
+An open stops after 4 sites or after 180 s in all (160 s with the switch's
+error window, less with a shorter open timeout of the job's own). A server the
 redirector names by its address, or by a name without a dot, cannot be named
 in `tried=` (a redirector masks servers by full host name), so the redirector
-may send the next attempt to it again; the open then ends with the error.
-The counters `open_failovers`, `opens_recovered` and `opens_failed_everywhere`
-(STATS.md) count these, and the per-file record file has a line per attempt
-(FORMAT.md, route `failover`).
+may send the next attempt to it again; uCache then asks the regional
+redirector for the other copies of the file and opens one directly (the
+per-file record file has route `candidate` for these attempts). A copy listed
+as on tape is skipped, with the log line `<file>: the copy at <host>:<port> is
+on tape (offline); not opened`.
+The counters `open_failovers`, `opens_recovered`, `opens_failed_everywhere`,
+`failover_locates` and `offline_copies_skipped` (STATS.md) count these, and the per-file record file has a line per attempt
+(FORMAT.md, routes `failover` and `candidate`).
 
 ## The cache is filling my disk
 

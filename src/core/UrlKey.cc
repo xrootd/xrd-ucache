@@ -292,6 +292,25 @@ std::string mergeTried(const std::string& url) {
   return mergeTriedParams(url, /*dropReselection=*/false, /*keepReason=*/false);
 }
 
+std::vector<std::string> triedHosts(const std::string& url) {
+  std::vector<std::string> hosts;
+  (void)mergeTriedParams(url, /*dropReselection=*/false, /*keepReason=*/false, nullptr, &hosts);
+  return hosts;
+}
+
+std::string urlAtServer(const std::string& url, const std::string& hostPort, bool keepTried) {
+  const std::string u = keepTried ? url : stripCgiParams(url, {"tried", "triedrc"});
+  const auto scheme = u.find("://");
+  if (scheme == std::string::npos)
+    return u;
+  size_t a = scheme + 3;
+  const size_t e = std::min(u.find_first_of("/?", a), u.size());
+  const size_t at = u.find('@', a);
+  if (at < e)
+    a = at + 1; // keep the user
+  return u.substr(0, a) + hostPort + u.substr(e);
+}
+
 namespace {
 // An address (IPv4, IPv6, bracketed or not) rather than a host name.
 bool isAddress(const std::string& h) {

@@ -90,4 +90,14 @@ std::string mergeTried(const std::string& url);
 std::string withExclusions(const std::string& base, const std::vector<std::string>& ours,
                            const std::string& triedrc);
 
+// The hosts a URL's tried= lists (all of them, in order, duplicates dropped, as
+// written). Pure.
+std::vector<std::string> triedHosts(const std::string& url);
+
+// `url` opened at the server `hostPort` instead of its own: the URL's scheme,
+// user and path are kept, the host and port replaced. Every tried= and triedrc=
+// is dropped unless `keepTried`; other parameters (tokens, xrd.* options) are
+// kept byte for byte. Pure.
+std::string urlAtServer(const std::string& url, const std::string& hostPort, bool keepTried);
+
 } // namespace ucache

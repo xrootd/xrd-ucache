@@ -91,7 +91,7 @@ the consumers together.
  "origin_failures_data": 0, "origin_failures_expired": 0, "origin_failures_other": 0,
  "records_dropped": 0, "hist_origin_open_us": [..],
  "open_failovers": 0, "opens_recovered": 0, "opens_failed_everywhere": 0,
- "open_deadline_expiries": 0,
+ "open_deadline_expiries": 0, "failover_locates": 0, "offline_copies_skipped": 0,
  "entries": [{"key": "root://host:1094/path", "file_size": 0,
               "cached_bytes": 0, "page_size": 4096}],
  "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ... adaptive_federation=off"}
@@ -240,6 +240,12 @@ ones included, so a run with caching disabled shows its origin failures too.
   that expired at their timeout: the open deadline, the job's own shorter open
   timeout, or what was left of an open's time budget (also counted in
   `origin_failures_expired`).
+- `failover_locates`, `offline_copies_skipped` — with `adaptive_federation =
+  on`, requests to a regional redirector for the places a file is (made when
+  the redirector sends an open back to a server or site that failed, or finds
+  no copy after servers were left out; one request answers every open waiting
+  for the same answer), and listed copies not opened because the server says
+  they are on tape.
 
 `run_settings`, on the counter line, is the settings that decide how the
 origin is reached, as the plugin found them at load, one string:
