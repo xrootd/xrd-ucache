@@ -26,23 +26,29 @@ namespace ucache {
 // the build, never a classification in the field.
 namespace xrdwire {
 // Client status codes (XrdClStatus.hh).
+constexpr int kErrInternal = 7;
 constexpr int kErrDataError = 14;
 constexpr int kErrSocketError = 102;
 constexpr int kErrSocketTimeout = 103;
 constexpr int kErrSocketDisconnected = 104;
+constexpr int kErrPollerError = 105;
+constexpr int kErrSocketOptError = 106;
 constexpr int kErrStreamDisconnect = 107;
 constexpr int kErrConnectionError = 108;
 constexpr int kErrInvalidSession = 109;
 constexpr int kErrTlsError = 110;
 constexpr int kErrAuthFailed = 204;
 constexpr int kErrOperationExpired = 206;
+constexpr int kErrOperationInterrupted = 207;
 constexpr int kErrNotFound = 304;
 constexpr int kErrRedirectLimit = 306;
 constexpr int kErrErrorResponse = 400; // the server answered with an error: errNo holds its code
 // Server error codes (XProtocol.hh), in errNo with kErrErrorResponse.
 constexpr int kXrFileLocked = 3003;
+constexpr int kXrFileNotOpen = 3004;
 constexpr int kXrFSError = 3005;
 constexpr int kXrIOError = 3007;
+constexpr int kXrNoMemory = 3008;
 constexpr int kXrNotAuthorized = 3010;
 constexpr int kXrNotFound = 3011;
 constexpr int kXrServerError = 3012;
@@ -50,6 +56,7 @@ constexpr int kXrNoServer = 3014;
 constexpr int kXrCancelled = 3017;
 constexpr int kXrItExists = 3018;
 constexpr int kXrOverloaded = 3024;
+constexpr int kXrReqTimedOut = 3034;
 // Login flags of a host (XProtocol.hh), and the stat flag of a file on tape.
 constexpr uint32_t kIsServer = 0x1;
 constexpr uint32_t kIsManager = 0x2;  // a redirector
@@ -123,8 +130,10 @@ enum class OpenRoute : uint8_t {
   kFork,     // a forked child's open afresh of a handle it inherited
   kFailover, // with adaptive_federation on, an open of any of these at another site
   kCandidate, // ... at a server a regional redirector listed as holding the file
+  kRead,     // ... made because reads of the handle stopped (every attempt of such an open)
 };
-const char* openRouteName(OpenRoute r); // "relay", "lazy", "degraded", "fork", "failover", "candidate"
+// "relay", "lazy", "degraded", "fork", "failover", "candidate", "read"
+const char* openRouteName(OpenRoute r);
 
 // With adaptive_federation on, the deadline of every read open of a handle
 // the cache serves: the reader's own open, and the cache's own opens of the
@@ -175,9 +184,11 @@ enum class OpenStep : uint8_t {
 // tried=, so a copy may have been hidden by them. Only a chain through a
 // redirector can go elsewhere; a failure of the first host itself (the
 // redirector down, stalled or refusing) is final, as there is no other
-// redirector to ask.
+// redirector to ask. `repeats`: a success that landed on a server or site where
+// reads of the file stopped (the open of a read that moves): the redirector did
+// not keep it from there, so the regional redirector is asked for the copies.
 OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bool offline,
-                   bool excluded);
+                   bool excluded, bool repeats = false);
 
 // The host name a retry's tried= may carry for hop `i` of a chain, or "" when
 // it may not: never a redirector, nor the first host, nor an address or a
@@ -236,12 +247,62 @@ std::vector<Location> orderLocations(const std::vector<Location>& listed,
                                      const std::vector<SiteFailure>& failed);
 // The names of `failed` a retry's tried= carries, oldest first.
 std::vector<std::string> exclusionNames(const std::vector<SiteFailure>& failed);
+// Whether `f` is a server `failed` lists, or a site it lists. Servers behind one
+// address are not one site: an address is its own server alone.
+bool failedBefore(const std::vector<SiteFailure>& failed, const SiteFailure& f);
 // The error an open that failed at every site it tried ends with: "uCache:
 // <file>: no site could open it: <site> (<server>): <error>; ...", each error
 // cut to 160 bytes and without URL queries, the whole at most 1024 bytes.
 std::string allSitesFailedText(const std::string& file, const std::vector<SiteFailure>& failed);
 // Its list alone: "<site> (<server>): <error>; ...", each error cut likewise.
 std::string sitesFailedList(const std::vector<SiteFailure>& failed);
+
+// ---- Reading a file from another site (adaptive_federation on) --------------
+// A handle is armed to move its reads when the cache serves it, an open of it
+// succeeded through a redirector, and it was not shown a slot layout (whose
+// addresses no other site has). The origin reads of an armed handle have a
+// deadline, and one that fails in a way another site may not share is issued
+// again, in full, at another site: the reader gets the bytes, never the error,
+// within a bound on the attempts and on the time. `slotLayout`: the handle was
+// shown one.
+bool armedForReads(bool adaptiveFederation, bool cacheServes, bool viaRedirector, bool slotLayout);
+
+// The deadline of one origin read of an armed handle. It is above the client's
+// stream timeout plus its resolution (75 s at the defaults), so that on a
+// server that stopped answering the client's own check fires first and fails
+// every request of the connection at once; this deadline is the backstop for a
+// server that answers other requests and not this one. A first value, to be
+// revisited with measurements, and never below 30 s.
+inline constexpr int kReadDeadlineS = 120;
+static_assert(kReadDeadlineS >= 30, "a read deadline below 30 s expires healthy reads");
+// A test's deadline (the text of UCACHE_TEST_READ_DEADLINE_S), which may be below
+// that floor; unset, empty, not a number or not positive gives kReadDeadlineS.
+int readDeadlineS(const char* text);
+
+// How long a read may take in all, in seconds: the reader's own timeout when it
+// gave one, else the client's request timeout (`requestTimeoutS`), which is
+// what the read would be allowed without the cache.
+int readBudgetS(int readerTimeoutS, int requestTimeoutS);
+// The timeout of one attempt of a read, in seconds, `elapsedS` into its budget:
+// the deadline `deadlineS`, or what is left of the budget when that is less. A
+// reader's own shorter timeout passes unchanged, and its expiry ends the budget.
+// 0: no attempt may be made. That is only for `again`, an attempt after a failed
+// one, and when what is left is below the deadline capped at 30 s and, for a
+// reader with a timeout of its own, below half of it (a reader that gives 30 s
+// would otherwise never be moved).
+int readAttemptTimeoutS(int readerTimeoutS, int requestTimeoutS, int deadlineS, int elapsedS,
+                        bool again);
+// Attempts of one read, at as many servers.
+inline constexpr int kReadMaxAttempts = 4;
+
+// What follows a failed origin read of an armed handle. This is every status the
+// client's own recovery of a read handles, which is off on such a handle, and
+// more: the stream and connection errors, an expired request, and a server's
+// report of a fault of its own or of its storage. Final: a request no other site
+// would answer differently, and a corrupted answer (14), which is the integrity
+// check's to decide.
+enum class ReadStep : uint8_t { kFinal, kMove };
+ReadStep readStep(int code, int errNo);
 
 // A JSON string's contents: quote and backslash escaped, control bytes as
 // \u00XX, so a server's text can never break a record line.

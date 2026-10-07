@@ -62,10 +62,14 @@ static_assert(XrdCl::errConnectionError == 108 && XrdCl::errErrorResponse == 400
 static_assert(kXR_ItExists == 3018 && kXR_Overloaded == 3024,
               "kXR wire codes drifted from OpenRetry.cc");
 // The same for OpenPolicy.h's failure classes.
-static_assert(XrdCl::errDataError == xrdwire::kErrDataError &&
+static_assert(XrdCl::errInternal == xrdwire::kErrInternal &&
+                  XrdCl::errDataError == xrdwire::kErrDataError &&
                   XrdCl::errSocketError == xrdwire::kErrSocketError &&
                   XrdCl::errSocketTimeout == xrdwire::kErrSocketTimeout &&
                   XrdCl::errSocketDisconnected == xrdwire::kErrSocketDisconnected &&
+                  XrdCl::errPollerError == xrdwire::kErrPollerError &&
+                  XrdCl::errSocketOptError == xrdwire::kErrSocketOptError &&
+                  XrdCl::errOperationInterrupted == xrdwire::kErrOperationInterrupted &&
                   XrdCl::errStreamDisconnect == xrdwire::kErrStreamDisconnect &&
                   XrdCl::errConnectionError == xrdwire::kErrConnectionError &&
                   XrdCl::errInvalidSession == xrdwire::kErrInvalidSession &&
@@ -77,6 +81,9 @@ static_assert(XrdCl::errDataError == xrdwire::kErrDataError &&
                   XrdCl::errErrorResponse == xrdwire::kErrErrorResponse,
               "XrdCl status codes drifted from OpenPolicy.h");
 static_assert(kXR_FileLocked == xrdwire::kXrFileLocked && kXR_FSError == xrdwire::kXrFSError &&
+                  kXR_FileNotOpen == xrdwire::kXrFileNotOpen &&
+                  kXR_NoMemory == xrdwire::kXrNoMemory &&
+                  kXR_ReqTimedOut == xrdwire::kXrReqTimedOut &&
                   kXR_IOError == xrdwire::kXrIOError &&
                   kXR_NotAuthorized == xrdwire::kXrNotAuthorized &&
                   kXR_NotFound == xrdwire::kXrNotFound &&
@@ -101,6 +108,45 @@ bool readFaultFire() {
   if (budget.load(std::memory_order_relaxed) <= 0)
     return false; // production fast path: one relaxed load
   return budget.fetch_sub(1, std::memory_order_relaxed) > 0;
+}
+
+// UCACHE_TEST_READ_FAIL_KIND (inert unless set, read at load) says where the
+// faults of UCACHE_TEST_READ_FAIL_N strike and how. Unset: the issues of the
+// byte cache's misses, each failing with a connection error posted to its
+// handler, as if the client had answered. relay: the issues of relayed reads
+// instead. refuse: both, as an invalid-session error the issue call itself
+// returns, which nothing was sent for. final: the misses, with an error no
+// other site would answer differently. late: the misses, the error posted 500 ms
+// late (after the open of a move, on the loopback).
+enum class FaultKind : uint8_t { kMiss, kRelay, kRefuse, kFinal, kLate };
+static const FaultKind gFaultKind = [] {
+  const char* v = ::getenv("UCACHE_TEST_READ_FAIL_KIND");
+  const std::string k = v ? v : "";
+  return k == "relay"    ? FaultKind::kRelay
+         : k == "refuse" ? FaultKind::kRefuse
+         : k == "final"  ? FaultKind::kFinal
+         : k == "late"   ? FaultKind::kLate
+                         : FaultKind::kMiss;
+}();
+// True when the fault fires at this issue site: `s` is then what the issue call
+// returns (OK when the failure is posted to `h`, which gets exactly that).
+static bool injectReadFault(bool relaySite, ResponseHandler* h, XRootDStatus& s) {
+  const FaultKind k = gFaultKind;
+  const bool here =
+      relaySite ? k == FaultKind::kRelay || k == FaultKind::kRefuse : k != FaultKind::kRelay;
+  if (!here || !readFaultFire())
+    return false;
+  s = XRootDStatus();
+  if (k == FaultKind::kRefuse) {
+    s = XRootDStatus(XrdCl::stError, XrdCl::errInvalidSession);
+    return true;
+  }
+  const XRootDStatus err(XrdCl::stError, k == FaultKind::kFinal ? XrdCl::errInvalidResponse
+                                                                : XrdCl::errConnectionError);
+  Executor::instance().postAfter(k == FaultKind::kLate ? 500 : 0, [h, err] {
+    h->HandleResponseWithHosts(new XRootDStatus(err), nullptr, new HostList());
+  });
+  return true;
 }
 
 namespace {
@@ -2091,7 +2137,9 @@ static XrdCl::XRootDStatus relayToInner(const std::shared_ptr<HandleState>& st,
   if (XrdCl::File* f = st->acquireInner()) {
     auto* relay = newRelay(st, f, user, off, len);
     relay->readLen = readLen;
-    XrdCl::XRootDStatus s = issue(f, static_cast<XrdCl::ResponseHandler*>(relay));
+    XrdCl::XRootDStatus s;
+    if (!injectReadFault(true, relay, s))
+      s = issue(f, static_cast<XrdCl::ResponseHandler*>(relay));
     if (!s.IsOK()) {
       delete relay;
       st->releaseInner();
@@ -2461,14 +2509,10 @@ class MissReadHandler : public ResponseHandler {
 // in for the XrdCl callback thread, so the handler runs its real error path.
 XRootDStatus issueWireRead(XrdCl::File* f, uint64_t off, uint64_t len, void* buf,
                            MissReadHandler* mh, ucache::XrdTimeout timeout) {
-  if (readFaultFire()) {
-    Executor::instance().post([mh] {
-      mh->HandleResponseWithHosts(
-          new XRootDStatus(XrdCl::stError, XrdCl::errConnectionError), nullptr, nullptr);
-    });
-    return XRootDStatus();
-  }
-  return f->Read(off, len, buf, mh, timeout);
+  XRootDStatus s;
+  if (!injectReadFault(false, mh, s))
+    s = f->Read(off, len, buf, mh, timeout);
+  return s;
 }
 
 std::pair<uint64_t, uint64_t> roundChunk(const FileEntry& e, uint64_t off, uint64_t len);
@@ -2816,12 +2860,7 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
   auto* mh = new MissVReadHandler(st, f, entry, std::move(userChunks), std::move(missIdx),
                                   std::move(wire), user, nowUs(), std::move(direct));
   XRootDStatus s;
-  if (readFaultFire()) // test hook: wire vector read dies mid-stream
-    Executor::instance().post([mh] {
-      mh->HandleResponseWithHosts(
-          new XRootDStatus(XrdCl::stError, XrdCl::errConnectionError), nullptr, nullptr);
-    });
-  else
+  if (!injectReadFault(false, mh, s)) // test hook: wire vector read dies mid-stream
     s = f->VectorRead(wireChunks, nullptr, mh, 0);
   if (!s.IsOK()) {
     delete mh;

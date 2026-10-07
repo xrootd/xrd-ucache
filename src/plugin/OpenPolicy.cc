@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstdio>
+#include <cstdlib>
 
 namespace ucache {
 
@@ -184,6 +186,8 @@ const char* openRouteName(OpenRoute r) {
     return "fork";
   case OpenRoute::kCandidate:
     return "candidate";
+  case OpenRoute::kRead:
+    return "read";
   case OpenRoute::kFailover:
     break;
   }
@@ -218,11 +222,13 @@ int openDeadlineS(int readerTimeoutS, int deadlineS) {
 }
 
 OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bool offline,
-                   bool excluded) {
+                   bool excluded, bool repeats) {
   if (!v.viaRedirector) // a direct open has nowhere else to go
     return OpenStep::kFinal;
   if (code == 0)
-    return sizeDiffers || offline ? OpenStep::kFailOver : OpenStep::kFinal;
+    return sizeDiffers || offline ? OpenStep::kFailOver
+           : repeats              ? OpenStep::kLocate
+                                  : OpenStep::kFinal;
   const bool first = v.hops <= 1; // the redirector answered (or failed) itself
   const OpenStep elsewhere = first ? OpenStep::kFinal : OpenStep::kFailOver;
   // Not found by the redirector itself, with nothing of ours hiding a copy: no
@@ -349,6 +355,57 @@ std::vector<std::string> exclusionNames(const std::vector<SiteFailure>& failed) 
     if (!x.name.empty() && std::find(out.begin(), out.end(), x.name) == out.end())
       out.push_back(x.name);
   return out;
+}
+
+bool failedBefore(const std::vector<SiteFailure>& failed, const SiteFailure& f) {
+  const std::string host = f.server.substr(0, f.server.rfind(':'));
+  for (const SiteFailure& x : failed)
+    if (x.server == f.server || (x.site == f.site && f.site != host))
+      return true;
+  return false;
+}
+
+bool armedForReads(bool adaptiveFederation, bool cacheServes, bool viaRedirector, bool slotLayout) {
+  return adaptiveFederation && cacheServes && viaRedirector && !slotLayout;
+}
+
+int readDeadlineS(const char* text) {
+  char* end = nullptr;
+  const long v = text ? std::strtol(text, &end, 10) : 0;
+  return text && end != text && *end == '\0' && v > 0 && v < INT_MAX ? static_cast<int>(v)
+                                                                     : kReadDeadlineS;
+}
+
+int readBudgetS(int readerTimeoutS, int requestTimeoutS) {
+  if (readerTimeoutS > 0)
+    return readerTimeoutS;
+  return requestTimeoutS > 0 ? requestTimeoutS : kReadDeadlineS;
+}
+
+int readAttemptTimeoutS(int readerTimeoutS, int requestTimeoutS, int deadlineS, int elapsedS,
+                        bool again) {
+  const int left = readBudgetS(readerTimeoutS, requestTimeoutS) - elapsedS;
+  int floorS = std::min(deadlineS, 30);
+  if (readerTimeoutS > 0)
+    floorS = std::min(floorS, readerTimeoutS / 2);
+  if (again && left < std::max(floorS, 1))
+    return 0;
+  return std::max(std::min(deadlineS, left), 1);
+}
+
+ReadStep readStep(int code, int errNo) {
+  static constexpr int kCodes[] = {
+      kErrInternal,       kErrSocketError,    kErrSocketTimeout,    kErrSocketDisconnected,
+      kErrPollerError,    kErrSocketOptError, kErrStreamDisconnect, kErrConnectionError,
+      kErrInvalidSession, kErrTlsError,       kErrOperationExpired, kErrOperationInterrupted};
+  static constexpr int kServer[] = {kXrFileNotOpen,   kXrFSError,    kXrIOError,     kXrNoMemory,
+                                    kXrNotAuthorized, kXrNotFound,   kXrServerError, kXrNoServer,
+                                    kXrOverloaded,    kXrReqTimedOut};
+  const auto in = [](const auto& list, int v) {
+    return std::find(std::begin(list), std::end(list), v) != std::end(list);
+  };
+  const bool moves = in(kCodes, code) || (code == kErrErrorResponse && in(kServer, errNo));
+  return moves ? ReadStep::kMove : ReadStep::kFinal;
 }
 
 namespace {

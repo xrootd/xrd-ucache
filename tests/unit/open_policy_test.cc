@@ -135,6 +135,9 @@ TEST(OpenPolicy, Names) {
   EXPECT_STREQ(openRouteName(OpenRoute::kLazy), "lazy");
   EXPECT_STREQ(openRouteName(OpenRoute::kDegraded), "degraded");
   EXPECT_STREQ(openRouteName(OpenRoute::kFork), "fork");
+  EXPECT_STREQ(openRouteName(OpenRoute::kFailover), "failover");
+  EXPECT_STREQ(openRouteName(OpenRoute::kCandidate), "candidate");
+  EXPECT_STREQ(openRouteName(OpenRoute::kRead), "read");
 }
 
 TEST(OpenPolicy, JsonEscapeKeepsTheLineWhole) {
@@ -276,6 +279,136 @@ TEST(OpenPolicy, StepAfterAnAttempt) {
   EXPECT_EQ(stepAfter(v, 0, 0, false, true, false), OpenStep::kFailOver);
   EXPECT_EQ(stepAfter(kDirect, 0, 0, true, false, false), OpenStep::kFinal);
   EXPECT_EQ(stepAfter(kDirect, 0, 0, false, true, false), OpenStep::kFinal);
+  // The open of a read that moves: a success that landed where reads stopped
+  // asks the regional redirector for the copies, through a redirector only; a
+  // size or tape failure goes to another site as before.
+  EXPECT_EQ(stepAfter(v, 0, 0, false, false, false, true), OpenStep::kLocate);
+  EXPECT_EQ(stepAfter(v, 0, 0, true, false, false, true), OpenStep::kFailOver);
+  EXPECT_EQ(stepAfter(v, 0, 0, false, true, false, true), OpenStep::kFailOver);
+  EXPECT_EQ(stepAfter(kDirect, 0, 0, false, false, false, true), OpenStep::kFinal);
+  // A failure is judged as without it.
+  EXPECT_EQ(stepAfter(v, kErrOperationExpired, 0, false, false, false, true), OpenStep::kFailOver);
+  EXPECT_EQ(stepAfter(v, kErrSocketError, 0, false, false, false, true), OpenStep::kFinal);
+}
+
+// A server or site that failed before, as an attempt that succeeded sees it:
+// by server, or by the domain of a named host; never by an address, which the
+// servers of one machine share.
+TEST(OpenPolicy, FailedBefore) {
+  const SiteFailure a{"a.one.org:1094", "one.org", "a.one.org", "stopped"};
+  const SiteFailure lo1{"127.0.0.1:1095", "127.0.0.1", "", "stopped"};
+  const SiteFailure silent{"d.four.org:1094", "d.four.org:1094", "d.four.org", "never answered"};
+  const SiteFailure v6{"::1:1093", "::1", "", "stopped"};
+  const std::vector<SiteFailure> failed = {a, lo1, silent, v6};
+  EXPECT_TRUE(failedBefore(failed, a));
+  EXPECT_TRUE(failedBefore(failed, {"a2.one.org:1094", "one.org", "a2.one.org", ""}))
+      << "another server of a site that failed";
+  EXPECT_FALSE(failedBefore(failed, {"b.two.org:1094", "two.org", "b.two.org", ""}));
+  EXPECT_TRUE(failedBefore(failed, lo1));
+  EXPECT_FALSE(failedBefore(failed, {"127.0.0.1:1096", "127.0.0.1", "", ""}))
+      << "an address is its own server alone";
+  EXPECT_TRUE(failedBefore(failed, v6));
+  EXPECT_FALSE(failedBefore(failed, {"::1:1094", "::1", "", ""}));
+  EXPECT_FALSE(failedBefore(failed, {"d.four.org:1095", "d.four.org:1095", "d.four.org", ""}))
+      << "a server that never answered is its own site";
+  EXPECT_TRUE(failedBefore(failed, silent));
+  EXPECT_FALSE(failedBefore({}, a));
+}
+
+// ---- Reading a file from another site --------------------------------------
+
+// The four conditions of a handle that moves its reads.
+TEST(OpenPolicy, ArmedForReads) {
+  EXPECT_TRUE(armedForReads(true, true, true, false));
+  EXPECT_FALSE(armedForReads(false, true, true, false)) << "the switch is off";
+  EXPECT_FALSE(armedForReads(true, false, true, false)) << "a pass-through handle";
+  EXPECT_FALSE(armedForReads(true, true, false, false)) << "no redirector in any open";
+  EXPECT_FALSE(armedForReads(true, true, true, true)) << "shown a slot layout";
+}
+
+// The deadline of a test's choosing: unset, empty, not a number, not positive
+// and out of range all give the built-in one.
+TEST(OpenPolicy, ReadDeadlineOverride) {
+  EXPECT_EQ(kReadDeadlineS, 120);
+  EXPECT_EQ(readDeadlineS(nullptr), 120);
+  EXPECT_EQ(readDeadlineS(""), 120);
+  EXPECT_EQ(readDeadlineS("abc"), 120);
+  EXPECT_EQ(readDeadlineS("8x"), 120);
+  EXPECT_EQ(readDeadlineS("0"), 120);
+  EXPECT_EQ(readDeadlineS("-5"), 120);
+  EXPECT_EQ(readDeadlineS("99999999999"), 120);
+  EXPECT_EQ(readDeadlineS("8"), 8) << "below the floor of 30: a test's";
+  EXPECT_EQ(readDeadlineS("300"), 300);
+}
+
+// The timeout of an attempt of a read, with the built-in deadline of 120 s and
+// the client's default request timeout of 1800 s.
+namespace {
+constexpr int K = 120, RT = 1800;
+int first(int reader, int rt = RT, int k = K) {
+  return readAttemptTimeoutS(reader, rt, k, 0, false);
+}
+int again(int reader, int elapsed, int rt = RT, int k = K) {
+  return readAttemptTimeoutS(reader, rt, k, elapsed, true);
+}
+} // namespace
+TEST(OpenPolicy, ReadAttemptTimeout) {
+  EXPECT_EQ(readBudgetS(0, RT), 1800);
+  EXPECT_EQ(readBudgetS(45, RT), 45);
+  EXPECT_EQ(readBudgetS(0, 0), kReadDeadlineS) << "no budget at all falls back to the deadline";
+  // The first attempt: the deadline, or the reader's shorter timeout unchanged.
+  EXPECT_EQ(first(0), 120);
+  EXPECT_EQ(first(10), 10);
+  EXPECT_EQ(first(30), 30);
+  EXPECT_EQ(first(45), 45);
+  EXPECT_EQ(first(300), 120);
+  EXPECT_EQ(first(0, 40), 40) << "a request timeout of 40 s is kept";
+  EXPECT_EQ(first(0, 20), 20) << "a first attempt is never refused for the time left";
+  // After a failed attempt: what is left of the budget, nothing once it is below
+  // the floor (30 s, and for a reader with a timeout of its own half of it).
+  EXPECT_EQ(again(0, 1790), 0) << "10 s left";
+  EXPECT_EQ(again(0, 1770), 30);
+  EXPECT_EQ(again(0, 1000), 120);
+  EXPECT_EQ(again(100, 60), 40);
+  EXPECT_EQ(again(30, 0), 30) << "a refusal at once, from a reader that gives 30 s";
+  EXPECT_EQ(again(30, 15), 15);
+  EXPECT_EQ(again(30, 16), 0) << "14 s left, below half of the reader's 30";
+  EXPECT_EQ(again(10, 0), 10);
+  EXPECT_EQ(again(10, 6), 0);
+  EXPECT_EQ(again(1, 0), 1);
+  EXPECT_EQ(again(0, 1800), 0);
+  EXPECT_EQ(again(0, 2000), 0);
+  // A reader's own expiry ends the budget: nothing after it.
+  EXPECT_EQ(again(45, 45), 0);
+  // A test's deadline of 5 s.
+  EXPECT_EQ(first(0, RT, 5), 5);
+  EXPECT_EQ(first(10, RT, 5), 5);
+  EXPECT_EQ(again(0, 100, RT, 5), 5);
+  EXPECT_EQ(again(0, 1795, RT, 5), 5);
+  EXPECT_EQ(again(0, 1796, RT, 5), 0) << "the floor is 5 here: 4 left is below it";
+}
+
+// Every status of a failed read and what follows it.
+TEST(OpenPolicy, ReadStepClasses) {
+  EXPECT_EQ(kReadMaxAttempts, 4);
+  // The statuses the client's own read recovery handles (102, 103, 109, 110, 7
+  // and 207 among them), the stream errors and an expired request.
+  for (int code : {7, kErrSocketError, kErrSocketTimeout, kErrSocketDisconnected, 105, 106,
+                   kErrStreamDisconnect, kErrConnectionError, kErrInvalidSession, kErrTlsError,
+                   kErrOperationExpired, 207})
+    EXPECT_EQ(readStep(code, 0), ReadStep::kMove) << code;
+  // A server's report of a fault of its own, its storage or its credentials.
+  for (int errNo : {3004, kXrFSError, kXrIOError, 3008, kXrNotAuthorized, kXrNotFound,
+                    kXrServerError, kXrNoServer, kXrOverloaded, 3034})
+    EXPECT_EQ(readStep(kErrErrorResponse, errNo), ReadStep::kMove) << errNo;
+  // A corrupted answer is the integrity check's, a bad request no site's fault.
+  EXPECT_EQ(readStep(kErrDataError, 0), ReadStep::kFinal);
+  for (int errNo : {3000, 3001, 3002, 3006, 3013, 3015, 3016, 3019, kXrCancelled, kXrItExists,
+                    kXrFileLocked, 0})
+    EXPECT_EQ(readStep(kErrErrorResponse, errNo), ReadStep::kFinal) << errNo;
+  for (int code : {0, 3 /* errInvalidOp */, 9 /* errInvalidArgs */, 13 /* errNotSupported */,
+                   kErrAuthFailed, 303, kErrNotFound, kErrRedirectLimit, 101, 402})
+    EXPECT_EQ(readStep(code, 0), ReadStep::kFinal) << code;
 }
 
 // What a retry's tried= may carry for a hop.
