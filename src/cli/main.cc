@@ -15,6 +15,7 @@
 #include "DiskBench.h"
 #include "Publish.h"
 #include "UrlKey.h"
+#include "../plugin/ClientSettings.h"
 #ifdef UCACHE_HAVE_TRANSPOSE
 #include "CacheSource.h"
 #include "RNTupleRewrite.h"
@@ -3506,6 +3507,8 @@ int cmdSet(const Config& cfg, const char* key, const char* value) {
   if (k == "recompress" && (v == "on" || v == "1" || v == "true"))
     std::printf("  files already cached get a replica the next time a job reads them, or now "
                 "with `ucache recompress`\n");
+  if (const std::string note = cfg.setNote(k, v); !note.empty())
+    std::printf("%s\n", note.c_str());
   return 0;
 }
 
@@ -3984,6 +3987,37 @@ int cacheSpaceProbe(const std::string& dir, uint64_t unit) {
   return bad;
 }
 
+// The newest run's `run_settings` in a stats dir, or "" when no run has one.
+std::string lastRunSettings(const std::string& statsDir) {
+  const Run* newest = nullptr;
+  const std::vector<Run> runs = loadRuns(statsDir);
+  for (const Run& r : runs)
+    if (!r.runSettings.empty() && (!newest || r.endMs > newest->endMs))
+      newest = &r;
+  return newest ? newest->runSettings : "";
+}
+
+// adaptive_federation = on: what a job started from this shell will run with.
+// The CLI has no XRootD client, so a client.conf value is not seen here; the
+// last run's own record says what a job really had.
+void federationNote(const Config& cfg) {
+  std::string predicted;
+  for (int i = 0; i < kClientSettingCount; ++i) {
+    const ClientSetting& s = kClientSettings[i];
+    const char* v = ::getenv(s.envName);
+    predicted += std::string(i ? ", " : "") + s.name + " " +
+                 (v ? std::string(v) + " (" + s.envName + ", kept)"
+                    : std::to_string(s.federationValue));
+  }
+  std::printf("  [NOTE] adaptive_federation = on: jobs from this shell set the XRootD client's\n"
+              "         %s,\n"
+              "         except where a client.conf sets one\n",
+              predicted.c_str());
+  if (!cfg.cacheDir.empty())
+    if (const std::string rs = lastRunSettings(cfg.cacheDir + "/stats"); !rs.empty())
+      std::printf("         the last run had: %s\n", rs.c_str());
+}
+
 int cmdDoctor(const Config& cfg) {
   std::string conf = findUCacheConf();
   std::printf("ucache doctor\n  cache dir: %s\n  settings : %s\n  freshness: %s\n",
@@ -4037,6 +4071,8 @@ int cmdDoctor(const Config& cfg) {
                 "         the same job needs with no cache). If they run short, set recompress\n"
                 "         off and do not run `ucache recompress`; `ucache untranspose <url>`\n"
                 "         removes a file's replica while no job is reading it\n");
+  if (cfg.adaptiveFederation)
+    federationNote(cfg);
   if (!cfg.cacheDir.empty())
     if (const size_t n = countEarlierReplicas(cfg.cacheDir))
       std::printf("  [NOTE] %zu replica%s an earlier uCache made %s in the cache. This one does not\n"

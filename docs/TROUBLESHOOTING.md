@@ -227,6 +227,39 @@ To fail sooner, shorten the client's reconnect policy for the job, for example
 about 15 seconds. Files already in the cache and inside the freshness window
 need no server at all, so a warm pass over them is not affected.
 
+With `adaptive_federation = on`, uCache sets that policy itself where no
+`XRD_*` variable or `client.conf` sets it: a connection is tried for 31 s, twice,
+so a server that is down is given up after about a minute, and the failure is
+remembered for 180 s (`ucache doctor` and the run's `run_settings` show the
+values in force).
+
+## An open fails after a minute (`did not complete within 60 s`)
+
+With `adaptive_federation = on`, every read open of a file uCache serves has a
+deadline of 60 s: the job's own open, and the opens uCache makes of the origin
+when it needs bytes it does not hold. Without a deadline, an open waits for the
+XRootD client's request timeout (30 minutes by default) when a server never
+accepts the connection, accepts it and never answers, or is staging the copy
+from tape. With one, the open fails after 60 s with the client's `operation expired`
+error, and uCache warns
+`<file>: the open at <host>:<port> did not complete within 60 s (...)`. When
+uCache's own open fails this way, the job sees it as a read error, and the
+next read that needs the origin tries again. A shorter open timeout is kept as
+it is: one the program gives its open, or the client's `RequestTimeout`
+(`XRD_REQUESTTIMEOUT`, or a `client.conf`) when the program gives none.
+
+A server that never accepts the connection (its address drops every packet)
+is given up by the client after its connection window times its retries, 31 s
+twice with the switch on, which is past the deadline: such an open fails at the
+deadline, 60 s, with the same `operation expired` error and the same warning.
+
+With the switch off (the default) there is no deadline: the job's own open
+passes the job's own timeout, or none, exactly as without uCache, and the opens
+uCache makes of the origin carry none (they wait for the client's
+`RequestTimeout`), so the client's own
+recovery (at a redirector, going on to another server after a connection
+fails) has all the time it has without uCache.
+
 ## One server refuses or fails and stops the job
 
 Reading through a federation (a redirector that picks one of several servers

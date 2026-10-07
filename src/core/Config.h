@@ -198,8 +198,16 @@ struct Config {
   // codec checks) before it is cached or served; a basket that fails is never
   // kept or served, the read fails with "data is corrupted" and the failure is
   // reported. Forced on by `recompress = on`, which decodes what it converts
-  // anyway (`settings` names it "forced by recompress").
+  // anyway (`settings` names it "forced by recompress"), and by
+  // `adaptive_federation = on` ("forced by adaptive_federation").
   bool checkOriginIntegrity = false;             // UCACHE_CHECK_ORIGIN_INTEGRITY
+  // `adaptive_federation`: with it on, the XRootD client's connection settings
+  // are set at load to values that give up on an unreachable server sooner
+  // (connection window 31 s, 2 retries, error window 180 s), each only where
+  // neither an XRD_* variable nor a client.conf has set it, and
+  // check_origin_integrity is forced on. Off by default: the client's settings
+  // are left as they are.
+  bool adaptiveFederation = false;               // UCACHE_ADAPTIVE_FEDERATION
   // `mixed_maps`: a TTree file with a slot store is shown, at each open, the
   // newest MIXED map -- the baskets converted by then stated at their real
   // length, the rest at their slot's -- so a later pass reads what the store
@@ -267,6 +275,10 @@ struct Config {
   // Keys `ucache set` may write into the state file: any known key except
   // `dir` (the state file lives INSIDE the cache dir — bootstrap order).
   static bool stateSettable(const std::string& key);
+  // What `ucache set <key> <value>` adds below its confirmation, given the
+  // settings in force before it ("" = nothing to add): a value another setting
+  // overrides, or what a switch changes beyond its own name.
+  std::string setNote(const std::string& key, const std::string& value) const;
   // Serialized current value of a known key (for `ucache settings`).
   std::string valueOf(const std::string& key) const;
   // The CLI-managed current-values file.

@@ -108,6 +108,11 @@ struct HandleState {
   bool cpuBlended = false;
   std::shared_ptr<CacheStore> store; // process-wide; null => never cache
   std::string url;
+  // The timeout the reader gave its Open (0 = the client's default): with
+  // adaptive_federation on, the cache's own opens of this handle honour a
+  // shorter one (OpenPolicy.h openDeadlineS); with it off it is unused, and
+  // those opens pass none (the client's RequestTimeout), as before.
+  std::atomic<int> readerOpenTimeoutS{0};
   // Pass-through bytes this handle relayed, and the once-latch for its
   // per-file record. A handle with no entry (UCACHE_DISABLE, write-opened)
   // leaves no lifetime record from FileEntry, so the first of Close/dtor

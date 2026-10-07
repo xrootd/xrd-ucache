@@ -195,6 +195,11 @@ bool appendEscaped(std::string& out, char c, size_t max) {
 }
 } // namespace
 
+int openDeadlineS(int readerTimeoutS, int deadlineS) {
+  const int d = deadlineS > 0 ? deadlineS : kOpenDeadlineS;
+  return readerTimeoutS > 0 && readerTimeoutS < d ? readerTimeoutS : d;
+}
+
 std::string escapeForJson(const std::string& s) {
   std::string out;
   out.reserve(s.size());

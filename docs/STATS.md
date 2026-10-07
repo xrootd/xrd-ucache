@@ -92,7 +92,7 @@ the consumers together.
  "records_dropped": 0, "hist_origin_open_us": [..],
  "entries": [{"key": "root://host:1094/path", "file_size": 0,
               "cached_bytes": 0, "page_size": 4096}],
- "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ..."}
+ "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ... adaptive_federation=off"}
 ```
 
 Fields are added at the end of a line, never in the middle, and under names
@@ -214,7 +214,9 @@ ones included, so a run with caching disabled shows its origin failures too.
   server or its storage failed the request, or the redirectors sent it on past
   the redirect limit. `notfound`: no server holds the file. `data`: bytes
   refused (a basket or page that failed its checksum). `expired`: a request
-  that outlived its timeout, whose timeout not said. `other`: the rest, among
+  that outlived its timeout, whose timeout not said; with `adaptive_federation =
+  on`, among them an open that passed the open deadline (USER_GUIDE.md), its
+  `timeout_s` in its open line (FORMAT.md). `other`: the rest, among
   them a server's report that it could not reach a server behind it, which can
   be that site's network as well as this machine's. A read the cache fails open
   on (and relays) is counted when its first attempt fails, and again, as a
@@ -225,15 +227,19 @@ ones included, so a run with caching disabled shows its origin failures too.
 
 `run_settings`, on the counter line, is the settings that decide how the
 origin is reached, as the plugin found them at load, one string:
-`v1 check_origin_integrity=on|off` and then
-`xrdcl.<name>=<value>/<source>` for the XRootD client's `ConnectionWindow`,
-`ConnectionRetry`, `StreamErrorWindow`, `RequestTimeout`, `StreamTimeout` and
-`TimeoutResolution`. The source is `env` when the `XRD_<NAME>` variable is
-set, `default` when the value is the client's built-in one, and `client` when
-it differs and no variable is set (a `client.conf`, or the application). An
-application that changes a value after the plugin has loaded is not seen. A
-token missing from the string means the build that wrote it did not have that
-setting; tokens may be added at the end.
+`v1 check_origin_integrity=on|off`, then `xrdcl.<name>=<value>/<source>` for
+the XRootD client's `ConnectionWindow`, `ConnectionRetry`, `StreamErrorWindow`,
+`RequestTimeout`, `StreamTimeout` and `TimeoutResolution`, then
+`adaptive_federation=on|off`. The source is `env` when the `XRD_<NAME>`
+variable is set, `default` when the value is the client's built-in one, and
+`client` when it differs and no variable is set (a `client.conf`, or the
+application). With `adaptive_federation = on`, the first three say `ucache`
+when uCache set them (USER_GUIDE.md), `kept` when uCache kept the value of an
+`XRD_<NAME>` variable instead or the client refused uCache's write, and
+`client` when it kept a `client.conf` value. An application that changes a
+value after the plugin has loaded is not seen. A token missing from the string
+means the build that wrote it did not have that setting; tokens may be added
+at the end.
 
 ### Compact replicas of earlier releases
 

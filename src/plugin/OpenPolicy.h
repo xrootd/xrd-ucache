@@ -114,6 +114,34 @@ enum class OpenRoute : uint8_t {
 };
 const char* openRouteName(OpenRoute r); // "relay", "lazy", "degraded", "fork"
 
+// With adaptive_federation on, the deadline of every read open of a handle
+// the cache serves: the reader's own open, and the cache's own opens of the
+// origin (a trusted handle's first miss, a handle whose entry was gone, a
+// forked child's open afresh). Without one, an open waits for as long as the
+// XRootD client's request timeout (30 minutes by default) when a server
+// accepts the connection and never answers, or a copy is being staged from
+// tape. With one, the open fails with the client's "operation expired" error,
+// and the job can go on to whatever it does with a failed open. With the
+// switch off, the reader's own open passes the reader's own timeout unchanged,
+// and the cache's own opens carry none (the client's request timeout), as
+// before there was a deadline: there is no failover then, and the client's own recovery from a server that never
+// accepts the connection (going on to another data server at a redirector)
+// can take longer than any deadline.
+//
+// 60 s is a first value, to be revisited with measurements; it must stay at
+// least 30 s, so that a healthy open on a loaded server never expires.
+inline constexpr int kOpenDeadlineS = 60;
+static_assert(kOpenDeadlineS >= 30, "an open deadline below 30 s expires healthy opens");
+
+// The per-request timeout an open is given, in seconds. A positive timeout of
+// the reader's own below the deadline is the reader's choice and passes
+// unchanged; anything else (0, or longer) gets the deadline. For a reader that
+// gives none, the caller passes the client's RequestTimeout, which is what
+// that reader would wait uncached, so a shorter one is kept too. `deadlineS`
+// replaces kOpenDeadlineS when positive: a test's value, which may be below
+// the 30 s floor.
+int openDeadlineS(int readerTimeoutS, int deadlineS = 0);
+
 // A JSON string's contents: quote and backslash escaped, control bytes as
 // \u00XX, so a server's text can never break a record line.
 std::string escapeForJson(const std::string& s);

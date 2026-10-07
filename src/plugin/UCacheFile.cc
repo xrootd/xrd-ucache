@@ -204,6 +204,34 @@ std::string faultOpenUrl(const std::string& url, int attempt) {
   return (n > 0 && attempt <= n) ? rewritePortTo1(url) : url;
 }
 
+// UCACHE_TEST_OPEN_DEADLINE_S replaces the open deadline, for tests that
+// cannot wait a minute. Read once, when the library loads: a value set then
+// has no first-use guard that a fork could catch half taken, and the cache's
+// opens in a forked child read it too.
+const int gTestOpenDeadlineS = [] {
+  const char* v = ::getenv("UCACHE_TEST_OPEN_DEADLINE_S");
+  return v ? ::atoi(v) : 0;
+}();
+
+// The per-request timeout of a read open of a cached handle (OpenPolicy.h).
+// The deadline is part of adaptive_federation: with the switch off, the
+// reader's own open passes the reader's own timeout unchanged (0 = the
+// client's RequestTimeout), and the cache's own opens pass none (0), as they
+// did before there was a deadline (openAndWait). Without the switch there is no other
+// site to go on to, and a deadline would cut off the client's own recovery
+// from a server that never accepts the connection (at a redirector, it goes on
+// to another data server only before the request expires), so a job that
+// works uncached could fail. With the switch on, a reader that gives none (0)
+// waits, without the cache, for the client's RequestTimeout, so that is the
+// reader's own timeout the rule keeps when it is the shorter: no open waits
+// longer than it would uncached.
+ucache::XrdTimeout openDeadline(int readerTimeoutS) {
+  if (!globalConfig().adaptiveFederation)
+    return static_cast<ucache::XrdTimeout>(readerTimeoutS);
+  const int own = readerTimeoutS > 0 ? readerTimeoutS : defaultRequestTimeoutS();
+  return static_cast<ucache::XrdTimeout>(openDeadlineS(own, gTestOpenDeadlineS));
+}
+
 // ---- Records of the origin's answers (docs/FORMAT.md) ---------------------
 // Lines are built where the answer arrives, often on XrdCl's callback thread,
 // and only queued there (CacheStore::enqueueRecord): the periodic checkpoint
@@ -344,6 +372,16 @@ void noteOriginOpenOrThrow(const OpenAttempt& a, const XRootDStatus* status, con
     }
   }
   const int timeoutS = a.timeoutS > 0 ? a.timeoutS : defaultRequestTimeoutS();
+  if (s.code == XrdCl::errOperationExpired) {
+    // The server that did not answer is the last hop the open reached.
+    const std::string at = !hops.empty() ? hops.back().host + ":" + std::to_string(hops.back().port)
+                           : !server.empty() ? server
+                                             : std::string("the origin");
+    UCACHE_WARN("%s: the open at %s did not complete within %d s (a server that never accepted "
+                "the connection, one that accepted it and did not answer, or a copy being staged "
+                "from tape); the open fails",
+                recordFile(st.url).c_str(), at.c_str(), timeoutS);
+  }
   std::string line;
   line.reserve(512);
   line += "{\"kind\":\"open\",\"v\":1,\"ts_ms\":" + std::to_string(wallMs());
@@ -416,13 +454,35 @@ class ReaderOpenHandler : public ResponseHandler {
     delete this;
     real->HandleResponse(status, response);
   }
-  // XrdCl refused the open of `url` at once: no completion will come, so the
-  // attempt is recorded here (when `fresh`: the first open issued on its File),
-  // and this handler goes. The reader gets the error from Open itself.
+  // XrdCl refused the open of `url` at once (within its error window after a
+  // server failed, a new request to it fails before it is sent): no completion
+  // will come, so the attempt is recorded here (when `fresh`: the first open
+  // issued on its File), and the failure goes to the reader through its
+  // handler, as every other open failure does. Open then returns OK, so a
+  // reader handles one kind of failure only. The answer is posted, never given
+  // inside Open: a reader may hold a lock across Open that its handler takes.
+  // It carries an empty host list, since no host answered. The task holds only
+  // the reader's handler and a status (never the plugin object) and makes or
+  // destroys no client object; the work pool rebuilds itself in a forked child.
+  // What it costs: the reader's handler runs on uCache's work pool, behind the
+  // tasks queued there, some of which block (a cache open of the origin waits
+  // up to its deadline, or with adaptive_federation off up to the client's
+  // request timeout, a first-pass request up to its timeout). So a refusal
+  // that used to come back at once can reach the reader as late as one such
+  // wait when every worker is busy -- a one-worker pool on a one-core slot is
+  // the plain case. And a handler that itself opens, synchronously, another
+  // file the cache serves, refused too, waits for a free worker: on a
+  // one-worker pool it holds the only one and never returns. A pool kept for
+  // the delivery of reader opens alone removes the first; the second needs it
+  // never to wait on itself.
   void refused(const XRootDStatus& status, const std::string& url, bool fresh) {
     if (fresh)
       noteRefusedOpen(a_, status, url);
+    ResponseHandler* real = real_;
     delete this;
+    Executor::instance().post([real, status] {
+      real->HandleResponseWithHosts(new XRootDStatus(status), nullptr, new HostList());
+    });
   }
 
  private:
@@ -467,8 +527,10 @@ class OpenWaitHandler : public ResponseHandler {
   }
   std::shared_ptr<OpenResult> r_;
 };
-// Opens `f` for reading and waits for the answer, as the synchronous open did:
-// with no bound of its own (XrdCl's request timeout ends it), and an error
+// Opens `f` for reading and waits for the answer, as the synchronous open did,
+// within the open deadline when adaptive_federation is on (OpenPolicy.h; XrdCl
+// ends the request when it passes, with errOperationExpired), else within
+// XrdCl's request timeout whatever the reader gave its own open, and an error
 // XrdCl returns at once, when no answer will come, returned as it is.
 // `server` gets the host:port of the last host the answer names, the server
 // the attempt reached (empty when none), taken from the answer rather than from
@@ -480,9 +542,13 @@ XRootDStatus openAndWait(XrdCl::File* f, const std::string& url, std::string& se
   auto r = std::make_shared<OpenResult>();
   auto* h = new OpenWaitHandler(r);
   a.t0 = nowUs();
+  const ucache::XrdTimeout deadline = globalConfig().adaptiveFederation
+                                          ? openDeadline(a.st->readerOpenTimeoutS.load())
+                                          : static_cast<ucache::XrdTimeout>(0);
+  a.timeoutS = static_cast<int>(deadline);
   const bool fresh = firstOpenOn(*a.st, f);
-  const XRootDStatus s = f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h,
-                                 static_cast<ucache::XrdTimeout>(0));
+  const XRootDStatus s =
+      f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h, deadline);
   if (!s.IsOK()) {
     delete h;
     if (fresh)
@@ -520,14 +586,22 @@ class RetryingOpenHandler : public ResponseHandler {
   }
 
   // Issue the first attempt on the ctor-created inner file. Always returns stOK:
-  // `real_` will receive exactly one completion (now, after a retry, or a
-  // forwarded failure), so the XrdCl sync wrapper waits for our handler instead
-  // of short-circuiting on a sync error.
+  // `real_` will receive exactly one completion (after a retry, or a forwarded
+  // failure), so the XrdCl sync wrapper waits for our handler instead of
+  // short-circuiting on a sync error. For a handle the cache serves, what
+  // follows a sync error is posted, so that the reader is never answered from
+  // inside Open (see ReaderOpenHandler::refused, which also says what posting
+  // to the work pool costs).
   XRootDStatus start() {
     XRootDStatus s = issueOn(st_->inner.load());
     if (!s.IsOK()) { // sync issue error: no callback will come
       lastStatus_ = s;
-      decideRetryOrForward();
+      if (record_) {
+        RetryingOpenHandler* self = this;
+        Executor::instance().post([self] { self->decideRetryOrForward(); });
+      } else {
+        decideRetryOrForward();
+      }
     }
     return XRootDStatus();
   }
@@ -561,6 +635,8 @@ class RetryingOpenHandler : public ResponseHandler {
       return;
     }
     lastStatus_ = s ? *s : XRootDStatus(XrdCl::stError);
+    if (record_ && h)
+      lastHosts_ = std::move(h); // the reader's failure carries the last hosts there were
     decideRetryOrForward();
   }
 
@@ -598,9 +674,10 @@ class RetryingOpenHandler : public ResponseHandler {
   }
 
   void forwardFailure() {
-    // Non-null empty HostList: the native completion contract (see complete()).
-    real_->HandleResponseWithHosts(new XRootDStatus(lastStatus_), nullptr,
-                                   new HostList());
+    // The hosts of the last attempt that went through any, else a non-null
+    // empty HostList: the native completion contract (see complete()).
+    HostList* hosts = lastHosts_ ? lastHosts_.release() : new HostList();
+    real_->HandleResponseWithHosts(new XRootDStatus(lastStatus_), nullptr, hosts);
     delete this;
   }
 
@@ -614,6 +691,7 @@ class RetryingOpenHandler : public ResponseHandler {
   const bool record_; // a handle the cache serves: its attempts are recorded
   int attempt_ = 0;
   XRootDStatus lastStatus_;
+  std::unique_ptr<HostList> lastHosts_; // of the last failed attempt that had any
   OpenAttempt a_; // the attempt in flight, as recorded
 };
 
@@ -2049,6 +2127,7 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
 
   const Config& cfg = globalConfig();
   st_->url = url;
+  st_->readerOpenTimeoutS.store(static_cast<int>(timeout));
   using OF = XrdCl::OpenFlags;
   bool writey = flags & (OF::Update | OF::Write | OF::New | OF::Delete);
   passthroughOnly_ = writey || cfg.disable || !st_->store;
@@ -2107,29 +2186,36 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // open-retry enabled (opt-in) wrap the app handler so a TRANSIENT open failure
   // is retried on a fresh inner file (Case A); write-opens and
   // the null-handler case are never wrapped.
+  // With adaptive_federation on, a read open of a handle the cache serves has
+  // a deadline (OpenPolicy.h); every other open keeps the reader's timeout.
+  const ucache::XrdTimeout openTimeout =
+      passthroughOnly_ ? timeout : openDeadline(static_cast<int>(timeout));
   if (cfg.openRetries > 0 && !writey && handler) {
     // Recorded for a handle the cache serves only, as without retries.
-    auto* rh = new RetryingOpenHandler(st_, url, flags, mode, timeout, handler, cfg,
+    auto* rh = new RetryingOpenHandler(st_, url, flags, mode, openTimeout, handler, cfg,
                                        !passthroughOnly_);
     return rh->start();
   }
   // Otherwise a cached handle's read open passes through ReaderOpenHandler,
   // which hands the reader XrdCl's own completion; every other open forwards
   // the reader's handler unchanged. An error XrdCl returns at once (no
-  // completion will come) is the reader's answer, as without the wrapper; a
-  // watched open records it as a failed attempt first.
+  // completion will come) is, for a watched open, recorded as a failed attempt
+  // and given to the reader through its handler, and Open returns OK; for any
+  // other open it is the reader's answer, as without the plugin.
   ResponseHandler* h = handler;
   ReaderOpenHandler* watched = nullptr;
   if (!passthroughOnly_ && handler)
-    h = watched = new ReaderOpenHandler(handler, st_, static_cast<int>(timeout));
+    h = watched = new ReaderOpenHandler(handler, st_, static_cast<int>(openTimeout));
   XrdCl::File* f = st_->inner.load();
   const std::string openUrl = faultOpenUrl(url, 1); // test hook only; `url` in production
   const bool fresh = firstOpenOn(*st_, f);
-  const XRootDStatus s = f->Open(openUrl, flags, mode, h, timeout);
-  if (s.IsOK())
+  const XRootDStatus s = f->Open(openUrl, flags, mode, h, openTimeout);
+  if (s.IsOK()) {
     sentOpenOn(*st_, f);
-  else if (watched)
+  } else if (watched) {
     watched->refused(s, openUrl, fresh);
+    return XRootDStatus();
+  }
   return s;
 }
 

@@ -78,6 +78,25 @@ jobs:
           r1=$(retries /tmp/cache-ir1); r2=$(retries /tmp/cache-ir2)
           echo "open_retries: $r1 and $r2"
           [ "${r1:-0}" -ge 63 ] && [ "${r2:-0}" -ge 60 ]
+      - name: an open the client refuses at once reaches the reader through its handler
+        run: |
+          # Two opens to a refused port in one process: the second falls inside
+          # the client's error window and is refused before it is sent. Then the
+          # same through the retrying handler, both attempts refused.
+          export XRD_CONNECTIONWINDOW=3 XRD_CONNECTIONRETRY=1 XRD_PLUGINCONFDIR=/tmp/conf
+          export UCACHE_REVALIDATE_S=0 XRD_LOGLEVEL=Debug
+          F=/bench/data/f.bin; U=root://127.0.0.1:10940/$F
+          mkdir -p /tmp/cache-or /tmp/cache-or2
+          XRD_LOGFILE=/tmp/or.log UCACHE_DIR=/tmp/cache-or UCACHE_TEST_OPEN_FAIL_N=1 UCACHE_OPEN_RETRIES=0 \
+            ./build/tests/ucache-plugin-fuzz "$U" $F 1 1 1 open-refused
+          XRD_LOGFILE=/tmp/or2.log UCACHE_DIR=/tmp/cache-or2 UCACHE_TEST_OPEN_FAIL_N=2 UCACHE_OPEN_RETRIES=1 \
+            UCACHE_OPEN_RETRY_BASE_MS=1 ./build/tests/ucache-plugin-fuzz "$U" $F 1 1 1 open-refused
+          # The refusals happened: without them each open fails through the
+          # client's own handler, and the mode would pass without testing anything.
+          n1=$(grep -c '\[127.0.0.1:1\] Unable to send the message kXR_open' /tmp/or.log)
+          n2=$(grep -c '\[127.0.0.1:1\] Unable to send the message kXR_open' /tmp/or2.log)
+          echo "opens refused at once: $n1 and $n2"
+          [ "$n1" = 1 ] && [ "$n2" = 3 ]
 
   # macOS: keep the tree compiling under AppleClang and run the hermetic tests.
   # Build-and-test only, deliberately: reading root:// through the plugin needs a

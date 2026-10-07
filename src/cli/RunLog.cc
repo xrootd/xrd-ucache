@@ -156,6 +156,7 @@ void loadCounters(const std::string& path, Run& r) {
   r.endS = fieldU64(last, "ts");
   r.startMs = fieldU64(last, "start_ms");
   r.endMs = fieldU64(last, "ts_ms");
+  r.runSettings = fieldStr(last, "run_settings");
   {
     const std::string src = fieldStr(last, "counter_source");
     if (src == "perf" || src == "rusage")

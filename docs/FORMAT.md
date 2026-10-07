@@ -355,7 +355,7 @@ can hold an access token, and `file` is the cache key, which has none.
  "route":"relay","status":"ok","code":0,"errno":0,"class":"none",
  "chain":"g:1094/0x102*,r:1094/0x2,d:1094/0x1","data_server":"d:1094",
  "site":"dom.ain","site_src":"domain","stat_flags":16,"size":123,"us":812,
- "timeout_s":1800,"msg":""}
+ "timeout_s":60,"msg":""}
 ```
 
 - `seq` numbers one open of one handle, its retries included (unique in the
@@ -377,8 +377,14 @@ can hold an access token, and `file` is the cache key, which has none.
   was found (`domain`).
 - `stat_flags` and `size`: the file's stat as the open answered it; -1 on
   failure.
-- `us`: issue to answer; `timeout_s`: the timeout the request carried (the
-  client's `RequestTimeout` when it carried none).
+- `us`: issue to answer; `timeout_s`: the timeout the request carried, the
+  client's `RequestTimeout` when it carried none. With `adaptive_federation =
+  on` that is the open deadline, 60 s, or a shorter open timeout of the
+  reader's own, or the client's `RequestTimeout` when the reader gave none and
+  that is shorter. With it off (and in records of builds without the
+  deadline), a `relay` line has the reader's own open timeout, or the
+  `RequestTimeout` when it gave none, and a `lazy`, `degraded` or `fork` line
+  has the `RequestTimeout`: uCache's own opens carry no timeout then.
 - `msg`: the error's text, at most 200 bytes as written (escapes included);
   `""` on success.
 

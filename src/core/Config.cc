@@ -216,6 +216,8 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.recompressKeepOriginals = truthy(v);
   else if (k == "check_origin_integrity")
     c.checkOriginIntegrity = truthy(v);
+  else if (k == "adaptive_federation")
+    c.adaptiveFederation = truthy(v);
   else if (k == "mixed_maps")
     c.mixedMaps = !falsy(v); // default on; see Config.h
   else if (k == "recompress_codecs")
@@ -333,6 +335,13 @@ void clampAndFinish(Config& c, bool explicitMax) {
     c.checkOriginIntegrity = true;
     c.sources["check_origin_integrity"] = "forced by recompress";
   }
+  // Reading from more than one site is safe only when what arrives is checked:
+  // a copy that differs from the file's own checksums is caught before it is
+  // kept or served.
+  if (c.adaptiveFederation && !c.checkOriginIntegrity) {
+    c.checkOriginIntegrity = true;
+    c.sources["check_origin_integrity"] = "forced by adaptive_federation";
+  }
 }
 
 // Layers above the conf: state file (found under the EFFECTIVE cache dir —
@@ -419,6 +428,7 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"recompress", "UCACHE_RECOMPRESS"},
       {"recompress_keep_originals", "UCACHE_RECOMPRESS_KEEP_ORIGINALS"},
       {"check_origin_integrity", "UCACHE_CHECK_ORIGIN_INTEGRITY"},
+      {"adaptive_federation", "UCACHE_ADAPTIVE_FEDERATION"},
       {"mixed_maps", "UCACHE_MIXED_MAPS"},
       {"recompress_codecs", "UCACHE_RECOMPRESS_CODECS"},
       {"trace", "UCACHE_TRACE"},
@@ -468,6 +478,19 @@ bool Config::stateSettable(const std::string& key) {
     if (key == spec.key)
       return true;
   return false;
+}
+
+std::string Config::setNote(const std::string& key, const std::string& value) const {
+  if (key == "check_origin_integrity" && falsy(value) && (recompress || adaptiveFederation))
+    return std::string("  the check stays on while ") +
+           (recompress ? "recompress" : "adaptive_federation") +
+           " = on, which forces it on (`ucache settings` shows it)";
+  if (key == "adaptive_federation" && truthy(value))
+    return "  the XRootD client's connection settings change too: connection window 31 s, "
+           "connection retries 2, error window 180 s, each where no XRD_* variable or "
+           "client.conf sets it; every read open of a cached file gets a 60 s deadline; "
+           "check_origin_integrity is forced on";
+  return "";
 }
 
 std::string Config::valueOf(const std::string& key) const {
@@ -561,6 +584,8 @@ std::string Config::valueOf(const std::string& key) const {
     return onoff(recompressKeepOriginals);
   if (key == "check_origin_integrity")
     return onoff(checkOriginIntegrity);
+  if (key == "adaptive_federation")
+    return onoff(adaptiveFederation);
   if (key == "mixed_maps")
     return onoff(mixedMaps);
   if (key == "recompress_codecs")

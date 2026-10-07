@@ -12,6 +12,7 @@
 // plugin for filesystem objects (verified in XrdClFileSystem.cc) — all FS
 // ops are naturally pass-through, and a broken cache can never break a job.
 #include "Announce.h"
+#include "ClientSettings.h"
 #include "CopyDetect.h"
 #include "CpuCounters.h"
 #include "Executor.h"
@@ -227,12 +228,64 @@ void announceIdentity(const Config& cfg) {
                 informed ? "= 'ucache/...'" : "kept from the environment");
 }
 
+// The client's built-in value of each of kClientSettings, in its order.
+constexpr int kClientSettingDefaults[kClientSettingCount] = {
+    XrdCl::DefaultConnectionWindow, XrdCl::DefaultConnectionRetry,
+    XrdCl::DefaultStreamErrorWindow};
+
+// Where each of kClientSettings came from, for run_settings; null until
+// applyClientSettings has run with the switch on (the plain rule applies).
+const char* gClientSettingSource[kClientSettingCount] = {nullptr, nullptr, nullptr};
+
+// adaptive_federation = on: the client's connection settings (ClientSettings.h).
+// Under the same guard as the announcement, for the same reason: when uCache
+// relays a program's own reads untouched (disabled, no cache dir, a copy tool),
+// the client's behaviour is the program's, and stays so. Runs before the first
+// connection: a connection copies these values when it is created.
+void applyClientSettings(const Config& cfg) {
+  if (!cfg.adaptiveFederation || cfg.disable || cfg.cacheDir.empty() ||
+      (cfg.copyDetect && copyProgramSignal() != CopySignal::kNone))
+    return;
+  XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv();
+  if (!env)
+    return;
+  bool envSet[kClientSettingCount], isDefault[kClientSettingCount];
+  int value[kClientSettingCount];
+  for (int i = 0; i < kClientSettingCount; ++i) {
+    value[i] = kClientSettingDefaults[i];
+    env->GetInt(kClientSettings[i].name, value[i]);
+    envSet[i] = ::getenv(kClientSettings[i].envName) != nullptr;
+    isDefault[i] = value[i] == kClientSettingDefaults[i];
+  }
+  const ClientSettingsPlan plan = planClientSettings(true, envSet, isDefault);
+  std::string kept;
+  for (int i = 0; i < kClientSettingCount; ++i) {
+    bool applied = false;
+    if (plan.step[i] == ClientSettingStep::kApply) {
+      applied = env->PutInt(kClientSettings[i].name, kClientSettings[i].federationValue);
+      if (applied)
+        value[i] = kClientSettings[i].federationValue;
+    }
+    gClientSettingSource[i] = clientSettingSource(plan.step[i], applied, envSet[i], isDefault[i]);
+    if (plan.step[i] != ClientSettingStep::kApply || !applied)
+      kept += std::string(kept.empty() ? "" : ", ") +
+              (envSet[i] ? kClientSettings[i].envName : kClientSettings[i].name) + "=" +
+              std::to_string(value[i]);
+  }
+  UCACHE_INFO("adaptive_federation: the XRootD client's connection window is %d s, connection "
+              "retries %d, error window %d s%s",
+              value[0], value[1], value[2],
+              kept.empty() ? "" : (" (kept as set before: " + kept + ")").c_str());
+}
+
 // The run line's `run_settings` (docs/STATS.md): the settings that decide how
 // the origin is reached, with where each value came from. The XRootD client's
 // connection and timeout settings are read as the plugin finds them at load;
 // an application that changes one later is not seen. Its source is "env" when
 // the XRD_<NAME> variable is set, "default" when it is the client's built-in
-// value, and "client" otherwise (a client.conf, or the application).
+// value, and "client" otherwise (a client.conf, or the application); with
+// adaptive_federation on, the three connection settings say "ucache" or "kept"
+// (ClientSettings.h).
 std::string runSettings(const Config& cfg) {
   struct Knob {
     const char* name;
@@ -255,10 +308,15 @@ std::string runSettings(const Config& cfg) {
     for (const char* c = k.name; *c; ++c)
       var += static_cast<char>(std::toupper(static_cast<unsigned char>(*c)));
     const char* src = ::getenv(var.c_str()) ? "env" : v == k.dflt ? "default" : "client";
+    for (int i = 0; i < kClientSettingCount; ++i)
+      if (gClientSettingSource[i] && std::strcmp(k.name, kClientSettings[i].name) == 0)
+        src = gClientSettingSource[i];
     out += std::string(" xrdcl.") + k.name + "=" + std::to_string(v) + "/" + src;
     if (std::strcmp(k.name, "RequestTimeout") == 0)
       gRequestTimeoutS.store(v, std::memory_order_relaxed);
   }
+  out += " adaptive_federation=";
+  out += cfg.adaptiveFederation ? "on" : "off";
   return out;
 }
 
@@ -342,6 +400,7 @@ void initGlobals() {
   if (gConfig->copyDetect)
     copyDetectInit(reinterpret_cast<const void*>(&XrdCl::DefaultEnv::GetEnv));
   announceIdentity(*gConfig);
+  applyClientSettings(*gConfig);
   gStore = new std::shared_ptr<CacheStore>(
       gConfig->cacheDir.empty()
           ? nullptr

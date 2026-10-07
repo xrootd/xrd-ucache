@@ -66,6 +66,9 @@ struct Run {
   // per-process counters, the whole process from its start). Empty when the
   // record says nothing, which older records never do.
   std::string counterSource;
+  // The origin settings the run had (docs/STATS.md `run_settings`), from the
+  // last counter line; empty on records written before it existed.
+  std::string runSettings;
   // perf only: the share of the time the counters were enabled that they were
   // actually counting, over the whole run -- from the last counter line, like
   // the counts, which are already scaled up by it. Negative when that line

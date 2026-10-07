@@ -163,6 +163,85 @@ TEST(Config, CheckOriginIntegrityForcedByRecompress) {
   }
 }
 
+// adaptive_federation: off by default, set from the conf or its env twin, and
+// it forces check_origin_integrity on -- unless recompress already did, whose
+// label is kept.
+TEST(Config, AdaptiveFederationForcesTheIntegrityCheck) {
+  EnvGuard g;
+  {
+    Config c = Config::fromEnv();
+    EXPECT_FALSE(c.adaptiveFederation);
+    EXPECT_EQ(c.valueOf("adaptive_federation"), "off");
+    EXPECT_EQ(c.sources.count("adaptive_federation"), 0u);
+  }
+  std::map<std::string, std::string> conf = {{"adaptive_federation", "on"}};
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_TRUE(c.adaptiveFederation);
+    EXPECT_EQ(c.valueOf("adaptive_federation"), "on");
+    EXPECT_EQ(c.sources.at("adaptive_federation"), "conf");
+    EXPECT_TRUE(c.checkOriginIntegrity);
+    EXPECT_EQ(c.sources.at("check_origin_integrity"), "forced by adaptive_federation");
+  }
+  conf = {{"check_origin_integrity", "off"}};
+  ::setenv("UCACHE_ADAPTIVE_FEDERATION", "1", 1);
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_TRUE(c.adaptiveFederation);
+    EXPECT_EQ(c.sources.at("adaptive_federation"), "env");
+    EXPECT_TRUE(c.checkOriginIntegrity) << "no layer undoes the forcing";
+    EXPECT_EQ(c.sources.at("check_origin_integrity"), "forced by adaptive_federation");
+  }
+  conf = {{"recompress", "on"}};
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_TRUE(c.checkOriginIntegrity);
+    EXPECT_EQ(c.sources.at("check_origin_integrity"), "forced by recompress")
+        << "the first forcing keeps its label";
+  }
+  conf = {{"check_origin_integrity", "on"}};
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_EQ(c.sources.at("check_origin_integrity"), "conf")
+        << "a check already on is not relabelled";
+  }
+  ::setenv("UCACHE_ADAPTIVE_FEDERATION", "off", 1);
+  {
+    Config c = Config::fromEnv();
+    EXPECT_FALSE(c.adaptiveFederation);
+    EXPECT_FALSE(c.checkOriginIntegrity);
+  }
+}
+
+// The notes `ucache set` prints: turning the check off while a switch forces it
+// says it stays on, and turning the switch on names the client settings.
+TEST(Config, SetNotes) {
+  EnvGuard g;
+  Config plain = Config::fromEnv();
+  EXPECT_EQ(plain.setNote("check_origin_integrity", "off"), "");
+  EXPECT_EQ(plain.setNote("check_origin_integrity", "on"), "");
+  EXPECT_EQ(plain.setNote("adaptive_federation", "off"), "");
+  const std::string on = plain.setNote("adaptive_federation", "on");
+  EXPECT_NE(on.find("connection window 31 s"), std::string::npos) << on;
+  EXPECT_NE(on.find("connection retries 2"), std::string::npos) << on;
+  EXPECT_NE(on.find("error window 180 s"), std::string::npos) << on;
+  EXPECT_NE(on.find("60 s deadline"), std::string::npos) << on;
+  EXPECT_NE(on.find("check_origin_integrity is forced on"), std::string::npos) << on;
+  EXPECT_EQ(plain.setNote("adaptive_federation", "1"), on);
+  EXPECT_EQ(plain.setNote("recompress", "off"), "");
+
+  std::map<std::string, std::string> conf = {{"adaptive_federation", "on"}};
+  Config fed = Config::fromEnv(&conf);
+  const std::string off = fed.setNote("check_origin_integrity", "off");
+  EXPECT_NE(off.find("stays on while adaptive_federation = on"), std::string::npos) << off;
+  EXPECT_EQ(fed.setNote("check_origin_integrity", "on"), "");
+
+  conf = {{"recompress", "on"}};
+  Config rec = Config::fromEnv(&conf);
+  const std::string off2 = rec.setNote("check_origin_integrity", "false");
+  EXPECT_NE(off2.find("stays on while recompress = on"), std::string::npos) << off2;
+}
+
 // mixed_maps: on by default. in_use_seconds: 1 day, seconds >= 0 only (0 = no
 // protection); it replaces evict_protect_seconds and map_expiry_seconds.
 TEST(Config, MixedMapsAndTheInUseWindow) {

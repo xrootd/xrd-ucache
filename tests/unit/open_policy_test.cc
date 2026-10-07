@@ -162,3 +162,23 @@ TEST(OpenPolicy, RecordTextDropsQueriesAndIsBounded) {
   EXPECT_EQ(recordText(std::string(250, 'a')).size(), 200u);
   EXPECT_EQ(recordText(std::string(250, 'a'), 10), std::string(10, 'a'));
 }
+
+// The open deadline: a reader's own shorter timeout passes unchanged, anything
+// else gets the deadline; a test's deadline replaces it, below the floor too.
+TEST(OpenPolicy, OpenDeadline) {
+  EXPECT_EQ(kOpenDeadlineS, 60);
+  EXPECT_EQ(openDeadlineS(0), 60);
+  EXPECT_EQ(openDeadlineS(10), 10);
+  EXPECT_EQ(openDeadlineS(45), 45);
+  EXPECT_EQ(openDeadlineS(120), 60);
+  EXPECT_EQ(openDeadlineS(60), 60);
+  EXPECT_EQ(openDeadlineS(-1), 60);
+  // A reader that gives none is called with the client's RequestTimeout: the
+  // default 1800 gets the deadline, a RequestTimeout of 40 is kept.
+  EXPECT_EQ(openDeadlineS(1800), 60);
+  EXPECT_EQ(openDeadlineS(40), 40);
+  EXPECT_EQ(openDeadlineS(0, 5), 5);
+  EXPECT_EQ(openDeadlineS(10, 5), 5);
+  EXPECT_EQ(openDeadlineS(3, 5), 3);
+  EXPECT_EQ(openDeadlineS(0, -5), 60) << "only a positive value replaces the deadline";
+}

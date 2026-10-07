@@ -18,6 +18,9 @@
 //                      first miss); `ops` = handle cycles, `threads` = racers
 //   inner-race-relay   retries of the reader's own open (an untrusted handle),
 //                      raced from the moment Open() returns until it completes
+//
+// open-refused checks that an open the client refuses at once still reaches
+// the reader through its handler (see runOpenRefused).
 #include <XrdCl/XrdClFile.hh>
 #include <XrdCl/XrdClURL.hh>
 #ifdef UCACHE_FUZZ_HAVE_TRANSPOSE
@@ -662,13 +665,105 @@ int runInnerRace(const char* url, const char* local, uint64_t cycles, int racers
   return 0;
 }
 
+// open-refused: an open the client refuses at once reaches the reader through
+// its handler. Within the client's error window after a server failed, a new
+// request to that host:port fails inside Open, before anything is sent. So:
+// the test open fault sends every open to port 1 (never bound, so refused);
+// the first open fails through its handler, as any connection failure does;
+// the second, of a second handle in the same process, is the one refused at
+// once. For a handle the cache serves, Open must return OK for both, and each
+// handler get exactly one failure, with a host list, on another thread than
+// the one in Open (a completion given inside Open would run there). A plugin
+// without this returns the second failure from Open itself, which is also
+// what shows that the second open was refused at once.
+//
+// With UCACHE_OPEN_RETRIES=1 and the fault on both attempts
+// (UCACHE_TEST_OPEN_FAIL_N=2), the opens go through the retrying handler: the
+// first handle's retry is the one refused at once, and its failure must carry
+// the host list of the attempt that reached the client (naming 127.0.0.1:1);
+// the second handle's first attempt is refused at once, inside Open, and what
+// follows must still be answered off the opening thread.
+int runOpenRefused(const char* url) {
+  const char* mode = "open-refused";
+  const int retries = envInt("UCACHE_OPEN_RETRIES", 0);
+  if ((retries != 0 && retries != 1) || envInt("UCACHE_TEST_OPEN_FAIL_N", 0) < retries + 1 ||
+      envInt("UCACHE_REVALIDATE_S", -1) != 0 || envInt("XRD_CONNECTIONRETRY", 0) != 1) {
+    std::printf("%s: SETUP: needs UCACHE_OPEN_RETRIES=0 with UCACHE_TEST_OPEN_FAIL_N>=1, or "
+                "UCACHE_OPEN_RETRIES=1 with UCACHE_TEST_OPEN_FAIL_N>=2; UCACHE_REVALIDATE_S=0 "
+                "and XRD_CONNECTIONRETRY=1\n",
+                mode);
+    return 2;
+  }
+  struct Handler : StrictOpenHandler {
+    std::thread::id on;
+    bool nullHosts = false;
+    std::string hosts; // the first completion's, host:port joined by spaces
+    void HandleResponseWithHosts(XrdCl::XRootDStatus* status, XrdCl::AnyObject* response,
+                                 XrdCl::HostList* hostList) override {
+      {
+        std::lock_guard<std::mutex> g(mu);
+        if (completions == 0) {
+          on = std::this_thread::get_id();
+          if (hostList)
+            for (const auto& h : *hostList)
+              hosts += (hosts.empty() ? "" : " ") + h.url.GetHostId();
+        }
+        nullHosts = nullHosts || hostList == nullptr;
+      }
+      StrictOpenHandler::HandleResponseWithHosts(status, response, hostList);
+    }
+  };
+  int bad = 0;
+  for (int i = 1; i <= 2; ++i) {
+    auto* f = new XrdCl::File(); // leaked with its handler: a late completion lands safely
+    auto* h = new Handler();
+    const XrdCl::XRootDStatus st = f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h);
+    std::printf("%s: open %d: Open() returned %s\n", mode, i, st.ToString().c_str());
+    if (!st.IsOK()) {
+      ++bad;
+      continue;
+    }
+    if (h->succeededWithin(std::chrono::seconds(60)) || h->count() == 0) {
+      std::printf("%s: open %d: FAIL: %s\n", mode, i,
+                  h->count() ? "the open succeeded (the fault did not reach it)"
+                             : "no completion within 60 s");
+      ++bad;
+      continue;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a second completion
+    std::lock_guard<std::mutex> g(h->mu);
+    std::printf("%s: open %d: the handler was answered %s (%d completion(s)), hosts [%s]\n", mode,
+                i, h->answer.c_str(), h->completions, h->hosts.c_str());
+    if (h->completions != 1 || h->viaPlain) {
+      std::printf("%s: open %d: FAIL: not exactly one completion\n", mode, i);
+      ++bad;
+    }
+    if (h->on == std::this_thread::get_id()) {
+      std::printf("%s: open %d: FAIL: answered inside Open, on the opening thread\n", mode, i);
+      ++bad;
+    }
+    if (h->nullHosts) {
+      std::printf("%s: open %d: FAIL: the failure came with a null host list\n", mode, i);
+      ++bad;
+    }
+    if (retries == 1 && i == 1 && h->hosts.find("127.0.0.1:1") == std::string::npos) {
+      std::printf("%s: open 1: FAIL: the failure does not carry the hosts of the attempt that "
+                  "reached the client\n",
+                  mode);
+      ++bad;
+    }
+  }
+  std::printf(bad ? "%s: FAIL\n" : "%s: clean\n", mode);
+  return bad ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
   if (argc < 3) {
     std::fprintf(stderr,
                  "usage: %s <root-url> <local-path> [ops] [threads] [seed] "
-                 "[fuzz|inner-race|inner-race-relay]\n",
+                 "[fuzz|inner-race|inner-race-relay|open-refused]\n",
                  argv[0]);
     return 2;
   }
@@ -677,6 +772,8 @@ int main(int argc, char** argv) {
   if (mode == "inner-race" || mode == "inner-race-relay")
     return runInnerRace(url, argv[2], argc > 3 ? ::strtoull(argv[3], nullptr, 10) : 200,
                         argc > 4 ? ::atoi(argv[4]) : 4, mode == "inner-race-relay");
+  if (mode == "open-refused")
+    return runOpenRefused(url);
   if (mode != "fuzz") {
     std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 2;
