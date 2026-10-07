@@ -224,4 +224,23 @@ struct BasketKeyCheck {
 BasketKeyCheck checkBasketKey(const KeyInfo& k, const BasketHeader& b, const BranchInfo& br,
                               size_t basket, const std::string& treeName);
 
+// Where every basket of the file's tree starts, from the tree's own record:
+// each branch's basket seeks (seek > 0; branches whose baskets live in another
+// file are left out), sorted and unique.
+std::vector<uint64_t> basketSeeks(const FileMeta& fm);
+
+// The key-position check of fetched bytes [spanOff, spanOff + n) held in `p`:
+// a basket that starts at S in the span, and whose key header lies wholly in
+// it, must say in its key that it sits at S. ROOT itself refuses a basket
+// whose key says otherwise; bytes that are not the basket (zeros among them)
+// fail it. `seeks` is basketSeeks(). A basket that starts before the span, or
+// whose header the span cuts, is not judged. Reads nothing outside [p, p + n).
+struct MisplacedKeys {
+  uint64_t first = 0;  // the first failing S in [lo, hi), when count > 0
+  uint32_t count = 0;  // failing S in [lo, hi): the bytes the reader asked for
+  bool outside = false; // a failing S in the span but outside [lo, hi)
+};
+MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks, uint64_t spanOff,
+                                const void* p, uint64_t n, uint64_t lo, uint64_t hi);
+
 } // namespace ucache::transpose

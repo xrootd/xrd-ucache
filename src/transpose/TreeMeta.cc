@@ -257,6 +257,45 @@ BasketKeyCheck checkBasketKey(const KeyInfo& k, const BasketHeader& b, const Bra
   return c;
 }
 
+std::vector<uint64_t> basketSeeks(const FileMeta& fm) {
+  std::vector<uint64_t> s;
+  for (const auto& b : fm.branches)
+    if (!b.externalFile)
+      for (int64_t seek : b.basketSeek)
+        if (seek > 0)
+          s.push_back(static_cast<uint64_t>(seek));
+  std::sort(s.begin(), s.end());
+  s.erase(std::unique(s.begin(), s.end()), s.end());
+  return s;
+}
+
+MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks, uint64_t spanOff,
+                                const void* bytes, uint64_t n, uint64_t lo, uint64_t hi) {
+  const auto* p = static_cast<const uint8_t*>(bytes);
+  MisplacedKeys m;
+  for (auto it = std::lower_bound(seeks.begin(), seeks.end(), spanOff);
+       it != seeks.end() && *it - spanOff < n; ++it) {
+    // The key's version (bytes 4-5) says how wide fSeekKey (from byte 18) is.
+    // Seeks only grow from here, so once a header no longer fits none will.
+    const uint64_t at = *it - spanOff;
+    if (n - at < 6)
+      break;
+    const bool wide = beGet<uint16_t>(p + at + 4) > 1000;
+    if (n - at < (wide ? 26u : 22u))
+      break;
+    const int64_t key = wide ? beGet<int64_t>(p + at + 18) : beGet<int32_t>(p + at + 18);
+    if (key == static_cast<int64_t>(*it))
+      continue;
+    if (*it >= lo && *it < hi) {
+      if (m.count++ == 0)
+        m.first = *it;
+    } else {
+      m.outside = true;
+    }
+  }
+  return m;
+}
+
 std::string blockCodec(const uint8_t* p, size_t n) {
   if (n < 9)
     return "";

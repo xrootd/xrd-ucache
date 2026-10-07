@@ -21,6 +21,11 @@
 //
 // open-refused checks that an open the client refuses at once still reaches
 // the reader through its handler (see runOpenRefused).
+//
+// And one checks check_origin_integrity's key-position check of byte-cache
+// misses against a copy with one basket zeroed (see runKeyCheck):
+//   key-check <off> <len>   <root-url> serves that copy, <local-path> is the
+//                      undamaged file; ops, threads and seed are ignored
 #include <XrdCl/XrdClFile.hh>
 #include <XrdCl/XrdClURL.hh>
 #ifdef UCACHE_FUZZ_HAVE_TRANSPOSE
@@ -41,6 +46,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unistd.h>
 #include <vector>
 
@@ -757,18 +763,396 @@ int runOpenRefused(const char* url) {
   return bad ? 1 : 0;
 }
 
+// A read's completion, with the contract every completion must keep: exactly
+// one, through HandleResponseWithHosts, with a non-null HostList. Handlers live
+// for the process, so a late second completion is counted.
+struct ReadWait : XrdCl::ResponseHandler {
+  std::mutex mu;
+  std::condition_variable cv;
+  int completions = 0;
+  bool viaPlain = false, nullHosts = false;
+  XrdCl::XRootDStatus status; // the first completion's
+  void HandleResponse(XrdCl::XRootDStatus* s, XrdCl::AnyObject* r) override {
+    {
+      std::lock_guard<std::mutex> g(mu);
+      viaPlain = true;
+    }
+    HandleResponseWithHosts(s, r, nullptr);
+  }
+  void HandleResponseWithHosts(XrdCl::XRootDStatus* s, XrdCl::AnyObject* r,
+                               XrdCl::HostList* h) override {
+    std::lock_guard<std::mutex> g(mu);
+    if (!h)
+      nullHosts = true;
+    if (++completions == 1 && s)
+      status = *s;
+    delete s;
+    delete r;
+    delete h;
+    cv.notify_all();
+  }
+  bool wait() {
+    std::unique_lock<std::mutex> l(mu);
+    return cv.wait_for(l, std::chrono::seconds(120), [&] { return completions > 0; });
+  }
+  bool contractKept() {
+    std::lock_guard<std::mutex> g(mu);
+    return completions == 1 && !viaPlain && !nullHosts;
+  }
+};
+
+#ifdef UCACHE_FUZZ_HAVE_TRANSPOSE
+// The uCache plugin this process mapped, from /proc/self/maps ("none" if none).
+std::string mappedPlugin() {
+  FILE* m = std::fopen("/proc/self/maps", "r");
+  std::string found = "none";
+  char line[4096];
+  while (m && std::fgets(line, sizeof line, m))
+    if (const char* at = std::strstr(line, "libXrdClUCache"))
+      if (const char* path = std::strchr(line, '/'); path && path < at)
+        found.assign(path, std::strcspn(path, "\n"));
+  if (m)
+    std::fclose(m);
+  return found;
+}
+#endif
+
+// key-check: check_origin_integrity's key-position check of byte-cache misses.
+// <root-url> serves a copy of <local-path> whose basket at <off> (<len> bytes)
+// is zeros. Run with UCACHE_CHECK_ORIGIN_INTEGRITY=on and a fresh cache. The
+// zeroed basket lies wholly in the last page of the basket before it, which
+// ends where it starts. On new handles, one after another:
+//   0. (with UCACHE_KEYCHECK_STEP0, see below) the parse of the file's records
+//      that a miss runs: no other handle waits for it, a held origin stops it
+//      within the read's own timeout, and a later miss parses again;
+//   1. a Read of the basket before it is a miss whose rounded edge page holds
+//      the zeroed basket: its bytes are exact;
+//   2. a Read of the zeroed basket fails with errDataError, "failed its check"
+//      in the message (it was not served from the edge page of 1: nothing of
+//      that fetch was kept);
+//   3. a VectorRead of it fails the same way;
+//   4. a VectorRead of the basket before it reads exactly;
+//   5. a Read of the zeroed basket still fails its check (nothing of 4 kept);
+//   6. Reads of the zeroed basket on two fresh handles at once (one waits for
+//      the other's fetch) both fail their check, within seconds;
+//   7. seven Reads of it in a row on one handle all fail their check (a failed
+//      check never trips the handle to pass-through).
+// Every completion is exactly one, through HandleResponseWithHosts, with a
+// non-null HostList.
+int runKeyCheck(const char* url, const char* local, uint64_t off, uint32_t len) {
+  const char* mode = "key-check";
+  std::setvbuf(stdout, nullptr, _IOLBF, 0); // a run cut off by a timeout keeps what it printed
+#ifdef UCACHE_FUZZ_HAVE_TRANSPOSE
+  const char* on = ::getenv("UCACHE_CHECK_ORIGIN_INTEGRITY");
+  if (!on || std::strcmp(on, "on") != 0) {
+    std::printf("%s: SETUP: run with UCACHE_CHECK_ORIGIN_INTEGRITY=on\n", mode);
+    return 2;
+  }
+  const ucache::transpose::FileMeta fm = ucache::transpose::parseFile(local);
+  std::vector<std::pair<uint64_t, uint32_t>> baskets;
+  for (const auto& b : fm.branches)
+    for (size_t i = 0; i < b.basketSeek.size() && i < b.basketBytes.size(); ++i)
+      if (b.basketSeek[i] > 0)
+        baskets.emplace_back(static_cast<uint64_t>(b.basketSeek[i]),
+                             static_cast<uint32_t>(b.basketBytes[i]));
+  std::sort(baskets.begin(), baskets.end());
+  auto it = std::lower_bound(baskets.begin(), baskets.end(), std::make_pair(off, uint32_t{0}));
+  if (!fm.error.empty() || it == baskets.end() || it->first != off || it->second != len ||
+      it == baskets.begin()) {
+    std::printf("%s: SETUP: no basket of %u bytes at %llu with one before it in %s\n", mode, len,
+                (unsigned long long)off, local);
+    return 2;
+  }
+  const auto prev = *(it - 1);
+  const char* ps = ::getenv("UCACHE_PAGE_SIZE");
+  const uint64_t page = ps ? ::strtoull(ps, nullptr, 10) : 4096;
+  const uint64_t prevEnd = prev.first + prev.second;
+  const uint64_t edgeEnd = (prevEnd + page - 1) / page * page;
+  if (prevEnd != off || off % page == 0 || off + len > edgeEnd) {
+    std::printf("%s: SETUP: the zeroed basket is not wholly in the last page of the basket "
+                "before it (%llu+%u, page %llu)\n",
+                mode, (unsigned long long)prev.first, prev.second, (unsigned long long)page);
+    return 2;
+  }
+  // Commands that stop the origin answering and let it answer again.
+  const char* hold = ::getenv("UCACHE_KEYCHECK_HOLD");
+  const char* release = ::getenv("UCACHE_KEYCHECK_RELEASE");
+  // Step 0 reads a basket X that shares no page with the two above, so what it
+  // keeps changes nothing for the steps after it.
+  const bool step0 = ::getenv("UCACHE_KEYCHECK_STEP0") != nullptr;
+  const auto x = std::find_if(baskets.begin(), baskets.end(), [&](const auto& b) {
+    return b.first + b.second <= prev.first / page * page || b.first >= edgeEnd;
+  });
+  const char* reval = ::getenv("UCACHE_REVALIDATE_S");
+  if (step0 && (!hold || !release || !reval || std::strcmp(reval, "0") != 0 ||
+                x == baskets.end())) {
+    std::printf("%s: SETUP: step 0 needs UCACHE_KEYCHECK_HOLD and _RELEASE, "
+                "UCACHE_REVALIDATE_S=0 (a trusted handle would open the origin at its first "
+                "miss, and wait there), and a basket that shares no page with those two\n",
+                mode);
+    return 2;
+  }
+  // The fault: the origin serves zeros there (read with no plugin).
+  {
+    XrdCl::File plain(false);
+    std::vector<char> z(len, 1);
+    uint32_t got = 0;
+    if (!plain.Open(url, XrdCl::OpenFlags::Read).IsOK() ||
+        !plain.Read(off, len, z.data(), got).IsOK() || got != len ||
+        std::count(z.begin(), z.end(), 0) != static_cast<std::ptrdiff_t>(len)) {
+      std::printf("%s: SETUP: the origin does not serve zeros at %llu+%u\n", mode,
+                  (unsigned long long)off, len);
+      return 2;
+    }
+    const XrdCl::XRootDStatus closed = plain.Close();
+    (void)closed;
+  }
+  std::printf("%s: zeroed basket %llu+%u, the one before %llu+%u\n", mode,
+              (unsigned long long)off, len, (unsigned long long)prev.first, prev.second);
+  Source src(local);
+  int fails = 0;
+  auto verdict = [&](bool ok, const std::string& what) {
+    std::printf("%s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
+    fails += ok ? 0 : 1;
+  };
+  // Handlers and buffers live for the process: a late completion lands in them.
+  std::vector<ReadWait*> handlers;
+  auto buffer = [](size_t n) { return (new std::vector<char>(n, 0x5A))->data(); };
+  std::unique_ptr<XrdCl::File> file;
+  auto reopen = [&]() { // a close waits for the pages a read keeps
+    if (file && !file->Close().IsOK())
+      return false;
+    file = std::make_unique<XrdCl::File>(); // plugins enabled
+    return strictOpen(*file, url);
+  };
+  auto failsTheCheck = [&](ReadWait* w, int seconds) {
+    std::unique_lock<std::mutex> l(w->mu);
+    const bool done = w->cv.wait_for(l, std::chrono::seconds(seconds),
+                                     [&] { return w->completions > 0; });
+    const std::string said = done ? w->status.ToStr() : "no answer";
+    return std::make_pair(done && w->status.code == XrdCl::errDataError &&
+                              said.find("failed its check") != std::string::npos,
+                          said);
+  };
+  auto readZeroed = [&](XrdCl::File& f, const char* what) {
+    auto* w = new ReadWait();
+    handlers.push_back(w);
+    const XrdCl::XRootDStatus s = f.Read(off, len, buffer(len), w);
+    const auto r = s.IsOK() ? failsTheCheck(w, 120) : std::make_pair(false, s.ToString());
+    verdict(r.first, std::string(what) + ": " + r.second);
+    return r.first;
+  };
+  auto prevExact = [&](bool vector, const char* what, XrdCl::File* on = nullptr) {
+    auto* w = new ReadWait();
+    handlers.push_back(w);
+    char* buf = buffer(prev.second);
+    XrdCl::ChunkList chunks{XrdCl::ChunkInfo(prev.first, prev.second, buf)};
+    XrdCl::File& f = on ? *on : *file;
+    const XrdCl::XRootDStatus s = vector ? f.VectorRead(chunks, nullptr, w)
+                                         : f.Read(prev.first, prev.second, buf, w);
+    bool ok = s.IsOK() && w->wait();
+    std::lock_guard<std::mutex> g(w->mu);
+    ok = ok && w->status.IsOK() &&
+         std::memcmp(buf, src.bytes.data() + prev.first, prev.second) == 0;
+    verdict(ok, what);
+  };
+  // 0. Before anything of the file is read, so its records are not cached:
+  // with the origin held, handle 1's Read of X runs the parse of the records
+  // and waits in it, and handle 2's Read() call returns at once (it does not
+  // wait for another handle's parse; its miss goes unchecked). The parse gives
+  // up within handle 1's read timeout (3 s). Once the origin answers again and
+  // a second has passed, a miss parses again: the zeroed basket fails its check.
+  // Its two handles are the file's only ones; they are closed after it, and a
+  // read it parked keeps the entry for the 10 s of its missed-wakeup timer, so
+  // the steps after it start 11 s later, on a new entry of the file, as they
+  // do without it.
+  if (step0) {
+    auto h1 = std::make_unique<XrdCl::File>(), h2 = std::make_unique<XrdCl::File>();
+    if (!strictOpen(*h1, url) || !strictOpen(*h2, url) || std::system(hold) != 0) {
+      std::printf("%s: SETUP: step 0's opens or the hold command failed\n", mode);
+      return 2;
+    }
+    auto* w1 = new ReadWait();
+    auto* w2 = new ReadWait();
+    handlers.push_back(w1);
+    handlers.push_back(w2);
+    char* b1 = buffer(x->second);
+    char* b2 = buffer(x->second);
+    XrdCl::XRootDStatus s1;
+    std::atomic<bool> back{false};
+    std::thread t([&] {
+      s1 = h1->Read(x->first, x->second, b1, w1, 3);
+      back = true;
+    });
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    verdict(!back, "0. handle 1's Read() call of X (" + std::to_string(x->first) +
+                       ") waits in its parse of the file's records (the origin is held)");
+    const auto t0 = std::chrono::steady_clock::now();
+    const XrdCl::XRootDStatus s2 = h2->Read(x->first, x->second, b2, w2);
+    const double took =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const bool parsing = !back;
+    verdict(took < 1.0 && parsing, "0. handle 2's Read() call returns in " +
+                                       std::to_string(took) + " s, before handle 1's (" +
+                                       (parsing ? "it did" : "it did not") + ")");
+    for (int i = 0; i < 600 && !back; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    verdict(back, "0. handle 1's Read() call returns while the origin is held (the parse's "
+                  "reads carry the read's own timeout)");
+    const bool released = std::system(release) == 0;
+    t.join();
+    if (!released) {
+      std::printf("%s: SETUP: the release command failed: %s\n", mode, release);
+      return 2;
+    }
+    bool exact = true;
+    for (auto [st, w, b] : {std::make_tuple(s1, w1, b1), std::make_tuple(s2, w2, b2)}) {
+      const bool done = st.IsOK() && w->wait();
+      std::lock_guard<std::mutex> g(w->mu);
+      exact = exact && done && w->status.IsOK() &&
+              std::memcmp(b, src.bytes.data() + x->first, x->second) == 0;
+    }
+    verdict(exact, "0. both Reads of X are exact once the origin answers");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    readZeroed(*h1, "0. a Read of the zeroed basket on handle 1 then fails its check (the "
+                    "parse a failed read stopped ran again)");
+    const XrdCl::XRootDStatus c1 = h1->Close(), c2 = h2->Close();
+    (void)c1;
+    (void)c2;
+    std::this_thread::sleep_for(std::chrono::seconds(11));
+  }
+  if (!reopen()) {
+    std::printf("%s: SETUP: open failed\n", mode);
+    return 2;
+  }
+  std::printf("PLUGIN %s\n", mappedPlugin().c_str());
+  prevExact(false, "1. a Read of the basket before the zeroed one is exact (its edge page holds "
+                   "the zeroed basket)");
+  if (!reopen()) {
+    std::printf("%s: SETUP: close and reopen failed\n", mode);
+    return 2;
+  }
+  readZeroed(*file, "2. a Read of the zeroed basket fails its check (a miss, not the edge page)");
+  {
+    auto* w = new ReadWait();
+    handlers.push_back(w);
+    XrdCl::ChunkList chunks{XrdCl::ChunkInfo(off, len, buffer(len))};
+    const XrdCl::XRootDStatus s = file->VectorRead(chunks, nullptr, w);
+    const auto r = s.IsOK() ? failsTheCheck(w, 120) : std::make_pair(false, s.ToString());
+    verdict(r.first, "3. a VectorRead of the zeroed basket fails its check: " + r.second);
+  }
+  if (!reopen()) {
+    std::printf("%s: SETUP: close and reopen failed\n", mode);
+    return 2;
+  }
+  prevExact(true, "4. a VectorRead of the basket before the zeroed one is exact");
+  if (!reopen()) {
+    std::printf("%s: SETUP: close and reopen failed\n", mode);
+    return 2;
+  }
+  readZeroed(*file, "5. a Read of the zeroed basket after 4 fails its check (a miss again)");
+  // 6. Two handles of a fresh entry at once: the second read finds the first's
+  // fetch in flight and waits for it; when that fetch fails its check, it must
+  // fetch, and fail, for itself, and not wait out a timeout. Both handles first
+  // read the basket before (which arms the check). With UCACHE_KEYCHECK_HOLD
+  // and UCACHE_KEYCHECK_RELEASE (commands that stop the origin answering and
+  // let it answer again), both reads are issued while the origin is held, so
+  // the second surely waits for the first's fetch; without them it may not.
+  {
+    if (!reopen()) {
+      std::printf("%s: SETUP: close and reopen failed\n", mode);
+      return 2;
+    }
+    auto other = std::make_unique<XrdCl::File>();
+    if (!strictOpen(*other, url)) {
+      std::printf("%s: SETUP: second open failed\n", mode);
+      return 2;
+    }
+    prevExact(false, "6. (setup) the basket before the zeroed one is exact on the first handle");
+    prevExact(false, "6. (setup) ... and on the second", other.get());
+    const bool held = hold && release;
+    if (held && std::system(hold) != 0) {
+      std::printf("%s: SETUP: the hold command failed: %s\n", mode, hold);
+      return 2;
+    }
+    auto* w1 = new ReadWait();
+    auto* w2 = new ReadWait();
+    handlers.push_back(w1);
+    handlers.push_back(w2);
+    const XrdCl::XRootDStatus s1 = file->Read(off, len, buffer(len), w1);
+    const XrdCl::XRootDStatus s2 = other->Read(off, len, buffer(len), w2);
+    if (held) {
+      int early = 0;
+      for (auto* w : {w1, w2}) {
+        std::lock_guard<std::mutex> g(w->mu);
+        early += w->completions;
+      }
+      verdict(early == 0, "6. neither read was answered while the origin was held (" +
+                              std::to_string(early) + ")");
+      if (std::system(release) != 0) {
+        std::printf("%s: SETUP: the release command failed: %s\n", mode, release);
+        return 2;
+      }
+    }
+    const auto r1 = s1.IsOK() ? failsTheCheck(w1, 5) : std::make_pair(false, s1.ToString());
+    const auto r2 = s2.IsOK() ? failsTheCheck(w2, 5) : std::make_pair(false, s2.ToString());
+    verdict(r1.first, std::string("6. the first of two Reads at once fails its check within 5 s") +
+                          (held ? " (both issued while the origin was held)" : "") + ": " +
+                          r1.second);
+    verdict(r2.first, "6. the second, which waited for the first's fetch, fails its check within "
+                      "5 s: " + r2.second);
+    const XrdCl::XRootDStatus closed = other->Close();
+    (void)closed;
+  }
+  // 7. A failed check is not a cache error: a handle that fails it again and
+  // again never trips to passing reads straight to the origin, which would
+  // serve the zeros.
+  if (!reopen()) {
+    std::printf("%s: SETUP: close and reopen failed\n", mode);
+    return 2;
+  }
+  for (int i = 1; i <= 7; ++i)
+    if (!readZeroed(*file, ("7. failing Read " + std::to_string(i) + " of 7 on one handle fails "
+                            "its check").c_str()))
+      break; // one failure says it; the rest would only wait
+  const XrdCl::XRootDStatus cs = file->Close();
+  if (!cs.IsOK())
+    std::fprintf(stderr, "close: %s\n", cs.ToString().c_str());
+  std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a late second completion
+  bool kept = true;
+  for (auto* w : handlers)
+    kept = kept && w->contractKept();
+  verdict(kept, "every read had exactly one completion, through HandleResponseWithHosts, with a "
+                "non-null HostList");
+  verdict(openHandlersBad() == 0, "every open had exactly one completion");
+  std::printf("%s: %s\n", mode, fails ? "FAILED" : "clean");
+  return fails ? 1 : 0;
+#else
+  (void)url;
+  (void)local;
+  (void)off;
+  (void)len;
+  std::printf("%s: SETUP: built without the tree parser\n", mode);
+  return 2;
+#endif
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
   if (argc < 3) {
     std::fprintf(stderr,
                  "usage: %s <root-url> <local-path> [ops] [threads] [seed] "
-                 "[fuzz|inner-race|inner-race-relay|open-refused]\n",
+                 "[fuzz|inner-race|inner-race-relay|open-refused|key-check <off> <len>]\n",
                  argv[0]);
     return 2;
   }
   const char* url = argv[1];
   const std::string mode = argc > 6 ? argv[6] : "fuzz";
+  if (mode == "key-check")
+    return argc > 8 ? runKeyCheck(url, argv[2], ::strtoull(argv[7], nullptr, 10),
+                                  static_cast<uint32_t>(::strtoul(argv[8], nullptr, 10)))
+                    : 2;
   if (mode == "inner-race" || mode == "inner-race-relay")
     return runInnerRace(url, argv[2], argc > 3 ? ::strtoull(argv[3], nullptr, 10) : 200,
                         argc > 4 ? ::atoi(argv[4]) : 4, mode == "inner-race-relay");

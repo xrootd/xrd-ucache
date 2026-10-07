@@ -22,6 +22,7 @@
 #pragma once
 
 #include "ReadMap.h"
+#include "XrdClTimeout.h"
 
 #include <atomic>
 #include <cstdint>
@@ -34,6 +35,8 @@
 namespace ucache {
 
 struct OriginSource;
+struct HandleState;
+class FileEntry;
 
 class ReadRule : public std::enable_shared_from_this<ReadRule> {
  public:
@@ -78,6 +81,28 @@ class ReadRule : public std::enable_shared_from_this<ReadRule> {
 // Whether this process decided to read `key` directly: such a file is never
 // given a new slot store.
 bool readRuleDirect(const std::string& key);
+
+// check_origin_integrity: where every basket of the file's tree starts
+// (transpose::basketSeeks), 8 bytes a basket, for the key-position check of
+// byte-cache misses. Built once per file entry per process: from the rule's
+// own parse when the file has a rule, otherwise by one parse through
+// OriginSource. Empty for a file whose tree does not parse (RNTuple, not
+// ROOT): it is not checked. Null while the table is not built: while another
+// handle's parse runs (no handle waits for another's), and after a parse that
+// a failed origin read stopped; the caller's miss then goes unchecked, and a
+// later miss asks again. At most one parse of a file runs at a time. At most
+// 32 tables are held; the oldest is parsed again if it is needed again.
+// Thread-safe. The parse BLOCKS the thread that issues the miss (the reader's
+// own, or an XrdCl worker when a reader issues a read from inside a
+// completion); each of its synchronous reads carries `timeout`, the miss's own
+// (0: the client's default). After a parse that a failed read stopped, none
+// runs for a second. It keeps the pages of the records it reads in the byte
+// cache, and their other bytes are not checked. `fm`: the tree the caller
+// parsed already, which builds the table instead (ReadRule::observe).
+std::shared_ptr<const std::vector<uint64_t>> keySeeksFor(const std::shared_ptr<HandleState>& st,
+                                                         const std::shared_ptr<FileEntry>& entry,
+                                                         XrdTimeout timeout,
+                                                         const transpose::FileMeta* fm = nullptr);
 
 // fork(): a child decides afresh for every file (a decision costs at most a
 // few early fills, and the bytes read are the same). Before is called from the

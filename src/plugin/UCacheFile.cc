@@ -1081,6 +1081,25 @@ static std::shared_ptr<ReadRule> directRule(const std::shared_ptr<HandleState>& 
 static bool ruleReadsData(const std::shared_ptr<ReadRule>& r, uint64_t off, uint64_t len) {
   return r && r->readsData(off, len);
 }
+// check_origin_integrity on a byte-cache miss: each basket that starts in the
+// fetched bytes must say in its key that it sits where the tree's record puts
+// it (transpose::firstMisplacedKey). The handle's table of basket positions is
+// set on the thread that issues the miss, before the miss, by a parse whose
+// reads carry the miss's own timeout; the miss's completion reads it (null:
+// not checked). A file whose tree does not parse has an empty one. (A build
+// without the tree parser checks nothing.)
+static std::shared_ptr<const std::vector<uint64_t>> keySeeksOf(HandleState& st) {
+  std::lock_guard<std::mutex> g(st.mu);
+  return st.keySeeks;
+}
+static void armKeyCheck(const std::shared_ptr<HandleState>& st,
+                        const std::shared_ptr<FileEntry>& entry, XrdTimeout timeout) {
+  if (!globalConfig().checkOriginIntegrity || keySeeksOf(*st))
+    return;
+  auto seeks = keySeeksFor(st, entry, timeout);
+  std::lock_guard<std::mutex> g(st->mu);
+  st->keySeeks = std::move(seeks);
+}
 #else
 static std::shared_ptr<ReadRule> directRule(const std::shared_ptr<HandleState>&,
                                             const std::shared_ptr<FileEntry>&,
@@ -1088,6 +1107,8 @@ static std::shared_ptr<ReadRule> directRule(const std::shared_ptr<HandleState>&,
   return nullptr;
 }
 static bool ruleReadsData(const std::shared_ptr<ReadRule>&, uint64_t, uint64_t) { return false; }
+static void armKeyCheck(const std::shared_ptr<HandleState>&, const std::shared_ptr<FileEntry>&,
+                        XrdTimeout) {}
 #endif
 
 static void noteAppRead(const std::shared_ptr<HandleState>& st,
@@ -1548,6 +1569,29 @@ void persistPagesReserved(const std::shared_ptr<HandleState>& st,
   });
 }
 
+// A miss whose bytes failed the key-position check: reported with the server
+// that sent them, counted, and the read fails. Nothing of the fetch is kept
+// or served, and it is not relayed to the origin either (that would serve the
+// same bytes). The record carries the fetch's span, as the other fetch
+// failures do; the message names the basket. Returns the status the reader
+// gets. The fetch's bytes are not counted among the origin's.
+[[maybe_unused]] XRootDStatus* originCheckFailed(HandleState& st, FileEntry& entry, const char* op,
+                                                 uint64_t pos, uint32_t n, uint64_t spanOff,
+                                                 uint64_t spanLen, const std::string& server) {
+  char msg[600];
+  std::snprintf(msg, sizeof msg,
+                "%s: a basket at %llu from %s failed its check (key position differs from the "
+                "tree's record); not served",
+                entry.key().key.c_str(), static_cast<unsigned long long>(pos),
+                server.empty() ? "the origin" : server.c_str());
+  UCACHE_WARN("%s", msg);
+  if (st.store)
+    st.store->stats().originChecksFailed.fetch_add(n, std::memory_order_relaxed);
+  auto* refused = new XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, msg);
+  noteOriginFailure(st, &entry.obs().servers, op, spanOff, spanLen, *refused, server);
+  return refused;
+}
+
 // Single-Read miss: rounded wire read, user completion first, async persist.
 class MissReadHandler : public ResponseHandler {
  public:
@@ -1618,6 +1662,30 @@ class MissReadHandler : public ResponseHandler {
       return;
     }
 
+    // check_origin_integrity: a basket the reader asked for that fails the key
+    // check fails the read. One only in the rounded rest of the fetch (a
+    // neighbour sharing an edge page) does not concern this reader: it is
+    // served, and nothing of the fetch is kept, so the neighbour's own read
+    // misses and is checked. Readers parked on this fetch then fetch, one after
+    // another, for themselves.
+    bool keepNone = false;
+#ifdef UCACHE_HAVE_COLDRUN
+    if (auto seeks = keySeeksOf(*st_)) {
+      const auto m = transpose::firstMisplacedKey(*seeks, wireOff_, wireBuf_->data(), got,
+                                                  userOff_, userOff_ + userLen_);
+      if (m.count) {
+        if (gateLen_)
+          entry_->endFetch(wireOff_, gateLen_); // waiters fetch, and are checked, on their own
+        complete(user_,
+                 originCheckFailed(*st_, *entry_, "read", m.first, m.count, wireOff_, got,
+                                   answeredBy(*st_, h.get())),
+                 nullptr);
+        delete this;
+        return;
+      }
+      keepNone = m.outside;
+    }
+#endif
     // Serve the user first (memcpy only — no disk on this thread)...
     std::memcpy(userBuf_, wireBuf_->data() + (userOff_ - wireOff_), userLen_);
     if (st_->store) {
@@ -1642,8 +1710,11 @@ class MissReadHandler : public ResponseHandler {
     complete(user_, okStatus(), chunkResponse(userOff_, userLen_, userBuf_));
     // ...then persist full pages asynchronously (§5.2 step 4). Ownership of
     // the wire buffer MOVES to the task: single owner, no cross-thread
-    // refcount teardown (keeps TSan exact and the lifetime obvious).
-    persistPagesReserved(st_, entry_, wireOff_, std::move(wireBuf_), got, gateLen_);
+    // refcount teardown (keeps TSan exact and the lifetime obvious). Nothing
+    // of it is kept when its edge failed the key check (parked readers then
+    // fetch for themselves).
+    persistPagesReserved(st_, entry_, wireOff_, std::move(wireBuf_), keepNone ? 0 : got,
+                         gateLen_);
     delete this;
   }
 
@@ -1764,13 +1835,13 @@ class MissVReadHandler : public ResponseHandler {
     std::unique_ptr<XRootDStatus> s(status);
     std::unique_ptr<AnyObject> r(response);
     std::unique_ptr<HostList> h(hostList);
+    uint64_t wireBytes = 0;
+    for (const auto& w : wire_)
+      wireBytes += w.len;
 
     if (!s || !s->IsOK()) {
       // Wire failure: fail open — reissue the FULL original chunk list as
       // pure pass-through (hits included; wasteful but simple and faithful).
-      uint64_t wireBytes = 0;
-      for (const auto& w : wire_)
-        wireBytes += w.len;
       noteOriginFailure(*st_, &entry_->obs().servers, "readv", wire_.front().off, wireBytes,
                         s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal),
                         answeredBy(*st_, h.get()));
@@ -1792,6 +1863,45 @@ class MissVReadHandler : public ResponseHandler {
       delete this;
       return;
     }
+
+    // check_origin_integrity, as for a single read: a failing basket inside a
+    // miss chunk fails the whole request (one damaged basket fails the
+    // reader's whole fill); one only in an element's rounded rest is served
+    // and nothing of this answer is kept. Each element is checked on its own,
+    // so a key header that an element cut divides is not judged.
+    bool keepNone = false;
+#ifdef UCACHE_HAVE_COLDRUN
+    if (auto seeks = keySeeksOf(*st_)) {
+      // One walk of each element finds whether any key in it fails; only an
+      // element that holds one is walked again for each miss chunk it covers.
+      // Every element overlaps a miss chunk (it is one's rounded run), so a
+      // failing key in no chunk is "outside" for each chunk of its element.
+      transpose::MisplacedKeys bad;
+      for (const auto& w : wire_) {
+        if (!transpose::firstMisplacedKey(*seeks, w.off, w.buf->data(), w.len, w.off, w.off)
+                 .outside)
+          continue;
+        for (size_t idx : missIdx_) {
+          const auto& c = userChunks_[idx];
+          if (c.offset >= w.off + w.len || c.offset + c.length <= w.off)
+            continue;
+          const auto m = transpose::firstMisplacedKey(*seeks, w.off, w.buf->data(), w.len,
+                                                      c.offset, c.offset + c.length);
+          bad.first = bad.count ? bad.first : m.first;
+          bad.count += m.count;
+          keepNone = keepNone || m.outside;
+        }
+      }
+      if (bad.count) {
+        complete(user_,
+                 originCheckFailed(*st_, *entry_, "readv", bad.first, bad.count,
+                                   wire_.front().off, wireBytes, answeredBy(*st_, h.get())),
+                 nullptr);
+        delete this;
+        return;
+      }
+    }
+#endif
 
     // Scatter wire bytes into the user's miss chunks (memcpy only). A chunk can
     // span several elements: an oversized run is cut into protocol-legal pieces,
@@ -1825,9 +1935,6 @@ class MissVReadHandler : public ResponseHandler {
     }
     if (st_->store) {
       auto& stats = st_->store->stats();
-      uint64_t wireBytes = 0;
-      for (const auto& w : wire_)
-        wireBytes += w.len;
       stats.missBytes.fetch_add(missBytes, std::memory_order_relaxed);
       // What a file read directly fetched for its data is relayed, not a fill.
       stats.originBytes.fetch_add(wireBytes - std::min(wireBytes, directBytes),
@@ -1847,6 +1954,8 @@ class MissVReadHandler : public ResponseHandler {
                           true, wireTraceFields(server, inflight_.t0, inflight_.nc));
     }
     st_->noteCacheOk();
+    if (keepNone)
+      wire_.clear(); // served, and nothing of this answer is kept
     if (direct_) {
       noteDirectBytes(st_, entry_, directBytes);
       persistWithoutData();
@@ -2870,6 +2979,7 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
           0, offset, size);
     }
   }
+  armKeyCheck(st_, entry, timeout);
 
   // MISS from the caller's thread: rounded wire read. Dedup: an identical
   // rounded miss already in flight (another handle/thread — RDF-IMT re-reads
@@ -3041,6 +3151,8 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
   // max_read_fraction: a file read directly is neither read ahead nor waited
   // for; what it misses is fetched for this request only.
   std::shared_ptr<ReadRule> direct = missIdx.empty() ? nullptr : directRule(st, entry, chunks);
+  if (!missIdx.empty())
+    armKeyCheck(st, entry, 0); // as the wire vector read below
 #ifdef UCACHE_HAVE_PREFETCH
   // Read-ahead learns from every fill and, once confirmed, fetches the next
   // one while the reader computes; posted to its own thread, never blocking.

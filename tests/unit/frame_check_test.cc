@@ -378,3 +378,179 @@ TEST(BasketKey, FieldsRootIgnoresAreOnlyNoted) {
   EXPECT_FALSE(c.fail);
   EXPECT_EQ(c.anomalies.size(), 2u);
 }
+
+// The key-position check of fetched bytes (firstMisplacedKey). Each failing
+// case uses the same bytes as a passing one with one change; the passing cases
+// are the control that the check does not fail everything.
+namespace {
+
+// The record ROOT wrote (a version 1004 key: 64-bit fSeekKey at byte 18), as
+// it would read had ROOT written it at `seek`.
+std::vector<uint8_t> wideAt(uint64_t seek) {
+  std::vector<uint8_t> w = bytes(kLzmaRecord, sizeof(kLzmaRecord));
+  for (int i = 0; i < 8; ++i)
+    w[18 + i] = static_cast<uint8_t>(seek >> (8 * (7 - i)));
+  return w;
+}
+
+// The same record as a version 4 key: fSeekKey and fSeekPdir 4 bytes each, as
+// ROOT writes a key below 2 GiB.
+std::vector<uint8_t> narrowAt(uint32_t seek) {
+  const std::vector<uint8_t> w = wideAt(seek);
+  std::vector<uint8_t> n(w.begin(), w.begin() + 18);
+  n[3] = static_cast<uint8_t>(n[3] - 8); // fNbytes
+  n[4] = 0;
+  n[5] = 4;                              // fVersion
+  n[15] = static_cast<uint8_t>(n[15] - 8); // fKeylen
+  n.insert(n.end(), w.begin() + 22, w.begin() + 26); // fSeekKey, low 4 bytes
+  n.insert(n.end(), w.begin() + 30, w.begin() + 34); // fSeekPdir, low 4 bytes
+  n.insert(n.end(), w.begin() + 34, w.end());
+  return n;
+}
+
+// `rec` placed at file offset `at` in a span of `len` bytes from `spanOff`.
+struct Span {
+  uint64_t off;
+  std::vector<uint8_t> b;
+};
+Span spanWith(const std::vector<uint8_t>& rec, uint64_t spanOff, uint64_t at, size_t len) {
+  Span s{spanOff, std::vector<uint8_t>(len, 0xAB)};
+  std::copy(rec.begin(), rec.end(), s.b.begin() + (at - spanOff));
+  return s;
+}
+MisplacedKeys check(const std::vector<uint64_t>& seeks, const Span& s, uint64_t lo, uint64_t hi) {
+  return firstMisplacedKey(seeks, s.off, s.b.data(), s.b.size(), lo, hi);
+}
+
+} // namespace
+
+TEST(KeyPosition, RootWrittenKeysPass) {
+  // The record as ROOT wrote it, a 64-bit key at 300.
+  const uint64_t S = kLzmaRecordSeek;
+  MisplacedKeys m = check({S}, spanWith(wideAt(S), 0, S, 4096), S, S + sizeof(kLzmaRecord));
+  EXPECT_EQ(m.count, 0u);
+  EXPECT_FALSE(m.outside);
+  // The same as a 32-bit key: the shape parseKey reads, at the same place.
+  const std::vector<uint8_t> n = narrowAt(S);
+  const auto k = parseKey(n.data(), n.size(), 0);
+  ASSERT_TRUE(k);
+  EXPECT_EQ(k->ver, 4);
+  EXPECT_EQ(k->seekkey, kLzmaRecordSeek);
+  EXPECT_EQ(k->name, "x");
+  EXPECT_EQ(check({S}, spanWith(n, 0, S, 4096), S, S + n.size()).count, 0u);
+  // 64-bit keys at 27,130,216 (2408 bytes into a page) and past 2^31.
+  for (uint64_t at : {uint64_t{27130216}, (uint64_t{1} << 31) + 4096, uint64_t{5} << 32}) {
+    m = check({at}, spanWith(wideAt(at), at - 2408, at, 4096), at, at + sizeof(kLzmaRecord));
+    EXPECT_EQ(m.count, 0u) << at;
+    EXPECT_FALSE(m.outside) << at;
+  }
+}
+
+TEST(KeyPosition, ZerosWhereTheTreeSaysABasketIsFail) {
+  // A basket of 1,647 bytes at 27,130,216, 2408 bytes into its page, read
+  // back as zeros: the shape seen at a site.
+  const uint64_t S = 27130216;
+  Span s = spanWith(wideAt(S), S - 2408, S, 4096);
+  ASSERT_EQ(check({S}, s, S, S + 1647).count, 0u);
+  std::fill(s.b.begin() + 2408, s.b.begin() + 2408 + 1647, 0);
+  MisplacedKeys m = check({S}, s, S, S + 1647);
+  EXPECT_EQ(m.count, 1u);
+  EXPECT_EQ(m.first, S);
+  EXPECT_FALSE(m.outside);
+  // The same past 2^31: zeros read as a version 0 key whose position is 0.
+  const uint64_t far = (uint64_t{1} << 31) + 1000;
+  Span z = spanWith(wideAt(far), far - 1000, far, 4096);
+  ASSERT_EQ(check({far}, z, far, far + 1647).count, 0u);
+  std::fill(z.b.begin() + 1000, z.b.begin() + 1000 + 1647, 0);
+  m = check({far}, z, far, far + 1647);
+  EXPECT_EQ(m.count, 1u);
+  EXPECT_EQ(m.first, far);
+  // And a 32-bit key's header zeroed.
+  Span n = spanWith(narrowAt(kLzmaRecordSeek), 0, kLzmaRecordSeek, 4096);
+  ASSERT_EQ(check({uint64_t(kLzmaRecordSeek)}, n, 0, 4096).count, 0u);
+  std::fill(n.b.begin() + kLzmaRecordSeek, n.b.begin() + kLzmaRecordSeek + 40, 0);
+  EXPECT_EQ(check({uint64_t(kLzmaRecordSeek)}, n, 0, 4096).count, 1u);
+}
+
+TEST(KeyPosition, ASeekOffByOneFails) {
+  const uint64_t S = 27130216;
+  ASSERT_EQ(check({S}, spanWith(wideAt(S), S - 100, S, 4096), S, S + 100).count, 0u);
+  const MisplacedKeys m = check({S}, spanWith(wideAt(S + 1), S - 100, S, 4096), S, S + 100);
+  EXPECT_EQ(m.count, 1u);
+  EXPECT_EQ(m.first, S);
+  const uint64_t T = kLzmaRecordSeek;
+  ASSERT_EQ(check({T}, spanWith(narrowAt(T), 0, T, 4096), 0, 4096).count, 0u);
+  EXPECT_EQ(check({T}, spanWith(narrowAt(T + 1), 0, T, 4096), 0, 4096).count, 1u);
+}
+
+TEST(KeyPosition, WhatTheSpanDoesNotHoldWhollyIsNotJudged) {
+  const uint64_t S = 1000;
+  const std::vector<uint8_t> zeros(4096, 0);
+  // A header the span's end cuts: zeros read as version 0, whose header is 22
+  // bytes, and a misplaced 64-bit key, whose header is 26.
+  EXPECT_EQ(firstMisplacedKey({S}, 0, zeros.data(), S + 21, 0, S + 21).count, 0u);
+  EXPECT_EQ(firstMisplacedKey({S}, 0, zeros.data(), S + 22, 0, S + 22).count, 1u);
+  const Span cut = spanWith(wideAt(S + 1), 0, S, 4096);
+  EXPECT_EQ(firstMisplacedKey({S}, 0, cut.b.data(), S + 25, 0, S + 25).count, 0u);
+  EXPECT_EQ(firstMisplacedKey({S}, 0, cut.b.data(), S + 26, 0, S + 26).count, 1u);
+  // A span that starts inside a basket: that basket is not judged.
+  EXPECT_EQ(firstMisplacedKey({S}, S + 1, zeros.data(), 4096, S + 1, S + 4097).count, 0u);
+  // Zeros with no basket of the table inside them.
+  EXPECT_EQ(firstMisplacedKey({S, 9000}, 2000, zeros.data(), 4096, 2000, 6096).count, 0u);
+  EXPECT_EQ(firstMisplacedKey({}, 0, zeros.data(), 4096, 0, 4096).count, 0u);
+  EXPECT_EQ(firstMisplacedKey({S}, 0, nullptr, 0, 0, 0).count, 0u);
+}
+
+TEST(KeyPosition, OnlyTheReadersBasketsFailTheRead) {
+  // Two baskets in one fetch: the reader's at A is good; its neighbour at B is
+  // zeros and lies in the rounded rest of the fetch only.
+  const uint64_t A = 300, B = 3000;
+  Span s = spanWith(wideAt(A), 0, A, 4096);
+  std::fill(s.b.begin() + B, s.b.end(), 0);
+  MisplacedKeys m = check({A, B}, s, A, A + sizeof(kLzmaRecord));
+  EXPECT_EQ(m.count, 0u);
+  EXPECT_TRUE(m.outside);
+  m = check({A, B}, s, A, B + 1); // the reader's bytes reach B
+  EXPECT_EQ(m.count, 1u);
+  EXPECT_EQ(m.first, B);
+  EXPECT_FALSE(m.outside);
+}
+
+TEST(KeyPosition, BasketSeeksAreTheTreesOwn) {
+  FileMeta fm;
+  BranchInfo a, b, ext;
+  a.basketSeek = {500, 100, 0};
+  b.basketSeek = {300, 100};
+  ext.basketSeek = {700};
+  ext.externalFile = true;
+  fm.branches = {a, b, ext};
+  EXPECT_EQ(basketSeeks(fm), (std::vector<uint64_t>{100, 300, 500}));
+}
+
+TEST(KeyPosition, ZerosFailTheKeyHeaderCheck) {
+  // A key header of zeros parses (every length is 0) and fails on its position.
+  const std::vector<uint8_t> zeros(1647, 0);
+  const auto k = parseKey(zeros.data(), zeros.size(), 0);
+  ASSERT_TRUE(k);
+  const auto b = parseBasketHeader(zeros.data(), zeros.size(), 0, *k);
+  ASSERT_TRUE(b);
+  BranchInfo br;
+  br.name = "nElectron";
+  br.basketSeek = {27130216};
+  br.basketBytes = {1647};
+  br.basketEntry = {0, 100};
+  const BasketKeyCheck c = checkBasketKey(*k, *b, br, 0, "Events");
+  EXPECT_TRUE(c.fail);
+  ASSERT_FALSE(c.problems.empty());
+  EXPECT_EQ(c.problems.front(), "key position differs from the branch's record");
+}
+
+TEST(KeyPosition, CodecCheckOfZerosPassesToday) {
+  // A characterization of today's gap, not the behaviour wanted: an object of
+  // length 0 has no block to check, so the codec check passes all-zero bytes
+  // and only the key-position check catches them. Once the byte path checks
+  // codecs, a record that is not a basket where the tree says a basket is
+  // must count as failed, and this expectation is to be inverted.
+  const std::vector<uint8_t> zeros(1647, 0);
+  EXPECT_EQ(decode(zeros, 0).check, FrameCheck::kPassed);
+}

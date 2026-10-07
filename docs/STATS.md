@@ -213,10 +213,12 @@ ones included, so a run with caching disabled shows its origin failures too.
   TLS errors, failed authentication, a refused authorization). `site`: the
   server or its storage failed the request, or the redirectors sent it on past
   the redirect limit. `notfound`: no server holds the file. `data`: bytes
-  refused (a basket or page that failed its checksum). `expired`: a request
-  that outlived its timeout, whose timeout not said; with `adaptive_federation =
-  on`, among them an open that passed the open deadline (USER_GUIDE.md), its
-  `timeout_s` in its open line (FORMAT.md). `other`: the rest, among
+  refused (a basket or page that failed its checksum, or a basket of a
+  byte-cache fetch whose key is not where the tree's record puts it).
+  `expired`: a request that outlived its timeout, whose timeout not said; with
+  `adaptive_federation = on`, among them an open that passed the open deadline
+  (USER_GUIDE.md), its `timeout_s` in its open line (FORMAT.md). `other`: the
+  rest, among
   them a server's report that it could not reach a server behind it, which can
   be that site's network as well as this machine's. A read the cache fails open
   on (and relays) is counted when its first attempt fails, and again, as a
@@ -279,7 +281,14 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   is corrupted" and the log names the file, the position, the codec and the
   server; or that carry no checksum (ZSTD as ROOT writes it, baskets stored
   uncompressed), which nothing can check. Only what a first pass converts is
-  checked for now; other bytes are not counted here.
+  checked by checksum; other bytes are not counted here except as follows.
+  `origin_checks_failed` also counts the baskets of a byte-cache fetch from the
+  origin that the reader asked for and whose key does not say they sit where
+  the tree's record puts them: the read fails with "failed its check ... not
+  served", naming the position and the server, and nothing of that fetch is
+  kept; the fetch's bytes are not counted in `origin_bytes`, and its
+  `origin_failure` record, not a `wire` trace line, shows it. This check
+  counts no passes.
 - `cold_replica_convert_us` — time spent converting, summed over the threads that did
   it; it is CPU a pass spends that a pass without recompression does not.
 - `cold_replica_declined` — converted records not kept: they still did not fit

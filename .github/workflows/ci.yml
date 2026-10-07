@@ -51,6 +51,20 @@ jobs:
           printf 'url = 127.0.0.1:10940\nlib = %s\nenable = true\n' "$PWD/build/src/plugin/libXrdClUCache.so" > /tmp/conf/u.conf
           XRD_PLUGINCONFDIR=/tmp/conf UCACHE_DIR=/tmp/cache ./build/tests/ucache-plugin-fuzz root://127.0.0.1:10940//bench/data/f.bin /bench/data/f.bin 100000 1 1
           XRD_PLUGINCONFDIR=/tmp/conf UCACHE_DIR=/tmp/cache ./build/tests/ucache-plugin-fuzz root://127.0.0.1:10940//bench/data/f.bin /bench/data/f.bin 100000 8 2
+      - name: a basket the origin serves as zeros fails the key-position check
+        run: |
+          # Jet_pt basket 1 of the fixture (2481 bytes at 4915) lies wholly in the
+          # last page of the basket before it, a page that holds none of the
+          # file's records. The origin serves a copy with that basket zeroed.
+          cp tests/data/unnamed_codec_fixture.root /bench/data/zeroed.root
+          dd if=/dev/zero of=/bench/data/zeroed.root bs=64K seek=4915 count=2481 \
+             oflag=seek_bytes iflag=count_bytes conv=notrunc status=none
+          chmod a+r /bench/data/zeroed.root
+          # A cache of its own: the mode needs one that holds none of the file.
+          mkdir -p /tmp/cache-keycheck
+          XRD_PLUGINCONFDIR=/tmp/conf UCACHE_DIR=/tmp/cache-keycheck UCACHE_CHECK_ORIGIN_INTEGRITY=on \
+            ./build/tests/ucache-plugin-fuzz root://127.0.0.1:10940//bench/data/zeroed.root \
+            tests/data/unnamed_codec_fixture.root 0 1 0 key-check 4915 2481
       - name: copies through the plugin are the origin's bytes (copy engine vs a reader, one process)
         run: |
           # A cache of its own: the probe needs one that does not hold the file yet.

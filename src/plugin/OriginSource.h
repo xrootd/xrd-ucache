@@ -32,6 +32,8 @@ struct OriginSource : transpose::Source {
 
   std::shared_ptr<HandleState> st;
   std::shared_ptr<FileEntry> entry;
+  bool readFailed = false; // a read from the origin failed (which says nothing of the file)
+  XrdTimeout timeout = 0;  // of each read from the origin (0: the client's default)
 
   bool has(uint64_t off, uint64_t n) override {
     return off + n >= off && off + n <= entry->fileSize();
@@ -62,8 +64,10 @@ struct OriginSource : transpose::Source {
       return false;
     std::vector<char> buf(we - ws);
     XrdCl::File* f = st->acquireInner();
-    if (!f)
+    if (!f) {
+      readFailed = true;
       return false;
+    }
     uint32_t got = 0;
     const uint64_t t0 = nowUs();
     // Counted among the reads in flight to its server for as long as it is
@@ -75,14 +79,16 @@ struct OriginSource : transpose::Source {
     std::atomic<uint64_t>* srv = st->store ? serverInFlight(server) : nullptr;
     const uint64_t inFlight = srv ? srv->fetch_add(1, std::memory_order_relaxed) + 1 : 0;
     XrdCl::XRootDStatus s = f->Read(ws, static_cast<uint32_t>(we - ws), buf.data(), got,
-                                    static_cast<ucache::XrdTimeout>(0));
+                                    timeout);
     if (srv)
       srv->fetch_sub(1, std::memory_order_relaxed);
     st->releaseInner();
     if (!s.IsOK())
       noteOriginFailure(*st, &entry->obs().servers, "records", ws, we - ws, s, server);
-    if (!s.IsOK() || got < off + n - ws)
+    if (!s.IsOK() || got < off + n - ws) {
+      readFailed = true;
       return false;
+    }
     if (st->store) {
       auto& stats = st->store->stats();
       stats.originBytes.fetch_add(got, std::memory_order_relaxed);

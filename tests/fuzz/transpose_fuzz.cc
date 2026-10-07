@@ -8,7 +8,8 @@
 //   transpose-fuzz [seed-root-file]     (or UCACHE_FUZZ_FILE)
 //
 // Stage 1 (always): parseKey/decompressFrames over random + magic-seeded
-// buffers. Stage 2 (with a seed file — a SMALL ROOT-written TTree):
+// buffers, and the key-position check over random spans and basket tables.
+// Stage 2 (with a seed file — a SMALL ROOT-written TTree):
 // whole-file mutants (byte flips biased into the header/tree-key/
 // keys-list regions the parser actually reads, big-endian length bombs,
 // truncations, extensions, zeroed spans) -> parseFile -> the slot layout over
@@ -21,10 +22,12 @@
 #include "Transposer.h"
 #include "TreeMeta.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <memory>
 #include <random>
 #include <string>
 #include <unistd.h>
@@ -89,6 +92,75 @@ void bufferFuzz(uint64_t iters, uint64_t seed) {
     }
   }
   std::printf("transpose-fuzz: buffer stage clean (%llu iters)\n",
+              (unsigned long long)iters);
+}
+
+// The key-position check over random fetched spans and random basket tables:
+// it must read nothing outside the span (each span is its own allocation of
+// exactly its length, for the ASan lane), give the same answer twice, report
+// only seeks of the table inside the reader's range, never fail a key that
+// says where it sits, and fail one whose position was changed.
+void keyPositionFuzz(uint64_t iters, uint64_t seed) {
+  std::mt19937_64 rng(seed ^ 0x6b6579);
+  for (uint64_t i = 0; i < iters; ++i) {
+    const size_t n = rng() % 8192;
+    const uint64_t spanOff = rng() % 2 ? rng() % 100000 : (uint64_t{1} << 31) + rng() % 100000;
+    std::unique_ptr<uint8_t[]> p(n ? new uint8_t[n] : nullptr);
+    for (size_t k = 0; k < n; ++k)
+      p[k] = rng() % 3 ? 0 : static_cast<uint8_t>(rng());
+    std::vector<uint64_t> seeks;
+    const size_t ns = rng() % 16;
+    for (size_t k = 0; k < ns; ++k) {
+      const uint64_t at = rng() % (n + 64); // drawn in this order, so a seed replays
+      const uint64_t before = rng() % 4 ? 0 : rng() % 64;
+      seeks.push_back(spanOff + at - before);
+    }
+    std::sort(seeks.begin(), seeks.end());
+    seeks.erase(std::unique(seeks.begin(), seeks.end()), seeks.end());
+    // Some baskets carry a key that says where they sit, 32- or 64-bit.
+    std::vector<uint64_t> good;
+    std::vector<bool> goodWide;
+    uint64_t end = spanOff; // keys are written in order and never overlap
+    for (uint64_t s : seeks) {
+      if (s < end || s - spanOff + 26 > n || rng() % 2)
+        continue;
+      uint8_t* k = p.get() + (s - spanOff);
+      const bool wide = s > INT32_MAX || rng() % 2;
+      k[4] = wide ? 0x03 : 0;
+      k[5] = wide ? 0xec : 4;
+      for (int b = 0; b < (wide ? 8 : 4); ++b)
+        k[18 + b] = static_cast<uint8_t>(s >> (8 * ((wide ? 7 : 3) - b)));
+      good.push_back(s);
+      goodWide.push_back(wide);
+      end = s + 26;
+    }
+    const uint64_t lo = spanOff + rng() % (n + 1), hi = lo + rng() % (n + 1);
+    const MisplacedKeys a = firstMisplacedKey(seeks, spanOff, p.get(), n, lo, hi);
+    const MisplacedKeys b = firstMisplacedKey(seeks, spanOff, p.get(), n, lo, hi);
+    if (a.count != b.count || a.first != b.first || a.outside != b.outside)
+      violate("firstMisplacedKey: not deterministic", i, seed);
+    if (a.count && (a.first < lo || a.first >= hi || a.first < spanOff ||
+                    !std::binary_search(seeks.begin(), seeks.end(), a.first) ||
+                    std::binary_search(good.begin(), good.end(), a.first)))
+      violate("firstMisplacedKey: reported a basket it may not judge", i, seed);
+    if (a.count > seeks.size())
+      violate("firstMisplacedKey: more failures than baskets", i, seed);
+    // And it catches what it must: a good key the reader asked for, with one
+    // byte of its position changed, fails.
+    for (size_t g = 0; g < good.size(); ++g) {
+      if (good[g] < lo || good[g] >= hi)
+        continue;
+      uint8_t& last = p[good[g] - spanOff + (goodWide[g] ? 25 : 21)];
+      last ^= 0x01;
+      if (firstMisplacedKey(seeks, spanOff, p.get(), n, lo, hi).count == 0)
+        violate("firstMisplacedKey: a key whose position was changed passed", i, seed);
+      last ^= 0x01;
+      break;
+    }
+    if (failures)
+      return;
+  }
+  std::printf("transpose-fuzz: key-position stage clean (%llu iters)\n",
               (unsigned long long)iters);
 }
 
@@ -289,6 +361,7 @@ int main(int argc, char** argv) {
   const char* file = argc > 1 ? argv[1] : ::getenv("UCACHE_FUZZ_FILE");
 
   bufferFuzz(iters * 20, seed);
+  keyPositionFuzz(iters * 20, seed);
   if (file && *file) {
     int rc = fileFuzz(file, iters, seed);
     if (rc)

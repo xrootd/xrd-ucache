@@ -47,7 +47,76 @@ std::deque<std::weak_ptr<ReadRule>>& maps() {
 
 std::atomic<bool> g_warned{false};
 
+// The key-seek tables (keySeeksFor), oldest first, one per file entry: a file
+// changed at the origin has a new entry, so a table never outlives the bytes it
+// was parsed from. The lock is never held across a parse, so no handle waits
+// for another's. Lock order: a rule's lock, then this one.
+constexpr size_t kMaxKeySeekTables = 32;
+// After a parse that a failed origin read stopped, no other for this long: a
+// failing origin costs one parse attempt a second, not one a miss.
+constexpr uint64_t kKeySeekRetryUs = 1'000'000;
+struct KeySeekTable {
+  std::weak_ptr<FileEntry> entry; // compared by identity, never locked
+  bool parsing = false;
+  uint64_t failedUs = 0; // when a failed origin read last stopped a parse
+  std::shared_ptr<const std::vector<uint64_t>> seeks; // null until built
+};
+std::mutex& tablesMu() {
+  static auto* m = new std::mutex;
+  return *m;
+}
+std::deque<std::shared_ptr<KeySeekTable>>& tables() {
+  static auto* d = new std::deque<std::shared_ptr<KeySeekTable>>();
+  return *d;
+}
+
 } // namespace
+
+// The one place a table is built: from `fm` when the caller parsed the tree
+// already (ReadRule::observe), else by one parse through OriginSource, if no
+// parse of the file is running. A parse that failed on the file's content
+// (not ROOT, no tree: RNTuple) leaves the table empty for good; one that a
+// failed origin read stopped leaves it unbuilt, for a miss after the retry
+// interval to try again.
+std::shared_ptr<const std::vector<uint64_t>> keySeeksFor(const std::shared_ptr<HandleState>& st,
+                                                         const std::shared_ptr<FileEntry>& entry,
+                                                         XrdTimeout timeout,
+                                                         const tp::FileMeta* fm) {
+  std::unique_lock<std::mutex> g(tablesMu());
+  std::shared_ptr<KeySeekTable> t;
+  for (const auto& x : tables())
+    if (!x->entry.owner_before(entry) && !entry.owner_before(x->entry))
+      t = x;
+  if (!t) {
+    t = std::make_shared<KeySeekTable>();
+    t->entry = entry;
+    tables().push_back(t);
+    if (tables().size() > kMaxKeySeekTables)
+      tables().pop_front();
+  }
+  if (!fm && (t->seeks || t->parsing || (t->failedUs && nowUs() - t->failedUs < kKeySeekRetryUs)))
+    return t->seeks;
+  OriginSource src;
+  tp::FileMeta own;
+  if (!fm) {
+    t->parsing = true;
+    g.unlock();
+    src.st = st;
+    src.entry = entry;
+    src.timeout = timeout;
+    own = tp::parseReaderTree(src, static_cast<int64_t>(entry->fileSize()));
+    g.lock();
+    t->parsing = false;
+    if (src.readFailed) {
+      t->failedUs = nowUs();
+      return t->seeks;
+    }
+    fm = &own;
+  }
+  t->seeks = std::make_shared<const std::vector<uint64_t>>(
+      fm->error.empty() ? tp::basketSeeks(*fm) : std::vector<uint64_t>());
+  return t->seeks;
+}
 
 void readRuleBeforeFork() {
   // The child's handler uses these: a first use in progress in another thread
@@ -56,6 +125,8 @@ void readRuleBeforeFork() {
   (void)registry();
   (void)mapsMu();
   (void)maps();
+  (void)tablesMu();
+  (void)tables();
 }
 
 void readRuleAfterForkChild() {
@@ -64,8 +135,11 @@ void readRuleAfterForkChild() {
   rules->swap(registry());
   auto* held = new std::deque<std::weak_ptr<ReadRule>>(); // leaked
   held->swap(maps());
+  auto* kept = new std::deque<std::shared_ptr<KeySeekTable>>(); // leaked
+  kept->swap(tables());
   new (&regMu()) std::mutex;
   new (&mapsMu()) std::mutex;
+  new (&tablesMu()) std::mutex;
 }
 
 ReadRule::~ReadRule() = default;
@@ -124,6 +198,8 @@ ReadRule::State ReadRule::observe(const std::vector<std::pair<uint64_t, uint64_t
     tp::FileMeta fm = tp::parseReaderTree(src, static_cast<int64_t>(size_));
     if (fm.error.empty()) {
       map_ = std::make_unique<tp::ReadMap>(tp::ReadMap::fromTree(fm));
+      if (globalConfig().checkOriginIntegrity) // the key-position check's table, from this parse
+        keySeeksFor(src.st, src.entry, 0, &fm);
     } else if (fm.error.find("not found") != std::string::npos && src.fetchHead()) {
       tp::RNTupleMeta rm = tp::parseRNTuple(src, static_cast<int64_t>(size_), "");
       if (rm.error.empty())

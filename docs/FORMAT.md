@@ -406,7 +406,8 @@ any server and has no line.
  "msg":""}
 ```
 
-- `op`: `read` and `readv` (the byte cache's fetches), `first_pass` (a
+- `op`: `read` and `readv` (the byte cache's fetches, and a basket there
+  whose key is not where the tree's record puts it), `first_pass` (a
   replica's first pass, and a basket or page there that failed its checksum),
   `records` (the file's own records, read to set up its layout), `relay` (a
   request passed straight to the origin).
