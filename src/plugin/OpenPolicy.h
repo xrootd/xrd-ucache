@@ -216,6 +216,12 @@ int budgetS(int readerTimeoutS, int sewS, int trS, int maxS = 0);
 // otherwise never have a second attempt).
 bool budgetSpent(int64_t remainingMs, int attemptDeadlineS, int readerTimeoutS = 0);
 
+// How long a copy the regional redirector lists is given to answer the question of its
+// state before an open of it: a copy at a site that stalls would otherwise take the
+// open's whole deadline, one after the other, before any copy is opened.
+inline constexpr int kCandidateStatS = 10;
+static_assert(kCandidateStatS < kOpenDeadlineS, "a copy's answer must not take a whole open deadline");
+
 // One site an open failed at, as the final error and the next attempt see it.
 struct SiteFailure {
   std::string server; // host:port

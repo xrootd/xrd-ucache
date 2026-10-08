@@ -709,7 +709,10 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
                   const AttemptView& w, const std::string& sentUrl, int sourceAttempt,
                   uint64_t want) noexcept {
   const bool ok = s.IsOK();
-  if (!ok && sourceAttempt <= cfg.openRetries && isRetryableOpen(s.code, s.errNo)) {
+  // With a sequence an expiry is not retried at the same URL, which meets the server that
+  // stalled or its neighbour: it goes on to another site.
+  if (!ok && sourceAttempt <= cfg.openRetries && isRetryableOpen(s.code, s.errNo) &&
+      !(seq && s.code == xrdwire::kErrOperationExpired)) {
     if (st.store)
       st.store->stats().openRetries.fetch_add(1, std::memory_order_relaxed);
     return Next::kSameSource;
@@ -947,7 +950,7 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     const std::string where = urlAtServer(base, server, false);
     XRootDStatus s;
     std::unique_ptr<AnyObject> resp;
-    const int t = q.timeout();
+    const int t = std::min<int>(q.timeout(), kCandidateStatS);
     (void)fsCall(
         server, t, 2 * q.trS,
         [&](XrdCl::FileSystem& fs, ResponseHandler* h) {
