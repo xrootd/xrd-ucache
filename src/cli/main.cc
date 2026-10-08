@@ -4020,7 +4020,9 @@ void federationNote(const Config& cfg) {
   }
   std::printf("  [NOTE] adaptive_federation = on: jobs from this shell set the XRootD client's\n"
               "         %s,\n"
-              "         except where a client.conf sets one\n",
+              "         except where a client.conf sets one; a file opened through a redirector also has\n"
+              "         the client's own read recovery turned off and a deadline of 120 s for each read\n"
+              "         (a read that fails is made again at another site)\n",
               predicted.c_str());
   if (!cfg.cacheDir.empty())
     if (const std::string rs = lastRunSettings(cfg.cacheDir + "/stats"); !rs.empty())

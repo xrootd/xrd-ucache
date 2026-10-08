@@ -235,7 +235,10 @@ ones included, so a run with caching disabled shows its origin failures too.
   the bound of sites or time, or by the redirector sending the open back to a
   server or site that failed already). An open whose first failure is final (no
   copy anywhere, a redirector that refuses the client itself) is in none of
-  them.
+  them. The open that moves a file's reads to another site after a read failed
+  (USER_GUIDE.md) counts in them as an open does: each of its attempts is one
+  in `open_failovers`, its success one in `opens_recovered`, and its failure
+  at every site one in `opens_failed_everywhere`.
 - `open_deadline_expiries` — with `adaptive_federation = on`, open attempts
   that expired at their timeout: the open deadline, the job's own shorter open
   timeout, or what was left of an open's time budget (also counted in

@@ -219,8 +219,10 @@ a sick cache filesystem (full, read-only, failing disk).
 When the server a job reads from dies and stays down, the XRootD client keeps
 trying to reconnect before it reports an error. With its default settings that
 takes about 8 minutes (measured: 480 s), and meanwhile reads neither fail nor
-progress. A job through uCache behaves exactly like one without it, with caching
-on or off: the error arrives at the same moment.
+progress. With the default settings a job through uCache behaves exactly like
+one without it, with caching on or off: the error arrives at the same moment.
+(With `adaptive_federation = on` a read that fails at its server is made again
+at another site; see below.)
 
 To fail sooner, shorten the client's reconnect policy for the job, for example
 `XRD_CONNECTIONWINDOW=15 XRD_CONNECTIONRETRY=2`: the read error then comes after
@@ -318,8 +320,9 @@ the copies at that server's domain are tried last. A copy listed
 as on tape is skipped, with the log line `<file>: the copy at <host>:<port> is
 on tape (offline); not opened`.
 The counters `open_failovers`, `opens_recovered`, `opens_failed_everywhere`,
-`failover_locates` and `offline_copies_skipped` (STATS.md) count these, and the per-file record file has a line per attempt
-(FORMAT.md, routes `failover` and `candidate`).
+`failover_locates` and `offline_copies_skipped` (STATS.md) count these, and the
+per-file record file has a line per attempt (FORMAT.md, routes `failover` and
+`candidate`).
 
 ## uCache read the file at another site
 
@@ -344,6 +347,15 @@ connection (`StreamTimeout`, 60 s, and its `TimeoutResolution`, 15 s, by
 default), which fails every read of that connection at once; the 120 s limit is
 for a server that answers other requests and not this one. A job that sets
 `StreamTimeout` above 120 s sees each of its files move after its own 120 s.
+
+The 120 s covers a whole call, a read split into several requests included, so
+a read of a large range that the connection cannot deliver in 120 s fails at the
+deadline, and is made again at another site with the same result, though the
+server works. A job whose own timeout for a read is 30 s or less (uproot passes
+30 s) is not moved when a server stalls: its timeout ends the read before the
+time a move needs is left, and it gets that timeout's error, as it would
+without uCache. A file opened through an EOS front end moves through that front
+end, which names the next server: no other site is asked.
 
 A session the client lost while a file was idle (a server restarted) moves the
 file at its next read without naming the server it left. A file with the client's

@@ -489,6 +489,8 @@ std::string Config::setNote(const std::string& key, const std::string& value) co
     return "  the XRootD client's connection settings change too: connection window 31 s, "
            "connection retries 2, error window 180 s, each where no XRD_* variable or "
            "client.conf sets it; every read open of a cached file gets a 60 s deadline; "
+           "a file opened through a redirector has the client's own read recovery turned off and a "
+           "deadline of 120 s for each read, and a read that fails is made again at another site; "
            "check_origin_integrity is forced on";
   return "";
 }
