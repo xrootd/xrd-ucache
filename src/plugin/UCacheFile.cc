@@ -709,10 +709,11 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
                   const AttemptView& w, const std::string& sentUrl, int sourceAttempt,
                   uint64_t want) noexcept {
   const bool ok = s.IsOK();
-  // With a sequence an expiry is not retried at the same URL, which meets the server that
-  // stalled or its neighbour: it goes on to another site.
+  // With a sequence, an expiry at a server behind a redirector is not retried at the same URL,
+  // which meets the server that stalled or its neighbour: it goes on to another site. An open
+  // that has no other site to go to (a direct URL, or the redirector itself) is retried.
   if (!ok && sourceAttempt <= cfg.openRetries && isRetryableOpen(s.code, s.errNo) &&
-      !(seq && s.code == xrdwire::kErrOperationExpired)) {
+      !(seq && s.code == xrdwire::kErrOperationExpired && w.v.viaRedirector && w.v.hops > 1)) {
     if (st.store)
       st.store->stats().openRetries.fetch_add(1, std::memory_order_relaxed);
     return Next::kSameSource;
