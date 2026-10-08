@@ -385,7 +385,11 @@ TEST(OpenPolicy, ReadAttemptTimeout) {
   // After a failed attempt: what is left of the budget, nothing once it is below
   // the floor (30 s, and for a reader with a timeout of its own half of it).
   EXPECT_EQ(again(0, 1790), 0) << "10 s left";
-  EXPECT_EQ(again(0, 1770), 30);
+  EXPECT_EQ(again(0, 1769), 31);
+  EXPECT_EQ(again(0, 1770), 30) << "30 s left: the floor itself is allowed";
+  EXPECT_EQ(again(0, 1771), 0) << "29 s left: below the floor";
+  EXPECT_EQ(again(100, 70), 30);
+  EXPECT_EQ(again(100, 71), 0) << "a reader with 100 s: the floor is 30, 29 left";
   EXPECT_EQ(again(0, 1000), 120);
   EXPECT_EQ(again(100, 60), 40);
   EXPECT_EQ(again(30, 0), 30) << "a refusal at once, from a reader that gives 30 s";
@@ -615,4 +619,95 @@ TEST(OpenPolicy, OrderLocations) {
   EXPECT_EQ(names(orderLocations(siteOnly, {}, stalled)), "red1.site.org:1094 red2.site.org:1094 ")
       << "nothing else left: the site's servers, in the answer's order";
   EXPECT_STREQ(openRouteName(OpenRoute::kCandidate), "candidate");
+}
+
+// The address of a copy in a locate's answer.
+TEST(OpenPolicy, LocationOfAnAddress) {
+  const struct {
+    const char* address;
+    const char* host;
+    int port;
+  } forms[] = {
+      {"cms-xrd-global.cern.ch:1094", "cms-xrd-global.cern.ch", 1094},
+      {"Data1.Site.ORG:2094", "Data1.Site.ORG", 2094}, // the case is kept: matching lowercases
+      {"10.1.2.3:1095", "10.1.2.3", 1095},
+      {"[2001:db8::7]:1094", "2001:db8::7", 1094},
+      {"[::1]:1094", "::1", 1094},
+      {"[::127.0.0.1]:12122", "127.0.0.1", 12122}, // an IPv4 address in its IPv6 form
+      {"[::ffff:127.0.0.1]:12123", "127.0.0.1", 12123},
+      {"::ffff:10.0.0.9:1096", "10.0.0.9", 1096}, // unbracketed: the last colon is the port's
+      {"host.example.org", "host.example.org", 1094}, // no port: the default one
+  };
+  for (const auto& f : forms) {
+    const Location l = locationOf(f.address, false, false);
+    EXPECT_EQ(l.host, f.host) << f.address;
+    EXPECT_EQ(l.port, f.port) << f.address;
+  }
+  const Location m = locationOf("a.two.org:1094", true, true);
+  EXPECT_TRUE(m.manager);
+  EXPECT_TRUE(m.pending);
+  EXPECT_FALSE(locationOf("a.two.org:1094", false, false).manager);
+}
+
+// A copy on tape: its stat flags say so, or a test's list names its server.
+TEST(OpenPolicy, CopyOffline) {
+  const std::string list = ",127.0.0.1:12122,[::1]:1094,";
+  EXPECT_FALSE(copyOffline(0, "a.two.org:1094", nullptr));
+  EXPECT_TRUE(copyOffline(kStatOffline, "a.two.org:1094", nullptr));
+  EXPECT_TRUE(copyOffline(kStatOffline | 1, "a.two.org:1094", &list)) << "the flag with other flags";
+  EXPECT_FALSE(copyOffline(1 | 4, "a.two.org:1094", &list)) << "other flags are not the tape's";
+  EXPECT_TRUE(copyOffline(0, "127.0.0.1:12122", &list));
+  EXPECT_TRUE(copyOffline(0, "[::1]:1094", &list));
+  EXPECT_FALSE(copyOffline(0, "127.0.0.1:1212", &list)) << "a server is named whole: host and port";
+  EXPECT_FALSE(copyOffline(0, "0.0.1:12122", &list));
+}
+
+// Two rules say that a server or site failed already: failedBefore, for the copy an open
+// landed on, and the list of copies (orderLocations), for the ones still to try. They are
+// two implementations (one lowercases): each row says what each answers, and the rows
+// where they differ do so on purpose. `list`: the list of copies leaves the copy out.
+TEST(OpenPolicy, FailedBeforeAndTheListOfCopiesAgree) {
+  const std::vector<SiteFailure> failed = {
+      {"a.one.org:1094", "one.org", "a.one.org", "e"},
+      {"127.0.0.1:1095", "127.0.0.1", "", "e"},
+      {"::1:1093", "::1", "", "e"},
+      {"d.four.org:1094", "d.four.org:1094", "d.four.org", "never answered"}};
+  const auto excludedByList = [&](const std::string& host, int port) {
+    Location l, other;
+    l.host = host;
+    l.port = port;
+    other.host = "z.nine.org";
+    other.port = 1094;
+    const std::vector<Location> r = orderLocations({l, other}, {}, failed);
+    return r.size() == 1 && r[0].host == "z.nine.org";
+  };
+  const struct {
+    const char* host;
+    int port;
+    bool before; // failedBefore
+    bool list;   // excludedByList
+    const char* why;
+  } rows[] = {
+      {"a.one.org", 1094, true, true, "the server that failed"},
+      {"A.One.ORG", 1094, true, true, "the same, in another case"},
+      {"a2.one.org", 1094, true, true, "another server of the site"},
+      {"a.one.org", 1095, true, true, "another port of the server: the site failed"},
+      {"b.two.org", 1094, false, false, "another site"},
+      {"127.0.0.1", 1095, true, true, "an address: the server that failed"},
+      {"127.0.0.1", 1096, false, false, "an address is its own server alone"},
+      {"::1", 1093, true, true, "an IPv6 address: the server that failed"},
+      {"::1", 1094, false, false, "another port of the address"},
+      {"d.four.org", 1094, true, true, "a server that never answered"},
+      // The list also leaves out the other servers of the domain of a server that never
+      // answered, which stall as it did; an open that landed on one is not "failed before".
+      {"d.four.org", 1095, false, true, "a server that never answered is its own site"},
+      {"e.four.org", 1094, false, true, "a sibling in its domain"},
+  };
+  for (const auto& r : rows) {
+    SiteFailure f;
+    f.server = std::string(r.host) + ":" + std::to_string(r.port);
+    f.site = siteOf(r.host);
+    EXPECT_EQ(failedBefore(failed, f), r.before) << r.host << ":" << r.port << " " << r.why;
+    EXPECT_EQ(excludedByList(r.host, r.port), r.list) << r.host << ":" << r.port << " " << r.why;
+  }
 }

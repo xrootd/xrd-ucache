@@ -42,6 +42,14 @@
 #                          server, and open_failovers equal to those opens. With the
 #                          switch off the failed reads are relayed on the same file and
 #                          the client's read recovery stays on
+#   zeros                  a copy that serves a basket as zeros (the fixture of the key-position
+#                          check, tests/data/unnamed_codec_fixture.root): with the switch on the
+#                          read fails its check and is made again at another site, for a Read and
+#                          for a VectorRead, exactly, once; when the first move lands on a copy
+#                          that is damaged too, that answer is refused as well; when every copy
+#                          is damaged the reader gets errDataError, after at most four reads and
+#                          never the zeros; with the switch off (the check on) it gets the error
+#                          and no read is moved
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD=$(cd "${1:?usage: fed_ci.sh BUILD_DIR}" && pwd)
@@ -59,6 +67,7 @@ host() { env -u LD_LIBRARY_PATH -u XRD_PLUGINCONFDIR -u XRD_PLUGIN "$@"; }
 BASE=${FED_CI_PORT_BASE:-21100}
 RX=$BASE RC=$((BASE + 1)) AX=$((BASE + 21)) BX=$((BASE + 22)) CX=$((BASE + 23))
 W=$(mktemp -d "${TMPDIR:-/tmp}/fed-ci-XXXXXX"); chmod 755 "$W"
+cd "$W" || exit 2 # the servers' runtime directories stay here, not in the caller's
 echo "fed_ci: working in $W (ports $BASE..$((BASE + 23)))"
 FAILS=0
 verdict() { if [ "$2" = 0 ]; then echo "PASS: $1"; else echo "FAIL: $1"; FAILS=$((FAILS + 1)); fi; }
@@ -193,7 +202,7 @@ if [ "$DEF" = off ]; then
   direct_read a $L10; r=$?; [ "$r" != 0 ]; verdict "a refuses the file" $?
   RL0=$(regional_locates $L10)
   FEDENV=()
-  res=$(fuzz "$W/c10" "$W/f10.log" "root://127.0.0.1:$RX/$L10" "$W/f.bin" 12 1 1 open-failover)
+  res=$(fuzz "$W/c10" "$W/f10.log" "root://127.0.0.1:$RX/$L10" "$W/f.bin" 30 1 1 open-failover)
   echo "$res" | tail -2 | sed 's/^/    /'
   echo "$res" | grep -q '^open-failover: FAIL$'; verdict "some opens failed: the refusal was felt and nothing failed over" $?
   [ "$(grep 'MsgHandler created' "$W/f10.log" | grep -c 'kXR_locate ')" = 0 ]; verdict "no kXR_locate in the client's log" $?
@@ -215,19 +224,19 @@ place8() { # LFN server... (8 MiB)
 # CACHE -> the lines of one kind of its per-file records
 recs() { cat "$1"/stats/*.files.jsonl 2>/dev/null | grep "\"kind\":\"$2\""; }
 field() { sed -n "s/.*\"$1\":\"\{0,1\}\([^\",}]*\).*/\1/p"; } # a field of each line
-# rf CASE N SWITCH [KIND]: the case on a file of its own; sets RES, RC (its cache), SV (the servers it read from)
+# rf CASE N SWITCH [KIND]: the case on a file of its own; sets RES, RFC (its cache), SV (the servers it read from)
 rf() {
   local c=$1 n=$2 sw=$3 kind=${4:-}
   local l=/store/ci/rf-$c-${kind:-x}.bin
   place8 $l a b c
-  RC="$W/c-rf-$c-${kind:-x}"
+  RFC="$W/c-rf-$c-${kind:-x}"
   FEDENV=(UCACHE_ADAPTIVE_FEDERATION=$sw UCACHE_TEST_READ_FAIL_N=$n ${kind:+UCACHE_TEST_READ_FAIL_KIND=$kind})
-  RES=$(fuzz "$RC" "$W/rf-$c-${kind:-x}.log" "root://127.0.0.1:$RX/$l" "$W/f8.bin" 1 1 1 read-failover $c)
+  RES=$(fuzz "$RFC" "$W/rf-$c-${kind:-x}.log" "root://127.0.0.1:$RX/$l" "$W/f8.bin" 1 1 1 read-failover $c)
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-220
   SV=($(echo "$RES" | sed -n 's/^SERVERS //p'))
-  FL=($(recs "$RC" origin_failure | field data_server))   # the server of each failed read
-  MV=($(recs "$RC" open | grep '"route":"read"' | grep '"outcome":"ok"' | field data_server)) # where each move landed
-  NRA=$(recs "$RC" open | grep -c '"route":"read"')       # open attempts of moves
+  FL=($(recs "$RFC" origin_failure | field data_server))   # the server of each failed read
+  MV=($(recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | field data_server)) # where each move landed
+  NRA=$(recs "$RFC" open | grep -c '"route":"read"')       # open attempts of moves
 }
 clean() { echo "$RES" | grep -q "^read-failover $1: clean\$"; }
 
@@ -235,36 +244,106 @@ rf miss 2 on
 clean miss; verdict "miss: a Read and a VectorRead whose origin read failed are exact, once, and move the handle" $?
 [ "${#FL[@]}" = 2 ] && [ "${FL[0]}" = "${SV[0]}" ] && [ "${FL[1]}" = "${SV[1]}" ]; verdict "miss: the failed reads name the servers the handle was at (${FL[*]})" $?
 [ "${#MV[@]}" = 2 ] && [ "${MV[0]}" = "${SV[1]}" ] && [ "${MV[1]}" = "${SV[2]}" ]; verdict "miss: a move of route read after each landed at the next server (${MV[*]})" $?
-[ "$(counter "$RC" open_failovers)" = "$NRA" ]; verdict "miss: open_failovers $(counter "$RC" open_failovers) equals the attempts of route read ($NRA)" $?
+[ "$(counter "$RFC" open_failovers)" = "$NRA" ]; verdict "miss: open_failovers $(counter "$RFC" open_failovers) equals the attempts of route read ($NRA)" $?
 
 rf relay 2 on relay
 clean relay; verdict "relay: a PgRead and a VectorRead into one buffer that failed are exact, once, and move the handle" $?
-[ "$(recs "$RC" origin_failure | field op | tr '\n' ' ')" = "relay relay " ] && [ "${#MV[@]}" = 2 ]; verdict "relay: two failed relayed reads, two moves (${MV[*]})" $?
+[ "$(recs "$RFC" origin_failure | field op | tr '\n' ' ')" = "relay relay " ] && [ "${#MV[@]}" = 2 ]; verdict "relay: two failed relayed reads, two moves (${MV[*]})" $?
 
 rf refuse 3 on refuse
 clean refuse; verdict "refuse: reads the client refused at once are exact, once" $?
-[ "$(recs "$RC" origin_failure | grep -c '"code":109')" = 3 ] && [ "${#MV[@]}" -ge 1 ]; verdict "refuse: three refusals recorded with 109, each followed by a move (${#MV[@]} moves)" $?
+[ "$(recs "$RFC" origin_failure | grep -c '"code":109')" = 3 ] && [ "${#MV[@]}" -ge 1 ]; verdict "refuse: three refusals recorded with 109, each followed by a move (${#MV[@]} moves)" $?
 
 rf final 2 on final
 clean final; verdict "final: reads that failed with an error no other site would change are exact, once, and stay put" $?
-[ "$(recs "$RC" origin_failure | grep -c '"code":303')" = 2 ] && [ "$NRA" = 0 ]; verdict "final: two failures recorded with 303, no open of route read" $?
+[ "$(recs "$RFC" origin_failure | grep -c '"code":303')" = 2 ] && [ "$NRA" = 0 ]; verdict "final: two failures recorded with 303, no open of route read" $?
 
 for kind in "" late; do
   rf many 8 on $kind
   clean many; verdict "many${kind:+ ($kind)}: 32 reads at once at one handle, up to 8 of them failing, are exact, once" $?
   # The first failure is the arming read's, alone. The others (how many depends on how many of the reads missed: at most 7)
-  # were issued at the server it moved to and share one move. An injected failure carries no host, so one that is
-  # handled after that move names the server of the move's landing; late ones are all handled after the first move.
+  # were issued at the server it moved to and share a move. An injected failure carries no host, so one that is
+  # handled after a move names the server of that move's landing. How many moves there are depends on the timing:
+  # fewer than the failures is what shows that a move serves several.
   same=1
   for ((i = 1; i < ${#FL[@]}; i++)); do
-    case "${FL[$i]}" in "${MV[0]:-y}") ;; "${MV[1]:-y}") [ -n "$kind" ] && same=0 ;; *) same=0 ;; esac
+    [[ " ${MV[*]} " == *" ${FL[$i]} "* ]] || same=0
   done
-  [ "${#FL[@]}" -ge 3 ] && [ "$same" = 1 ] && [ "${#MV[@]}" = 2 ]; verdict "many${kind:+ ($kind)}: of ${#FL[@]} failures the ones after the first name the server they were issued at, and one move serves them (${#MV[@]} moves in all)" $?
+  [ "${#FL[@]}" -ge 3 ] && [ "$same" = 1 ] && [ "${#MV[@]}" -ge 1 ] && [ "${#MV[@]}" -lt "${#FL[@]}" ]; verdict "many${kind:+ ($kind)}: of ${#FL[@]} failures the ones after the first name the server of a move, and the moves (${#MV[@]}) are fewer than the failures" $?
 done
 
 rf off 2 off
 clean off; verdict "switch off: failed reads are relayed on the same file, exact, once; the client's read recovery is on" $?
 [ "$NRA" = 0 ] && [ "${#FL[@]}" = 2 ]; verdict "switch off: two failures recorded, no open of route read" $?
+
+echo; echo "=== a basket a server serves as zeros: the read is made again at another site"
+FIX="$HERE/../data/unnamed_codec_fixture.root" # Jet_pt basket 1: 2481 bytes at 4915 (ci.yml's key-position step)
+placefix() { # LFN server... (the fixture)
+  local lfn=$1 s; shift
+  for s in "$@"; do
+    install -d -m 777 "$W/data/$s/$(dirname "$lfn" | sed 's|^/||')"
+    cp "$FIX" "$W/data/$s$lfn"; chmod 666 "$W/data/$s$lfn"
+  done
+}
+zero_at() { # LFN server... : the basket zeroed in the copies on those servers
+  local lfn=$1 s; shift
+  for s in "$@"; do
+    dd if=/dev/zero of="$W/data/$s$lfn" bs=64K seek=4915 count=2481 oflag=seek_bytes iflag=count_bytes conv=notrunc status=none
+  done
+}
+# What the test client runs, with the port of the server its handle landed on, to zero the basket there.
+cat > "$W/zero.sh" <<ZERO
+#!/bin/sh
+case \$1 in $AX) s=a ;; $BX) s=b ;; $CX) s=c ;; *) exit 1 ;; esac
+dd if=/dev/zero of="$W/data/\$s\$ZERO_LFN" bs=64K seek=4915 count=2481 oflag=seek_bytes iflag=count_bytes conv=notrunc status=none
+ZERO
+chmod 755 "$W/zero.sh"
+# zr CASE LFN SWITCH [land]: plugin_fuzz's read-failover CASE on LFN (the check on); `land`: the basket is
+# zeroed on the server the handle lands on. Sets RES, RFC (its cache), SV (landed, final), F14 (failed
+# reads with code 14), FL (their servers), MV (where each move landed) and NRA (attempts of route read).
+zr() {
+  local c=$1 l=$2 sw=$3 land=${4:-} n
+  n=$(echo "$l" | tr / _)
+  RFC="$W/c-zr$n"
+  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=$sw UCACHE_CHECK_ORIGIN_INTEGRITY=on ${land:+UCACHE_ZERO_CMD=$W/zero.sh ZERO_LFN=$l})
+  RES=$(fuzz "$RFC" "$W/zr$n.log" "root://127.0.0.1:$RX/$l" "$FIX" 1 1 1 read-failover $c)
+  echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-220
+  SV=($(echo "$RES" | sed -n 's/^SERVERS //p'))
+  F14=$(recs "$RFC" origin_failure | grep -c '"code":14,')
+  FL=($(recs "$RFC" origin_failure | grep '"code":14,' | field data_server))
+  MV=($(recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | field data_server))
+  NRA=$(recs "$RFC" open | grep -c '"route":"read"')
+}
+clean_zr() { echo "$RES" | grep -q "^read-failover $1: clean\$"; }
+# (a) the copy the handle landed on serves zeros: a Read, a VectorRead
+for c in zero zerov; do
+  L=/store/ci/zr-$c.root; placefix $L a b c
+  zr $c $L on land
+  clean_zr $c; verdict "$c: the zeroed basket is refused and read exactly at another server, once (${SV[*]})" $?
+  [ "$F14" = 1 ] && [ "${FL[0]:-x}" = "${SV[0]}" ]; verdict "$c: one failed read with code 14, at the server the handle landed on (${FL[*]})" $?
+  [ "${#MV[@]}" -ge 1 ] && [ "${MV[-1]}" = "${SV[1]}" ]; verdict "$c: a move of route read ended at the server the bytes came from (${MV[*]})" $?
+done
+# (b) the first move may land on a copy that is damaged too: that answer is refused as well. A new file
+# each time, until a first move landed on one (up to 30).
+hit=0 allok=1
+for i in $(seq 30); do
+  L=/store/ci/zr-b$i.root; placefix $L a b c; zero_at $L b
+  zr zero $L on land
+  clean_zr zero || { allok=0; break; }
+  [ "$F14" -ge 2 ] && { hit=$i; break; }
+done
+[ "$allok" = 1 ]; verdict "two damaged copies: every read was exact, once, from the one that is not" $?
+[ "$hit" != 0 ]; verdict "two damaged copies: a move landed on the damaged one and its answer was refused too (file $hit of at most 30; $F14 failed reads, ${#MV[@]} moves)" $?
+# (c) every copy is damaged: the reader gets the error, after at most four reads, never the zeros
+L=/store/ci/zr-all.root; placefix $L a b c; zero_at $L a b c
+zr zeroerr $L on
+clean_zr zeroerr; verdict "every copy damaged: the read fails its check, once, and never serves the zeros" $?
+[ "$F14" -ge 1 ] && [ "$F14" -le 4 ]; verdict "every copy damaged: $F14 failed reads (one to four)" $?
+# (d) the switch off, the check on: the same read fails its check and is not moved
+L=/store/ci/zr-off.root; placefix $L a b c; zero_at $L a b c
+zr zeroerr $L off
+clean_zr zeroerr; verdict "switch off: the read fails its check, once, and never serves the zeros" $?
+[ "$F14" = 1 ] && [ "$NRA" = 0 ]; verdict "switch off: one failed read, no open of route read ($F14, $NRA)" $?
 
 echo; echo "fed_ci: $FAILS failure(s)"
 exit $((FAILS > 0))
