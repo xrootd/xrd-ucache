@@ -305,12 +305,19 @@ int failoverMaxSites() {
   return gTestFailoverMaxSites > 0 ? gTestFailoverMaxSites : kFailoverMaxSites;
 }
 // The pool for the work that waits for another site: the moves of a handle's reads
-// and what follows them, and the re-opens of a reader's open. A stalled site holds
-// one of its threads for as long as the attempts last (up to kFailoverMaxS), so
-// that work is not given to the pool that serves cache hits and persists
-// (Executor::instance). Built at first use, as that one is: a fork finds no thread.
+// and the re-opens of a reader's open. A stalled site holds one of its threads for as
+// long as the attempts last (up to kFailoverMaxS), so that work is not given to the
+// pool that serves cache hits and persists (Executor::instance). Built at first use, as
+// that one is: a fork finds no thread.
 Executor& moveExecutor() {
-  static Executor* exec = new Executor(3);
+  static Executor* exec = new Executor(4);
+  return *exec;
+}
+// The pool that gives a read its answer once its move is over: the read issued again, or the
+// failure handed to the reader's handler, which may block. Apart from the moves, so that an
+// answer never waits behind a move that is stalled.
+Executor& deliverExecutor() {
+  static Executor* exec = new Executor(2);
   return *exec;
 }
 // UCACHE_TEST_OFFLINE_HOSTS=host:port,... (inert unless set): the stat an open
@@ -2297,7 +2304,7 @@ static void runMove(const std::shared_ptr<HandleState>& st, int capS, uint64_t f
   for (auto& w : waiters)
     goOn.push_back(w(adopted));
   for (auto& g : goOn)
-    moveExecutor().post(std::move(g));
+    deliverExecutor().post(std::move(g));
 }
 
 // A read that was issued on `on` failed with `s`. Calls `cont(true)` when the
@@ -2306,7 +2313,7 @@ static void runMove(const std::shared_ptr<HandleState>& st, int capS, uint64_t f
 // handle is going away. Starts the move when none is under way, and names the
 // server as one that failed -- except for a session the client lost (109), which
 // a healthy server loses at a restart. Never blocks and makes no File, so it may
-// run on a client callback thread; `cont` runs on the move executor. `capS`: what is
+// run on a client callback thread; `cont` runs on the deliver executor. `capS`: what is
 // left of the failed request's time.
 static void moveOn(const std::shared_ptr<HandleState>& st, XrdCl::File* on, const XRootDStatus& s,
                    int capS, HandleState::MoveWaiter cont) {
@@ -2319,7 +2326,7 @@ static void moveOn(const std::shared_ptr<HandleState>& st, XrdCl::File* on, cons
   }
   if (gone || st->inner.load() != on) {
     lk.unlock();
-    moveExecutor().post([cont = std::move(cont), gone] { cont(!gone)(); });
+    deliverExecutor().post([cont = std::move(cont), gone] { cont(!gone)(); });
     return;
   }
   if (s.code != XrdCl::errInvalidSession && !st->source.server.empty()) {
