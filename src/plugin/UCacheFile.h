@@ -86,7 +86,10 @@ struct HandleState {
   std::atomic<uint64_t> forkGen{Executor::forkGeneration()};
   std::atomic<uint64_t> forkClaim{Executor::forkGeneration()};
   ForkLayout forkLayout = ForkLayout::kNone;  // under setupMu, then mu
-  bool innerStale = false;    // under innerOpenMu: the inner file is to be opened afresh
+  // The inner file is to be opened afresh: set where a forked child starts the handle
+  // over, cleared when the open ends (ensureInnerOpen). Atomic so that a caller that only
+  // asks never waits for innerOpenMu, which a move holds for its whole budget.
+  std::atomic<bool> innerStale{false};
   bool reopenInChild = false; // set at Open: the cache serves this handle
   // The layout this handle's reader was shown before a fork could not be set
   // up again in the child: reads fail rather than give other bytes.
@@ -194,8 +197,13 @@ struct HandleState {
   SiteFailure source;
   std::vector<SiteFailure> readFailed;
   bool moveInFlight = false;
-  std::vector<std::function<void(bool)>> moveWaiters;
+  // A read waiting for a move: given whether the handle moved, it takes the handle's
+  // File and leaves the parked count, and returns what then issues the read again or
+  // answers it (moveOn).
+  using MoveWaiter = std::function<std::function<void()>(bool)>;
+  std::vector<MoveWaiter> moveWaiters;
   int parkedReads = 0;
+  bool wholeCopy = false; // under mu: set up as a copy (the first read took the whole file)
   void applyReadPolicy();
   void unpark();
   // The timeout of an origin read of this handle (OpenPolicy.h readAttemptTimeoutS),
@@ -262,8 +270,9 @@ struct HandleState {
   // Wait, up to `max`, for the cache's own requests on the inner file to
   // finish. Close must do this: XrdCl refuses to close a file with requests
   // in flight, and read-ahead's are not the application's to lose a close
-  // over. Bounded, because a hung origin request must not hang a close.
-  void waitInnerIdle(std::chrono::milliseconds max);
+  // over. Bounded, because a hung origin request must not hang a close. False
+  // when requests or parked reads are left.
+  bool waitInnerIdle(std::chrono::milliseconds max);
   // Install a fresh inner file in place of a terminally-failed (or refused)
   // one, which moves to `retired`; returns the fresh one. Returns nullptr,
   // changing nothing, once the handle is shut down, or with `onlyIfIdle` while
@@ -277,12 +286,10 @@ struct HandleState {
   // A File of this handle's: plugins off, the reader's properties given again in
   // order and, on an armed handle, the client's read recovery off. Under mu.
   std::unique_ptr<XrdCl::File> makeInner();
-  // A forked child has yet to open this handle's origin file afresh.
+  // A forked child has yet to open this handle's origin file afresh, or is doing so.
+  // With adaptive_federation on it never waits: a move holds innerOpenMu for its whole
+  // budget, and a caller that needs the open calls ensureInnerOpen, which waits for it.
   bool reopenPending();
-  // As reopenPending, but with adaptive_federation on false at once while
-  // another thread is opening the origin. Only for Close and the handle's
-  // destruction: a call that needs the open waits for it (reopenPending).
-  bool reopenPendingNoWait();
 
   // Async page-persist accounting. Persists are posted off the read path
   // (§5.2 step 4), but Close/destruction must wait for them so short-lived
@@ -413,5 +420,8 @@ bool processExiting();
 // A forked child's first cache work: re-arms what lived only in the parent's
 // timer queue (the periodic checkpoint). Cheap when there is nothing to do.
 void resumeAfterFork();
+// Builds the table of asks to the regional redirectors and has a forked child start
+// it anew (UCacheFile.cc); called once, where the plugin starts, before any thread.
+void locateInit();
 
 } // namespace ucache

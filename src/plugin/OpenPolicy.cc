@@ -313,6 +313,27 @@ AfterFailure afterFailure(std::vector<SiteFailure>& failed, const SiteFailure& f
   return seen || sameSite ? AfterFailure::kRepeat : AfterFailure::kRetry;
 }
 
+Location locationOf(const std::string& address, bool manager, bool pending) {
+  Location l;
+  const auto colon = address.rfind(':');
+  l.host = address.substr(0, colon);
+  if (l.host.size() > 1 && l.host.front() == '[' && l.host.back() == ']')
+    l.host = l.host.substr(1, l.host.size() - 2);
+  if (l.host.compare(0, 7, "::ffff:") == 0)
+    l.host.erase(0, 7);
+  else if (l.host.compare(0, 2, "::") == 0 && l.host.find('.') != std::string::npos)
+    l.host.erase(0, 2);
+  l.port = colon == std::string::npos ? 1094 : std::atoi(address.c_str() + colon + 1);
+  l.manager = manager;
+  l.pending = pending;
+  return l;
+}
+
+bool copyOffline(uint32_t statFlags, const std::string& server, const std::string* testOffline) {
+  return (statFlags & kStatOffline) ||
+         (testOffline && testOffline->find("," + server + ",") != std::string::npos);
+}
+
 std::vector<Location> orderLocations(const std::vector<Location>& listed,
                                      const std::vector<std::string>& readerTried,
                                      const std::vector<SiteFailure>& failed) {

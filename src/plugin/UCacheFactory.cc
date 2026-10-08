@@ -388,6 +388,7 @@ void initGlobals() {
   pinSelfInMemory(); // before any thread exists that could outlive an unload
   // Before any plugin thread exists, so that no fork can find one unprepared.
   ::pthread_atfork(forkPrepare, forkParent, forkChild);
+  locateInit();
   // Leaked intentionally: destruction order against XrdCl teardown and the
   // executor threads is unknowable; the final stats dump happens via atexit.
   gConfig = new Config(Config::fromEnv(gPluginConf));

@@ -247,6 +247,13 @@ struct Location {
   bool manager = false; // a redirector of its own, not a data server
   bool pending = false; // the file is being brought online there
 };
+// A Location from "host:port" as a locate's answer gives it: a bracketed IPv6 host
+// loses its brackets, an IPv4 address in its IPv6 form ("::127.0.0.1",
+// "::ffff:127.0.0.1") is the IPv4 one, and no port is 1094.
+Location locationOf(const std::string& address, bool manager, bool pending);
+// Whether the copy at `server` (host:port) is on tape: its stat flags say so, or a
+// test's list (`testOffline`, ",host:port,host:port,"; null for none) names it.
+bool copyOffline(uint32_t statFlags, const std::string& server, const std::string* testOffline);
 // Which of `listed` to open, in order. Dropped: servers the reader's own tried=
 // names (`readerTried`; never used), and the servers and the sites of `failed`
 // (a site is its domain; an address stands for its server alone). Of what is
