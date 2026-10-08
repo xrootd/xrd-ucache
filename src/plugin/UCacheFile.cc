@@ -2716,6 +2716,11 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   // it never used. The first real work claims one (childWork).
 }
 
+bool HandleState::waitParked(std::chrono::milliseconds max) {
+  std::unique_lock<std::mutex> lk(mu);
+  return innerCv.wait_for(lk, max, [this] { return parkedReads == 0; });
+}
+
 bool HandleState::waitInnerIdle(std::chrono::milliseconds max) {
   std::unique_lock<std::mutex> lk(mu);
   return innerCv.wait_for(lk, max, [this] { return innerOps == 0 && parkedReads == 0; });
@@ -4028,6 +4033,11 @@ uint64_t UCacheFile::shownSize() const {
 
 XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
+  // A read waiting for a move is a request in flight, which the client's own Close refuses: waited
+  // for, within the bound, before anything of the handle is changed, so that a Close that is
+  // refused leaves the handle as it was and the read goes on.
+  if (!st_->waitParked(std::chrono::seconds(10)))
+    return XRootDStatus(XrdCl::stError, XrdCl::errInvalidOp);
   // Wait for queued page persists before flushing meta, so the cache is
   // complete on disk when the process (which may exit right after Close)
   // goes away. This blocks Close, never a read (§5.2 step 4).
@@ -4067,7 +4077,7 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
   // has already stopped new ones being issued for this handle, so this is a
   // bounded wait for what was already sent.
   if (!st_->waitInnerIdle(std::chrono::seconds(10)))
-    return XRootDStatus(XrdCl::stError, XrdCl::errInvalidOp); // requests or parked reads are left: not closed, as the client's own Close
+    return XRootDStatus(XrdCl::stError, XrdCl::errInvalidOp); // requests are left: not closed, as the client's own Close
   // A trusted cache-only handle that never hit a miss never opened the origin;
   // there is nothing to close remotely (UCACHE_REVALIDATE_S). Nor has a forked
   // child that never opened afresh the handle it inherited: that file is the

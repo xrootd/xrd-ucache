@@ -273,6 +273,9 @@ struct HandleState {
   // over. Bounded, because a hung origin request must not hang a close. False
   // when requests or parked reads are left.
   bool waitInnerIdle(std::chrono::milliseconds max);
+  // Wait, up to `max`, for the reads waiting for a move to be issued again or answered. False when
+  // some are left.
+  bool waitParked(std::chrono::milliseconds max);
   // Install a fresh inner file in place of a terminally-failed (or refused)
   // one, which moves to `retired`; returns the fresh one. Returns nullptr,
   // changing nothing, once the handle is shut down, or with `onlyIfIdle` while
