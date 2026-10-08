@@ -152,10 +152,11 @@ regional_locates() { grep -c "Xrootd_Protocol: locate .*$1\$" "$REGLOG"; }
 echo; echo "=== an open sent back to the server that refused it"
 # The file is on b and c, and c refuses it. A new file each time, one open: when the
 # regional's first answer is c, it sends the retry to c again (a name that cannot be
-# masked), and the open goes on to a server the regional lists. Up to 40 files.
+# masked), and the open goes on to a server the regional lists. Up to 120 files (about 7 are
+# needed on average, and the leg stops at the first).
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
 got=0 allok=1
-for i in $(seq 40); do
+for i in $(seq 120); do
   L=/store/ci/f5-$i.bin
   place $L b c
   chmod 000 "$W/data/c$L"
@@ -164,7 +165,7 @@ for i in $(seq 40); do
   if [ "$(records "$W/c5-$i" | grep -c '"route":"candidate","status":"ok"')" -ge 1 ]; then got=$i; break; fi
 done
 [ "$allok" = 1 ]; verdict "every open succeeded, one completion, right bytes" $?
-[ "$got" != 0 ]; verdict "an open was sent back to c and went to a listed server (file $got of at most 40)" $?
+[ "$got" != 0 ]; verdict "an open was sent back to c and went to a listed server (file $got of at most 120)" $?
 if [ "$got" != 0 ]; then
   records "$W/c5-$got" | sed 's/^/    rec: /' | cut -c1-230
   direct_read c $L; r=$?; [ "$r" != 0 ]; verdict "c refuses the file (a direct read fails)" $?
