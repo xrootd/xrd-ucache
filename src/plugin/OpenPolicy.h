@@ -187,8 +187,12 @@ enum class OpenStep : uint8_t {
 // redirector to ask. `repeats`: a success that landed on a server or site where
 // reads of the file stopped (the open of a read that moves): the redirector did
 // not keep it from there, so the regional redirector is asked for the copies.
+// `regionalKnown`: a regional redirector can be asked. A server that did not
+// answer within the deadline then sends the open to that list, not back through
+// the redirector, which would steer it to the other server of the same site,
+// and that one stalls as well.
 OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bool offline,
-                   bool excluded, bool repeats = false);
+                   bool excluded, bool repeats = false, bool regionalKnown = false);
 
 // The host name a retry's tried= may carry for hop `i` of a chain, or "" when
 // it may not: never a redirector, nor the first host, nor an address or a

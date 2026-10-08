@@ -311,7 +311,10 @@ redirector names by its address, or by a name without a dot, cannot be named
 in `tried=` (a redirector masks servers by full host name), so the redirector
 may send the next attempt to it again; uCache then asks the regional
 redirector for the other copies of the file and opens one directly (the
-per-file record file has route `candidate` for these attempts). A copy listed
+per-file record file has route `candidate` for these attempts). It does the
+same after a server that stalled past the open deadline, so that the next
+attempt does not meet the other server of the same site, which stalls too;
+the copies at that server's domain are tried last. A copy listed
 as on tape is skipped, with the log line `<file>: the copy at <host>:<port> is
 on tape (offline); not opened`.
 The counters `open_failovers`, `opens_recovered`, `opens_failed_everywhere`,

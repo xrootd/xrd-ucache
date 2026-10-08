@@ -738,20 +738,23 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
       f.error = "reads from it stopped, and the redirector sent the open back";
     // The open goes on to the regional redirector's list of copies when it was
     // not found though a copy may exist, when the redirector handed back a
-    // server or site that failed already, and after an attempt at a listed copy
-    // that failed (it has no redirector to send it elsewhere). Without a
-    // regional redirector to ask, it ends.
+    // server or site that failed already, when a server did not answer within
+    // the deadline (a retry through the redirector would meet the site's other
+    // server), and after an attempt at a listed copy that failed (it has no
+    // redirector to send it elsewhere). Without a regional redirector to ask,
+    // it ends, or tries elsewhere through the redirector after a stall.
+    const bool canAsk = !seq->regional.empty() || seq->located;
     const OpenStep step =
         onCandidate ? (ok && !sizeDiffers && !offline ? OpenStep::kFinal : OpenStep::kLocate)
                     : stepAfter(w.v, ok ? 0 : s.code, ok ? 0 : static_cast<int>(s.errNo),
-                                sizeDiffers, offline, seq->excluded, repeats);
+                                sizeDiffers, offline, seq->excluded, repeats, canAsk);
     AfterFailure af = AfterFailure::kStop;
     if (step != OpenStep::kFinal)
       af = afterFailure(seq->failed, f, failoverMaxSites(), seq->stopped());
     const bool more = seq->ci < seq->cands.size() || (seq->sawOffline && !seq->lastResort);
     const bool locate = af != AfterFailure::kStop &&
-                        (step == OpenStep::kLocate || af == AfterFailure::kRepeat) &&
-                        (!seq->regional.empty() || seq->located) && (!onCandidate || more);
+                        (step == OpenStep::kLocate || af == AfterFailure::kRepeat) && canAsk &&
+                        (!onCandidate || more);
     const bool goOn = locate || (af == AfterFailure::kRetry && step == OpenStep::kFailOver);
     {
       std::lock_guard<std::mutex> g(st.mu);

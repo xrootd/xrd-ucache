@@ -289,6 +289,24 @@ TEST(OpenPolicy, StepAfterAnAttempt) {
   // A failure is judged as without it.
   EXPECT_EQ(stepAfter(v, kErrOperationExpired, 0, false, false, false, true), OpenStep::kFailOver);
   EXPECT_EQ(stepAfter(v, kErrSocketError, 0, false, false, false, true), OpenStep::kFinal);
+  // A server that did not answer within the deadline: with a regional redirector
+  // to ask, the copies are asked for, as a retry through the redirector would
+  // meet the site's other server; without one, another site is tried as before.
+  // The redirector's own stall and a direct open stay final, and no other
+  // failure changes.
+  const auto withRegional = [](const ChainView& c, int code, int errNo = 0) {
+    return stepAfter(c, code, errNo, false, false, false, false, true);
+  };
+  EXPECT_EQ(withRegional(v, kErrOperationExpired), OpenStep::kLocate);
+  EXPECT_EQ(step(v, kErrOperationExpired), OpenStep::kFailOver);
+  EXPECT_EQ(withRegional(kRedirectorOnly, kErrOperationExpired), OpenStep::kFinal);
+  EXPECT_EQ(withRegional(kDirect, kErrOperationExpired), OpenStep::kFinal);
+  for (int code : {kErrSocketTimeout, kErrConnectionError, kErrRedirectLimit})
+    EXPECT_EQ(withRegional(v, code), OpenStep::kFailOver) << code;
+  for (int errNo : {kXrNotAuthorized, kXrServerError, kXrIOError})
+    EXPECT_EQ(withRegional(v, kErrErrorResponse, errNo), OpenStep::kFailOver) << errNo;
+  EXPECT_EQ(withRegional(v, kErrErrorResponse, kXrNotFound), OpenStep::kLocate);
+  EXPECT_EQ(withRegional(v, kErrSocketError), OpenStep::kFinal);
 }
 
 // A server or site that failed before, as an attempt that succeeded sees it:
@@ -586,5 +604,15 @@ TEST(OpenPolicy, OrderLocations) {
                                  {{"fst.site.org:1094", "site.org", "", "e"}})),
             "eos.site.org:1094 ");
   EXPECT_TRUE(orderLocations({}, {}, failed).empty());
+  // A server that never answered is its own site (host:port), yet the other
+  // servers in the domain of its name are left out with it: they stall as well.
+  const std::vector<SiteFailure> stalled = {
+      {"red2.site.org:1094", "red2.site.org:1094", "red2.site.org", "no answer"}};
+  const std::vector<Location> sibling = {loc("red1.site.org", 1094), loc("red2.site.org", 1094),
+                                         loc("a.two.org", 1094)};
+  EXPECT_EQ(names(orderLocations(sibling, {}, stalled)), "a.two.org:1094 ");
+  const std::vector<Location> siteOnly = {loc("red1.site.org", 1094), loc("red2.site.org", 1094)};
+  EXPECT_EQ(names(orderLocations(siteOnly, {}, stalled)), "red1.site.org:1094 red2.site.org:1094 ")
+      << "nothing else left: the site's servers, in the answer's order";
   EXPECT_STREQ(openRouteName(OpenRoute::kCandidate), "candidate");
 }

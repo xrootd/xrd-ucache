@@ -222,7 +222,7 @@ int openDeadlineS(int readerTimeoutS, int deadlineS) {
 }
 
 OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bool offline,
-                   bool excluded, bool repeats) {
+                   bool excluded, bool repeats, bool regionalKnown) {
   if (!v.viaRedirector) // a direct open has nowhere else to go
     return OpenStep::kFinal;
   if (code == 0)
@@ -240,7 +240,8 @@ OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bo
     return OpenStep::kFailOver;
   case kErrNotFound:
     return notFound;
-  case kErrOperationExpired:
+  case kErrOperationExpired: // the server stalled: the retry would meet its site's other server
+    return regionalKnown && !first ? OpenStep::kLocate : elsewhere;
   case kErrSocketTimeout:
   case kErrConnectionError:
     return elsewhere;
@@ -331,9 +332,15 @@ std::vector<Location> orderLocations(const std::vector<Location>& listed,
       continue;
     const bool literal = isIpv4(host) || isIpv6(host);
     size_t age = failed.size();
-    for (size_t i = 0; i < failed.size() && age == failed.size(); ++i)
-      if (lower(failed[i].server) == server || (!literal && failed[i].site == siteOf(host)))
+    const std::string site = siteOf(host);
+    for (size_t i = 0; i < failed.size() && age == failed.size(); ++i) {
+      // A server that never answered is its own site (host:port), but the
+      // domain of its name is where its siblings are.
+      const std::string& fs = failed[i].server;
+      if (lower(fs) == server ||
+          (!literal && (failed[i].site == site || siteOf(fs.substr(0, fs.rfind(':'))) == site)))
         age = i;
+    }
     if (age < failed.size())
       excluded.emplace_back(age, l);
     else
