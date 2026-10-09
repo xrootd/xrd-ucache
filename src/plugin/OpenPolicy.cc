@@ -368,9 +368,13 @@ std::vector<Location> orderLocations(const std::vector<Location>& listed,
           (!literal && (failed[i].site == site || siteOf(fs.substr(0, fs.rfind(':'))) == site)))
         age = i;
     }
-    if (age < failed.size())
-      excluded.emplace_back(age, l);
-    else
+    const bool refused = std::any_of(failed.begin(), failed.end(), [&](const SiteFailure& x) {
+      return x.bad && lower(x.server) == server;
+    });
+    if (age < failed.size()) {
+      if (!refused)
+        excluded.emplace_back(age, l);
+    } else
       (l.pending ? pending : online).push_back(l);
   }
   online.insert(online.end(), pending.begin(), pending.end());

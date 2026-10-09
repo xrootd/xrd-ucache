@@ -810,9 +810,12 @@ opens uCache makes of the origin. A success is taken wherever it lands; for the
 opens uCache makes of a file it holds, only a copy of the size it holds; a
 copy with no bytes of a file named `*.root` (a ROOT file is never empty; a size
 of zero is an ordinary size for any other name) and a copy on tape (the
-server's answer to the open says `Offline`) are passed over for another site's; when no other site opens the file, it is opened once more
-as the job asked for it and that answer stands, so a file that is readable
-without uCache stays readable. Each open tries
+server's answer to the open says `Offline`) are passed over for another site's.
+When no other site opens a file whose copy on tape was passed over, it is opened once
+more as the job asked for it and that answer stands, so a file that is readable
+without uCache stays readable. When every copy is empty (or the URL names a server
+directly and that copy is empty), the job's open fails with one error of class `data`
+that names each copy tried, its size and why it was refused. Each open tries
 at most 4 sites, within 180 s in all (less when the job's own open timeout is
 shorter, and with the switch's error window of 180 s, 160 s), and an open that
 fails at every site it tries ends with an error naming each site and its

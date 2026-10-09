@@ -30,6 +30,10 @@
 #                          empty), the open goes on to a copy with bytes, the reader gets the
 #                          file's own bytes, and the records show the empty copy's size 0, a
 #                          failed attempt of op open, class data, and the copy that was taken
+#   all copies empty       the file is named *.root and every copy is empty: the open fails with
+#                          one error of class data that names each copy tried with its server and
+#                          its size, three attempts at three servers (a refused copy is not opened
+#                          again), each recorded as a failure of op open, class data
 #   all refused            a, b and c refuse the file: Open() returns OK, one
 #                          completion, a failure that names all three servers
 #   switch off             the default: a refused at a: some opens fail, the client
@@ -205,6 +209,27 @@ if [ "$got" != 0 ]; then
   verdict "the empty copy is recorded as a failure of op open, class data" $?
   [ "$(counter "$W/c11-$got" origin_failures_data)" -ge 1 ]; verdict "origin_failures_data counts it" $?
 fi
+
+echo; echo "=== every copy of a file named *.root is empty: one error naming the copies"
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
+L12=/store/ci/ee.root
+place $L12 a b c
+for s in a b c; do : > "$W/data/$s$L12"; done
+res=$(fuzz "$W/c12" "$W/f12.log" "root://127.0.0.1:$RX/$L12" "$W/f.bin" 1 1 1 open-denied)
+echo "$res" | sed 's/^/    /' | cut -c1-900
+echo "$res" | grep -q '^open-denied: clean$'; verdict "Open() returned OK and the reader got one completion, a failure" $?
+n=0; for s in a b c; do echo "$res" | grep -q "(127.0.0.1:$(port_of $s)): size 0:" && n=$((n + 1)); done
+[ "$n" = 3 ]; verdict "the error names all three copies, each with its size 0 ($n of 3)" $?
+echo "$res" | grep -q 'no site could open it'; verdict "the error says no site could open it" $?
+echo "$res" | grep -q 'Received corrupted data'; verdict "the error is a data error" $?
+[ "$(records "$W/c12" | wc -l)" = 3 ] && [ "$(records "$W/c12" | grep -c '"size":0,')" = 3 ]
+verdict "three attempts, each at a copy of size 0 (a refused copy is not opened again)" $?
+records "$W/c12" | tail -1 | grep -q '"outcome":"error"'; verdict "the last record line says outcome error" $?
+[ "$(cat "$W/c12"/stats/*.files.jsonl | grep '"kind":"origin_failure"' | grep -c '"op":"open".*"class":"data"')" = 3 ]
+verdict "three failures of op open, class data are recorded" $?
+[ "$(counter "$W/c12" origin_failures_data)" = 3 ]; verdict "origin_failures_data counts three" $?
+[ "$(grep -c 'Sending a close command for handle' "$W/f12.log")" -ge 3 ]; verdict "each copy that was opened was closed" $?
+[ -z "$(find "$W/c12" \( -name '*.meta' -o -name '*.data' \) -print -quit)" ]; verdict "nothing of the file is cached" $?
 
 echo; echo "=== all refused: a, b and c refuse the file"
 L9=/store/ci/f9.bin

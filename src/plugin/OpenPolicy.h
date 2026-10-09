@@ -234,6 +234,9 @@ struct SiteFailure {
   std::string site;
   std::string name;  // what tried= may carry for it (exclusionName), "" for none
   std::string error; // the error's text
+  // The open succeeded and the copy is refused for what it is (an empty ROOT file): it is not
+  // opened again by this sequence, and the error that ends it is of class data.
+  bool bad = false;
 };
 // What the sequence does after a fail-over outcome, given the sites that
 // failed before (`failed`, to which `f` is added unless its server is there):
@@ -264,7 +267,8 @@ bool copyOffline(uint32_t statFlags, const std::string& server, const std::strin
 // names (`readerTried`; never used), and the servers and the sites of `failed`
 // (a site is its domain; an address stands for its server alone). Of what is
 // left, online copies come before pending ones, each in the answer's order.
-// When nothing is left, the failed ones are given, the oldest failure first.
+// When nothing is left, the failed ones are given, the oldest failure first,
+// except a server whose copy was refused for what it is (`bad`): that one is final.
 std::vector<Location> orderLocations(const std::vector<Location>& listed,
                                      const std::vector<std::string>& readerTried,
                                      const std::vector<SiteFailure>& failed);

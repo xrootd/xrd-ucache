@@ -424,7 +424,9 @@ any server and has no line.
   `records` (the file's own records, read to set up its layout), `relay` (a
   request passed straight to the origin), `open` (with `adaptive_federation =
   on`, a copy refused after its open succeeded: an empty copy of a file named
-  `*.root`; class `data`, code 14, `off` and `len` 0).
+  `*.root`; class `data`, code 14, `off` and `len` 0). When no other copy is left, the
+  open's last line has `outcome` `error` although its own status is `ok`: the
+  job's open failed (the copy was refused).
 - `off`, `len`: the span asked for (a vector read's first offset and its
   bytes); `data_server`: the last host of the failed answer, else the server
   the file's open reached (for a pass-through handle, whose open is not

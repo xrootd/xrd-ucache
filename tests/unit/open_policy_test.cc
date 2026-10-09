@@ -619,6 +619,18 @@ TEST(OpenPolicy, OrderLocations) {
   const std::vector<Location> siteOnly = {loc("red1.site.org", 1094), loc("red2.site.org", 1094)};
   EXPECT_EQ(names(orderLocations(siteOnly, {}, stalled)), "red1.site.org:1094 red2.site.org:1094 ")
       << "nothing else left: the site's servers, in the answer's order";
+  // A copy refused for what it is (`bad`) is final: when nothing else is left it is not given
+  // again, though a server that merely failed is. Its siblings are not bad because it is.
+  SiteFailure refused{"a.two.org:1094", "two.org", "a.two.org", "size 0"};
+  refused.bad = true;
+  const std::vector<Location> pair = {loc("a.two.org", 1094), loc("b.two.org", 1094)};
+  EXPECT_EQ(names(orderLocations(pair, {}, {refused})), "b.two.org:1094 ")
+      << "the sibling of a refused copy is a failed server as before, not a refused one";
+  EXPECT_EQ(names(orderLocations({loc("a.two.org", 1094)}, {}, {refused})), "")
+      << "the only copy was refused: nothing is left to open";
+  const SiteFailure failedOnly{"a.two.org:1094", "two.org", "a.two.org", "refused"};
+  EXPECT_EQ(names(orderLocations({loc("a.two.org", 1094)}, {}, {failedOnly})), "a.two.org:1094 ")
+      << "a server that merely failed is still the last resort";
   EXPECT_STREQ(openRouteName(OpenRoute::kCandidate), "candidate");
 }
 

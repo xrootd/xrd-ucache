@@ -669,7 +669,12 @@ struct FailoverSeq {
                           const XRootDStatus& last) const noexcept try {
     if (failed.empty())
       return last;
-    XRootDStatus out(last.status, last.code, last.errNo, allSitesFailedText(file, failed));
+    // A refused copy is why the open failed, whatever the last attempt said: class data.
+    const bool refused = std::any_of(failed.begin(), failed.end(),
+                                     [](const SiteFailure& x) { return x.bad; });
+    XRootDStatus out(refused ? XrdCl::stError : last.status,
+                     refused ? XrdCl::errDataError : last.code, refused ? 0 : last.errNo,
+                     allSitesFailedText(file, failed));
     if (st.store)
       st.store->stats().opensFailedEverywhere.fetch_add(1, std::memory_order_relaxed);
     UCACHE_WARN("%s: no site could open it: %s", file.c_str(), sitesFailedList(failed).c_str());
@@ -728,16 +733,26 @@ struct FailoverSeq {
 };
 
 // What follows one attempt of an open.
-enum class Next : uint8_t { kDone, kSameSource, kElsewhere, kLocate };
+enum class Next : uint8_t {
+  kDone,
+  kSameSource,
+  kElsewhere,
+  kLocate,
+  // The open succeeded and the copy is refused for what it is (no bytes in a ROOT file), and no
+  // other copy is left to try: the open ends with one error that names every copy tried.
+  kRefuse,
+};
 // The attempt answered `s` (`w`: its reading), the `sourceAttempt`-th at its
 // source, sent to `sentUrl`; `want`: the size the cache holds (0: none). A
 // transient failure is retried at the same source first (open_retries), while
 // the sequence `seq` may issue more (null: adaptive_federation off); then,
 // with `seq`, an outcome another site may not share -- a success of another
-// size, an empty ROOT file or one on tape, included -- goes elsewhere. A copy no
-// other site replaces is kept: that is how an open ends when a bound stops the
-// sequence. When no other site opens a file whose copy on tape was passed over,
-// one last open of the reader's own URL is made and its answer stands. Counts
+// size, an empty ROOT file or one on tape, included -- goes elsewhere. A copy of
+// another size, or on tape, that no other site replaces is kept: that is how an open ends
+// when a bound stops the sequence. An empty ROOT file is not: with no other copy to try
+// the open ends with kRefuse, and its error names every copy (FailoverSeq::finalError).
+// When no other site opens a file whose copy on tape was passed over, one last open of
+// the reader's own URL is made and its answer stands, unless the copy is empty. Counts
 // the retries.
 // Throws nothing: for want of memory the open ends with this answer.
 Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XRootDStatus& s,
@@ -758,32 +773,42 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
   if (!seq)
     return Next::kDone;
   try {
-    if (seq->lastResort) // the last open: whatever it answers stands
-      return Next::kDone;
-    const bool onCandidate = seq->onCandidate;
-    seq->onCandidate = false;
-    seq->noteChain(w, s);
     // A move takes no copy whose size it cannot read: the size the reader was shown is
     // what tells a copy from a damaged one.
     const bool sizeDiffers =
         ok && want && (w.size >= 0 ? static_cast<uint64_t>(w.size) != want : seq->read);
-    const bool offline =
-        ok && w.statFlags >= 0 && (static_cast<uint64_t>(w.statFlags) & xrdwire::kStatOffline);
     // A copy with no bytes of a file named *.root is a bad copy, refused like one of another size.
     const bool emptyRoot = ok && !sizeDiffers && emptyRootCopy(st.url, w.size);
     const bool bad = sizeDiffers || emptyRoot;
     SiteFailure f = siteFailure(w, s, hostPortOfUrl(sentUrl));
+    const bool offline =
+        ok && w.statFlags >= 0 && (static_cast<uint64_t>(w.statFlags) & xrdwire::kStatOffline);
     const bool repeats = ok && seq->read && failedBefore(seq->failed, f);
     if (sizeDiffers)
       f.error = w.size < 0 ? std::string("its size could not be read")
                            : "it serves " + std::to_string(w.size) + " bytes, the cached file has " +
                                  std::to_string(want);
     else if (emptyRoot)
-      f.error = "the copy there is empty, and a ROOT file never is";
+      f.error = "size 0: the copy is empty, and a ROOT file never is";
     else if (offline)
       f.error = "the copy there is on tape (offline)";
     else if (repeats)
       f.error = "reads from it stopped, and the redirector sent the open back";
+    f.bad = emptyRoot;
+    // The copy is refused and no other is tried: it goes on the list the error names, and is counted.
+    const auto refuse = [&] {
+      const bool listed = std::any_of(seq->failed.begin(), seq->failed.end(),
+                                      [&](const SiteFailure& x) { return x.server == f.server; });
+      if (!listed)
+        seq->failed.push_back(f);
+      noteBadCopy(st, f.server, f.error);
+      return Next::kRefuse;
+    };
+    if (seq->lastResort) // the last open: whatever it answers stands, but an empty ROOT file
+      return emptyRoot ? refuse() : Next::kDone;
+    const bool onCandidate = seq->onCandidate;
+    seq->onCandidate = false;
+    seq->noteChain(w, s);
     // The open goes on to the regional redirector's list of copies when it was
     // not found though a copy may exist, when the redirector handed back a
     // server or site that failed already, when a server did not answer within
@@ -810,6 +835,8 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
         return Next::kDone;
     }
     if (!goOn) {
+      if (emptyRoot)
+        return refuse();
       if (ok || !seq->sawOffline || processExiting())
         return Next::kDone;
       seq->lastResort = true; // see FailoverSeq::sawOffline
@@ -1328,8 +1355,8 @@ class RetryingOpenHandler : public ResponseHandler {
     const Next n = afterAttempt(*st_, cfg_, seq_.get(), s, w, sentUrl_, sourceAttempt_, 0);
     const bool ok = s.IsOK();
     a_.endUs = nowUs();
-    if (seq_ && n == Next::kDone) {
-      a_.outcome = ok ? "ok" : "error";
+    if (seq_ && (n == Next::kDone || n == Next::kRefuse)) {
+      a_.outcome = ok && n == Next::kDone ? "ok" : "error";
       a_.budgetS = seq_->budget;
     }
     if (n == Next::kLocate) // recorded by doRetry, which asks where the copies are first
@@ -1341,9 +1368,11 @@ class RetryingOpenHandler : public ResponseHandler {
         seq_->recovered(*st_, lastServer(w), attempt_);
       return false;
     }
-    lastStatus_ = ok ? XRootDStatus(XrdCl::stError, XrdCl::errErrorResponse, kXR_FSError,
-                                    "the copy there is on tape (offline)")
-                     : s;
+    lastStatus_ = n == Next::kRefuse
+                      ? XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, "the copy is refused")
+                  : ok ? XRootDStatus(XrdCl::stError, XrdCl::errErrorResponse, kXR_FSError,
+                                      "the copy there is on tape (offline)")
+                       : s;
     if (record_ && h)
       lastHosts_ = std::move(h); // the reader's failure carries the last hosts there were
     RetryingOpenHandler* self = this;
@@ -1355,6 +1384,9 @@ class RetryingOpenHandler : public ResponseHandler {
     case Next::kElsewhere:
     case Next::kLocate:
       moveExecutor().post([self, ok, n] { self->doRetry(true, ok, n == Next::kLocate); });
+      break;
+    case Next::kRefuse: // the refused copy is open: closed in the executor, not on this thread
+      moveExecutor().post([self] { self->doRefuse(); });
       break;
     case Next::kDone:
       forwardFailure();
@@ -1393,6 +1425,8 @@ class RetryingOpenHandler : public ResponseHandler {
       held_.reset();
     }
     if (exiting || (locate && listed.empty())) {
+      if (closeOld && !exiting) // a copy refused for what it is, and no other to try
+        st->resetInner(/*leakOld=*/false, /*onlyIfIdle=*/false, /*closeOld=*/true);
       forwardFailure();
       return;
     }
@@ -1410,6 +1444,15 @@ class RetryingOpenHandler : public ResponseHandler {
     const XRootDStatus s = issueOn(fresh, isFresh);
     if (!s.IsOK()) // sync re-issue error: classify again, never drop a completion
       refusedAtOnce(s, isFresh);
+  }
+
+  // Runs on the move executor: the open ends with the error that names the copies. The copy
+  // that was refused is open, and is closed without waiting.
+  void doRefuse() {
+    const std::shared_ptr<HandleState> st = st_; // once forwarded, `this` is gone
+    if (!processExiting())
+      st->resetInner(/*leakOld=*/false, /*onlyIfIdle=*/false, /*closeOld=*/true);
+    forwardFailure();
   }
 
   void forwardFailure() {
@@ -1690,22 +1733,22 @@ bool HandleState::ensureInnerOpen() {
   // the reader's off-thread backoff: acceptable because this is the degraded/
   // miss path only and innerOpened latches, so a handle runs at most one
   // sequence. open_retries == 0 (default) skips the retries.
+  Next n = Next::kDone;
   for (int sourceAttempt = 1;; ++sourceAttempt) {
     const std::string sent = faultOpenUrl(source, ++lazyOpenAttempt);
     ans = openAndWait(f, sent, a, seq ? seq->timeout() : static_cast<ucache::XrdTimeout>(0),
                       seq ? 2 * seq->trS : 0);
     reached = ans.hosts && !ans.hosts->empty() ? hostPortOf(ans.hosts->back().url) : std::string();
     const AttemptView w = viewOf(*this, ans.status, ans.hosts.get(), f);
-    const Next n =
-        afterAttempt(*this, cfg, seq ? &*seq : nullptr, ans.status, w, sent, sourceAttempt, want);
+    n = afterAttempt(*this, cfg, seq ? &*seq : nullptr, ans.status, w, sent, sourceAttempt, want);
     a.endUs = nowUs();
     // Whether this attempt ends the sequence, known before it is recorded: its last line
     // says how the open ended. Asking for the next listed copy waits, here.
     std::string listed;
-    const bool end = n == Next::kDone || processExiting() ||
+    const bool end = n == Next::kDone || n == Next::kRefuse || processExiting() ||
                      (n == Next::kLocate && (listed = locateNext(*this, *seq, fillUrl)).empty());
     if (seq && end) {
-      a.outcome = ans.status.IsOK() ? "ok" : "error";
+      a.outcome = ans.status.IsOK() && n != Next::kRefuse ? "ok" : "error";
       a.budgetS = seq->budget;
     }
     noteAnswer(a, ans, sent, f, w);
@@ -1735,6 +1778,8 @@ bool HandleState::ensureInnerOpen() {
   XRootDStatus s = ans.status;
   if (abandoned(f, s.IsOK()))
     return false;
+  if (n == Next::kRefuse) // refused for what the copy is, and no other to try: the open fails
+    s = XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, "the copy is refused");
   if (s.IsOK() && want) {
     XrdCl::StatInfo* si = nullptr;
     const XRootDStatus ss = f->Stat(false, si);
@@ -1785,7 +1830,7 @@ bool HandleState::ensureInnerOpen() {
     lazyOpenFailUs = nowUs();
     // A failed open is TERMINAL on the object: install a fresh file
     // now so the post-cool-down re-attempt doesn't replay the cached error.
-    resetInner(/*leakOld=*/ans.unfinished, /*onlyIfIdle=*/true);
+    resetInner(/*leakOld=*/ans.unfinished, /*onlyIfIdle=*/true, /*closeOld=*/n == Next::kRefuse);
     // Named by its cache key, which carries no query (a query can carry an
     // access token). Other log lines that name the reader's URL print it whole.
     const auto key = UrlKey::parse(url, cfg.keepCgi);
@@ -2232,7 +2277,7 @@ static bool moveInner(HandleState& st, std::vector<SiteFailure> failed, uint64_t
     w = viewOf(st, ans.status, ans.hosts.get(), f.get());
     n = afterAttempt(st, cfg, &seq, ans.status, w, source, 1, want);
     a.endUs = nowUs();
-    const bool end = n == Next::kDone || (exiting = processExiting()) ||
+    const bool end = n == Next::kDone || n == Next::kRefuse || (exiting = processExiting()) ||
                      (n == Next::kLocate && (listed = locateNext(st, seq, base)).empty());
     if (end) { // the last line of the sequence says how it ended
       a.outcome = ans.status.IsOK() ? "ok" : "error";
@@ -2252,7 +2297,7 @@ static bool moveInner(HandleState& st, std::vector<SiteFailure> failed, uint64_t
   // A size the copy does not give is not the one the reader was shown. Nothing is
   // adopted at an exit: the answer is only the last one there was.
   const bool sizeOk = w.size >= 0 && static_cast<uint64_t>(w.size) == want;
-  if (exiting || !ans.status.IsOK() || !sizeOk) {
+  if (exiting || !ans.status.IsOK() || !sizeOk || n == Next::kRefuse) {
     if (ans.unfinished)
       (void)f.release();
     (void)seq.finalError(st, recordFile(st.url), ans.status); // counted, and said
