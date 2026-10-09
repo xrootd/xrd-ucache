@@ -24,6 +24,12 @@
 #                          client sends a locate, the regional logs it,
 #                          failover_locates counts it, and the open that was sent
 #                          back is made at b: an attempt of route candidate
+#   empty copy             the file is named *.root, a and b hold it and c holds it empty; a
+#                          new file each time, one open, until an open landed on c first. With
+#                          adaptive_federation on that copy is refused (a ROOT file is never
+#                          empty), the open goes on to a copy with bytes, the reader gets the
+#                          file's own bytes, and the records show the empty copy's size 0, a
+#                          failed attempt of op open, class data, and the copy that was taken
 #   all refused            a, b and c refuse the file: Open() returns OK, one
 #                          completion, a failure that names all three servers
 #   switch off             the default: a refused at a: some opens fail, the client
@@ -177,6 +183,28 @@ if [ "$got" != 0 ]; then
   records "$W/c5-$got" | tail -1 | grep -q '"outcome":"ok"'; verdict "the last record line says outcome ok" $?
 fi
 L5=$L
+
+echo; echo "=== an empty copy of a file named *.root is refused"
+# Up to 60 files (about 3 are needed on average, and the leg stops at the first).
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
+got=0 allok=1
+for i in $(seq 60); do
+  L=/store/ci/ec-$i.root
+  place $L a b
+  install -d -m 777 "$W/data/c/store/ci"; : > "$W/data/c$L"; chmod 666 "$W/data/c$L"
+  res=$(fuzz "$W/c11-$i" "$W/f11-$i.log" "root://127.0.0.1:$RX/$L" "$W/f.bin" 1 1 1 open-failover)
+  echo "$res" | grep -q '^open-failover: clean$' || { allok=0; echo "$res" | sed 's/^/    /'; break; }
+  if records "$W/c11-$i" | head -1 | grep -q '"size":0,'; then got=$i; break; fi
+done
+[ "$allok" = 1 ]; verdict "every open succeeded, one completion, right bytes" $?
+[ "$got" != 0 ]; verdict "an open landed on the empty copy first (file $got of at most 60)" $?
+if [ "$got" != 0 ]; then
+  records "$W/c11-$got" | sed 's/^/    rec: /' | cut -c1-230
+  records "$W/c11-$got" | tail -1 | grep -q '"status":"ok".*"size":1048576,'; verdict "the open ended at a copy with 1048576 bytes" $?
+  cat "$W/c11-$got"/stats/*.files.jsonl | grep '"kind":"origin_failure"' | grep -q '"op":"open".*"class":"data"'
+  verdict "the empty copy is recorded as a failure of op open, class data" $?
+  [ "$(counter "$W/c11-$got" origin_failures_data)" -ge 1 ]; verdict "origin_failures_data counts it" $?
+fi
 
 echo; echo "=== all refused: a, b and c refuse the file"
 L9=/store/ci/f9.bin

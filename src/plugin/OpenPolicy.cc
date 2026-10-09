@@ -267,6 +267,12 @@ OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bo
   }
 }
 
+bool emptyRootCopy(const std::string& path, long long size) {
+  const size_t end = path.find('?');
+  const size_t n = end == std::string::npos ? path.size() : end;
+  return size == 0 && n >= 5 && path.compare(n - 5, 5, ".root") == 0;
+}
+
 std::string exclusionName(const std::vector<Hop>& hops, int i) {
   if (i <= 0 || static_cast<size_t>(i) >= hops.size())
     return std::string();

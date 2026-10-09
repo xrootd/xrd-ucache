@@ -712,3 +712,29 @@ TEST(OpenPolicy, FailedBeforeAndTheListOfCopiesAgree) {
     EXPECT_EQ(excludedByList(r.host, r.port), r.list) << r.host << ":" << r.port << " " << r.why;
   }
 }
+
+// A copy with no bytes of a file named *.root is a bad copy; a size of zero is an
+// ordinary size for any other name.
+TEST(OpenPolicy, EmptyRootCopy) {
+  EXPECT_TRUE(emptyRootCopy("/store/mc/a/b.root", 0));
+  EXPECT_TRUE(emptyRootCopy("root://h:1094//store/a.root", 0)) << "a URL";
+  EXPECT_TRUE(emptyRootCopy("root://h:1094//store/a.root?tried=x.org&triedrc=ioerr", 0))
+      << "the query is not part of the name";
+  EXPECT_TRUE(emptyRootCopy("a.root", 0));
+  EXPECT_TRUE(emptyRootCopy("/store/a.root.root", 0));
+  // Not empty, or not known: no claim.
+  EXPECT_FALSE(emptyRootCopy("/store/a.root", 1));
+  EXPECT_FALSE(emptyRootCopy("/store/a.root", 4247184));
+  EXPECT_FALSE(emptyRootCopy("/store/a.root", -1)) << "a size that could not be read";
+  // Not the name of a ROOT file: an empty file is an ordinary file.
+  EXPECT_FALSE(emptyRootCopy("/store/a.dat", 0));
+  EXPECT_FALSE(emptyRootCopy("/store/a.root.gz", 0));
+  EXPECT_FALSE(emptyRootCopy("/store/a.root/", 0)) << "a trailing slash";
+  EXPECT_FALSE(emptyRootCopy("/store/aroot", 0)) << "no dot";
+  EXPECT_FALSE(emptyRootCopy("/store/a.dat?name=b.root", 0)) << "only the query ends in .root";
+  EXPECT_FALSE(emptyRootCopy("/store/a.ROOT", 0)) << "only the lower-case .root counts";
+  EXPECT_FALSE(emptyRootCopy("", 0));
+  EXPECT_FALSE(emptyRootCopy("root", 0));
+  EXPECT_FALSE(emptyRootCopy(".roo", 0));
+  EXPECT_FALSE(emptyRootCopy("?a.root", 0)) << "nothing before the query";
+}

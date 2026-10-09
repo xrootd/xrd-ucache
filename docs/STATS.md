@@ -215,8 +215,9 @@ ones included, so a run with caching disabled shows its origin failures too.
   TLS errors, failed authentication, a refused authorization). `site`: the
   server or its storage failed the request, or the redirectors sent it on past
   the redirect limit. `notfound`: no server holds the file. `data`: bytes
-  refused (a basket or page that failed its checksum, or a basket of a
-  byte-cache fetch whose key is not where the tree's record puts it).
+  refused (a basket or page that failed its checksum, a basket of a
+  byte-cache fetch whose key is not where the tree's record puts it, or, with
+  `adaptive_federation = on`, an empty copy of a file named `*.root`).
   `expired`: a request that outlived its timeout, whose timeout not said; with
   `adaptive_federation = on`, among them an open that passed the open deadline
   (USER_GUIDE.md), its `timeout_s` in its open line (FORMAT.md). `other`: the

@@ -318,7 +318,12 @@ same after a server that stalled past the open deadline, so that the next
 attempt does not meet the other server of the same site, which stalls too;
 the copies at that server's domain are tried last. A copy listed
 as on tape is skipped, with the log line `<file>: the copy at <host>:<port> is
-on tape (offline); not opened`.
+on tape (offline); not opened`. A copy of a file named `*.root` that holds no
+bytes is a bad copy: the open is made again at another site, with the log line
+`... could not open it (the copy there is empty, and a ROOT file never is); trying
+another site`, and the empty copy is counted in `origin_failures_data` and recorded
+as an `origin_failure` line of op `open` (FORMAT.md). When no other site is left, the
+open ends on the last copy, as without uCache.
 The counters `open_failovers`, `opens_recovered`, `opens_failed_everywhere`,
 `failover_locates` and `offline_copies_skipped` (STATS.md) count these, and the
 per-file record file has a line per attempt (FORMAT.md, routes `failover` and

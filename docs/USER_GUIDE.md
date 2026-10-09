@@ -808,8 +808,9 @@ through the redirector, naming the servers that failed in `tried=` so that the
 redirector sends it elsewhere. This holds for the job's own open and for the
 opens uCache makes of the origin. A success is taken wherever it lands; for the
 opens uCache makes of a file it holds, only a copy of the size it holds; a
-copy on tape (the server's answer to the open says `Offline`) is passed over
-for another site's; when no other site opens the file, it is opened once more
+copy with no bytes of a file named `*.root` (a ROOT file is never empty; a size
+of zero is an ordinary size for any other name) and a copy on tape (the
+server's answer to the open says `Offline`) are passed over for another site's; when no other site opens the file, it is opened once more
 as the job asked for it and that answer stands, so a file that is readable
 without uCache stays readable. Each open tries
 at most 4 sites, within 180 s in all (less when the job's own open timeout is

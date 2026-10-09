@@ -605,6 +605,20 @@ void noteSizeDisagreement(HandleState& st, const std::string& server, uint64_t s
 } catch (...) {
 }
 
+// A copy refused for what it is, though its open succeeded: counted as a data failure of
+// `server`, recorded as an `origin_failure` line of op `open`, and put on the file's account
+// of its servers, as noteSizeDisagreement does.
+void noteBadCopy(HandleState& st, const std::string& server, const std::string& why) try {
+  std::shared_ptr<FileEntry> e;
+  {
+    std::lock_guard<std::mutex> g(st.mu);
+    e = st.entry;
+  }
+  noteOriginFailure(st, e ? &e->obs().servers : nullptr, "open", 0, 0,
+                    XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, why), server);
+} catch (...) {
+}
+
 // One open's attempts, with adaptive_federation on, as one sequence
 // (OpenPolicy.h): its time budget, read at its start, the sites that failed,
 // and what the next attempt names in tried=. Used by one driver at a time: the
@@ -720,10 +734,11 @@ enum class Next : uint8_t { kDone, kSameSource, kElsewhere, kLocate };
 // transient failure is retried at the same source first (open_retries), while
 // the sequence `seq` may issue more (null: adaptive_federation off); then,
 // with `seq`, an outcome another site may not share -- a success of another
-// size, or on tape, included -- goes elsewhere. A copy no other site replaces
-// is kept: that is how an open ends when a bound stops the sequence. When no
-// other site opens a file whose copy on tape was passed over, one last open of
-// the reader's own URL is made and its answer stands. Counts the retries.
+// size, an empty ROOT file or one on tape, included -- goes elsewhere. A copy no
+// other site replaces is kept: that is how an open ends when a bound stops the
+// sequence. When no other site opens a file whose copy on tape was passed over,
+// one last open of the reader's own URL is made and its answer stands. Counts
+// the retries.
 // Throws nothing: for want of memory the open ends with this answer.
 Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XRootDStatus& s,
                   const AttemptView& w, const std::string& sentUrl, int sourceAttempt,
@@ -754,12 +769,17 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
         ok && want && (w.size >= 0 ? static_cast<uint64_t>(w.size) != want : seq->read);
     const bool offline =
         ok && w.statFlags >= 0 && (static_cast<uint64_t>(w.statFlags) & xrdwire::kStatOffline);
+    // A copy with no bytes of a file named *.root is a bad copy, refused like one of another size.
+    const bool emptyRoot = ok && !sizeDiffers && emptyRootCopy(st.url, w.size);
+    const bool bad = sizeDiffers || emptyRoot;
     SiteFailure f = siteFailure(w, s, hostPortOfUrl(sentUrl));
     const bool repeats = ok && seq->read && failedBefore(seq->failed, f);
     if (sizeDiffers)
       f.error = w.size < 0 ? std::string("its size could not be read")
                            : "it serves " + std::to_string(w.size) + " bytes, the cached file has " +
                                  std::to_string(want);
+    else if (emptyRoot)
+      f.error = "the copy there is empty, and a ROOT file never is";
     else if (offline)
       f.error = "the copy there is on tape (offline)";
     else if (repeats)
@@ -773,9 +793,9 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     // it ends, or tries elsewhere through the redirector after a stall.
     const bool canAsk = !seq->regional.empty() || seq->located;
     const OpenStep step =
-        onCandidate ? (ok && !sizeDiffers && !offline ? OpenStep::kFinal : OpenStep::kLocate)
-                    : stepAfter(w.v, ok ? 0 : s.code, ok ? 0 : static_cast<int>(s.errNo),
-                                sizeDiffers, offline, seq->excluded, repeats, canAsk);
+        onCandidate ? (ok && !bad && !offline ? OpenStep::kFinal : OpenStep::kLocate)
+                    : stepAfter(w.v, ok ? 0 : s.code, ok ? 0 : static_cast<int>(s.errNo), bad,
+                                offline, seq->excluded, repeats, canAsk);
     AfterFailure af = AfterFailure::kStop;
     if (step != OpenStep::kFinal)
       af = afterFailure(seq->failed, f, failoverMaxSites(), seq->stopped());
@@ -801,6 +821,8 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
       if (st.store)
         st.store->stats().sizeDisagreements.fetch_add(1, std::memory_order_relaxed);
       noteSizeDisagreement(st, f.server, static_cast<uint64_t>(w.size), want);
+    } else if (emptyRoot) {
+      noteBadCopy(st, f.server, f.error);
     }
     UCACHE_WARN("%s: %s (%s) could not open it (%s); trying another site",
                 recordFile(st.url).c_str(), f.server.c_str(), f.site.c_str(),

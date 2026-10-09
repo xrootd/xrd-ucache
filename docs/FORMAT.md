@@ -422,7 +422,9 @@ any server and has no line.
   whose key is not where the tree's record puts it), `first_pass` (a
   replica's first pass, and a basket or page there that failed its checksum),
   `records` (the file's own records, read to set up its layout), `relay` (a
-  request passed straight to the origin).
+  request passed straight to the origin), `open` (with `adaptive_federation =
+  on`, a copy refused after its open succeeded: an empty copy of a file named
+  `*.root`; class `data`, code 14, `off` and `len` 0).
 - `off`, `len`: the span asked for (a vector read's first offset and its
   bytes); `data_server`: the last host of the failed answer, else the server
   the file's open reached (for a pass-through handle, whose open is not
@@ -430,8 +432,9 @@ any server and has no line.
   known); `codec`, after `data_server`, on a checksum failure
   whose compression is known.
 - At most 16 lines per file, server and class in a process; the per-file
-  record's `data_servers` counts every failed read. Open failures are in the
-  `open` lines only.
+  record's `data_servers` counts every failed read. Failed opens are in the
+  `open` lines only; a copy refused after its open succeeded is there too, as
+  a line of op `open`.
 
 **`"kind":"size_disagreement"`, v1** — with `adaptive_federation = on`, one
 line each time an open uCache made of a file it holds landed on a copy of

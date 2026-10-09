@@ -194,6 +194,12 @@ enum class OpenStep : uint8_t {
 OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bool offline,
                    bool excluded, bool repeats = false, bool regionalKnown = false);
 
+// Whether a copy of `path` that reports `size` bytes is a bad copy for that file: no
+// bytes in a file named *.root (a ROOT file is never empty). The name is the path
+// without a query (what follows the first '?'), and only the lower-case ".root" counts,
+// as ROOT's own tools write it. For any other name a size of zero is an ordinary size.
+bool emptyRootCopy(const std::string& path, long long size);
+
 // The host name a retry's tried= may carry for hop `i` of a chain, or "" when
 // it may not: never a redirector, nor the first host, nor an address or a
 // name without a dot (neither masks a server at a redirector), nor a data
