@@ -199,6 +199,17 @@ OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bo
 // without a query (what follows the first '?'), and only the lower-case ".root" counts,
 // as ROOT's own tools write it. For any other name a size of zero is an ordinary size.
 bool emptyRootCopy(const std::string& path, long long size);
+// Whether `path` names a ROOT file: the part before the first '?' ends in the lower-case ".root".
+bool rootNamed(const std::string& path);
+
+// The header check of a ROOT file's copy: the first kRootHeaderBytes bytes of a file named
+// *.root. A ROOT file begins with "root", a version (a 32-bit integer, big-endian, at 4) and at
+// 12 the end of the file: a 32-bit integer, or a 64-bit one when the version is 1000000 or more.
+// rootFileEnd returns that end, as the first `n` bytes of `b` state it, or -1 when they make no
+// claim: they do not begin with "root", or fewer than 20 bytes are there. A copy whose size is
+// not the end its header states is a bad copy (a transfer that was cut, or appended to).
+inline constexpr size_t kRootHeaderBytes = 64;
+long long rootFileEnd(const unsigned char* b, size_t n);
 
 // The host name a retry's tried= may carry for hop `i` of a chain, or "" when
 // it may not: never a redirector, nor the first host, nor an address or a

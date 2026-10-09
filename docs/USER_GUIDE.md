@@ -809,12 +809,18 @@ redirector sends it elsewhere. This holds for the job's own open and for the
 opens uCache makes of the origin. A success is taken wherever it lands; for the
 opens uCache makes of a file it holds, only a copy of the size it holds; a
 copy with no bytes of a file named `*.root` (a ROOT file is never empty; a size
-of zero is an ordinary size for any other name) and a copy on tape (the
-server's answer to the open says `Offline`) are passed over for another site's.
+of zero is an ordinary size for any other name), a copy of such a file whose size
+is not the end its own header states (the first 64 bytes of the copy are read
+inside the job's open: a transfer that was cut, or appended to; bytes that are not
+a ROOT file's header make no claim, and a file not named `*.root` is not looked at)
+and a copy on tape (the server's answer to the open says `Offline`) are passed over
+for another site's. A copy whose size equals the end its header states confirms the
+file's size, which the cache entry keeps (FORMAT.md): another size is not accepted
+for it.
 When no other site opens a file whose copy on tape was passed over, it is opened once
 more as the job asked for it and that answer stands, so a file that is readable
-without uCache stays readable. When every copy is empty (or the URL names a server
-directly and that copy is empty), the job's open fails with one error of class `data`
+without uCache stays readable. When every copy is refused for what it is (empty, or cut short of its header's end;
+or the URL names a server directly and that copy is), the job's open fails with one error of class `data`
 that names each copy tried, its size and why it was refused. Each open tries
 at most 4 sites, within 180 s in all (less when the job's own open timeout is
 shorter, and with the switch's error window of 180 s, 160 s), and an open that

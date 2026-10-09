@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <climits>
 #include <vector>
 
 using namespace ucache;
@@ -749,4 +750,64 @@ TEST(OpenPolicy, EmptyRootCopy) {
   EXPECT_FALSE(emptyRootCopy("root", 0));
   EXPECT_FALSE(emptyRootCopy(".roo", 0));
   EXPECT_FALSE(emptyRootCopy("?a.root", 0)) << "nothing before the query";
+}
+
+TEST(OpenPolicy, RootNamed) {
+  EXPECT_TRUE(rootNamed("/store/mc/a/b.root"));
+  EXPECT_TRUE(rootNamed("root://h:1094//store/a.root?tried=x.org"));
+  EXPECT_TRUE(rootNamed(".root"));
+  EXPECT_FALSE(rootNamed("/store/a.ROOT"));
+  EXPECT_FALSE(rootNamed("/store/a.root.gz"));
+  EXPECT_FALSE(rootNamed("/store/a.dat?name=b.root"));
+  EXPECT_FALSE(rootNamed("/store/aroot"));
+  EXPECT_FALSE(rootNamed(""));
+}
+
+namespace {
+std::vector<unsigned char> header(const char* magic, uint32_t version, uint64_t end, bool wide) {
+  std::vector<unsigned char> b(magic, magic + 4);
+  const auto put = [&b](uint64_t v, int n) {
+    for (int i = n - 1; i >= 0; --i)
+      b.push_back(static_cast<unsigned char>(v >> (8 * i)));
+  };
+  put(version, 4);
+  put(100, 4); // where the first record begins
+  put(end, wide ? 8 : 4);
+  while (b.size() < kRootHeaderBytes)
+    b.push_back(0x5a);
+  return b;
+}
+} // namespace
+
+// What a copy's first bytes say about where the file ends: the end, or no claim.
+TEST(OpenPolicy, RootFileEnd) {
+  // The first bytes of a real file (6559 bytes): the end it states is its size.
+  const unsigned char real[] = {0x72, 0x6f, 0x6f, 0x74, 0x00, 0x00, 0xf8, 0x72, 0x00, 0x00,
+                                0x00, 0x64, 0x00, 0x00, 0x19, 0x9f, 0x00, 0x00, 0x19, 0x64};
+  EXPECT_EQ(rootFileEnd(real, sizeof real), 6559);
+  EXPECT_EQ(rootFileEnd(real, sizeof real - 1), -1) << "fewer than 20 bytes: no claim";
+  EXPECT_EQ(rootFileEnd(real, 0), -1);
+  // A 32-bit end, a 64-bit one for a version of a million or more, the end one past 2 GiB.
+  auto b = header("root", 62002, 123456789, false);
+  EXPECT_EQ(rootFileEnd(b.data(), b.size()), 123456789);
+  b = header("root", 1062002, 5000000000ull, true);
+  EXPECT_EQ(rootFileEnd(b.data(), b.size()), 5000000000ll);
+  b = header("root", 1000000, 7, true);
+  EXPECT_EQ(rootFileEnd(b.data(), b.size()), 7) << "version 1000000 is the first with a 64-bit end";
+  b = header("root", 999999, 7, false);
+  EXPECT_EQ(rootFileEnd(b.data(), b.size()), 7);
+  b = header("root", 62002, 0x80000000u, false);
+  EXPECT_EQ(rootFileEnd(b.data(), b.size()), 2147483648ll) << "never negative";
+  b = header("root", 1062002, ~0ull, true);
+  EXPECT_EQ(rootFileEnd(b.data(), b.size()), LLONG_MAX) << "an end no file has: it equals no size";
+  // Only the first 20 bytes count, and exactly 20 are enough.
+  b = header("root", 62002, 4242, false);
+  EXPECT_EQ(rootFileEnd(b.data(), 20), 4242);
+  // No claim: not a ROOT file's first bytes, whatever follows the first four.
+  for (const char* magic : {"Root", "ROOT", "toor", "roo\0", "\0\0\0\0"}) {
+    b = header(magic, 62002, 4242, false);
+    EXPECT_EQ(rootFileEnd(b.data(), b.size()), -1) << magic;
+  }
+  const std::vector<unsigned char> zeros(kRootHeaderBytes, 0);
+  EXPECT_EQ(rootFileEnd(zeros.data(), zeros.size()), -1) << "a block of zeros";
 }

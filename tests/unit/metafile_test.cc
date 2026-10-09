@@ -207,3 +207,37 @@ TEST(MetaFile, SerializeEmptyCrcsWritesAbsentTable) {
   for (uint32_t c : d->pageCrcs)
     EXPECT_EQ(c, 0u);
 }
+
+// The size-confirmed bit lives in the flags word, which every reader tests with masks: a build
+// that does not know the bit reads the sidecar as before, and a sidecar written before the bit
+// reads as not confirmed. No format version change.
+TEST(MetaFile, SizeConfirmedBitRoundtripsAndOtherReadersIgnoreIt) {
+  MetaData m = sample();
+  m.flags = MetaData::kFlagPinned | MetaData::kFlagComplete | MetaData::kFlagSizeConfirmed;
+  const auto buf = MetaFile::serialize(m);
+  const auto d = MetaFile::deserialize(buf.data(), buf.size());
+  ASSERT_TRUE(d) << "a sidecar with the bit set loads: the version is the same";
+  EXPECT_EQ(MetaData::kFormatVersion, 1u);
+  EXPECT_EQ(d->flags, m.flags);
+  EXPECT_TRUE(d->flags & MetaData::kFlagSizeConfirmed);
+  // What a build that knows only bits 0 and 1 reads: both, as before.
+  constexpr uint32_t kOldMask = MetaData::kFlagPinned | MetaData::kFlagComplete;
+  EXPECT_EQ(d->flags & kOldMask, kOldMask);
+  EXPECT_TRUE(d->flags & MetaData::kFlagPinned);
+  EXPECT_TRUE(d->flags & MetaData::kFlagComplete);
+  // A sidecar of an earlier release (flags with bits 0 and 1 only) is not confirmed.
+  MetaData old = sample();
+  old.flags = MetaData::kFlagPinned | MetaData::kFlagComplete;
+  const auto ob = MetaFile::serialize(old);
+  const auto od = MetaFile::deserialize(ob.data(), ob.size());
+  ASSERT_TRUE(od);
+  EXPECT_FALSE(od->flags & MetaData::kFlagSizeConfirmed);
+  // The scan path reads it the same.
+  TempDir td;
+  RealIO io;
+  const std::string path = td.path() + "/c.meta";
+  ASSERT_EQ(MetaFile::store(io, path, m, false), 0);
+  const auto sum = MetaFile::loadSummary(io, path);
+  ASSERT_TRUE(sum);
+  EXPECT_EQ(sum->flags, m.flags);
+}

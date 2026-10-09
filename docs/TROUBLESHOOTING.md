@@ -322,8 +322,13 @@ on tape (offline); not opened`. A copy of a file named `*.root` that holds no
 bytes is a bad copy: the open is made again at another site, with the log line
 `... could not open it (size 0: the copy is empty, and a ROOT file never is); trying
 another site`, and the empty copy is counted in `origin_failures_data` and recorded
-as an `origin_failure` line of op `open` (FORMAT.md). When no other copy is left (every
-copy is empty, or the URL names a server directly), the job's open fails with one
+as an `origin_failure` line of op `open` (FORMAT.md). So is a copy of a file named
+`*.root` whose size is not the end its own header states (`size 10161194: its header
+says the file is 16935324 bytes`): inside the job's open uCache reads the first 64
+bytes of the copy, within the open's time; a read that fails or runs out of time is a
+failure of the copy, as an open's would be, and bytes that do not begin with `root`
+make no claim (the copy stands). The job is never shown the cut copy or its size. When no
+other copy is left (every copy is refused, or the URL names a server directly), the job's open fails with one
 error that names each copy tried, its server and its site, its size and why it was
 refused (`no site could open it: <site> (<server>): size 0: the copy is empty, ...`),
 of class `data`; the copy that was opened is closed and nothing of it is cached.

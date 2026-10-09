@@ -5,6 +5,7 @@
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace ucache {
 
@@ -267,10 +268,27 @@ OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bo
   }
 }
 
-bool emptyRootCopy(const std::string& path, long long size) {
+bool rootNamed(const std::string& path) {
   const size_t end = path.find('?');
   const size_t n = end == std::string::npos ? path.size() : end;
-  return size == 0 && n >= 5 && path.compare(n - 5, 5, ".root") == 0;
+  return n >= 5 && path.compare(n - 5, 5, ".root") == 0;
+}
+
+bool emptyRootCopy(const std::string& path, long long size) {
+  return size == 0 && rootNamed(path);
+}
+
+long long rootFileEnd(const unsigned char* b, size_t n) {
+  if (n < 20 || std::memcmp(b, "root", 4) != 0)
+    return -1;
+  const auto be = [b](size_t at, int bytes) {
+    uint64_t v = 0;
+    for (int i = 0; i < bytes; ++i)
+      v = v << 8 | b[at + static_cast<size_t>(i)];
+    return v;
+  };
+  const uint64_t end = be(4, 4) >= 1000000 ? be(12, 8) : be(12, 4);
+  return end > static_cast<uint64_t>(LLONG_MAX) ? LLONG_MAX : static_cast<long long>(end);
 }
 
 std::string exclusionName(const std::vector<Hop>& hops, int i) {

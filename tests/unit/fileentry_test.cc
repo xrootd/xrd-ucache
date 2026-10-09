@@ -284,6 +284,64 @@ TEST(FileEntry, PinnedFlagPersists) {
   EXPECT_FALSE(e->pinned());
 }
 
+// A ROOT file whose header agrees with the size the origin reported has its size confirmed; the
+// entry keeps that with its sidecar. Only a sibling's own commit may not lose it, and a new
+// size is a new entry, which starts unconfirmed.
+TEST(FileEntry, ConfirmedSizeIsKeptWithTheEntry) {
+  Fixture fx;
+  {
+    auto e = fx.open();
+    EXPECT_FALSE(e->sizeConfirmed()) << "a fresh entry is not confirmed";
+    e->confirmSize();
+    EXPECT_TRUE(e->sizeConfirmed());
+    e->confirmSize(); // again: no change
+    e->flushAll();
+  }
+  auto e = fx.open();
+  EXPECT_TRUE(e->sizeConfirmed()) << "stored with the sidecar and read back";
+  // Pages written afterwards, and a pin set, keep it (the merge commit and the whole rewrite).
+  e->writePages(0, 4096, fx.src.data());
+  e->flushAll();
+  e->setPinned(true);
+  e->setPinned(false);
+  e.reset();
+  EXPECT_TRUE(fx.open()->sizeConfirmed());
+  // The origin size changed: another file, a new entry, not confirmed.
+  Fixture& f2 = fx;
+  f2.size = fx.size + 4096;
+  auto g = f2.open();
+  EXPECT_FALSE(g->sizeConfirmed());
+}
+
+TEST(FileEntry, ConfirmedSizeSurvivesASiblingsCommitAndIsAdoptedByIt) {
+  Fixture fx;
+  auto a = fx.open();
+  auto b = fx.open();
+  a->confirmSize();
+  a->flushAll();
+  // B never confirmed and commits pages: the disk's bit stands, and B adopts it.
+  b->writePages(4096, 4096, fx.src.data() + 4096);
+  b->flushAll();
+  EXPECT_TRUE(b->sizeConfirmed());
+  a.reset();
+  b.reset();
+  EXPECT_TRUE(fx.open()->sizeConfirmed());
+  // The other order: B confirms in memory while A commits first and does not know it.
+  Fixture fy;
+  auto c = fy.open();
+  auto d = fy.open();
+  c->writePages(0, 4096, fy.src.data());
+  c->flushAll();
+  d->confirmSize();
+  d->writePages(4096, 4096, fy.src.data() + 4096);
+  d->flushAll();
+  c.reset();
+  d.reset();
+  auto e = fy.open();
+  EXPECT_TRUE(e->sizeConfirmed());
+  EXPECT_TRUE(e->hasRange(0, 2 * 4096)) << "the pages of both are there";
+}
+
 TEST(FileEntry, VerifyAllScrub) {
   Fixture fx;
   auto e = fx.open();

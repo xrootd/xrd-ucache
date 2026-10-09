@@ -249,6 +249,11 @@ struct HandleState {
   // holds positions in this one. A refusal latches for the handle and drops
   // the entry's trust, so the next open checks the origin again.
   std::atomic<uint64_t> expectedOriginSize{0};
+  // The origin size that passed the header check of a ROOT file (0: none), the copy's own header
+  // saying where the file ends at the size it reported (OpenPolicy.h rootFileEnd): set by the
+  // reader's open of a file named *.root with adaptive_federation on, and by a handle whose
+  // entry carries the size confirmed (MetaData::kFlagSizeConfirmed).
+  std::atomic<uint64_t> confirmedSize{0};
   std::string trustMarker;              // the entry's .val path, removed on such a refusal
   std::atomic<bool> sizeRefused{false}; // set: no origin read of this handle reaches that source
   bool ensureInnerOpen(); // lazy origin open on first miss; the caller waits for it

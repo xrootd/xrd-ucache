@@ -170,6 +170,11 @@ class FileEntry {
 
   bool pinned();
   void setPinned(bool p);
+  // The entry's origin size passed the header check of a ROOT file (MetaData::
+  // kFlagSizeConfirmed). Set once, stored with the next sidecar commit, and kept by every
+  // process that holds the entry.
+  bool sizeConfirmed();
+  void confirmSize();
   uint64_t cachedBytes();
 
   // CRC scrub over all present pages (CLI `verify`, crash suite).

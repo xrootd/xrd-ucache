@@ -33,7 +33,7 @@ reach disk, in keys or file names.
 | 0 | 4 | magic | `"UCAC"` |
 | 4 | 4 | format_version u32 | = 1; mismatch → treat as absent |
 | 8 | 4 | page_size u32 | power of two, 4 KiB–1 MiB; fixed at entry creation |
-| 12 | 4 | flags u32 | bit0 = pinned, bit1 = complete |
+| 12 | 4 | flags u32 | bit0 = pinned, bit1 = complete, bit2 = size confirmed (below); other bits are kept as read |
 | 16 | 8 | file_size u64 | origin size validator (always checked) |
 | 24 | 8 | atime u64 | unix seconds, coarse (≤1 update/min) — eviction LRU key |
 | 32 | 8 | origin_mtime u64 | 0 unless `UCACHE_VALIDATE=size+mtime` |
@@ -49,6 +49,16 @@ reach disk, in keys or file names.
 
 `npages = ceil(file_size / page_size)`. The tail page covers only
 `file_size − (npages−1)·page_size` bytes; its CRC covers exactly those bytes.
+
+Flag bit2, *size confirmed*: with `adaptive_federation = on`, an open of a file
+named `*.root` reads the first 64 bytes of the copy it landed on. A ROOT file's header
+states where the file ends; when that equals the size the copy reported, the size is
+confirmed and the entry carries the bit, and a copy of another size is not accepted
+for the entry or for a handle that holds it. The bit is only ever set, and goes with
+the entry when the origin size changes (a new entry starts unconfirmed). It is not a
+format change: a build that does not know the bit ignores it and keeps it when it
+rewrites the sidecar (`format_version` stays 1, since any other version makes a reader
+treat the entry as absent), and a sidecar written before the bit reads as not confirmed.
 
 ## Integrity rules
 
@@ -424,7 +434,8 @@ any server and has no line.
   `records` (the file's own records, read to set up its layout), `relay` (a
   request passed straight to the origin), `open` (with `adaptive_federation =
   on`, a copy refused after its open succeeded: an empty copy of a file named
-  `*.root`; class `data`, code 14, `off` and `len` 0). When no other copy is left, the
+  `*.root`, or one whose size is not the end its own header states, `msg` saying which;
+  class `data`, code 14, `off` and `len` 0). When no other copy is left, the
   open's last line has `outcome` `error` although its own status is `ok`: the
   job's open failed (the copy was refused).
 - `off`, `len`: the span asked for (a vector read's first offset and its

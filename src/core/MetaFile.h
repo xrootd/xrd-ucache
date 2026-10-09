@@ -26,6 +26,10 @@ struct MetaData {
   static constexpr uint32_t kFormatVersion = 1;
   static constexpr uint32_t kFlagPinned = 1u << 0;
   static constexpr uint32_t kFlagComplete = 1u << 1;
+  // The origin size passed the header check of a ROOT file (a copy whose header states
+  // where the file ends, at the size it reported): a copy of another size is not this entry's
+  // file. Only ever set; other bits stay as they are when this one is not known.
+  static constexpr uint32_t kFlagSizeConfirmed = 1u << 2;
   enum CksumKind : uint8_t { kCksumNone = 0, kCksumAdler32 = 1, kCksumCrc32c = 2 };
 
   uint32_t pageSize = 0; // fixed at entry creation

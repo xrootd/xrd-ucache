@@ -217,7 +217,8 @@ ones included, so a run with caching disabled shows its origin failures too.
   the redirect limit. `notfound`: no server holds the file. `data`: bytes
   refused (a basket or page that failed its checksum, a basket of a
   byte-cache fetch whose key is not where the tree's record puts it, or, with
-  `adaptive_federation = on`, an empty copy of a file named `*.root`).
+  `adaptive_federation = on`, an empty copy of a file named `*.root`, or one whose
+  size is not the end its own header states).
   `expired`: a request that outlived its timeout, whose timeout not said; with
   `adaptive_federation = on`, among them an open that passed the open deadline
   (USER_GUIDE.md), its `timeout_s` in its open line (FORMAT.md). `other`: the

@@ -1271,6 +1271,7 @@ bool FileEntry::commitSnapshot(MetaData snapshot, const PageBitmap& sets, const 
     }
     if (pinTouched)
       out.flags = (out.flags & ~MetaData::kFlagPinned) | (snapshot.flags & MetaData::kFlagPinned);
+    out.flags |= snapshot.flags & MetaData::kFlagSizeConfirmed; // only ever set: no delta to track
     out.flags &= ~MetaData::kFlagComplete;
     if (n && out.bitmap.count() == n)
       out.flags |= MetaData::kFlagComplete;
@@ -1334,6 +1335,7 @@ bool FileEntry::commitSnapshot(MetaData snapshot, const PageBitmap& sets, const 
   }
   if (!pinTouched_)
     meta_.flags = (meta_.flags & ~MetaData::kFlagPinned) | (out.flags & MetaData::kFlagPinned);
+  meta_.flags |= out.flags & MetaData::kFlagSizeConfirmed; // a sibling's, kept here too
   meta_.flags &= ~MetaData::kFlagComplete;
   if (n && meta_.bitmap.count() == n)
     meta_.flags |= MetaData::kFlagComplete;
@@ -1344,6 +1346,19 @@ bool FileEntry::commitSnapshot(MetaData snapshot, const PageBitmap& sets, const 
 bool FileEntry::pinned() {
   std::lock_guard<std::mutex> g(mu_);
   return meta_.flags & MetaData::kFlagPinned;
+}
+
+bool FileEntry::sizeConfirmed() {
+  std::lock_guard<std::mutex> g(mu_);
+  return meta_.flags & MetaData::kFlagSizeConfirmed;
+}
+
+void FileEntry::confirmSize() {
+  std::lock_guard<std::mutex> g(mu_);
+  if (meta_.flags & MetaData::kFlagSizeConfirmed)
+    return;
+  meta_.flags |= MetaData::kFlagSizeConfirmed;
+  dirty_ = true; // the next commit stores it
 }
 
 void FileEntry::setPinned(bool p) {

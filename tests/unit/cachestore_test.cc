@@ -273,6 +273,31 @@ TEST(CacheStore, RemoveEntryHandlesReplicaOnlyOrphan) {
   EXPECT_FALSE(store.removeEntry(key)); // now truly gone
 }
 
+// Pinning a closed entry rewrites its sidecar flag directly: the size-confirmed bit stays.
+TEST(CacheStore, PinningAClosedEntryKeepsItsConfirmedSize) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  {
+    auto e = store.open(keyN(7), 100000);
+    ASSERT_TRUE(e);
+    e->confirmSize();
+    e->flushAll();
+  }
+  ASSERT_TRUE(store.setPinnedByKey(keyN(7), true));
+  auto m = MetaFile::load(io, keyN(7).metaPath(cfg.cacheDir));
+  ASSERT_TRUE(m);
+  EXPECT_TRUE(m->flags & MetaData::kFlagPinned);
+  EXPECT_TRUE(m->flags & MetaData::kFlagSizeConfirmed);
+  ASSERT_TRUE(store.setPinnedByKey(keyN(7), false));
+  m = MetaFile::load(io, keyN(7).metaPath(cfg.cacheDir));
+  ASSERT_TRUE(m);
+  EXPECT_FALSE(m->flags & MetaData::kFlagPinned);
+  EXPECT_TRUE(m->flags & MetaData::kFlagSizeConfirmed);
+}
+
 TEST(CacheStore, CleanupAllRespectsDryRunAndPins) {
   CleanupFx fx(3, 8);
   fx.store->setPinnedByKey(keyN(1), true);
