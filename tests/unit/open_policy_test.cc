@@ -347,22 +347,22 @@ TEST(OpenPolicy, ArmedForReads) {
 // The deadline of a test's choosing: unset, empty, not a number, not positive
 // and out of range all give the built-in one.
 TEST(OpenPolicy, ReadDeadlineOverride) {
-  EXPECT_EQ(kReadDeadlineS, 120);
-  EXPECT_EQ(readDeadlineS(nullptr), 120);
-  EXPECT_EQ(readDeadlineS(""), 120);
-  EXPECT_EQ(readDeadlineS("abc"), 120);
-  EXPECT_EQ(readDeadlineS("8x"), 120);
-  EXPECT_EQ(readDeadlineS("0"), 120);
-  EXPECT_EQ(readDeadlineS("-5"), 120);
-  EXPECT_EQ(readDeadlineS("99999999999"), 120);
+  EXPECT_EQ(kReadDeadlineS, 300);
+  EXPECT_EQ(readDeadlineS(nullptr), 300);
+  EXPECT_EQ(readDeadlineS(""), 300);
+  EXPECT_EQ(readDeadlineS("abc"), 300);
+  EXPECT_EQ(readDeadlineS("8x"), 300);
+  EXPECT_EQ(readDeadlineS("0"), 300);
+  EXPECT_EQ(readDeadlineS("-5"), 300);
+  EXPECT_EQ(readDeadlineS("99999999999"), 300);
   EXPECT_EQ(readDeadlineS("8"), 8) << "below the floor of 30: a test's";
-  EXPECT_EQ(readDeadlineS("300"), 300);
+  EXPECT_EQ(readDeadlineS("120"), 120) << "a test's value that is the old built-in one";
 }
 
-// The timeout of an attempt of a read, with the built-in deadline of 120 s and
+// The timeout of an attempt of a read, with the built-in limit of 300 s and
 // the client's default request timeout of 1800 s.
 namespace {
-constexpr int K = 120, RT = 1800;
+constexpr int K = 300, RT = 1800;
 int first(int reader, int rt = RT, int k = K) {
   return readAttemptTimeoutS(reader, rt, k, 0, false);
 }
@@ -375,11 +375,12 @@ TEST(OpenPolicy, ReadAttemptTimeout) {
   EXPECT_EQ(readBudgetS(45, RT), 45);
   EXPECT_EQ(readBudgetS(0, 0), kReadDeadlineS) << "no budget at all falls back to the deadline";
   // The first attempt: the deadline, or the reader's shorter timeout unchanged.
-  EXPECT_EQ(first(0), 120);
+  EXPECT_EQ(first(0), 300);
   EXPECT_EQ(first(10), 10);
   EXPECT_EQ(first(30), 30);
   EXPECT_EQ(first(45), 45);
-  EXPECT_EQ(first(300), 120);
+  EXPECT_EQ(first(600), 300);
+  EXPECT_EQ(first(300), 300);
   EXPECT_EQ(first(0, 40), 40) << "a request timeout of 40 s is kept";
   EXPECT_EQ(first(0, 20), 20) << "a first attempt is never refused for the time left";
   // After a failed attempt: what is left of the budget, nothing once it is below
@@ -390,7 +391,7 @@ TEST(OpenPolicy, ReadAttemptTimeout) {
   EXPECT_EQ(again(0, 1771), 0) << "29 s left: below the floor";
   EXPECT_EQ(again(100, 70), 30);
   EXPECT_EQ(again(100, 71), 0) << "a reader with 100 s: the floor is 30, 29 left";
-  EXPECT_EQ(again(0, 1000), 120);
+  EXPECT_EQ(again(0, 1000), 300);
   EXPECT_EQ(again(100, 60), 40);
   EXPECT_EQ(again(30, 0), 30) << "a refusal at once, from a reader that gives 30 s";
   EXPECT_EQ(again(30, 15), 15);

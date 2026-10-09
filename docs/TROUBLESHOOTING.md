@@ -328,9 +328,9 @@ per-file record file has a line per attempt (FORMAT.md, routes `failover` and
 
 With `adaptive_federation = on`, a read that fails at the server a file was
 opened at, in a way another site may not share (the server stopped answering,
-the connection was lost, the request ran past its deadline of 120 s, or the
-server reported a fault of its own or of its storage), is made again at another
-site, and the job gets the bytes. The log says so, once for every move:
+the connection was lost, the request ran past its time limit of 5 minutes, or
+the server reported a fault of its own or of its storage), is made again at
+another site, and the job gets the bytes. The log says so, once for every move:
 
 - `<file>: reads from <host>:<port> stopped (<error>); reading it from
   <host>:<port> from now on`, when another site served it;
@@ -342,15 +342,17 @@ failed, then a line per open attempt with route `read` (FORMAT.md). The
 counters of an open at another site (`open_failovers`, `opens_recovered`,
 `opens_failed_everywhere`) count these attempts, and `origin_failures_*` the
 failed reads. A read stops after 4 attempts or the time it was allowed. A
-server that stalls is usually found first by the client's own check of a silent
+server that stalls is found by silence: the client's own check of a quiet
 connection (`StreamTimeout`, 60 s, and its `TimeoutResolution`, 15 s, by
-default), which fails every read of that connection at once; the 120 s limit is
-for a server that answers other requests and not this one. A job that sets
-`StreamTimeout` above 120 s sees each of its files move after its own 120 s.
+default) ends every read of that connection at once with an error, and each is
+made again at another site. The 5-minute limit is only a backstop, for a server
+that answers other requests on the connection and never this one. A job that
+sets `StreamTimeout` close to or above 300 s sees each of its files move after
+its own 300 s.
 
-The 120 s covers a whole call, a read split into several requests included, so
-a read of a large range that the connection cannot deliver in 120 s fails at the
-deadline, and is made again at another site with the same result, though the
+The 300 s covers a whole call, a read split into several requests included, so
+a read of a large range that the connection cannot deliver in 300 s fails at the
+limit, and is made again at another site with the same result, though the
 server works. A job whose own timeout for a read is 30 s or less (uproot passes
 30 s) is not moved when a server stalls: its timeout ends the read before the
 time a move needs is left, and it gets that timeout's error, as it would

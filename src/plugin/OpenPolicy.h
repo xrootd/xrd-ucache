@@ -284,13 +284,18 @@ std::string sitesFailedList(const std::vector<SiteFailure>& failed);
 // shown one.
 bool armedForReads(bool adaptiveFederation, bool cacheServes, bool viaRedirector, bool slotLayout);
 
-// The deadline of one origin read of an armed handle. It is above the client's
-// stream timeout plus its resolution (75 s at the defaults), so that on a
-// server that stopped answering the client's own check fires first and fails
-// every request of the connection at once; this deadline is the backstop for a
-// server that answers other requests and not this one. A first value, to be
-// revisited with measurements, and never below 30 s.
-inline constexpr int kReadDeadlineS = 120;
+// The time limit of one origin read of an armed handle: a backstop, 5 minutes. A
+// server that stops answering is found by silence, not by this limit: the client's
+// own check of a quiet connection (its stream timeout, 60 s, and its timeout
+// resolution, 15 s, at the defaults) ends every request on that connection at once
+// with an error, and each is made again at another site. The limit is on the whole
+// call, from the moment it is issued, queueing and delivery included, and it is set
+// so large that a read still running at it moves data at a rate nothing useful
+// could be done at. It is the end of a read on a server that answers other requests
+// on the connection and never this one. It must stay above the stream timeout plus
+// its resolution, or it fires first; a reader that sets a longer stream timeout
+// moves each file after this limit. Never below 30 s.
+inline constexpr int kReadDeadlineS = 300;
 static_assert(kReadDeadlineS >= 30, "a read deadline below 30 s expires healthy reads");
 // A test's deadline (the text of UCACHE_TEST_READ_DEADLINE_S), which may be below
 // that floor; unset, empty, not a number or not positive gives kReadDeadlineS.

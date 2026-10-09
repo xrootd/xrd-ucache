@@ -95,6 +95,9 @@ static_assert(kXR_isServer == xrdwire::kIsServer && kXR_isManager == xrdwire::kI
                   kXR_attrMeta == xrdwire::kAttrMeta && kXR_offline == xrdwire::kStatOffline &&
                   XrdCl::StatInfo::Offline == xrdwire::kStatOffline,
               "XRootD login or stat flags drifted from OpenPolicy.h");
+// A silent connection must be found by the client's own check before a read's limit.
+static_assert(XrdCl::DefaultStreamTimeout + XrdCl::DefaultTimeoutResolution < kReadDeadlineS,
+              "the client's stream timeout and its resolution must end before a read's limit");
 
 // Test-only wire-read fault (PluginSupport.h): the origin dying mid-stream
 // after a healthy open, so the fail-open contract -- the reader still gets the

@@ -843,7 +843,9 @@ uCache.
 `adaptive_federation = on`, a file that uCache serves, that was opened through
 a redirector, and that is not shown in a layout of uCache's own (`recompress`),
 has the reads it makes of the origin bounded: one that has not been answered
-after 120 s, or the job's own timeout of that read when that is shorter (the
+after 5 minutes (a backstop: a server that goes quiet is found sooner, by the
+client's own check of a quiet connection, 60 s plus its timeout resolution of
+15 s), or the job's own timeout of that read when that is shorter (the
 client's `RequestTimeout` when the job gave none), is given up. A read that
 fails in a way another site may not share, because the server stopped
 answering, the connection was lost, the request expired, or the server
