@@ -811,3 +811,25 @@ TEST(OpenPolicy, RootFileEnd) {
   const std::vector<unsigned char> zeros(kRootHeaderBytes, 0);
   EXPECT_EQ(rootFileEnd(zeros.data(), zeros.size()), -1) << "a block of zeros";
 }
+
+// A short answer counts against a copy only when the request lies wholly inside the confirmed size.
+TEST(OpenPolicy, ShortInsideConfirmed) {
+  constexpr uint64_t N = 1000000; // the confirmed size
+  EXPECT_TRUE(shortInsideConfirmed(N, 500000, 65536, 0)) << "no bytes at all, inside the file";
+  EXPECT_TRUE(shortInsideConfirmed(N, 500000, 65536, 100)) << "a part of them";
+  EXPECT_TRUE(shortInsideConfirmed(N, N - 65536, 65536, 65535)) << "a request that ends at the end";
+  // Exact answers, and answers of more than was asked, are not short.
+  EXPECT_FALSE(shortInsideConfirmed(N, 500000, 65536, 65536));
+  EXPECT_FALSE(shortInsideConfirmed(N, 500000, 65536, 70000));
+  // A request that reaches past the end of the file is answered short, as it should be.
+  EXPECT_FALSE(shortInsideConfirmed(N, N - 1000, 65536, 1000)) << "across the end";
+  EXPECT_FALSE(shortInsideConfirmed(N, N - 65535, 65536, 100)) << "one byte past the end";
+  EXPECT_FALSE(shortInsideConfirmed(N, N + 10, 65536, 0)) << "wholly past the end";
+  EXPECT_FALSE(shortInsideConfirmed(N, N, 65536, 0)) << "at the end";
+  // No confirmed size: never held against a copy, whatever the answer.
+  EXPECT_FALSE(shortInsideConfirmed(0, 500000, 65536, 0));
+  EXPECT_FALSE(shortInsideConfirmed(0, 0, 1, 0));
+  // Nothing asked, or arguments that wrap.
+  EXPECT_FALSE(shortInsideConfirmed(N, 500000, 0, 0));
+  EXPECT_FALSE(shortInsideConfirmed(N, ~0ull - 10, 100, 0)) << "off + len wraps";
+}

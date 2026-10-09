@@ -41,7 +41,8 @@
 // right bytes, once, with adaptive_federation on and the file's copies behind a
 // redirector (see runReadFailover). The caller checks the records. The cases
 // zero, zerov and zeroerr do the same for a read of a basket that a server serves
-// as zeros (see runZero).
+// as zeros (see runZero), and cut, cutonly and end for a copy that is cut short after
+// the open (see runCut).
 #include <XrdCl/XrdClFile.hh>
 #include <XrdCl/XrdClURL.hh>
 #ifdef UCACHE_FUZZ_HAVE_TRANSPOSE
@@ -1435,10 +1436,98 @@ int runZero(const char* url, const char* local, const std::string& which) {
   return fails ? 1 : 0;
 }
 
+// read-failover cut | cutonly | end: <local-path> is a ROOT file of at least 64 KiB, whose
+// header says where it ends, and <root-url> serves it from the servers of a federation that
+// do not use sendfile (a copy cut under an open file then answers short, where sendfile would
+// break the connection). The handle is opened (adaptive_federation on: the open reads the
+// header, so the file's size is confirmed), then UCACHE_CUT_CMD, when set, is run with the port
+// of the server the handle landed on and cuts that copy short. Then 64 KiB are read inside the
+// file's size, past the cut:
+//   cut      the read is the file's own bytes, from another server than the cut one
+//   cutonly  every copy was cut: the read fails with errDataError, and its message says the
+//            answer was short inside the file's size
+//   end      nothing is cut. A Read and a PgRead that reach past the end of the file are answered
+//            with the bytes that exist, short, as they always were, and the handle stays put
+int runCut(const char* url, const char* local, const std::string& which) {
+  const char* mode = "read-failover";
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
+  Source src(local);
+  const uint64_t size = src.bytes.size();
+  if (size < 65536 + 40000) {
+    std::printf("%s: SETUP: %s is shorter than 104 KB\n", mode, local);
+    return 2;
+  }
+  int fails = 0;
+  const auto verdict = [&](bool ok, const std::string& what) {
+    std::printf("%s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
+    fails += ok ? 0 : 1;
+  };
+  auto file = std::make_unique<XrdCl::File>(); // plugins enabled
+  std::string landed;
+  if (!strictOpen(*file, url) || !file->GetProperty("DataServer", landed)) {
+    std::printf("%s: SETUP: open failed\n", mode);
+    return 2;
+  }
+  if (const char* cmd = ::getenv("UCACHE_CUT_CMD"))
+    if (std::system((std::string(cmd) + " " + landed.substr(landed.rfind(':') + 1)).c_str()) != 0) {
+      std::printf("%s: SETUP: %s failed\n", mode, cmd);
+      return 2;
+    }
+  std::string now = landed;
+  std::vector<char> buf(65536, 0x5A);
+  if (which == "end") { // past the end: short, exact, no move
+    uint32_t got = 0;
+    XrdCl::XRootDStatus s = file->Read(size - 1000, 65536, buf.data(), got);
+    verdict(s.IsOK() && got == 1000 && std::memcmp(buf.data(), src.bytes.data() + size - 1000, 1000) == 0,
+            "a Read across the end of the file is answered with the 1000 bytes there are (" +
+                s.ToString() + ", " + std::to_string(got) + " bytes)");
+    std::vector<uint32_t> cksums;
+    s = file->PgRead(size - 1000, 65536, buf.data(), cksums, got);
+    verdict(s.IsOK() && got == 1000 && std::memcmp(buf.data(), src.bytes.data() + size - 1000, 1000) == 0,
+            "a PgRead across the end is answered with the 1000 bytes there are (" + s.ToString() +
+                ", " + std::to_string(got) + " bytes)");
+    s = file->Read(size + 5000, 65536, buf.data(), got);
+    verdict(s.IsOK() && got == 0, "a Read past the end is answered with no bytes (" + s.ToString() + ")");
+    file->GetProperty("DataServer", now);
+    verdict(now == landed, "the handle is still read from " + landed + " (now " + now + ")");
+  } else {
+    auto* w = new ReadWait(); // leaked with its buffer: a late completion lands safely
+    const uint64_t off = 40000;
+    const XrdCl::XRootDStatus s = file->Read(off, 65536, buf.data(), w);
+    const bool answered = s.IsOK() && w->wait();
+    std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a second completion
+    file->GetProperty("DataServer", now);
+    {
+      std::lock_guard<std::mutex> g(w->mu);
+      const std::string said = w->status.ToStr();
+      if (which == "cutonly") {
+        verdict(answered && w->status.code == XrdCl::errDataError &&
+                    w->status.GetErrorMessage().find("inside the file's size of") != std::string::npos,
+                "the read inside the file's size past the cut fails with the data error: " + said +
+                    " " + w->status.GetErrorMessage());
+      } else {
+        verdict(answered && w->status.IsOK() && std::memcmp(buf.data(), src.bytes.data() + off, 65536) == 0,
+                "the read past the cut is the file's own bytes (" + (answered ? said : "no answer") + ")");
+        verdict(now != landed, "it was read from " + now + " after " + landed);
+      }
+    }
+    verdict(w->contractKept(), "one completion, through HandleResponseWithHosts, with a non-null HostList");
+  }
+  const XrdCl::XRootDStatus cs = file->Close();
+  if (!cs.IsOK())
+    std::printf("INFO  close: %s\n", cs.ToString().c_str());
+  verdict(openHandlersBad() == 0, "every open had exactly one completion");
+  std::printf("SERVERS %s %s\n", landed.c_str(), now.c_str());
+  std::printf("%s %s: %s\n", mode, which.c_str(), fails ? "FAILED" : "clean");
+  return fails ? 1 : 0;
+}
+
 int runReadFailover(const char* url, const char* local, const std::string& which) {
   const char* mode = "read-failover";
   if (which.rfind("zero", 0) == 0)
     return runZero(url, local, which);
+  if (which == "cut" || which == "cutonly" || which == "end")
+    return runCut(url, local, which);
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   Source src(local);
   if (src.bytes.size() < 8 * 1024 * 1024) {

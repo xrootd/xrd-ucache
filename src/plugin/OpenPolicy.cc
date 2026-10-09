@@ -425,6 +425,10 @@ bool armedForReads(bool adaptiveFederation, bool cacheServes, bool viaRedirector
   return adaptiveFederation && cacheServes && viaRedirector && !slotLayout;
 }
 
+bool shortInsideConfirmed(uint64_t confirmed, uint64_t off, uint64_t len, uint64_t got) {
+  return confirmed && len && got < len && off + len >= off && off + len <= confirmed;
+}
+
 int readDeadlineS(const char* text) {
   char* end = nullptr;
   const long v = text ? std::strtol(text, &end, 10) : 0;

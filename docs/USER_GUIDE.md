@@ -870,7 +870,14 @@ the time it was allowed. The bytes of a read that was served elsewhere are not
 kept in the cache. When a basket of a read that missed fails the key-position
 check (`check_origin_integrity`), the read is made again at another site too,
 and its answer is checked as well; if no other site serves it, the job gets
-the error naming the server, never the damaged bytes. Because the client's own
+the error naming the server, never the damaged bytes. So is a read that a copy
+answers short, inside a file whose size was confirmed at the open (a file named
+`*.root` whose copy's header said where it ends, at the size the copy reported): the
+copy ends before the file does, which is a data failure of that copy. A short answer
+is normal when a read reaches past the end of a file, and without a confirmed size it
+is never held against a copy: the read ends as it would without uCache. If no other
+copy has the size the job was shown, the job gets one error that names each copy tried
+and what it said. Because the client's own
 recovery of a read would otherwise run first, such a file has it turned off
 (`ReadRecovery` and `WriteRecovery` read `false`, and a program cannot turn them
 back on): a call that the client used to recover on a connection that was lost

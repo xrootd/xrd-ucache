@@ -2403,7 +2403,9 @@ static bool moveInner(HandleState& st, std::vector<SiteFailure> failed, uint64_t
   if (exiting || !ans.status.IsOK() || !sizeOk || n == Next::kRefuse) {
     if (ans.unfinished)
       (void)f.release();
-    (void)seq.finalError(st, recordFile(st.url), ans.status); // counted, and said
+    const XRootDStatus e = seq.finalError(st, recordFile(st.url), ans.status); // counted, and said
+    std::lock_guard<std::mutex> g(st.mu);
+    st.moveFailure = e.GetErrorMessage();
     return false;
   }
   const SiteFailure at = siteFailure(w, ans.status, hostPortOfUrl(source));
@@ -2417,6 +2419,7 @@ static bool moveInner(HandleState& st, std::vector<SiteFailure> failed, uint64_t
   st.retired.push_back(std::move(st.innerOwned));
   st.innerOwned = std::move(f);
   st.inner = st.innerOwned.get();
+  st.moveFailure.clear();
   st.dataServer = to = at.server;
   st.source = at;
   st.viaRedirector = st.viaRedirector || w.v.viaRedirector;
@@ -2438,6 +2441,7 @@ static void runMove(const std::shared_ptr<HandleState>& st, int capS, uint64_t f
     {
       std::lock_guard<std::mutex> g(st->mu);
       live = st->innerValid && !st->closed; // the handle may have closed while this waited
+      st->moveFailure.clear();
       from = st->source.server;
       failed = st->readFailed;
       if (!want && st->entry)
@@ -2504,7 +2508,9 @@ static void moveOn(const std::shared_ptr<HandleState>& st, XrdCl::File* on, cons
   }
   if (s.code != XrdCl::errInvalidSession && !st->source.server.empty()) {
     st->readFailed.push_back(st->source);
-    st->readFailed.back().error = s.ToString();
+    st->readFailed.back().error = s.code == XrdCl::errDataError && !s.GetErrorMessage().empty()
+                                      ? s.GetErrorMessage()
+                                      : s.ToString();
     if (st->readFailed.size() > kFailoverMaxSites - 1) // room for the move's own sites in its bound
       st->readFailed.erase(st->readFailed.begin());
   }
@@ -2538,6 +2544,24 @@ static XRootDStatus refusedLater(const std::shared_ptr<HandleState>& st, XRootDS
   Executor::instance().post(
       [h, s] { h->HandleResponseWithHosts(new XRootDStatus(s), nullptr, new HostList()); });
   return XRootDStatus();
+}
+
+// The status a short answer inside the confirmed size (OpenPolicy.h shortInsideConfirmed) becomes: a data failure of the copy that
+// gave it, recorded and counted as one (`op`, `tally` as noteOriginFailure takes them), and the
+// read fails or, on an armed handle, moves. `got` of the `len` bytes asked at `off` came.
+static XRootDStatus* shortAnswer(HandleState& st, ServerTally* tally, const char* op, uint64_t off,
+                                 uint64_t len, uint64_t got, const std::string& server) {
+  char msg[300];
+  std::snprintf(msg, sizeof msg,
+                "answered %llu of the %llu bytes asked at %llu, inside the file's size of %llu bytes",
+                static_cast<unsigned long long>(got), static_cast<unsigned long long>(len),
+                static_cast<unsigned long long>(off),
+                static_cast<unsigned long long>(st.confirmedSize.load(std::memory_order_relaxed)));
+  UCACHE_WARN("%s: %s %s; not served", recordFile(st.url).c_str(),
+              server.empty() ? "the origin" : server.c_str(), msg);
+  auto* refused = new XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, msg);
+  noteOriginFailure(st, tally, op, off, len, *refused, server);
+  return refused;
 }
 
 namespace {
@@ -2628,6 +2652,11 @@ struct RelayHandler : XrdCl::ResponseHandler {
       lastHosts.reset();
     }
     XrdCl::HostList* h = lastHosts ? lastHosts.release() : new HostList();
+    if (!f && last.code == XrdCl::errDataError) { // the move found no copy: the error names them
+      std::lock_guard<std::mutex> g(st->mu);
+      if (!st->moveFailure.empty())
+        last = XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, st->moveFailure);
+    }
     if (user)
       user->HandleResponseWithHosts(new XRootDStatus(last), nullptr, h);
     else
@@ -2718,6 +2747,24 @@ struct RelayHandler : XrdCl::ResponseHandler {
         checkFailed = true;
       }
 #endif
+    // A plain or page read answered short inside the file's confirmed size: the copy ends
+    // there, and the read is a data failure of it (moved on an armed handle).
+    if (s && s->IsOK() && !checkFailed && len && r) {
+      uint64_t got = len;
+      XrdCl::ChunkInfo* ci = nullptr;
+      XrdCl::PageInfo* pi = nullptr;
+      r->Get(ci);
+      r->Get(pi);
+      if (ci || pi)
+        got = ci ? ci->length : pi->GetLength();
+      if (shortInsideConfirmed(st->confirmedSize.load(std::memory_order_relaxed), off, len, got)) {
+        delete s;
+        delete r;
+        s = shortAnswer(*st, &st->relayServers, "relay", off, len, got, answeredBy(*st, h));
+        r = nullptr;
+        checkFailed = true;
+      }
+    }
     // Timed before the inner file is given back, so a Close that waits for
     // this read finds its time already on the handle.
     if (st->store && t0 && s && s->IsOK()) {
@@ -3101,6 +3148,22 @@ class MissReadHandler : public ResponseHandler {
     uint64_t got = ci ? ci->length : 0;
     bool covers = ci && wireOff_ <= userOff_ && wireOff_ + got >= userOff_ + userLen_;
 
+    // A short answer of the copy inside the file's confirmed size is a data failure of it.
+    if (ci && shortInsideConfirmed(st_->confirmedSize.load(std::memory_order_relaxed), userOff_,
+                                   userLen_,
+                                   wireOff_ + got > userOff_
+                                       ? std::min<uint64_t>(userLen_, wireOff_ + got - userOff_)
+                                       : 0)) {
+      if (gateLen_)
+        entry_->endFetch(wireOff_, gateLen_); // waiters refetch, and meet the same answer, on their own
+      std::unique_ptr<XRootDStatus> refused(shortAnswer(
+          *st_, &entry_->obs().servers, "read", wireOff_, wireBuf_->size(), got,
+          answeredBy(*st_, h.get())));
+      if (!handOff(*refused, h, true))
+        complete(user_, refused.release(), nullptr);
+      delete this;
+      return;
+    }
     if (!covers) {
       // Wire failure or short read on the rounded span: fail open — retry
       // the exact user request as pure pass-through, completing the user

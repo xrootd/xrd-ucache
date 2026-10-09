@@ -350,6 +350,14 @@ another site, and the job gets the bytes. The log says so, once for every move:
 - `<file>: reads from <host>:<port> stopped (<error>) and no other site could
   serve it`, when none did: the job then gets the error of the last attempt.
 
+A read that a copy answers short, wholly inside the size the file was confirmed to
+have at the open (see "uCache opened the file at another site" above), is such a failure too: the log
+says `<file>: <host>:<port> answered <n> of the <m> bytes asked at <offset>, inside the
+file's size of <size> bytes; not served`, the line in the record file is of class `data`
+(code 14), and the read is made again at a copy of that size. When none is left the job
+gets one error naming each copy tried and what it said. A read that reaches past the end
+of the file, and any short answer of a file whose size was not confirmed (a file not named
+`*.root`, or one whose header made no claim), is answered as it would be without uCache.
 The per-file record file has the `origin_failure` line of each read that
 failed, then a line per open attempt with route `read` (FORMAT.md). The
 counters of an open at another site (`open_failovers`, `opens_recovered`,

@@ -338,6 +338,14 @@ int readAttemptTimeoutS(int readerTimeoutS, int requestTimeoutS, int deadlineS, 
 // Attempts of one read, at as many servers.
 inline constexpr int kReadMaxAttempts = 4;
 
+// Whether a read answered `got` bytes of the `len` asked at `off` is a short answer that counts
+// against the copy: the file's size was confirmed by the header check (`confirmed`, 0 for none)
+// and the request lies wholly inside it, so the copy ends before the file does. A short answer is
+// normal at the end of a file, because readers, and the cache itself, ask for more than remains:
+// a request that reaches past the confirmed size, and any request when no size was confirmed, never
+// counts.
+bool shortInsideConfirmed(uint64_t confirmed, uint64_t off, uint64_t len, uint64_t got);
+
 // What follows a failed origin read of an armed handle. This is every status the
 // client's own recovery of a read handles, which is off on such a handle, and
 // more: the stream and connection errors, an expired request, and a server's

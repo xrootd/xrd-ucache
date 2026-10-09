@@ -41,8 +41,8 @@
 #                          copy of a file not named *.root is not looked at
 #   all copies empty       the file is named *.root and every copy is empty: the open fails with
 #                          one error of class data that names each copy tried with its server and
-#                          its size, three attempts at three servers (a refused copy is not opened
-#                          again), each recorded as a failure of op open, class data
+#                          its size, each attempt recorded as a failure of op open, class data, and a
+#                          copy the regional lists is not tried when it was refused already
 #   all refused            a, b and c refuse the file: Open() returns OK, one
 #                          completion, a failure that names all three servers
 #   switch off             the default: a refused at a: some opens fail, the client
@@ -61,6 +61,13 @@
 #                          server, and open_failovers equal to those opens. With the
 #                          switch off the failed reads are relayed on the same file and
 #                          the client's read recovery stays on
+#   cut after the open     the file is named *.root, its copies are whole, and the copy the handle
+#                          was opened at is cut short by the test: a read inside the file's size
+#                          past the cut is answered short, which is held against the copy (its size
+#                          was confirmed by the header at the open): the read is made again at
+#                          another copy and is exact. When every copy is cut the read fails with the
+#                          data error. A read that reaches past the end of an intact file is answered
+#                          short as it always was, and the handle does not move
 #   zeros                  a copy that serves a basket as zeros (the fixture of the key-position
 #                          check, tests/data/unnamed_codec_fixture.root): with the switch on the
 #                          read fails its check and is made again at another site, for a Read and
@@ -108,6 +115,7 @@ cfg() { # name role port [cms-port]
     echo "cms.allow host localhost"
     echo "cms.delay startup 2 lookup 1"
     echo "xrootd.trace emsg login redirect fs" # fs: the regional's log shows every locate
+    echo "xrootd.async nosf" # no sendfile: a copy cut under an open file then answers short
   } > "$W/$n.cfg"
 }
 cfg regional manager $RX $RC; cfg a server $AX; cfg b server $BX; cfg c server $CX
@@ -278,12 +286,22 @@ n=0; for s in a b c; do echo "$res" | grep -q "(127.0.0.1:$(port_of $s)): size 0
 [ "$n" = 3 ]; verdict "the error names all three copies, each with its size 0 ($n of 3)" $?
 echo "$res" | grep -q 'no site could open it'; verdict "the error says no site could open it" $?
 echo "$res" | grep -q 'Received corrupted data'; verdict "the error is a data error" $?
-[ "$(records "$W/c12" | wc -l)" = 3 ] && [ "$(records "$W/c12" | grep -c '"size":0,')" = 3 ]
-verdict "three attempts, each at a copy of size 0 (a refused copy is not opened again)" $?
+# The three servers answer from one address, so a retry through the redirector may be sent back to a copy
+# that was refused (four attempts, not three). A copy the regional lists is never one that was refused.
+NATT=$(records "$W/c12" | wc -l)
+[ "$NATT" -ge 3 ] && [ "$(records "$W/c12" | grep -c '"size":0,')" = "$NATT" ]
+verdict "at least three attempts ($NATT), each at a copy of size 0" $?
+seen="" dup=0
+while read -r line; do
+  srv=$(echo "$line" | sed -n 's/.*"data_server":"\([^"]*\)".*/\1/p')
+  case "$line" in *'"route":"candidate"'*) case " $seen " in *" $srv "*) dup=1 ;; esac ;; esac
+  seen="$seen $srv"
+done < <(records "$W/c12")
+[ "$dup" = 0 ]; verdict "an attempt at a listed copy was never at a copy that was refused already" $?
 records "$W/c12" | tail -1 | grep -q '"outcome":"error"'; verdict "the last record line says outcome error" $?
-[ "$(cat "$W/c12"/stats/*.files.jsonl | grep '"kind":"origin_failure"' | grep -c '"op":"open".*"class":"data"')" = 3 ]
-verdict "three failures of op open, class data are recorded" $?
-[ "$(counter "$W/c12" origin_failures_data)" = 3 ]; verdict "origin_failures_data counts three" $?
+[ "$(cat "$W/c12"/stats/*.files.jsonl | grep '"kind":"origin_failure"' | grep -c '"op":"open".*"class":"data"')" -ge 3 ]
+verdict "failures of op open, class data are recorded, one for each attempt" $?
+[ "$(counter "$W/c12" origin_failures_data)" = "$NATT" ]; verdict "origin_failures_data counts them ($NATT)" $?
 [ "$(grep -c 'Sending a close command for handle' "$W/f12.log")" -ge 3 ]; verdict "each copy that was opened was closed" $?
 [ -z "$(find "$W/c12" \( -name '*.meta' -o -name '*.data' \) -print -quit)" ]; verdict "nothing of the file is cached" $?
 
@@ -454,6 +472,43 @@ L=/store/ci/zr-off.root; placefix $L a b c; zero_at $L a b c
 zr zeroerr $L off
 clean_zr zeroerr; verdict "switch off: the read fails its check, once, and never serves the zeros" $?
 [ "$F14" = 1 ] && [ "$NRA" = 0 ]; verdict "switch off: one failed read, no open of route read ($F14, $NRA)" $?
+
+echo; echo "=== a copy cut short after the open: a read inside the file's size is answered short"
+CUTAT=30000
+for v in cut cutall; do
+  cat > "$W/$v.sh" <<CUTSH
+#!/bin/sh
+case \$1 in $AX) s=a ;; $BX) s=b ;; $CX) s=c ;; *) exit 1 ;; esac
+CUTTARGETS=\$s; [ $v = cutall ] && CUTTARGETS="a b c"
+for t in \$CUTTARGETS; do truncate -s $CUTAT "$W/data/\$t\$CUT_LFN"; done
+CUTSH
+  chmod 755 "$W/$v.sh"
+done
+# ct CASE SCRIPT LFN : plugin_fuzz's read-failover CASE on LFN (three whole copies), the script run after the open
+ct() {
+  local c=$1 script=$2 l=$3 n
+  n=$(echo "$l" | tr / _)
+  placew $l a b c
+  RFC="$W/c-ct$n"
+  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on ${script:+UCACHE_CUT_CMD=$W/$script.sh CUT_LFN=$l})
+  RES=$(fuzz "$RFC" "$W/ct$n.log" "root://127.0.0.1:$RX/$l" "$FIXW" 1 1 1 read-failover $c)
+  echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-300
+  SV=($(echo "$RES" | sed -n 's/^SERVERS //p'))
+  F14=$(recs "$RFC" origin_failure | grep -c '"op":"read".*"code":14,\|"op":"relay".*"code":14,')
+  NRA=$(recs "$RFC" open | grep -c '"route":"read"')
+}
+ct cut cut /store/ci/ct-cut.root
+echo "$RES" | grep -q '^read-failover cut: clean$'; verdict "cut: the read past the cut is the file's own bytes, from another server, once (${SV[*]})" $?
+[ "$F14" = 1 ]; verdict "cut: the short answer is one failed read of class data, code 14 ($F14)" $?
+recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | tail -1 | grep -q "\"size\":$FIXW_SIZE,"
+verdict "cut: a move of route read ended at a copy of $FIXW_SIZE bytes" $?
+[ "$(counter "$RFC" origin_failures_data)" -ge 1 ]; verdict "cut: origin_failures_data counts it" $?
+ct cutonly cutall /store/ci/ct-all.root
+echo "$RES" | grep -q '^read-failover cutonly: clean$'; verdict "cutonly: every copy is cut, the read fails with the data error and says why" $?
+[ "$F14" -ge 1 ] && [ "$F14" -le 4 ]; verdict "cutonly: $F14 failed reads (one to four)" $?
+ct end "" /store/ci/ct-end.root
+echo "$RES" | grep -q '^read-failover end: clean$'; verdict "end: reads that reach past the end of an intact file are answered short, exactly, and the handle stays (${SV[*]})" $?
+[ "$F14" = 0 ] && [ "$NRA" = 0 ]; verdict "end: no failed read, no move ($F14, $NRA)" $?
 
 echo; echo "fed_ci: $FAILS failure(s)"
 exit $((FAILS > 0))

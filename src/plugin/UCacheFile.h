@@ -196,6 +196,9 @@ struct HandleState {
   // for it, and the reads waiting between attempts, which Close waits for.
   SiteFailure source;
   std::vector<SiteFailure> readFailed;
+  // Under mu: the text of the error that names every copy the last move tried and found none to
+  // serve the reads (OpenPolicy.h allSitesFailedText); "" when the last move succeeded.
+  std::string moveFailure;
   bool moveInFlight = false;
   // A read waiting for a move: given whether the handle moved, it takes the handle's
   // File and leaves the parked count, and returns what then issues the read again or
