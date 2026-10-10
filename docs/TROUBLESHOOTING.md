@@ -323,11 +323,20 @@ bytes is a bad copy: the open is made again at another site, with the log line
 `... could not open it (size 0: the copy is empty, and a ROOT file never is); trying
 another site`, and the empty copy is counted in `origin_failures_data` and recorded
 as an `origin_failure` line of op `open` (FORMAT.md). So is a copy of a file named
-`*.root` whose size is not the end its own header states (`size 10161194: its header
-says the file is 16935324 bytes`): inside the job's open uCache reads the first 64
-bytes of the copy, within the open's time; a read that fails or runs out of time is a
-failure of the copy, as an open's would be, and bytes that do not begin with `root`
-make no claim (the copy stands). The job is never shown the cut copy or its size. When no
+`*.root` (`.root` in upper or lower case) whose first bytes show it is not a whole ROOT
+file: inside the job's open uCache reads the first 300 bytes of the copy, within what is
+left of the attempt's time (at least 5 s), and refuses a copy whose size is smaller than
+the end its own header states (`size 10161194: its header says the file is 16935324
+bytes`), one that does not begin with `root` (`size 16935324: it does not begin with
+"root", as every ROOT file does`, a copy of zeros among them), one too short to hold the
+header (`size 14: too short to hold a ROOT file's header`) and one whose server answers
+those bytes short (`size 16935324: a read of its first 300 bytes answered 120`). A read of
+them that fails or runs out of time is a failure of the copy, as an open's would be, and
+another copy is tried; the client's own recovery of that read and its following of a
+redirect are off for it, so no other copy answers it. A copy whose size is larger than the
+end its header states stands, and confirms nothing: ROOT reads such a file normally (a
+file updated in place, or with bytes appended). The job is never shown a refused copy or
+its size. When no
 other copy is left (every copy is refused, or the URL names a server directly), the job's open fails with one
 error that names each copy tried, its server and its site, its size and why it was
 refused (`no site could open it: <site> (<server>): size 0: the copy is empty, ...`),

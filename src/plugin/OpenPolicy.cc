@@ -268,27 +268,105 @@ OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bo
   }
 }
 
+OpenStep stepAfterHeaderRead(const ChainView& v, int code, int errNo, bool excluded,
+                             bool regionalKnown) {
+  const OpenStep s = stepAfter(v, code, errNo, false, false, excluded, false, regionalKnown);
+  return s == OpenStep::kFinal && v.viaRedirector && v.hops > 1 ? OpenStep::kFailOver : s;
+}
+
+bool clientRecoversRead(int code) {
+  switch (code) {
+  case kErrInternal:
+  case kErrSocketError:
+  case kErrSocketTimeout:
+  case kErrInvalidSession:
+  case kErrTlsError:
+  case kErrOperationInterrupted:
+  case kErrRedirect:
+    return true;
+  default:
+    return false;
+  }
+}
+
 bool rootNamed(const std::string& path) {
   const size_t end = path.find('?');
   const size_t n = end == std::string::npos ? path.size() : end;
-  return n >= 5 && path.compare(n - 5, 5, ".root") == 0;
+  if (n < 5)
+    return false;
+  static const char kExt[] = ".root";
+  for (size_t i = 0; i < 5; ++i)
+    if (std::tolower(static_cast<unsigned char>(path[n - 5 + i])) != kExt[i])
+      return false;
+  return true;
 }
 
 bool emptyRootCopy(const std::string& path, long long size) {
   return size == 0 && rootNamed(path);
 }
 
+size_t rootHeaderBytes(long long size) {
+  return size <= 0 ? 0 : static_cast<size_t>(std::min<long long>(size, kRootHeaderBytes));
+}
+
+namespace {
+uint64_t bigEndian(const unsigned char* b, size_t at, int bytes) {
+  uint64_t v = 0;
+  for (int i = 0; i < bytes; ++i)
+    v = v << 8 | b[at + static_cast<size_t>(i)];
+  return v;
+}
+// Where the end's field of a header with these first bytes ends: 16, or 20 for a 64-bit end;
+// 0 when the version is not there yet.
+size_t endFieldEnd(const unsigned char* b, size_t n) {
+  if (n < 8)
+    return 0;
+  return bigEndian(b, 4, 4) >= 1000000 ? 20 : 16;
+}
+} // namespace
+
 long long rootFileEnd(const unsigned char* b, size_t n) {
-  if (n < 20 || std::memcmp(b, "root", 4) != 0)
+  const size_t need = endFieldEnd(b, n);
+  if (need == 0 || n < need || std::memcmp(b, "root", 4) != 0)
     return -1;
-  const auto be = [b](size_t at, int bytes) {
-    uint64_t v = 0;
-    for (int i = 0; i < bytes; ++i)
-      v = v << 8 | b[at + static_cast<size_t>(i)];
-    return v;
-  };
-  const uint64_t end = be(4, 4) >= 1000000 ? be(12, 8) : be(12, 4);
+  const uint64_t end = need == 20 ? bigEndian(b, 12, 8) : bigEndian(b, 12, 4);
   return end > static_cast<uint64_t>(LLONG_MAX) ? LLONG_MAX : static_cast<long long>(end);
+}
+
+RootHeaderVerdict rootHeaderVerdict(const unsigned char* b, size_t n, long long size) {
+  RootHeaderVerdict v;
+  const std::string sz = "size " + std::to_string(size) + ": ";
+  const size_t want = rootHeaderBytes(size);
+  if (n < want) {
+    v.kind = RootHeaderVerdict::kBad;
+    v.why = sz + "a read of its first " + std::to_string(want) + " bytes answered " +
+            std::to_string(n);
+    return v;
+  }
+  if (std::memcmp(b, "root", std::min<size_t>(n, 4)) != 0) {
+    v.kind = RootHeaderVerdict::kBad;
+    v.why = sz + "it does not begin with \"root\", as every ROOT file does";
+    return v;
+  }
+  v.end = rootFileEnd(b, n);
+  if (v.end < 0) {
+    v.kind = RootHeaderVerdict::kBad;
+    v.why = sz + "too short to hold a ROOT file's header";
+    return v;
+  }
+  if (v.end > size) {
+    v.kind = RootHeaderVerdict::kBad;
+    v.why = sz + "its header says the file is " + std::to_string(v.end) + " bytes";
+    return v;
+  }
+  v.kind = v.end == size ? RootHeaderVerdict::kConfirmed : RootHeaderVerdict::kNoClaim;
+  return v;
+}
+
+int headerReadTimeoutS(int attemptLimitS, int64_t elapsedMs) {
+  const int64_t limitMs = int64_t(attemptLimitS > 0 ? attemptLimitS : kOpenDeadlineS) * 1000;
+  const int64_t leftS = (limitMs - std::max<int64_t>(elapsedMs, 0) + 999) / 1000;
+  return static_cast<int>(std::max<int64_t>(kHeaderReadFloorS, std::min<int64_t>(leftS, limitMs / 1000)));
 }
 
 std::string exclusionName(const std::vector<Hop>& hops, int i) {

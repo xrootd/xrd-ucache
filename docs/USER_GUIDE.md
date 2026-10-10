@@ -809,17 +809,27 @@ redirector sends it elsewhere. This holds for the job's own open and for the
 opens uCache makes of the origin. A success is taken wherever it lands; for the
 opens uCache makes of a file it holds, only a copy of the size it holds; a
 copy with no bytes of a file named `*.root` (a ROOT file is never empty; a size
-of zero is an ordinary size for any other name), a copy of such a file whose size
-is not the end its own header states (the first 64 bytes of the copy are read
-inside the job's open: a transfer that was cut, or appended to; bytes that are not
-a ROOT file's header make no claim, and a file not named `*.root` is not looked at)
-and a copy on tape (the server's answer to the open says `Offline`) are passed over
-for another site's. A copy whose size equals the end its header states confirms the
-file's size, which the cache entry keeps (FORMAT.md): another size is not accepted
-for it.
+of zero is an ordinary size for any other name; the name is the path without its
+query, `.root` in upper or lower case), a copy of such a file whose first bytes show
+it is not a whole ROOT file, and a copy on tape (the server's answer to the open says
+`Offline`) are passed over for another site's. Inside the job's open uCache reads the
+first 300 bytes of the copy (what ROOT itself reads at open; the whole copy when it is
+smaller), within what is left of that attempt's time (at least 5 s), and refuses a copy
+whose size is smaller than the end its own header states (a transfer that was cut), one
+that does not begin with `root` as every ROOT file does (a copy of zeros at the right
+size is one), one too short to hold its own header, and one whose server answers those
+bytes short. A read of them that fails or runs out of time is a failure of the copy, as
+an open's would be. For that read the client's own recovery of a read and its following
+of a server's redirect are off, so that no other copy answers it; at a URL that names a
+server directly, the open is made once more when the client would have recovered the
+read itself. A copy whose size is larger than the end its header states is not refused:
+ROOT reads such a file normally and ignores the bytes past that end (a file updated in
+place, bytes appended). A file not named `*.root` is not looked at. A copy whose size
+equals the end its header states confirms the file's size, which the cache entry keeps
+(FORMAT.md): another size is not accepted for it.
 When no other site opens a file whose copy on tape was passed over, it is opened once
 more as the job asked for it and that answer stands, so a file that is readable
-without uCache stays readable. When every copy is refused for what it is (empty, or cut short of its header's end;
+without uCache stays readable. When every copy is refused for what it is (empty, or its first bytes not those of a whole ROOT file;
 or the URL names a server directly and that copy is), the job's open fails with one error of class `data`
 that names each copy tried, its size and why it was refused. Each open tries
 at most 4 sites, within 180 s in all (less when the job's own open timeout is

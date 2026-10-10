@@ -196,6 +196,11 @@ struct HandleState {
   // for it, and the reads waiting between attempts, which Close waits for.
   SiteFailure source;
   std::vector<SiteFailure> readFailed;
+  // Under mu: the header read of the reader's open is in flight (UCacheFile.cc checkHeader), with
+  // the client's recovery and redirects off on its File; the reader's settings of those made
+  // meanwhile are kept in readerProps, from `headerProps` on, and given to the File at its end.
+  bool headerReading = false;
+  size_t headerProps = 0;
   // Under mu: the text of the error that names every copy the last move tried and found none to
   // serve the reads (OpenPolicy.h allSitesFailedText); "" when the last move succeeded.
   std::string moveFailure;

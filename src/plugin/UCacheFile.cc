@@ -78,7 +78,8 @@ static_assert(XrdCl::errInternal == xrdwire::kErrInternal &&
                   XrdCl::errOperationExpired == xrdwire::kErrOperationExpired &&
                   XrdCl::errNotFound == xrdwire::kErrNotFound &&
                   XrdCl::errRedirectLimit == xrdwire::kErrRedirectLimit &&
-                  XrdCl::errErrorResponse == xrdwire::kErrErrorResponse,
+                  XrdCl::errErrorResponse == xrdwire::kErrErrorResponse &&
+                  XrdCl::errRedirect == xrdwire::kErrRedirect,
               "XrdCl status codes drifted from OpenPolicy.h");
 static_assert(kXR_FileLocked == xrdwire::kXrFileLocked && kXR_FSError == xrdwire::kXrFSError &&
                   kXR_FileNotOpen == xrdwire::kXrFileNotOpen &&
@@ -113,16 +114,22 @@ bool readFaultFire() {
   return budget.fetch_sub(1, std::memory_order_relaxed) > 0;
 }
 
-// UCACHE_TEST_HEADER_FAIL_N (inert unless set): the header read of the first N opens it is
-// made for fails with a connection error, as if the copy's server had dropped it.
+// UCACHE_TEST_HEADER_FAIL_N (inert unless set, read at load): the header read of the first N
+// opens it is made for fails with a connection error, as if the copy's server had dropped it;
+// with UCACHE_TEST_HEADER_FAIL_KIND=short it is sent for one byte fewer than it needs, so the
+// copy's server answers it short.
+static std::atomic<int> gHeaderFaultBudget{[] {
+  const char* v = ::getenv("UCACHE_TEST_HEADER_FAIL_N");
+  return v ? ::atoi(v) : 0;
+}()};
+static const bool gHeaderFaultShort = [] {
+  const char* v = ::getenv("UCACHE_TEST_HEADER_FAIL_KIND");
+  return v && std::strcmp(v, "short") == 0;
+}();
 bool headerFaultFires() {
-  static std::atomic<int> budget{[] {
-    const char* v = ::getenv("UCACHE_TEST_HEADER_FAIL_N");
-    return v ? ::atoi(v) : 0;
-  }()};
-  if (budget.load(std::memory_order_relaxed) <= 0)
+  if (gHeaderFaultBudget.load(std::memory_order_relaxed) <= 0)
     return false;
-  return budget.fetch_sub(1, std::memory_order_relaxed) > 0;
+  return gHeaderFaultBudget.fetch_sub(1, std::memory_order_relaxed) > 0;
 }
 
 // UCACHE_TEST_READ_FAIL_KIND (inert unless set, read at load) says where the
@@ -416,9 +423,11 @@ struct AttemptView {
   std::vector<Hop> hops;
   ChainView v;
   long long statFlags = -1, size = -1;
-  // Where the copy's own header says the file ends, when the header was read (the reader's
-  // open of a file named *.root, rootFileEnd); -1 for none, which is no claim.
-  long long headerEnd = -1;
+  // What the copy's first bytes say of it, when they were read (the reader's open of a file
+  // named *.root, rootHeaderVerdict); kNoClaim when they were not. `headerFailed`: the read of
+  // them failed (the attempt's status is the read's), which is a failure of the copy.
+  RootHeaderVerdict header;
+  bool headerFailed = false;
 };
 // `f` is the File the attempt opened, or null for the handle's current one;
 // Stat(false) answers from the stat the open stored and sends no request, so
@@ -776,9 +785,15 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
   const bool ok = s.IsOK();
   // With a sequence, an expiry at a server behind a redirector is not retried at the same URL,
   // which meets the server that stalled or its neighbour: it goes on to another site. An open
-  // that has no other site to go to (a direct URL, or the redirector itself) is retried.
-  if (!ok && sourceAttempt <= cfg.openRetries && isRetryableOpen(s.code, s.errNo) &&
-      !(seq && s.code == xrdwire::kErrOperationExpired && w.v.viaRedirector && w.v.hops > 1)) {
+  // that has no other site to go to (a direct URL, or the redirector itself) is retried. So is,
+  // once, the open of a direct URL whose header read failed in a way the client would have
+  // recovered by opening the file again, had its recovery been on for that read.
+  const bool elsewhere = w.v.viaRedirector && w.v.hops > 1;
+  const bool retried =
+      (sourceAttempt <= cfg.openRetries && isRetryableOpen(s.code, s.errNo) &&
+       !(seq && s.code == xrdwire::kErrOperationExpired && elsewhere)) ||
+      (w.headerFailed && sourceAttempt == 1 && !elsewhere && clientRecoversRead(s.code));
+  if (!ok && retried) {
     if (st.store)
       st.store->stats().openRetries.fetch_add(1, std::memory_order_relaxed);
     return Next::kSameSource;
@@ -794,10 +809,11 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
         ok && want && (w.size >= 0 ? static_cast<uint64_t>(w.size) != want : seq->read);
     // A copy with no bytes of a file named *.root is a bad copy, refused like one of another size.
     const bool emptyRoot = ok && !sizeDiffers && emptyRootCopy(st.url, w.size);
-    // A copy whose size is not the end its own header states, or whose header was not read,
-    // is not refused for it: no claim is no verdict.
-    const bool headerBad = ok && !sizeDiffers && !emptyRoot && w.headerEnd >= 0 && w.size >= 0 &&
-                           w.headerEnd != w.size;
+    // A copy whose first bytes say it is bad (rootHeaderVerdict: cut short of its header's end,
+    // too short for a header, not beginning as a ROOT file does, or answering them short); one
+    // whose header was not read, or made no claim, is not refused for it.
+    const bool headerBad =
+        ok && !sizeDiffers && !emptyRoot && w.header.kind == RootHeaderVerdict::kBad;
     const bool refused = emptyRoot || headerBad;
     const bool bad = sizeDiffers || refused;
     SiteFailure f = siteFailure(w, s, hostPortOfUrl(sentUrl));
@@ -811,8 +827,7 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     else if (emptyRoot)
       f.error = "size 0: the copy is empty, and a ROOT file never is";
     else if (headerBad)
-      f.error = "size " + std::to_string(w.size) + ": its header says the file is " +
-                std::to_string(w.headerEnd) + " bytes";
+      f.error = w.header.why;
     else if (offline)
       f.error = "the copy there is on tape (offline)";
     else if (repeats)
@@ -840,10 +855,13 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     // redirector to send it elsewhere). Without a regional redirector to ask,
     // it ends, or tries elsewhere through the redirector after a stall.
     const bool canAsk = !seq->regional.empty() || seq->located;
+    // A header read that failed is a failure of the copy, whatever its code (stepAfterHeaderRead).
     const OpenStep step =
         onCandidate ? (ok && !bad && !offline ? OpenStep::kFinal : OpenStep::kLocate)
-                    : stepAfter(w.v, ok ? 0 : s.code, ok ? 0 : static_cast<int>(s.errNo), bad,
-                                offline, seq->excluded, repeats, canAsk);
+        : w.headerFailed && !ok
+            ? stepAfterHeaderRead(w.v, s.code, static_cast<int>(s.errNo), seq->excluded, canAsk)
+            : stepAfter(w.v, ok ? 0 : s.code, ok ? 0 : static_cast<int>(s.errNo), bad, offline,
+                        seq->excluded, repeats, canAsk);
     AfterFailure af = AfterFailure::kStop;
     if (step != OpenStep::kFinal)
       af = afterFailure(seq->failed, f, failoverMaxSites(), seq->stopped());
@@ -1354,8 +1372,9 @@ class RetryingOpenHandler : public ResponseHandler {
     std::unique_ptr<AnyObject> r(response);
     std::unique_ptr<HostList> h(hostList);
     AttemptView w = record_ ? viewOf(*st_, *s, h.get(), nullptr) : AttemptView();
-    // With a sequence, a copy of a file named *.root is looked at before the reader is shown it.
-    if (seq_ && s->IsOK() && w.size >= 20 && rootNamed(st_->url))
+    // With a sequence, a copy of a file named *.root is looked at before the reader is shown it
+    // (an empty one is refused for its size alone).
+    if (seq_ && s->IsOK() && w.size > 0 && rootNamed(st_->url))
       return checkHeader(std::move(s), std::move(r), std::move(h), std::move(w));
     finish(std::move(s), std::move(r), std::move(h), w, /*opened=*/false);
   }
@@ -1372,10 +1391,13 @@ class RetryingOpenHandler : public ResponseHandler {
   }
 
   // The header check: the open succeeded at a copy of a file named *.root, and before the
-  // reader's open completes the first bytes of that copy are read (OpenPolicy.h rootFileEnd),
-  // within the sequence's time. A read that fails or runs out of time is a failure of the copy,
-  // as an open's would be; bytes that make no claim leave the copy as it is. Never blocks: the
-  // answer is given by the read's completion, on the client's thread, to `finish`.
+  // reader's open completes the first bytes of that copy are read (OpenPolicy.h
+  // rootHeaderVerdict), within what is left of the attempt's own time (headerReadTimeoutS). A
+  // read that fails or runs out of time is a failure of the copy, as an open's would be. No
+  // other copy may answer it: the client's recovery of the read (an open of the file again
+  // through the redirector, after a lost connection) and its following of a server's redirect
+  // are off on the File for the read, and given back when it ends (restoreProps). Never blocks:
+  // the answer is given by the read's completion, on the client's thread, to `finish`.
   struct HeaderRead : ResponseHandler {
     HeaderRead(RetryingOpenHandler* o, std::unique_ptr<XRootDStatus> s,
                std::unique_ptr<AnyObject> r, std::unique_ptr<HostList> h, AttemptView w)
@@ -1390,29 +1412,73 @@ class RetryingOpenHandler : public ResponseHandler {
                                               : new XRootDStatus(XrdCl::stError, XrdCl::errInternal));
       std::unique_ptr<AnyObject> resp(response);
       std::unique_ptr<HostList> unused(hosts);
-      if (held)
+      if (held) {
+        restoreProps();
         o->st_->releaseInner();
+      }
       if (!rs->IsOK()) { // the copy failed the read: the open's own answer is not the reader's
         r.reset();
+        w.headerFailed = true;
         o->finish(std::move(rs), std::move(r), std::move(h), w, /*opened=*/true);
         return;
       }
       XrdCl::ChunkInfo* ci = nullptr;
       if (resp)
         resp->Get(ci);
-      w.headerEnd = ci ? rootFileEnd(buf, ci->length) : -1;
+      const size_t n = ci ? std::min<size_t>(ci->length, sizeof buf) : 0;
+      w.header = rootHeaderVerdict(buf, n, w.size);
       o->finish(std::move(s), std::move(r), std::move(h), w, /*opened=*/false);
     }
+    // The File's own recovery and redirect settings, as they were before the read, given back
+    // to it; the reader's settings of them made meanwhile (kept in readerProps, from
+    // `headerProps` on) win, and on a handle armed meanwhile the recovery stays off. Runs while
+    // the File is held.
+    void restoreProps() {
+      HandleState& st = *o->st_;
+      for (;;) {
+        std::string v[kProps];
+        for (int i = 0; i < kProps; ++i)
+          v[i] = saved[i];
+        size_t seen = 0;
+        bool armed = false;
+        {
+          std::lock_guard<std::mutex> g(st.mu);
+          seen = st.readerProps.size();
+          armed = st.moveOnReads;
+          for (size_t j = std::min(st.headerProps, seen); j < seen; ++j)
+            for (int i = 0; i < kProps; ++i)
+              if (st.readerProps[j].first == kPropNames[i]) {
+                v[i] = st.readerProps[j].second;
+                have[i] = true;
+              }
+        }
+        for (int i = 0; i < kProps; ++i)
+          if (have[i] && !(armed && i < 2)) // 0, 1: the recovery of reads and writes
+            f->SetProperty(kPropNames[i], v[i]);
+        std::lock_guard<std::mutex> g(st.mu);
+        if (st.readerProps.size() == seen) {
+          st.headerReading = false;
+          return;
+        }
+      }
+    }
+    static constexpr int kProps = 3;
+    static constexpr const char* kPropNames[kProps] = {"ReadRecovery", "WriteRecovery",
+                                                      "FollowRedirects"};
     RetryingOpenHandler* o;
     std::unique_ptr<XRootDStatus> s;
     std::unique_ptr<AnyObject> r;
     std::unique_ptr<HostList> h;
     AttemptView w;
-    bool held = false; // the inner file is held for the read (innerOps)
+    bool held = false;          // the inner file `f` is held for the read (innerOps)
+    XrdCl::File* f = nullptr;
+    std::string saved[kProps];  // its settings before the read
+    bool have[kProps] = {};     // which of them it answered
     unsigned char buf[kRootHeaderBytes] = {};
   };
   void checkHeader(std::unique_ptr<XRootDStatus> s, std::unique_ptr<AnyObject> r,
                    std::unique_ptr<HostList> h, AttemptView w) {
+    const size_t want = rootHeaderBytes(w.size);
     auto* hr = new HeaderRead(this, std::move(s), std::move(r), std::move(h), std::move(w));
     XrdCl::File* f = nullptr;
     {
@@ -1421,13 +1487,27 @@ class RetryingOpenHandler : public ResponseHandler {
         f = st_->inner.load();
         ++st_->innerOps;
         hr->held = true;
+        hr->f = f;
+        st_->headerReading = true; // the reader's settings of these wait for the read's end
+        st_->headerProps = st_->readerProps.size();
       }
     }
+    if (f) {
+      for (int i = 0; i < HeaderRead::kProps; ++i) {
+        hr->have[i] = f->GetProperty(HeaderRead::kPropNames[i], hr->saved[i]);
+        if (hr->have[i])
+          f->SetProperty(HeaderRead::kPropNames[i], "false");
+      }
+    }
+    const int limitS = headerReadTimeoutS(a_.timeoutS, static_cast<int64_t>((nowUs() - a_.t0) / 1000));
+    const bool fault = f && headerFaultFires();
+    const bool answeredShort = fault && gHeaderFaultShort && want >= 2;
     XRootDStatus rs(XrdCl::stError, XrdCl::errInvalidOp, 0, "the handle is closed");
-    if (f && headerFaultFires())
+    if (fault && !answeredShort)
       rs = XRootDStatus(XrdCl::stError, XrdCl::errConnectionError);
     else if (f)
-      rs = f->Read(0, kRootHeaderBytes, hr->buf, hr, seq_->timeout());
+      rs = f->Read(0, static_cast<uint32_t>(answeredShort ? want - 1 : want), hr->buf, hr,
+                   static_cast<ucache::XrdTimeout>(limitS));
     if (!rs.IsOK()) // nothing was sent, so no completion will come: the failure is the answer
       hr->HandleResponseWithHosts(new XRootDStatus(rs), nullptr, nullptr);
   }
@@ -1460,7 +1540,7 @@ class RetryingOpenHandler : public ResponseHandler {
     if (ok && n == Next::kDone) {
       if (seq_)
         seq_->recovered(*st_, lastServer(w), attempt_);
-      if (w.headerEnd >= 0 && w.headerEnd == w.size) // the header says what the copy has
+      if (w.header.kind == RootHeaderVerdict::kConfirmed) // the header says what the copy has
         st_->confirmedSize.store(static_cast<uint64_t>(w.size), std::memory_order_relaxed);
       return false;
     }
@@ -2896,6 +2976,7 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   innerOps = 0;        // requests XrdCl dropped in this child
   pendingPersists = 0; // tasks queued on the parent's pool, which never run here
   moveInFlight = false; // a move is the parent's: its reads wait there, and are left behind
+  headerReading = false; // so is the header read of an open: its end never comes here
   parkedReads = 0;
   new (&moveWaiters) std::vector<MoveWaiter>;
   new (&source) SiteFailure; // written under mu by callback threads: a fork may have caught them mid-write
@@ -5014,17 +5095,21 @@ bool UCacheFile::IsOpen() const {
 
 bool UCacheFile::SetProperty(const std::string& name, const std::string& value) {
   st_->syncFork();
+  const bool recovery = name == "ReadRecovery" || name == "WriteRecovery";
   if (globalConfig().adaptiveFederation) {
     // Kept, so that a File that replaces this one -- the open retried or made
     // at another site -- is given it too (resetInner). Recorded before it is
     // set: a File swapped in after this is either given it there or is the
-    // one loaded below.
+    // one loaded below. While the header read of the open is in flight, its
+    // File's recovery and redirects are not changed: the read's end gives the
+    // File the reader's latest setting.
     std::lock_guard<std::mutex> g(st_->mu);
     st_->readerProps.emplace_back(name, value);
+    if (st_->headerReading && (recovery || name == "FollowRedirects"))
+      return true;
   }
   // On an armed handle the reader cannot turn the client's read recovery back
   // on: the handle's own reads depend on it being off.
-  const bool recovery = name == "ReadRecovery" || name == "WriteRecovery";
   if (recovery && st_->moveOnReads)
     return true;
   const bool ok = st_->inner.load()->SetProperty(name, value);

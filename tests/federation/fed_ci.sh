@@ -24,21 +24,30 @@
 #                          client sends a locate, the regional logs it,
 #                          failover_locates counts it, and the open that was sent
 #                          back is made at b: an attempt of route candidate
-#   empty copy             the file is named *.root, a and b hold it and c holds it empty; a
-#                          new file each time, one open, until an open landed on c first. With
-#                          adaptive_federation on that copy is refused (a ROOT file is never
+#   empty copy             the file is a ROOT file named *.root, two servers hold it and the third
+#                          holds it empty (a, b and c in turn); a new file each time, one open,
+#                          until an open landed on the empty copy first.
+#                          With adaptive_federation on that copy is refused (a ROOT file is never
 #                          empty), the open goes on to a copy with bytes, the reader gets the
 #                          file's own bytes, and the records show the empty copy's size 0, a
 #                          failed attempt of op open, class data, and the copy that was taken
 #   cut short              the file is named *.root, a holds its first bytes (the header, which says
 #                          where the file ends, is intact), b holds all of it and c is empty. With
-#                          adaptive_federation on, the open that lands on a reads the first 64 bytes
-#                          of the copy, finds the size it reports is not the end the header states,
-#                          and goes on to a copy that is whole; the reader is shown the whole size;
-#                          the records show the copy's size, a failed attempt of op open, class data,
-#                          and the copy that was taken. When only the cut copy exists, the open fails
-#                          with one error that names the copy, its size and the header's end. The
-#                          copy of a file not named *.root is not looked at
+#                          adaptive_federation on, the open that lands on a reads the first 300
+#                          bytes of the copy, finds the size it reports smaller than the end the
+#                          header states, and goes on to a copy that is whole; the reader is shown
+#                          the whole size; the records show the copy's size, a failed attempt of op
+#                          open, class data, and the copy that was taken. When only the cut copy
+#                          exists, the open fails with one error that names the copy, its size and
+#                          the header's end. The copy of a file not named *.root is not looked at;
+#                          the name is checked in any case (*.ROOT)
+#   zeros at the size      one server holds as many zero bytes as the file has (a, b and c in
+#                          turn), the other two the file: the copy of zeros does not begin as a
+#                          ROOT file does and is refused; the open goes on to a whole copy
+#   longer than its header every copy is the file with bytes appended, so its header states an end
+#                          before its size (as for a file updated in place, which ROOT reads
+#                          normally): the open stands at the copy it landed on, nothing is refused,
+#                          the reader gets the file's own bytes and the size is not confirmed
 #   all copies empty       the file is named *.root and every copy is empty: the open fails with
 #                          one error of class data that names each copy tried with its server and
 #                          its size, each attempt recorded as a failure of op open, class data, and a
@@ -205,15 +214,40 @@ if [ "$got" != 0 ]; then
 fi
 L5=$L
 
+# A ROOT file for the header check's cases: its header states its size.
+FIXW="$HERE/../data/unnamed_codec_wide_fixture.root" # 106379 bytes; its header says so
+FIXW_SIZE=$(stat -c %s "$FIXW"); CUT=70000
+[ "$(head -c 4 "$FIXW")" = root ] && [ "$FIXW_SIZE" -gt "$CUT" ]; verdict "the fixture is a ROOT file of $FIXW_SIZE bytes, longer than the cut ($CUT)" $?
+copyw() { # SRC LFN server... (SRC on each)
+  local src=$1 lfn=$2 s; shift 2
+  for s in "$@"; do install -d -m 777 "$W/data/$s/$(dirname "$lfn" | sed 's|^/||')"; cp "$src" "$W/data/$s$lfn"; chmod 666 "$W/data/$s$lfn"; done
+}
+placew() { local lfn=$1; shift; copyw "$FIXW" "$lfn" "$@"; } # LFN server... (the whole fixture)
+head -c $CUT "$FIXW" > "$W/fixw-cut.bin"
+cutw() { local lfn=$1; shift; copyw "$W/fixw-cut.bin" "$lfn" "$@"; } # LFN server... (its first $CUT bytes)
+emptyw() { # LFN server... (an empty copy)
+  local lfn=$1 s; shift
+  for s in "$@"; do install -d -m 777 "$W/data/$s/$(dirname "$lfn" | sed 's|^/||')"; : > "$W/data/$s$lfn"; chmod 666 "$W/data/$s$lfn"; done
+}
+# the 300-byte reads at 0 (the header check) in a client's log
+nheader() { grep -c 'MsgHandler created.*kXR_read (handle: 0x[0-9a-f]*, offset: 0, size: 300)' "$1"; }
+# bit 2 of a sidecar's flags (offset 12): the size confirmed; "none" without a sidecar
+confirmed() {
+  local m; m=$(find "$1" -name '*.meta' | head -1)
+  if [ -z "$m" ]; then echo none; else echo $(( ($(od -An -tu4 -j12 -N4 "$m") >> 2) & 1 )); fi
+}
+
 echo; echo "=== an empty copy of a file named *.root is refused"
-# Up to 60 files (about 3 are needed on average, and the leg stops at the first).
+# Up to 60 files, the empty copy on a, b and c in turn (the regional may prefer a server when all
+# three hold the file), until an open landed on it first.
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
+others() { case $1 in a) echo b c ;; b) echo a c ;; c) echo a b ;; esac; }
 got=0 allok=1
 for i in $(seq 60); do
   L=/store/ci/ec-$i.root
-  place $L a b
-  install -d -m 777 "$W/data/c/store/ci"; : > "$W/data/c$L"; chmod 666 "$W/data/c$L"
-  res=$(fuzz "$W/c11-$i" "$W/f11-$i.log" "root://127.0.0.1:$RX/$L" "$W/f.bin" 1 1 1 open-failover)
+  e=$(echo a b c | cut -d' ' -f$((i % 3 + 1)))
+  placew $L $(others $e); emptyw $L $e
+  res=$(fuzz "$W/c11-$i" "$W/f11-$i.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
   echo "$res" | grep -q '^open-failover: clean$' || { allok=0; echo "$res" | sed 's/^/    /'; break; }
   if records "$W/c11-$i" | head -1 | grep -q '"size":0,'; then got=$i; break; fi
 done
@@ -221,29 +255,18 @@ done
 [ "$got" != 0 ]; verdict "an open landed on the empty copy first (file $got of at most 60)" $?
 if [ "$got" != 0 ]; then
   records "$W/c11-$got" | sed 's/^/    rec: /' | cut -c1-230
-  records "$W/c11-$got" | tail -1 | grep -q '"status":"ok".*"size":1048576,'; verdict "the open ended at a copy with 1048576 bytes" $?
+  records "$W/c11-$got" | tail -1 | grep -q "\"status\":\"ok\".*\"size\":$FIXW_SIZE,"; verdict "the open ended at a copy with $FIXW_SIZE bytes" $?
   cat "$W/c11-$got"/stats/*.files.jsonl | grep '"kind":"origin_failure"' | grep -q '"op":"open".*"class":"data"'
   verdict "the empty copy is recorded as a failure of op open, class data" $?
   [ "$(counter "$W/c11-$got" origin_failures_data)" -ge 1 ]; verdict "origin_failures_data counts it" $?
 fi
 
 echo; echo "=== a copy of a file named *.root that is cut short of its header's end is refused"
-FIXW="$HERE/../data/unnamed_codec_wide_fixture.root" # 106379 bytes; its header says so
-FIXW_SIZE=$(stat -c %s "$FIXW"); CUT=70000
-[ "$(head -c 4 "$FIXW")" = root ] && [ "$FIXW_SIZE" -gt "$CUT" ]; verdict "the fixture is a ROOT file of $FIXW_SIZE bytes, longer than the cut ($CUT)" $?
-placew() { # LFN server... (the whole fixture) ; cutw LFN server... (its first $CUT bytes)
-  local lfn=$1 s; shift
-  for s in "$@"; do install -d -m 777 "$W/data/$s/$(dirname "$lfn" | sed 's|^/||')"; cp "$FIXW" "$W/data/$s$lfn"; chmod 666 "$W/data/$s$lfn"; done
-}
-cutw() {
-  local lfn=$1 s; shift
-  for s in "$@"; do install -d -m 777 "$W/data/$s/$(dirname "$lfn" | sed 's|^/||')"; head -c $CUT "$FIXW" > "$W/data/$s$lfn"; chmod 666 "$W/data/$s$lfn"; done
-}
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
 got=0 allok=1
 for i in $(seq 60); do
   L=/store/ci/cut-$i.root
-  cutw $L a; placew $L b; install -d -m 777 "$W/data/c/store/ci"; : > "$W/data/c$L"; chmod 666 "$W/data/c$L"
+  cutw $L a; placew $L b; emptyw $L c
   res=$(fuzz "$W/c13-$i" "$W/f13-$i.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
   echo "$res" | grep -q '^open-failover: clean$' || { allok=0; echo "$res" | sed 's/^/    /'; break; }
   if records "$W/c13-$i" | head -1 | grep -q "\"size\":$CUT,"; then got=$i; break; fi
@@ -255,8 +278,7 @@ if [ "$got" != 0 ]; then
   records "$W/c13-$got" | tail -1 | grep -q "\"status\":\"ok\".*\"size\":$FIXW_SIZE,"; verdict "the open ended at a copy with $FIXW_SIZE bytes" $?
   cat "$W/c13-$got"/stats/*.files.jsonl | grep '"kind":"origin_failure"' | grep -q '"op":"open".*"class":"data".*its header says the file is '"$FIXW_SIZE"' bytes'
   verdict "the cut copy is recorded as a failure of op open, class data, with the sizes" $?
-  [ "$(grep -c 'MsgHandler created.*kXR_read (handle: 0x[0-9a-f]*, offset: 0, size: 64)' "$W/f13-$got.log")" -ge 2 ]
-  verdict "the first 64 bytes were read at each copy that had bytes" $?
+  [ "$(nheader "$W/f13-$got.log")" -ge 2 ]; verdict "the first 300 bytes were read at each copy that had bytes" $?
 fi
 # only the cut copy: the open fails, naming it
 L=/store/ci/cut-only.root
@@ -272,7 +294,49 @@ L=/store/ci/cut-only.dat
 cutw $L a
 res=$(fuzz "$W/c15" "$W/f15.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
 echo "$res" | grep -q '^open-failover: clean$'; verdict "the cut copy of a file not named *.root opens as it is (no header check)" $?
-[ "$(grep -c 'MsgHandler created.*kXR_read (handle: 0x[0-9a-f]*, offset: 0, size: 64)' "$W/f15.log")" = 0 ]; verdict "no 64-byte read was made for it" $?
+[ "$(nheader "$W/f15.log")" = 0 ]; verdict "no 300-byte read was made for it" $?
+# the name in upper case is a ROOT file's name too
+L=/store/ci/cut-only-upper.ROOT
+cutw $L a
+res=$(fuzz "$W/c16" "$W/f16.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-denied)
+echo "$res" | sed 's/^/    /' | cut -c1-700
+echo "$res" | grep -q '^open-denied: clean$' && echo "$res" | grep -q "(127.0.0.1:$AX): size $CUT: its header says the file is $FIXW_SIZE bytes"
+verdict "the cut copy of a file named *.ROOT is refused too, and the error names it" $?
+
+echo; echo "=== a copy that is zeros at the file's size is refused"
+head -c "$FIXW_SIZE" /dev/zero > "$W/fixw-zero.bin"
+got=0 allok=1
+for i in $(seq 60); do
+  L=/store/ci/zero-$i.root
+  z=$(echo a b c | cut -d' ' -f$((i % 3 + 1)))
+  copyw "$W/fixw-zero.bin" $L $z; placew $L $(others $z)
+  res=$(fuzz "$W/c17-$i" "$W/f17-$i.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
+  echo "$res" | grep -q '^open-failover: clean$' || { allok=0; echo "$res" | sed 's/^/    /'; break; }
+  if records "$W/c17-$i" | head -1 | grep -q "\"data_server\":\"127.0.0.1:$(port_of $z)\""; then got=$i; break; fi
+done
+[ "$allok" = 1 ]; verdict "every open succeeded, one completion, right bytes" $?
+[ "$got" != 0 ]; verdict "an open landed on the copy of zeros (file $got of at most 60)" $?
+if [ "$got" != 0 ]; then
+  records "$W/c17-$got" | sed 's/^/    rec: /' | cut -c1-230
+  cat "$W/c17-$got"/stats/*.files.jsonl | grep '"kind":"origin_failure"' | grep -q "\"op\":\"open\".*\"class\":\"data\".*size $FIXW_SIZE: it does not begin with"
+  verdict "the copy of zeros is recorded as a failure of op open, class data: it does not begin as a ROOT file does" $?
+  records "$W/c17-$got" | tail -1 | grep -q "\"status\":\"ok\".*\"size\":$FIXW_SIZE,"; verdict "the open ended at a whole copy" $?
+fi
+
+echo; echo "=== every copy is longer than its header says: the open stands"
+cat "$FIXW" > "$W/fixw-long.bin"; head -c 4096 /dev/urandom >> "$W/fixw-long.bin"
+LONG_SIZE=$(stat -c %s "$W/fixw-long.bin")
+L=/store/ci/long.root
+copyw "$W/fixw-long.bin" $L a b c
+res=$(fuzz "$W/c18" "$W/f18.log" "root://127.0.0.1:$RX/$L" "$W/fixw-long.bin" 1 1 1 open-failover)
+echo "$res" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-300
+records "$W/c18" | sed 's/^/    rec: /' | cut -c1-230
+echo "$res" | grep -q '^open-failover: clean$'; verdict "the open succeeded, one completion, the file's own bytes" $?
+[ "$(records "$W/c18" | wc -l)" = 1 ] && records "$W/c18" | grep -q "\"status\":\"ok\".*\"size\":$LONG_SIZE,"
+verdict "one attempt, ok, at a copy of $LONG_SIZE bytes (its header says $FIXW_SIZE): it stands" $?
+[ -z "$(cat "$W/c18"/stats/*.files.jsonl 2>/dev/null | grep '"kind":"origin_failure"')" ]; verdict "no copy was refused" $?
+[ "$(nheader "$W/f18.log")" = 1 ]; verdict "its first 300 bytes were read" $?
+[ "$(confirmed "$W/c18")" = 0 ]; verdict "the size is not confirmed (bit 2 of the sidecar's flags is clear)" $?
 
 echo; echo "=== every copy of a file named *.root is empty: one error naming the copies"
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)

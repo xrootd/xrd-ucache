@@ -43,6 +43,7 @@ constexpr int kErrOperationInterrupted = 207;
 constexpr int kErrNotFound = 304;
 constexpr int kErrRedirectLimit = 306;
 constexpr int kErrErrorResponse = 400; // the server answered with an error: errNo holds its code
+constexpr int kErrRedirect = 401;      // a redirect the client was told not to follow
 // Server error codes (XProtocol.hh), in errNo with kErrErrorResponse.
 constexpr int kXrFileLocked = 3003;
 constexpr int kXrFileNotOpen = 3004;
@@ -193,23 +194,69 @@ enum class OpenStep : uint8_t {
 // and that one stalls as well.
 OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bool offline,
                    bool excluded, bool repeats = false, bool regionalKnown = false);
+// The step after an open whose header read (rootHeaderVerdict) failed with (code, errNo) at
+// a copy reached through `v`: a failure of that copy, whatever the code, so another copy is
+// tried when the open went through a redirector; how (another site, or the regional's list
+// after a stall) is stepAfter's. A direct URL has no other copy: kFinal.
+OpenStep stepAfterHeaderRead(const ChainView& v, int code, int errNo, bool excluded,
+                             bool regionalKnown);
+// Whether the client would have recovered a read that failed with `code` by opening the file
+// again, had its read recovery and its following of redirects been on (its own list of the
+// failures it recovers: a lost or timed-out connection, a lost session, TLS, an interruption,
+// an internal error; and a server's redirect). The header read has both off, so that no other
+// copy answers it; a direct URL's open is made once more for such a failure, as the client
+// would have made it.
+bool clientRecoversRead(int code);
 
 // Whether a copy of `path` that reports `size` bytes is a bad copy for that file: no
-// bytes in a file named *.root (a ROOT file is never empty). The name is the path
-// without a query (what follows the first '?'), and only the lower-case ".root" counts,
-// as ROOT's own tools write it. For any other name a size of zero is an ordinary size.
+// bytes in a file named *.root (a ROOT file is never empty). For any other name a size of
+// zero is an ordinary size.
 bool emptyRootCopy(const std::string& path, long long size);
-// Whether `path` names a ROOT file: the part before the first '?' ends in the lower-case ".root".
+// Whether `path` names a ROOT file: the part before the first '?' (the path without its
+// query) ends in ".root", in upper or lower case.
 bool rootNamed(const std::string& path);
 
-// The header check of a ROOT file's copy: the first kRootHeaderBytes bytes of a file named
-// *.root. A ROOT file begins with "root", a version (a 32-bit integer, big-endian, at 4) and at
-// 12 the end of the file: a 32-bit integer, or a 64-bit one when the version is 1000000 or more.
-// rootFileEnd returns that end, as the first `n` bytes of `b` state it, or -1 when they make no
-// claim: they do not begin with "root", or fewer than 20 bytes are there. A copy whose size is
-// not the end its header states is a bad copy (a transfer that was cut, or appended to).
-inline constexpr size_t kRootHeaderBytes = 64;
+// The header check of a ROOT file's copy, made inside the open of a file named *.root: its
+// first kRootHeaderBytes bytes (what ROOT itself reads at open), or the whole copy when it is
+// smaller (rootHeaderBytes). A ROOT file begins with "root", a version (a 32-bit integer,
+// big-endian, at 4), where its first record begins (at 8) and at 12 the end of its data: a
+// 32-bit integer, or a 64-bit one when the version is 1000000 or more.
+inline constexpr size_t kRootHeaderBytes = 300;
+// The bytes the header check reads of a copy that reports `size` bytes (0 for none).
+size_t rootHeaderBytes(long long size);
+// The end of the data the first `n` bytes of `b` state, or -1 when they state none: they do
+// not begin with "root", or end before the end's own field (16 bytes, 20 for a 64-bit end).
 long long rootFileEnd(const unsigned char* b, size_t n);
+// What the header check says of a copy that reports `size` (> 0) bytes, given the `n` bytes
+// that a read of its first rootHeaderBytes(size) answered with:
+//  - kBad, refused (`why` says what is wrong, in words): the read answered fewer bytes than
+//    it asked for inside the copy's size (the copy ends before its reported size); the copy
+//    does not begin with "root" (no ROOT file is without it: ROOT and uproot refuse such a
+//    file; a copy of zeros at the right size is one); it is too short to hold its own header,
+//    up to the end's field; or its size is smaller than the end its header states (a cut copy:
+//    ROOT reports it truncated);
+//  - kConfirmed: its size equals that end, which confirms the file's size;
+//  - kNoClaim: its size is larger than that end. ROOT reads such a file normally and ignores
+//    the bytes past the end (a file updated in place, bytes appended, a writer that stopped
+//    after a save): the copy stands, and nothing is confirmed.
+// The other fields of the header and the top directory's record are not looked at yet.
+struct RootHeaderVerdict {
+  enum Kind : uint8_t { kNoClaim, kConfirmed, kBad };
+  Kind kind = kNoClaim;
+  long long end = -1; // the end the header states; -1 for none
+  std::string why;    // kBad: what is wrong with the copy
+};
+RootHeaderVerdict rootHeaderVerdict(const unsigned char* b, size_t n, long long size);
+// The time limit of the header read, in seconds: what is left of the open attempt's own limit
+// (`attemptLimitS`, the attempt issued `elapsedMs` ago), and at least kHeaderReadFloorS. The
+// floor gives a copy that answered its open at the very end of that limit a moment to answer
+// the read (one round trip to a server that has just answered). It is the margin that budgetS
+// keeps between an open's budget and the client's stream error window, so a read that starts
+// at the end of the budget still ends inside that window.
+inline constexpr int kHeaderReadFloorS = 5;
+static_assert(kHeaderReadFloorS >= 1 && kHeaderReadFloorS < kOpenDeadlineS,
+              "the header read's floor is a moment, never a fresh open deadline");
+int headerReadTimeoutS(int attemptLimitS, int64_t elapsedMs);
 
 // The host name a retry's tried= may carry for hop `i` of a chain, or "" when
 // it may not: never a redirector, nor the first host, nor an address or a

@@ -727,47 +727,83 @@ TEST(OpenPolicy, FailedBeforeAndTheListOfCopiesAgree) {
 }
 
 // A copy with no bytes of a file named *.root is a bad copy; a size of zero is an
-// ordinary size for any other name.
+// ordinary size for any other name. The name is the path without its query, in any case.
 TEST(OpenPolicy, EmptyRootCopy) {
-  EXPECT_TRUE(emptyRootCopy("/store/mc/a/b.root", 0));
-  EXPECT_TRUE(emptyRootCopy("root://h:1094//store/a.root", 0)) << "a URL";
-  EXPECT_TRUE(emptyRootCopy("root://h:1094//store/a.root?tried=x.org&triedrc=ioerr", 0))
-      << "the query is not part of the name";
-  EXPECT_TRUE(emptyRootCopy("a.root", 0));
-  EXPECT_TRUE(emptyRootCopy("/store/a.root.root", 0));
-  // Not empty, or not known: no claim.
-  EXPECT_FALSE(emptyRootCopy("/store/a.root", 1));
-  EXPECT_FALSE(emptyRootCopy("/store/a.root", 4247184));
-  EXPECT_FALSE(emptyRootCopy("/store/a.root", -1)) << "a size that could not be read";
-  // Not the name of a ROOT file: an empty file is an ordinary file.
-  EXPECT_FALSE(emptyRootCopy("/store/a.dat", 0));
-  EXPECT_FALSE(emptyRootCopy("/store/a.root.gz", 0));
-  EXPECT_FALSE(emptyRootCopy("/store/a.root/", 0)) << "a trailing slash";
-  EXPECT_FALSE(emptyRootCopy("/store/aroot", 0)) << "no dot";
-  EXPECT_FALSE(emptyRootCopy("/store/a.dat?name=b.root", 0)) << "only the query ends in .root";
-  EXPECT_FALSE(emptyRootCopy("/store/a.ROOT", 0)) << "only the lower-case .root counts";
-  EXPECT_FALSE(emptyRootCopy("", 0));
-  EXPECT_FALSE(emptyRootCopy("root", 0));
-  EXPECT_FALSE(emptyRootCopy(".roo", 0));
-  EXPECT_FALSE(emptyRootCopy("?a.root", 0)) << "nothing before the query";
+  struct Row {
+    const char* path;
+    long long size;
+    bool bad;
+    const char* why;
+  };
+  const Row rows[] = {
+      {"/store/mc/a/b.root", 0, true, "a path"},
+      {"root://h:1094//store/a.root", 0, true, "a URL"},
+      {"root://h:1094//store/a.root?tried=x.org&triedrc=ioerr", 0, true, "the query is not part of the name"},
+      {"a.root", 0, true, ""},
+      {"/store/a.root.root", 0, true, ""},
+      {"/store/a.ROOT", 0, true, "upper case"},
+      {"/store/a.Root", 0, true, "mixed case"},
+      {"root://h:1094//store/A.RoOt?x=y.dat", 0, true, "mixed case with a query"},
+      // Not empty, or not known: no claim.
+      {"/store/a.root", 1, false, ""},
+      {"/store/a.root", 4247184, false, ""},
+      {"/store/a.root", -1, false, "a size that could not be read"},
+      {"/store/a.ROOT", 1, false, "upper case, not empty"},
+      // Not the name of a ROOT file: an empty file is an ordinary file.
+      {"/store/a.dat", 0, false, ""},
+      {"/store/a.root.gz", 0, false, ""},
+      {"/store/a.ROOT.gz", 0, false, ""},
+      {"/store/a.root/", 0, false, "a trailing slash"},
+      {"/store/aroot", 0, false, "no dot"},
+      {"/store/aROOT", 0, false, "no dot, upper case"},
+      {"/store/a.dat?name=b.root", 0, false, "only the query ends in .root"},
+      {"/store/a.dat?name=b.ROOT", 0, false, "only the query ends in .ROOT"},
+      {"/store/a.r00t", 0, false, "zeros for the o's"},
+      {"", 0, false, ""},
+      {"root", 0, false, ""},
+      {"ROOT", 0, false, ""},
+      {".roo", 0, false, ""},
+      {"?a.root", 0, false, "nothing before the query"},
+  };
+  for (const Row& r : rows)
+    EXPECT_EQ(emptyRootCopy(r.path, r.size), r.bad) << r.path << " " << r.size << " " << r.why;
 }
 
 TEST(OpenPolicy, RootNamed) {
-  EXPECT_TRUE(rootNamed("/store/mc/a/b.root"));
-  EXPECT_TRUE(rootNamed("root://h:1094//store/a.root?tried=x.org"));
-  EXPECT_TRUE(rootNamed(".root"));
-  EXPECT_FALSE(rootNamed("/store/a.ROOT"));
-  EXPECT_FALSE(rootNamed("/store/a.root.gz"));
-  EXPECT_FALSE(rootNamed("/store/a.dat?name=b.root"));
-  EXPECT_FALSE(rootNamed("/store/aroot"));
-  EXPECT_FALSE(rootNamed(""));
+  struct Row {
+    const char* path;
+    bool root;
+  };
+  const Row rows[] = {
+      {"/store/mc/a/b.root", true},
+      {"root://h:1094//store/a.root?tried=x.org", true},
+      {".root", true},
+      {".ROOT", true},
+      {"/store/a.ROOT", true},
+      {"/store/a.Root", true},
+      {"/store/a.rOOT?x=1", true},
+      {"root://h:1094//store/a.ROOT?tried=x.org&triedrc=ioerr", true},
+      {"/store/a.root.gz", false},
+      {"/store/a.ROOT.GZ", false},
+      {"/store/a.dat?name=b.root", false},
+      {"/store/a.dat?name=b.ROOT", false},
+      {"/store/aroot", false},
+      {"/store/a_root", false},
+      {"/store/a.roo", false},
+      {"root", false},
+      {"", false},
+      {"?.root", false},
+  };
+  for (const Row& r : rows)
+    EXPECT_EQ(rootNamed(r.path), r.root) << r.path;
 }
 
 namespace {
-std::vector<unsigned char> header(const char* magic, uint32_t version, uint64_t end, bool wide) {
+std::vector<unsigned char> header(const char* magic, uint32_t version, uint64_t end, bool wide,
+                                  size_t n = kRootHeaderBytes) {
   std::vector<unsigned char> b(magic, magic + 4);
-  const auto put = [&b](uint64_t v, int n) {
-    for (int i = n - 1; i >= 0; --i)
+  const auto put = [&b](uint64_t v, int k) {
+    for (int i = k - 1; i >= 0; --i)
       b.push_back(static_cast<unsigned char>(v >> (8 * i)));
   };
   put(version, 4);
@@ -775,23 +811,30 @@ std::vector<unsigned char> header(const char* magic, uint32_t version, uint64_t 
   put(end, wide ? 8 : 4);
   while (b.size() < kRootHeaderBytes)
     b.push_back(0x5a);
+  b.resize(n);
   return b;
 }
 } // namespace
 
-// What a copy's first bytes say about where the file ends: the end, or no claim.
+// What a copy's first bytes say about where the file ends: the end, or none.
 TEST(OpenPolicy, RootFileEnd) {
   // The first bytes of a real file (6559 bytes): the end it states is its size.
   const unsigned char real[] = {0x72, 0x6f, 0x6f, 0x74, 0x00, 0x00, 0xf8, 0x72, 0x00, 0x00,
                                 0x00, 0x64, 0x00, 0x00, 0x19, 0x9f, 0x00, 0x00, 0x19, 0x64};
   EXPECT_EQ(rootFileEnd(real, sizeof real), 6559);
-  EXPECT_EQ(rootFileEnd(real, sizeof real - 1), -1) << "fewer than 20 bytes: no claim";
+  EXPECT_EQ(rootFileEnd(real, 16), 6559) << "a 32-bit end is whole at 16 bytes";
+  EXPECT_EQ(rootFileEnd(real, 15), -1) << "the end's field is cut";
+  EXPECT_EQ(rootFileEnd(real, 8), -1);
+  EXPECT_EQ(rootFileEnd(real, 7), -1) << "the version is cut";
   EXPECT_EQ(rootFileEnd(real, 0), -1);
   // A 32-bit end, a 64-bit one for a version of a million or more, the end one past 2 GiB.
   auto b = header("root", 62002, 123456789, false);
   EXPECT_EQ(rootFileEnd(b.data(), b.size()), 123456789);
   b = header("root", 1062002, 5000000000ull, true);
   EXPECT_EQ(rootFileEnd(b.data(), b.size()), 5000000000ll);
+  EXPECT_EQ(rootFileEnd(b.data(), 20), 5000000000ll) << "a 64-bit end is whole at 20 bytes";
+  EXPECT_EQ(rootFileEnd(b.data(), 19), -1) << "a 64-bit end's field is cut";
+  EXPECT_EQ(rootFileEnd(b.data(), 16), -1) << "16 bytes do not hold a 64-bit end";
   b = header("root", 1000000, 7, true);
   EXPECT_EQ(rootFileEnd(b.data(), b.size()), 7) << "version 1000000 is the first with a 64-bit end";
   b = header("root", 999999, 7, false);
@@ -800,16 +843,159 @@ TEST(OpenPolicy, RootFileEnd) {
   EXPECT_EQ(rootFileEnd(b.data(), b.size()), 2147483648ll) << "never negative";
   b = header("root", 1062002, ~0ull, true);
   EXPECT_EQ(rootFileEnd(b.data(), b.size()), LLONG_MAX) << "an end no file has: it equals no size";
-  // Only the first 20 bytes count, and exactly 20 are enough.
-  b = header("root", 62002, 4242, false);
-  EXPECT_EQ(rootFileEnd(b.data(), 20), 4242);
-  // No claim: not a ROOT file's first bytes, whatever follows the first four.
+  // Not a ROOT file's first bytes, whatever follows the first four.
   for (const char* magic : {"Root", "ROOT", "toor", "roo\0", "\0\0\0\0"}) {
     b = header(magic, 62002, 4242, false);
     EXPECT_EQ(rootFileEnd(b.data(), b.size()), -1) << magic;
   }
   const std::vector<unsigned char> zeros(kRootHeaderBytes, 0);
   EXPECT_EQ(rootFileEnd(zeros.data(), zeros.size()), -1) << "a block of zeros";
+}
+
+// The bytes the header check reads: ROOT's 300, or the whole copy when it is smaller.
+TEST(OpenPolicy, RootHeaderBytes) {
+  EXPECT_EQ(kRootHeaderBytes, 300u) << "what ROOT reads at open";
+  const std::pair<long long, size_t> rows[] = {{-1, 0},   {0, 0},     {1, 1},     {19, 19},
+                                               {20, 20},  {299, 299}, {300, 300}, {301, 300},
+                                               {6559, 300}, {LLONG_MAX, 300}};
+  for (const auto& r : rows)
+    EXPECT_EQ(rootHeaderBytes(r.first), r.second) << r.first;
+}
+
+// What the header check says of a copy, given what the read of its first bytes answered.
+TEST(OpenPolicy, RootHeaderVerdict) {
+  using K = RootHeaderVerdict::Kind;
+  const auto verdict = [](const std::vector<unsigned char>& b, long long size) {
+    return rootHeaderVerdict(b.data(), b.size(), size);
+  };
+  const auto first = [](const std::vector<unsigned char>& b, long long size) {
+    return std::vector<unsigned char>(b.begin(), b.begin() + static_cast<long>(rootHeaderBytes(size)));
+  };
+  // The end against the size, for a 32-bit and a 64-bit header, the end both below and above 2^32.
+  struct EndRow {
+    uint32_t version;
+    bool wide;
+    long long end, size;
+    K kind;
+    const char* why;
+  };
+  const EndRow ends[] = {
+      {62002, false, 6559, 6559, K::kConfirmed, "a whole copy"},
+      {62002, false, 6559, 6558, K::kBad, "one byte short of its header's end"},
+      {62002, false, 6559, 3000, K::kBad, "cut short"},
+      {62002, false, 6559, 6560, K::kNoClaim, "one byte past it"},
+      {62002, false, 6559, 10561, K::kNoClaim, "bytes appended, or a file updated in place"},
+      {1062002, true, 5000000000ll, 5000000000ll, K::kConfirmed, "a 64-bit end"},
+      {1062002, true, 5000000000ll, 4999999999ll, K::kBad, "a 64-bit end, cut"},
+      {1062002, true, 5000000000ll, 5000004096ll, K::kNoClaim, "a 64-bit end, longer"},
+      {1062002, true, 6559, 6559, K::kConfirmed, "a small file with a 64-bit header"},
+      {1062002, true, 6559, 400, K::kBad, "a small file with a 64-bit header, cut"},
+      {62002, false, 300, 300, K::kConfirmed, "a copy of exactly 300 bytes"},
+      {62002, false, 300, 299, K::kBad, "299 bytes of a file of 300"},
+      {62002, false, 250, 250, K::kConfirmed, "a copy shorter than 300 bytes, whole"},
+      {62002, false, 0, 6559, K::kNoClaim, "an end of 0 says nothing yet"},
+  };
+  for (const EndRow& r : ends) {
+    const auto b = first(header("root", r.version, static_cast<uint64_t>(r.end), r.wide), r.size);
+    const RootHeaderVerdict v = verdict(b, r.size);
+    EXPECT_EQ(v.kind, r.kind) << r.why;
+    EXPECT_EQ(v.end, r.end) << r.why;
+    EXPECT_EQ(v.kind == K::kBad, !v.why.empty()) << r.why;
+  }
+  // The cut copy's text names both sizes, as the records and the error say it.
+  EXPECT_EQ(verdict(header("root", 62002, 16935324, false), 10161194).why,
+            "size 10161194: its header says the file is 16935324 bytes");
+  // Not beginning with "root": a bad copy, whatever its size; zeros at the right size included.
+  for (const char* magic : {"Root", "ROOT", "toor", "roo\0", "\0\0\0\0", "NOTR"}) {
+    const RootHeaderVerdict v = verdict(header(magic, 62002, 6559, false), 6559);
+    EXPECT_EQ(v.kind, K::kBad) << magic;
+    EXPECT_EQ(v.why, "size 6559: it does not begin with \"root\", as every ROOT file does") << magic;
+  }
+  EXPECT_EQ(verdict(std::vector<unsigned char>(300, 0), 16935324).kind, K::kBad) << "all zeros";
+  // Every size from 1 to 300 bytes of a cut copy of a 32-bit and of a 64-bit file: too short to
+  // hold the header up to the end's field (16 bytes, or 20), else cut short of the end (6559).
+  for (bool wide : {false, true}) {
+    const auto full = header("root", wide ? 1062002 : 62002, 6559, wide);
+    const long long field = wide ? 20 : 16;
+    for (long long size = 1; size <= 300; ++size) {
+      const RootHeaderVerdict v = verdict(first(full, size), size);
+      EXPECT_EQ(v.kind, K::kBad) << size << " wide " << wide;
+      if (size < field)
+        EXPECT_EQ(v.why, "size " + std::to_string(size) + ": too short to hold a ROOT file's header")
+            << size;
+      else
+        EXPECT_EQ(v.end, 6559) << size;
+    }
+  }
+  // The first bytes of a copy that does not begin as a ROOT file does, at any size below 4.
+  EXPECT_EQ(verdict({'x'}, 1).why, "size 1: it does not begin with \"root\", as every ROOT file does");
+  EXPECT_EQ(verdict({'r', 'o'}, 2).why, "size 2: too short to hold a ROOT file's header");
+  // A read answered short inside the copy's size: the copy ends before its size, refused.
+  const auto whole = header("root", 62002, 6559, false);
+  for (size_t n : {size_t(0), size_t(1), size_t(20), size_t(64), size_t(299)}) {
+    const std::vector<unsigned char> part(whole.begin(), whole.begin() + static_cast<long>(n));
+    const RootHeaderVerdict v = verdict(part, 6559);
+    EXPECT_EQ(v.kind, K::kBad) << n;
+    EXPECT_EQ(v.why, "size 6559: a read of its first 300 bytes answered " + std::to_string(n)) << n;
+  }
+  const std::vector<unsigned char> part(whole.begin(), whole.begin() + 99);
+  EXPECT_EQ(verdict(part, 100).why, "size 100: a read of its first 100 bytes answered 99");
+  EXPECT_EQ(verdict(std::vector<unsigned char>(whole.begin(), whole.begin() + 100), 100).kind, K::kBad)
+      << "a whole copy of 100 bytes whose header says 6559";
+}
+
+// The header read's limit: what is left of the attempt's own open limit, at least the floor.
+TEST(OpenPolicy, HeaderReadTimeout) {
+  EXPECT_EQ(headerReadTimeoutS(60, 0), 60) << "an open that answered at once";
+  EXPECT_EQ(headerReadTimeoutS(60, 1), 60) << "rounded up";
+  EXPECT_EQ(headerReadTimeoutS(60, 20000), 40);
+  EXPECT_EQ(headerReadTimeoutS(60, 20001), 40) << "a part of a second left counts as a second";
+  EXPECT_EQ(headerReadTimeoutS(60, 54000), 6);
+  EXPECT_EQ(headerReadTimeoutS(60, 55000), kHeaderReadFloorS);
+  EXPECT_EQ(headerReadTimeoutS(60, 59999), kHeaderReadFloorS) << "never the open's limit afresh";
+  EXPECT_EQ(headerReadTimeoutS(60, 600000), kHeaderReadFloorS) << "past the limit: the floor";
+  EXPECT_EQ(headerReadTimeoutS(30, 1000), 29) << "an attempt given less than the deadline";
+  EXPECT_EQ(headerReadTimeoutS(3, 0), kHeaderReadFloorS) << "a test's short limit";
+  EXPECT_EQ(headerReadTimeoutS(60, -5), 60) << "a clock that went back counts as no time";
+  EXPECT_EQ(headerReadTimeoutS(0, 1000), kOpenDeadlineS - 1) << "no limit given: the deadline's";
+  for (int64_t ms = 0; ms <= 120000; ms += 7) {
+    const int t = headerReadTimeoutS(60, ms);
+    ASSERT_GE(t, kHeaderReadFloorS) << ms;
+    ASSERT_LE(t, 60) << ms;
+  }
+}
+
+// A header read that failed is a failure of the copy: another copy when the open went through a
+// redirector, whatever the code; a direct URL has none.
+TEST(OpenPolicy, StepAfterHeaderRead) {
+  const ChainView v = regionalThen(kServer);
+  for (int code : {kErrSocketError, kErrSocketDisconnected, kErrStreamDisconnect, kErrTlsError,
+                   kErrInvalidSession, kErrOperationInterrupted, kErrInternal, kErrDataError,
+                   kErrRedirect, kErrConnectionError, kErrSocketTimeout, 101})
+    EXPECT_EQ(stepAfterHeaderRead(v, code, 0, false, false), OpenStep::kFailOver) << code;
+  for (int errNo : {kXrIOError, kXrServerError, 3013, kXrNotAuthorized})
+    EXPECT_EQ(stepAfterHeaderRead(v, kErrErrorResponse, errNo, false, false), OpenStep::kFailOver)
+        << errNo;
+  // How another copy is found is the open's rule: a stall asks the regional for its list.
+  EXPECT_EQ(stepAfterHeaderRead(v, kErrOperationExpired, 0, false, true), OpenStep::kLocate);
+  EXPECT_EQ(stepAfterHeaderRead(v, kErrOperationExpired, 0, false, false), OpenStep::kFailOver);
+  EXPECT_EQ(stepAfterHeaderRead(v, kErrErrorResponse, kXrNotFound, false, false), OpenStep::kLocate);
+  // No other copy: a direct URL, or a chain with no data server after the redirector.
+  for (int code : {kErrSocketError, kErrRedirect, kErrOperationExpired, kErrConnectionError})
+    EXPECT_EQ(stepAfterHeaderRead(kDirect, code, 0, false, true), OpenStep::kFinal) << code;
+  EXPECT_EQ(stepAfterHeaderRead(kRedirectorOnly, kErrSocketError, 0, false, false), OpenStep::kFinal);
+}
+
+// The failures the client would have recovered by opening the file again (its read recovery and
+// its following of redirects), which the header read turns off.
+TEST(OpenPolicy, ClientRecoversRead) {
+  for (int code : {kErrSocketError, kErrSocketTimeout, kErrInvalidSession, kErrTlsError,
+                   kErrOperationInterrupted, kErrInternal, kErrRedirect})
+    EXPECT_TRUE(clientRecoversRead(code)) << code;
+  for (int code : {0, kErrConnectionError, kErrOperationExpired, kErrStreamDisconnect,
+                   kErrSocketDisconnected, kErrDataError, kErrErrorResponse, kErrNotFound,
+                   kErrRedirectLimit, kErrAuthFailed})
+    EXPECT_FALSE(clientRecoversRead(code)) << code;
 }
 
 // A short answer counts against a copy only when the request lies wholly inside the confirmed size.

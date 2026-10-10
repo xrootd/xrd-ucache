@@ -51,10 +51,12 @@ reach disk, in keys or file names.
 `file_size − (npages−1)·page_size` bytes; its CRC covers exactly those bytes.
 
 Flag bit2, *size confirmed*: with `adaptive_federation = on`, an open of a file
-named `*.root` reads the first 64 bytes of the copy it landed on. A ROOT file's header
-states where the file ends; when that equals the size the copy reported, the size is
-confirmed and the entry carries the bit, and a copy of another size is not accepted
-for the entry or for a handle that holds it. The bit is only ever set, and goes with
+named `*.root` (in upper or lower case) reads the first 300 bytes of the copy it landed
+on. A ROOT file's header states where the file ends; when that equals the size the copy
+reported, the size is confirmed and the entry carries the bit, and a copy of another
+size is not accepted for the entry or for a handle that holds it. A copy whose size is
+larger than that end confirms nothing (ROOT reads it normally); one whose size is
+smaller is refused (USER_GUIDE.md). The bit is only ever set, and goes with
 the entry when the origin size changes (a new entry starts unconfirmed). It is not a
 format change: a build that does not know the bit ignores it and keeps it when it
 rewrites the sidecar (`format_version` stays 1, since any other version makes a reader
@@ -434,7 +436,9 @@ any server and has no line.
   `records` (the file's own records, read to set up its layout), `relay` (a
   request passed straight to the origin), `open` (with `adaptive_federation =
   on`, a copy refused after its open succeeded: an empty copy of a file named
-  `*.root`, or one whose size is not the end its own header states, `msg` saying which;
+  `*.root`, or one whose first bytes show it is not a whole ROOT file (its size smaller
+  than the end its header states, not beginning with `root`, too short for its header, or
+  those bytes answered short), `msg` saying which;
   class `data`, code 14, `off` and `len` 0). A read answered short inside the file's
   confirmed size is a line of op `read` or `relay`, class `data`, code 14, `off` and
   `len` the span asked. When no other copy is left, the
