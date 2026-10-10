@@ -39,7 +39,8 @@
 #                          the whole size; the records show the copy's size, a failed attempt of op
 #                          open, class data, and the copy that was taken. When only the cut copy
 #                          exists, the open fails with one error that names the copy, its size and
-#                          the header's end. The copy of a file not named *.root is not looked at;
+#                          the header's end, and uCache has closed the copy. The copy of a file not
+#                          named *.root is not looked at;
 #                          the name is checked in any case (*.ROOT)
 #   zeros at the size      one server holds as many zero bytes as the file has (a, b and c in
 #                          turn), the other two the file: the copy of zeros does not begin as a
@@ -50,8 +51,9 @@
 #                          the reader gets the file's own bytes and the size is not confirmed
 #   all copies empty       the file is named *.root and every copy is empty: the open fails with
 #                          one error of class data that names each copy tried with its server and
-#                          its size, each attempt recorded as a failure of op open, class data, and a
-#                          copy the regional lists is not tried when it was refused already
+#                          its size, each attempt recorded as a failure of op open, class data, a
+#                          copy the regional lists is not tried when it was refused already, and
+#                          uCache closes each copy it opened (the test client never closes its File)
 #   all refused            a, b and c refuse the file: Open() returns OK, one
 #                          completion, a failure that names all three servers
 #   switch off             the default: a refused at a: some opens fail, the client
@@ -76,7 +78,8 @@
 #                          was opened at is cut short by the test: a read inside the file's size
 #                          past the cut is answered short, which is held against the copy (its size
 #                          was confirmed by the header at the open): the read is made again at
-#                          another copy and is exact. When every copy is cut the read fails with the
+#                          another copy and is exact, for a Read the cache serves and for a PgRead it
+#                          passes straight to the origin. When every copy is cut the read fails with the
 #                          data error, whose text says no copy could serve the read and names each
 #                          copy tried with its size. A read that reaches past the end of an intact
 #                          file is answered short as it always was, and the handle does not move
@@ -241,6 +244,15 @@ confirmed() {
   local m; m=$(find "$1" -name '*.meta' | head -1)
   if [ -z "$m" ]; then echo none; else echo $(( ($(od -An -tu4 -j12 -N4 "$m") >> 2) & 1 )); fi
 }
+# In a client log, the Files that opened a copy (each by the name XrdCl's log gives it, its
+# address and URL) and how many of them sent their own close: "OPENED CLOSED". The test client's
+# open-denied mode never closes or destroys its File, so every close there is uCache's.
+copies_closed() {
+  local o c
+  o=$(sed -n 's/.*\[File *\] \[\(0x[0-9a-f]*@.*\)\] successfully opened at .*/\1/p' "$1" | sort -u)
+  c=$(sed -n 's/.*\[File *\] \[\(0x[0-9a-f]*@.*\)\] Sending a close command for handle .*/\1/p' "$1" | sort -u)
+  echo "$(echo "$o" | grep -c .) $(comm -12 <(echo "$o") <(echo "$c") | grep -c .)"
+}
 
 echo; echo "=== an empty copy of a file named *.root is refused"
 # Up to 60 files, the empty copy on a, b and c in turn (the regional may prefer a server when all
@@ -294,6 +306,8 @@ echo "$res" | grep -q '^open-denied: clean$'; verdict "only the cut copy exists:
 echo "$res" | grep -q "(127.0.0.1:$AX): size $CUT: its header says the file is $FIXW_SIZE bytes"; verdict "the error names the copy, its size $CUT and the header's $FIXW_SIZE" $?
 echo "$res" | grep -q 'Received corrupted data'; verdict "the error is a data error" $?
 [ -z "$(find "$W/c14" \( -name '*.meta' -o -name '*.data' \) -print -quit)" ]; verdict "nothing of the file is cached" $?
+CC=$(copies_closed "$W/f14.log")
+[ "${CC% *}" -ge 1 ] && [ "${CC% *}" = "${CC#* }" ]; verdict "the cut copy that was opened was closed by uCache (opened, closed: $CC)" $?
 # a file not named *.root is not looked at: its copy is served as it is
 L=/store/ci/cut-only.dat
 cutw $L a
@@ -371,7 +385,8 @@ records "$W/c12" | tail -1 | grep -q '"outcome":"error"'; verdict "the last reco
 [ "$(cat "$W/c12"/stats/*.files.jsonl | grep '"kind":"origin_failure"' | grep -c '"op":"open".*"class":"data"')" -ge 3 ]
 verdict "failures of op open, class data are recorded, one for each attempt" $?
 [ "$(counter "$W/c12" origin_failures_data)" = "$NATT" ]; verdict "origin_failures_data counts them ($NATT)" $?
-[ "$(grep -c 'Sending a close command for handle' "$W/f12.log")" -ge 3 ]; verdict "each copy that was opened was closed" $?
+CC=$(copies_closed "$W/f12.log")
+[ "${CC% *}" = "$NATT" ] && [ "${CC#* }" = "$NATT" ]; verdict "each copy that was opened was closed by uCache (opened, closed: $CC; $NATT attempts)" $?
 [ -z "$(find "$W/c12" \( -name '*.meta' -o -name '*.data' \) -print -quit)" ]; verdict "nothing of the file is cached" $?
 
 echo; echo "=== all refused: a, b and c refuse the file"
@@ -587,14 +602,21 @@ ct() {
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-300
   SV=($(echo "$RES" | sed -n 's/^SERVERS //p'))
   F14=$(recs "$RFC" origin_failure | grep -c '"op":"read".*"code":14,\|"op":"relay".*"code":14,')
+  F14OPS=$(recs "$RFC" origin_failure | grep '"code":14,' | field op | tr '\n' ' ')
   NRA=$(recs "$RFC" open | grep -c '"route":"read"')
 }
 ct cut cut /store/ci/ct-cut.root
 echo "$RES" | grep -q '^read-failover cut: clean$'; verdict "cut: the read past the cut is the file's own bytes, from another server, once (${SV[*]})" $?
-[ "$F14" = 1 ]; verdict "cut: the short answer is one failed read of class data, code 14 ($F14)" $?
+[ "$F14" = 1 ] && [ "$F14OPS" = "read " ]; verdict "cut: the short answer is one failed read of class data, code 14, op read: a miss of the cache ($F14, $F14OPS)" $?
 recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | tail -1 | grep -q "\"size\":$FIXW_SIZE,"
 verdict "cut: a move of route read ended at a copy of $FIXW_SIZE bytes" $?
 [ "$(counter "$RFC" origin_failures_data)" -ge 1 ]; verdict "cut: origin_failures_data counts it" $?
+# the same with a PgRead across the cut (from 20000), which the cache passes straight to the origin: a page read's short answer
+ct cutpg cut /store/ci/ct-cutpg.root
+echo "$RES" | grep -q '^read-failover cutpg: clean$'; verdict "cutpg: a PgRead across the cut is the file's own bytes, from another server, once (${SV[*]})" $?
+[ "$F14" = 1 ] && [ "$F14OPS" = "relay " ]; verdict "cutpg: the short answer is one failed read of class data, code 14, op relay: the passed-through PgRead ($F14, $F14OPS)" $?
+recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | tail -1 | grep -q "\"size\":$FIXW_SIZE,"
+verdict "cutpg: a move of route read ended at a copy of $FIXW_SIZE bytes" $?
 ct cutonly cutall /store/ci/ct-all.root
 echo "$RES" | grep -q '^read-failover cutonly: clean$'; verdict "cutonly: every copy is cut, the read fails with the data error and says why" $?
 [ "$F14" -ge 1 ] && [ "$F14" -le 4 ]; verdict "cutonly: $F14 failed reads (one to four)" $?
