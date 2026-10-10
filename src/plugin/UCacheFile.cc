@@ -115,17 +115,21 @@ bool readFaultFire() {
 }
 
 // UCACHE_TEST_HEADER_FAIL_N (inert unless set, read at load): the header read of the first N
-// opens it is made for fails with a connection error, as if the copy's server had dropped it;
-// with UCACHE_TEST_HEADER_FAIL_KIND=short it is sent for one byte fewer than it needs, so the
-// copy's server answers it short.
+// opens it is made for fails with a connection error, as if the copy's server had dropped it.
+// UCACHE_TEST_HEADER_FAIL_KIND=short: it is sent for one byte fewer than it needs instead, so
+// the copy's server answers it short; =delay: it is sent kHeaderFaultDelayMs late, so that a
+// test can break the copy's connection between the open's answer and the read.
 static std::atomic<int> gHeaderFaultBudget{[] {
   const char* v = ::getenv("UCACHE_TEST_HEADER_FAIL_N");
   return v ? ::atoi(v) : 0;
 }()};
-static const bool gHeaderFaultShort = [] {
+enum class HeaderFault : uint8_t { kError, kShort, kDelay };
+static const HeaderFault gHeaderFaultKind = [] {
   const char* v = ::getenv("UCACHE_TEST_HEADER_FAIL_KIND");
-  return v && std::strcmp(v, "short") == 0;
+  const std::string k = v ? v : "";
+  return k == "short" ? HeaderFault::kShort : k == "delay" ? HeaderFault::kDelay : HeaderFault::kError;
 }();
+constexpr uint64_t kHeaderFaultDelayMs = 5000;
 bool headerFaultFires() {
   if (gHeaderFaultBudget.load(std::memory_order_relaxed) <= 0)
     return false;
@@ -1499,9 +1503,20 @@ class RetryingOpenHandler : public ResponseHandler {
           f->SetProperty(HeaderRead::kPropNames[i], "false");
       }
     }
-    const int limitS = headerReadTimeoutS(a_.timeoutS, static_cast<int64_t>((nowUs() - a_.t0) / 1000));
     const bool fault = f && headerFaultFires();
-    const bool answeredShort = fault && gHeaderFaultShort && want >= 2;
+    if (fault && gHeaderFaultKind == HeaderFault::kDelay) { // a test's: the read is sent late
+      RetryingOpenHandler* self = this;
+      moveExecutor().postAfter(kHeaderFaultDelayMs,
+                               [self, hr, f, want] { self->issueHeaderRead(hr, f, want, false); });
+      return;
+    }
+    issueHeaderRead(hr, f, want, fault);
+  }
+  // Sends the header read of `hr` on `f` (null: the handle closed), `want` bytes, within what is
+  // left of the attempt's time; `fault`: a test's fault strikes it.
+  void issueHeaderRead(HeaderRead* hr, XrdCl::File* f, size_t want, bool fault) {
+    const int limitS = headerReadTimeoutS(a_.timeoutS, static_cast<int64_t>((nowUs() - a_.t0) / 1000));
+    const bool answeredShort = fault && gHeaderFaultKind == HeaderFault::kShort && want >= 2;
     XRootDStatus rs(XrdCl::stError, XrdCl::errInvalidOp, 0, "the handle is closed");
     if (fault && !answeredShort)
       rs = XRootDStatus(XrdCl::stError, XrdCl::errConnectionError);
