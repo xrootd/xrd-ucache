@@ -642,6 +642,29 @@ TEST(OpenPolicy, NoteReadFailure) {
   noteReadFailure(l, fail("f:1", "zeros", true), 3);
   noteReadFailure(l, fail("g:1", "zeros", true), 3);
   EXPECT_EQ(servers(l), "b:1! e:1! f:1! g:1! ");
+  // A failure that is not bad, with every older one bad: it is kept, the newest, though the list
+  // then holds one more than three, so that a move never goes straight back to the copy it leaves.
+  noteReadFailure(l, fail("h:1", "stall", false), 3);
+  EXPECT_EQ(servers(l), "b:1! e:1! f:1! g:1! h:1 ");
+  EXPECT_EQ(l.back().error, "stall");
+  // The next one replaces it: the oldest that is not bad goes, never the newest.
+  noteReadFailure(l, fail("i:1", "socket", false), 3);
+  EXPECT_EQ(servers(l), "b:1! e:1! f:1! g:1! i:1 ");
+  noteReadFailure(l, fail("i:1", "stall", false), 3);
+  EXPECT_EQ(servers(l), "b:1! e:1! f:1! g:1! i:1 ") << "the same server: one entry";
+  // A list of three bad ones and one more that is not: four, the newest kept.
+  std::vector<SiteFailure> three;
+  for (const char* s : {"p:1", "q:1", "r:1"})
+    noteReadFailure(three, fail(s, "zeros", true), 3);
+  noteReadFailure(three, fail("s:1", "stall", false), 3);
+  EXPECT_EQ(servers(three), "p:1! q:1! r:1! s:1 ");
+  Location ls;
+  ls.host = "s";
+  ls.port = 1;
+  Location lt = ls;
+  lt.host = "t";
+  EXPECT_EQ(orderLocations({ls, lt}, {}, three).front().host, "t")
+      << "the copy just left is taken last";
   // What the list says of a server, in any case of its name.
   EXPECT_TRUE(refusedBefore(l, "B:1"));
   EXPECT_TRUE(refusedBefore(l, "g:1"));
@@ -659,6 +682,33 @@ TEST(OpenPolicy, NoteReadFailure) {
   std::vector<SiteFailure> stalls;
   noteReadFailure(stalls, fail("a.one.org:1094", "stall", false), 3);
   EXPECT_EQ(orderLocations({la}, {}, stalls).size(), 1u);
+}
+
+// The error a read is given in the second after a move made for an earlier read found no copy.
+TEST(OpenPolicy, EarlierMoveText) {
+  SiteFailure a{"127.0.0.1:14121", "127.0.0.1", "",
+                "answered 0 of the 65536 bytes asked at 10161194, inside the file's size of "
+                "16935324 bytes"};
+  a.size = 16935324;
+  const std::string move = noCopyServedText("/store/mc/f.root", {a});
+  EXPECT_EQ(earlierMoveText(move, 250),
+            "uCache: /store/mc/f.root: no copy could serve the read: a move made 250 ms ago for an "
+            "earlier read of the handle found none, and none is made again within a second; the "
+            "copies it tried, as they answered that read: 127.0.0.1 (127.0.0.1:14121, 16935324 "
+            "bytes): answered 0 of the 65536 bytes asked at 10161194, inside the file's size of "
+            "16935324 bytes");
+  EXPECT_NE(earlierMoveText(move, 999).find("999 ms ago"), std::string::npos);
+  EXPECT_NE(earlierMoveText(move, 1000).find("1 second ago"), std::string::npos);
+  EXPECT_NE(earlierMoveText(move, 0).find("0 ms ago"), std::string::npos);
+  // Not a move's text (an open's, or none): as it is.
+  EXPECT_EQ(earlierMoveText("uCache: /f: no site could open it: x", 5),
+            "uCache: /f: no site could open it: x");
+  EXPECT_EQ(earlierMoveText("", 5), "");
+  // At most 1024 bytes.
+  std::vector<SiteFailure> many(20, {"s.x.org:1094", "x.org", "s.x.org", std::string(150, 'e')});
+  const std::string m = earlierMoveText(noCopyServedText("/f", many), 10);
+  EXPECT_EQ(m.size(), 1024u);
+  EXPECT_EQ(m.find("uCache: /f: no copy could serve the read: a move made 10 ms ago"), 0u);
 }
 
 // The copies a locate lists, in the order they are tried.

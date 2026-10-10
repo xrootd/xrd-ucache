@@ -378,6 +378,10 @@ other copy is left (every copy is refused, or the URL names a server directly), 
 error that names each copy tried, its server and its site, its size and why it was
 refused (`no site could open it: <site> (<server>): size 0: the copy is empty, ...`),
 of class `data`; the copy that was opened is closed and nothing of it is cached.
+When the redirector sends a later attempt of the same open back to a copy it refused
+already, that copy is refused again as it is (`refused already at this open; it is not taken
+again`), with nothing read of it, and it is neither recorded nor counted a second time: the
+error names each copy once, and `origin_failures_data` counts each refused copy once.
 The counters `open_failovers`, `opens_recovered`, `opens_failed_everywhere`,
 `failover_locates` and `offline_copies_skipped` (STATS.md) count these, and the
 per-file record file has a line per attempt (FORMAT.md, routes `failover` and
@@ -435,8 +439,10 @@ another site, and the job gets the bytes. The log says so, once for every move:
   (<host>:<port>, <size> bytes): <error>; ...`). This holds whatever made the read
   move: a server's failure, a short answer (below), or a basket that failed the
   key-position check of `check_origin_integrity`. A read that fails within a second
-  after such a move gets the same error at once, without another attempt; the next
-  one after that tries again.
+  after such a move gets that move's error at once, without another attempt, saying so
+  (`no copy could serve the read: a move made <time> ago for an earlier read of the
+  handle found none, ...`: the offsets in the list that follows are that earlier
+  read's); the next one after that tries again.
 
 A read moves only to a copy of the size the job was shown at its open, also on a
 file whose reads uCache passes straight to the origin (its host is left out by the
@@ -448,6 +454,13 @@ that server is taken again. For a file whose reads uCache passes straight to the
 take any copy the regional redirector lists.
 A file whose size uCache does not know is not moved: the client's own recovery of its
 reads stays on.
+
+A job's open that the cache entry answered within its freshness window opens the file at an
+origin only when a read needs it. When the entry is gone by the job's first read (evicted
+meanwhile), that read opens the file at an origin, with the failover of an open. If that open
+fails at every copy, each read and `Stat` of the file gets that open's error, which names the
+copies (`no copy could serve the read: ...`), and nothing is sent to an origin on the file
+until an open succeeds: the first read after a second opens it again.
 
 A read that a copy answers short, wholly inside the file's confirmed size (confirmed by
 the header at this open, or kept by the cache entry within its freshness window for an
@@ -472,7 +485,14 @@ The per-file record file has the `origin_failure` line of each read that
 failed, then a line per open attempt with route `read` (FORMAT.md). The
 counters of an open at another site (`open_failovers`, `opens_recovered`,
 `opens_failed_everywhere`) count these attempts, and `origin_failures_*` the
-failed reads. A read stops after 4 attempts or the time it was allowed. A
+failed reads. A read stops after 4 attempts or the time it was allowed. When each
+move found a copy and the read failed there too until then, the job gets the same
+kind of error, with the code of the read's last failure, naming each copy the read
+was made at, its size and what it said (`uCache: <file>: no copy could serve the read:
+...`), and the log says `<file>: a read moved <n> time(s) and its bounds are spent:
+<copies>`. A copy that answered with bad bytes is marked so also when its read
+fails while a move of the handle is under way, or after the handle has left that
+copy. A
 server that stalls is found by silence: the client's own check of a quiet
 connection (`StreamTimeout`, 60 s, and its `TimeoutResolution`, 15 s, by
 default) ends every read of that connection at once with an error, and each is

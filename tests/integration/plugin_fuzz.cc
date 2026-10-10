@@ -1283,6 +1283,12 @@ int runOpenDenied(const char* url) {
 //             where it is, and the client's own read recovery is on
 //   many      (N=8, KIND unset or late) 8 threads read 4 pages each at once,
 //             8 of them failing: all are exact
+//   exhaust   (KIND=again, N=4) a PgRead, relayed, fails at the copy the handle
+//             is at and at every copy each move takes, until its attempts (4)
+//             are spent: it fails, once, with the connection error of its last
+//             attempt and the error that names every copy it was read from
+//             ("no copy could serve the read"), printed as "MSG"; a Read after
+//             it is exact
 struct ReadCase {
   const Source& src;
   XrdCl::File* file;
@@ -1445,16 +1451,25 @@ int runZero(const char* url, const char* local, const std::string& which) {
 // inside the file's size, past the cut:
 //   cut      the read is the file's own bytes, from another server than the cut one
 //   cutpg    the same with a PgRead, which the cache passes straight to the origin, from 20000, so
-//            that the caller's cut falls inside it (fed_ci.sh cuts at 30000) and the copy answers it
-//            with the bytes before the cut: the short answer of a page read is held against the copy
-//            as a plain read's is
+//            that the caller's cut falls inside it (fed_ci.sh cuts at 30000) and the copy answers
+//            it with the bytes before the cut: the short answer of a page read is held against the
+//            copy as a plain read's is
 //   cutpgpast the same with a PgRead from 40000, wholly past the cut: the copy answers it with no
 //            bytes, which the client fails itself with an invalid response (it cannot take an
 //            empty page answer); inside the file's size that is held against the copy too, and
 //            the read is made again at another copy (a client that took the empty answer would
 //            give a short one, held against the copy as well)
 //   cutonly  every copy was cut: the read fails with errDataError, and its message says the
-//            answer was short inside the file's size
+//            answer was short inside the file's size. A second Read, at 50000, made at once
+//            (within the second in which no move is made again), fails with the same error,
+//            whose message says it is that of a move made for an earlier read (the offsets it
+//            names are the first read's), printed as "MSG2"
+//   degraded the handle opened trusting its cache entry (the caller's window), and UCACHE_CUT_CMD
+//            removes the entry and makes every copy refuse the file: the handle's own open at its
+//            first read fails at every copy. A Read and then a PgRead inside the file each fail,
+//            once (at the call or through the handler), with the open's error, which names the
+//            copies ("no copy could serve the read"); never the client's error for a File that
+//            never opened, and the PgRead is never sent on that File (the client crashes there)
 //   end      nothing is cut. A Read and a PgRead that reach past the end of the file are answered
 //            with the bytes that exist, short, as they always were, and the handle stays put; a
 //            PgRead wholly past the end is answered as without uCache (no bytes, or the client's
@@ -1486,7 +1501,34 @@ int runCut(const char* url, const char* local, const std::string& which) {
     }
   std::string now = landed;
   std::vector<char> buf(65536, 0x5A);
-  if (which == "end") { // past the end: short, exact, no move
+  if (which == "degraded") { // the handle's own open fails: each read gets that open's error
+    for (const bool pg : {false, true}) {
+      auto* w = new ReadWait(); // leaked with its buffer: a late completion lands safely
+      auto* b = new std::vector<char>(65536, 0x5A);
+      const XrdCl::XRootDStatus s =
+          pg ? file->PgRead(40000, 65536, b->data(), w) : file->Read(40000, 65536, b->data(), w);
+      XrdCl::XRootDStatus got = s;
+      bool once = true;
+      if (s.IsOK()) {
+        const bool answered = w->wait();
+        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // room for a second completion
+        std::lock_guard<std::mutex> g(w->mu);
+        got =
+            answered ? w->status : XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errOperationExpired);
+        once = answered;
+      }
+      const std::string msg = got.GetErrorMessage();
+      std::printf("MSG %s %s\n", pg ? "pgread" : "read", msg.c_str());
+      verdict(!got.IsOK() && got.code != XrdCl::errInvalidOp &&
+                  msg.find("no copy could serve the read") != std::string::npos,
+              std::string(pg ? "a PgRead" : "a Read") +
+                  " fails with the open's error, which names "
+                  "the copies (" +
+                  got.ToStr() + (s.IsOK() ? ", through the handler" : ", at the call") + ")");
+      verdict(once && (!s.IsOK() || w->contractKept()),
+              std::string(pg ? "the PgRead" : "the Read") + " is answered once");
+    }
+  } else if (which == "end") { // past the end: short, exact, no move
     uint32_t got = 0;
     XrdCl::XRootDStatus s = file->Read(size - 1000, 65536, buf.data(), got);
     verdict(s.IsOK() && got == 1000 && std::memcmp(buf.data(), src.bytes.data() + size - 1000, 1000) == 0,
@@ -1517,6 +1559,11 @@ int runCut(const char* url, const char* local, const std::string& which) {
     const XrdCl::XRootDStatus s =
         pg ? file->PgRead(off, 65536, buf.data(), w) : file->Read(off, 65536, buf.data(), w);
     const bool answered = s.IsOK() && w->wait();
+    // cutonly: a second read at once, inside the second after the first's move found no copy
+    auto* w2 = new ReadWait(); // leaked with its buffer: a late completion lands safely
+    auto* b2 = new std::vector<char>(65536, 0x5A);
+    const XrdCl::XRootDStatus s2 =
+        which == "cutonly" ? file->Read(50000, 65536, b2->data(), w2) : XrdCl::XRootDStatus();
     std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a second completion
     file->GetProperty("DataServer", now);
     {
@@ -1527,6 +1574,15 @@ int runCut(const char* url, const char* local, const std::string& which) {
                     w->status.GetErrorMessage().find("inside the file's size of") != std::string::npos,
                 "the read inside the file's size past the cut fails with the data error: " + said +
                     " " + w->status.GetErrorMessage());
+        const bool answered2 = s2.IsOK() && w2->wait();
+        std::lock_guard<std::mutex> g2(w2->mu);
+        const std::string m2 = w2->status.GetErrorMessage();
+        std::printf("MSG2 %s\n", m2.c_str());
+        verdict(answered2 && w2->status.code == XrdCl::errDataError &&
+                    m2.find("for an earlier read of the handle") != std::string::npos,
+                "a second read at once fails with the error of the move made for the first, which "
+                "says so: " +
+                    (answered2 ? w2->status.ToStr() : s2.ToString()));
       } else {
         verdict(answered && w->status.IsOK() && std::memcmp(buf.data(), src.bytes.data() + off, 65536) == 0,
                 "the read past the cut is the file's own bytes (" + (answered ? said : "no answer") + ")");
@@ -1549,7 +1605,7 @@ int runReadFailover(const char* url, const char* local, const std::string& which
   if (which.rfind("zero", 0) == 0)
     return runZero(url, local, which);
   if (which == "cut" || which == "cutpg" || which == "cutpgpast" || which == "cutonly" ||
-      which == "end")
+      which == "end" || which == "degraded")
     return runCut(url, local, which);
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   Source src(local);
@@ -1624,6 +1680,26 @@ int runReadFailover(const char* url, const char* local, const std::string& which
     for (auto& t : ts)
       t.join();
     moved("after the 32 reads");
+  } else if (which == "exhaust") {
+    rc.read('r', 1 * M, "(first, to arm the handle) a Read is exact");
+    auto* w = new ReadWait(); // leaked with its buffer: a late completion lands safely
+    handlers.push_back(w);
+    auto* buf = new std::vector<char>(65536, 0x5A);
+    const XrdCl::XRootDStatus s = file->PgRead(2 * M, 65536, buf->data(), w);
+    const bool answered = s.IsOK() && w->wait();
+    {
+      std::lock_guard<std::mutex> g(w->mu);
+      const std::string msg = w->status.GetErrorMessage();
+      std::printf("MSG %s\n", msg.c_str());
+      rc.verdict(answered && w->status.code == XrdCl::errConnectionError &&
+                     msg.find("no copy could serve the read") != std::string::npos,
+                 "a PgRead that failed at every copy it was moved to fails with its last "
+                 "failure's code (" +
+                     (answered ? w->status.ToStr() : s.ToString()) +
+                     ") and the error that names the copies");
+    }
+    servers.push_back(rc.prop("DataServer"));
+    rc.read('r', 3 * M, "a Read after it is exact");
   } else {
     std::printf("%s: unknown case %s\n", mode, which.c_str());
     return 2;

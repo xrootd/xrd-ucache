@@ -421,7 +421,9 @@ bool refusedBefore(const std::vector<SiteFailure>& failed, const std::string& se
 // answered with bad bytes): it is put on the handle's list of copies its reads failed at,
 // `failed`, as its newest entry. A server listed already keeps one entry, the newest, and stays
 // bad once it was found bad. The list keeps at most `keep` entries, the oldest that is not bad
-// dropped first; one found bad is never dropped, so it is never opened again for the handle.
+// dropped first; one found bad is never dropped, so it is never opened again for the handle, and
+// neither is the newest, so that a move never goes straight back to the copy it leaves: when every
+// older entry was found bad, the list keeps one more than `keep`.
 void noteReadFailure(std::vector<SiteFailure>& failed, SiteFailure f, size_t keep);
 // What the sequence does after a fail-over outcome, given the sites that
 // failed before (`failed`, to which `f` is added unless its server is there):
@@ -475,6 +477,13 @@ std::string sitesFailedList(const std::vector<SiteFailure>& failed);
 // a copy whose size is not known without it; each error cut to 160 bytes and without URL
 // queries, the whole at most 1024 bytes.
 std::string noCopyServedText(const std::string& file, const std::vector<SiteFailure>& failed);
+// The error a read is given when a move of the handle, made for an earlier read `agoMs` ago, found
+// no copy, and none is made again so soon: that move's error (`moveText`, noCopyServedText's), said
+// to be the earlier read's, whose offsets its list of copies names: "uCache: <file>: no copy could
+// serve the read: a move made <ago> ago for an earlier read of the handle found none, and none is
+// made again within a second; the copies it tried, as they answered that read: <list>", at most
+// kErrorTextMax bytes. `moveText` as it is when it is not noCopyServedText's.
+std::string earlierMoveText(const std::string& moveText, uint64_t agoMs);
 
 // ---- Reading a file from another site (adaptive_federation on) --------------
 // A handle is armed to move its reads when the cache serves it, an open of it

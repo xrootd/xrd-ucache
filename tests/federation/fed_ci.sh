@@ -81,7 +81,10 @@
 #                          (a PgRead, a VectorRead into one buffer), reads the client
 #                          refuses at once, eight failures of threads at one handle (also
 #                          failing late), and a failure no other site would change, which
-#                          stays at its server. Each case checks the records: the failed
+#                          stays at its server. A read that fails at every copy each move takes
+#                          ends when its own attempts are spent (four) with the error that names
+#                          every copy it was read from, with its size, and the code of its last
+#                          failure. Each case checks the records: the failed
 #                          reads, each followed by an open with route read at another
 #                          server, and open_failovers equal to those opens. A handle whose
 #                          reads are all relayed (the name it was opened by, localhost, denied
@@ -115,6 +118,10 @@
 #                          for the handle (one failed read, no move takes it), and the error names
 #                          it; with the switch off (the check on) it gets the error and no read is
 #                          moved
+#   lost trust, open fails a handle opened trusting its cache entry (a freshness window) whose entry is
+#                          gone by its first read, and whose own open then fails at every copy (each
+#                          refuses the file): a Read and a PgRead each fail with that open's error,
+#                          which names the copies, and nothing is sent on the File that never opened
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD=$(cd "${1:?usage: fed_ci.sh BUILD_DIR}" && pwd)
@@ -689,6 +696,18 @@ for kind in "" late; do
   [ "${#FL[@]}" -ge 3 ] && [ "$same" = 1 ] && [ "${#MV[@]}" -ge 1 ] && [ "${#MV[@]}" -lt "${#FL[@]}" ]; verdict "many${kind:+ ($kind)}: of ${#FL[@]} failures the ones after the first name the server of a move, and the moves (${#MV[@]}) are fewer than the failures" $?
 done
 
+# A read that fails at every copy a move takes (UCACHE_TEST_READ_FAIL_KIND=again: the faults strike the relayed
+# read's first issue and each issue made again after a move): after its fourth attempt it ends, with the error that
+# names every copy it was read from, each with its size, and its last failure's code (108, a connection error).
+rf exhaust 4 on again
+echo "$RES" | grep '^MSG' | sed 's/^/    /' | cut -c1-600
+clean exhaust; verdict "exhaust: a PgRead that failed at every copy it was moved to fails once, with its last failure's code and the error naming the copies; the handle reads on" $?
+[ "$(recs "$RFC" origin_failure | grep '"op":"relay"' | grep -c '"code":108,')" = 4 ] && [ "${#MV[@]}" = 3 ]
+verdict "exhaust: four failed relayed reads of code 108 (the fault struck each attempt), three moves between them (${MV[*]})" $?
+NC=0; for p in $AX $BX $CX; do echo "$RES" | grep '^MSG' | grep -q "(127.0.0.1:$p, 8388608 bytes): \[ERROR\] Connection error" && NC=$((NC + 1)); done
+echo "$RES" | grep '^MSG' | grep -q 'no copy could serve the read' && [ "$NC" = 3 ]
+verdict "exhaust: the error says no copy could serve the read and names each of the three copies with its size 8388608 and its connection error ($NC of 3)" $?
+
 rf off 2 off
 clean off; verdict "switch off: failed reads are relayed on the same file, exact, once; the client's read recovery is on" $?
 [ "$NRA" = 0 ] && [ "${#FL[@]}" = 2 ]; verdict "switch off: two failures recorded, no open of route read" $?
@@ -823,11 +842,54 @@ verdict "cutpgpast: a move of route read ended at a copy of $FIXW_SIZE bytes" $?
 ct cutonly cutall /store/ci/ct-all.root
 echo "$RES" | grep -q '^read-failover cutonly: clean$'; verdict "cutonly: every copy is cut, the read fails with the data error and says why" $?
 [ "$F14" -ge 1 ] && [ "$F14" -le 4 ]; verdict "cutonly: $F14 failed reads (one to four)" $?
-echo "$RES" | grep -q "no copy could serve the read: .*, $FIXW_SIZE bytes): answered .*inside the file's size of $FIXW_SIZE bytes.*, $CUTAT bytes): it serves $CUTAT bytes, the cached file has $FIXW_SIZE"
+echo "$RES" | grep -v '^MSG2' | grep -q "no copy could serve the read: .*, $FIXW_SIZE bytes): answered .*inside the file's size of $FIXW_SIZE bytes.*, $CUTAT bytes): it serves $CUTAT bytes, the cached file has $FIXW_SIZE"
 verdict "cutonly: the error says no copy could serve the read, and names the copies tried with their sizes" $?
+# a second read made at once, while no move is made again: the first read's move's error, said to be that
+echo "$RES" | grep '^MSG2' | grep -q "no copy could serve the read: a move made [0-9]* ms ago for an earlier read of the handle found none.*: .*answered .* asked at [0-9]*"
+verdict "cutonly: a second read made at once gets the error of the move made for the first, which says whose offsets it names" $?
 ct end "" /store/ci/ct-end.root
 echo "$RES" | grep -q '^read-failover end: clean$'; verdict "end: reads that reach past the end of an intact file are answered short, exactly (a PgRead wholly past it as without uCache), and the handle stays (${SV[*]})" $?
 [ "$F14" = 0 ] && [ "$NRA" = 0 ]; verdict "end: no failed read, no move ($F14, $NRA)" $?
+
+echo; echo "=== a handle that lost its trust, whose own open then fails at every copy"
+# The first run fills the cache with a freshness window, so that the second opens trusting the entry (no request
+# at open). After that open the test removes the entry and has every copy refuse the file: the first read finds
+# no entry and opens the file itself, which fails at every copy. Each read then gets that open's error.
+L=/store/ci/degraded.root
+placew $L a b c
+DC="$W/c-degraded"
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_REVALIDATE_S=3600)
+res=$(fuzz "$DC" "$W/degraded-fill.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
+echo "$res" | grep -q '^open-failover: clean$' && [ -n "$(find "$DC" -name '*.meta' -print -quit)" ] && [ -n "$(find "$DC" -name '*.val' -print -quit)" ]
+verdict "lost trust: the first run read the file and left its entry and its freshness marker" $?
+N0=$(recs "$DC" open | wc -l) # the first run's open records; the second run's follow them
+cat > "$W/degraded.sh" <<DEGSH
+#!/bin/sh
+find "$DC" -name '*.meta' -delete
+for s in a b c; do chmod 000 "$W/data/\$s$L"; done
+DEGSH
+chmod 755 "$W/degraded.sh"
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_REVALIDATE_S=3600 UCACHE_CUT_CMD=$W/degraded.sh)
+RES=$(fuzz "$DC" "$W/degraded.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 read-failover degraded)
+echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-600
+recs "$DC" open | tail -n +$((N0 + 1)) | sed 's/^/    rec: /' | cut -c1-230
+echo "$RES" | grep -q '^read-failover degraded: clean$'; verdict "lost trust: a Read and a PgRead each fail once with the open's error, which names the copies (never the client's error for a File that never opened)" $?
+# the fault, from the client's log (which a client that dies still leaves): the handle was trusted at its open, and
+# its own open was then refused at each of the three copies
+NREF=0
+for p in $AX $BX $CX; do
+  grep -q "\[127.0.0.1:$p\] Handling error while processing kXR_open (file: $L,.*permission denied" "$W/degraded.log" && NREF=$((NREF + 1))
+done
+grep -q 'trusted recent cache for ' "$W/degraded.log" && [ "$NREF" = 3 ] && [ -z "$(find "$DC" -name '*.meta' -print -quit)" ]
+verdict "lost trust: the handle was trusted at its open, its entry was gone, and its own open was refused at each copy ($NREF of 3): the fault was in place" $?
+NDG=$(recs "$DC" open | tail -n +$((N0 + 1)) | grep -c '"route":"degraded"'); NOK=$(recs "$DC" open | tail -n +$((N0 + 1)) | grep -c '"status":"ok"')
+[ "$NDG" -ge 1 ] && [ "$NOK" = 0 ]
+verdict "lost trust: the records show the handle's own open (route degraded, then its failovers), none ok ($NDG degraded, $NOK ok)" $?
+n=0; for p in $AX $BX $CX; do echo "$RES" | grep '^MSG read' | grep -q "(127.0.0.1:$p)" && n=$((n + 1)); done
+[ "$n" = 3 ]; verdict "lost trust: the Read's error names each of the three copies ($n of 3)" $?
+[ "$(grep 'MsgHandler created' "$W/degraded.log" | grep -c 'kXR_pgread\|kXR_read ')" = 0 ]
+verdict "lost trust: no read was sent on the File that never opened (the client's log)" $?
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
 
 echo; echo "fed_ci: $FAILS failure(s)"
 exit $((FAILS > 0))

@@ -183,6 +183,12 @@ struct HandleState {
   // in order, given again to every File resetInner makes: an open made again
   // at another site would otherwise lose them. Under mu.
   std::vector<std::pair<std::string, std::string>> readerProps;
+  // With adaptive_federation on: held across the recording of a reader's property and its setting
+  // on the File (UCacheFile::SetProperty), and by the checks made at open while they turn the
+  // File's recovery and redirects off and give them back (checkHeader, restoreProps), so that a
+  // setting of the reader's never lands on the File between the two. Taken before mu, never under
+  // it.
+  std::mutex propMu;
   // adaptive_federation: a handle that moves its reads to another site (OpenPolicy.h
   // armedForReads) is armed once it is set up and an open of it went through a
   // redirector (`viaRedirector`, under mu). The client's own recovery of a read is
@@ -198,6 +204,9 @@ struct HandleState {
   // between attempts, which Close waits for.
   SiteFailure source;
   std::vector<SiteFailure> readFailed;
+  // Under mu: the source of each File a move put aside (moveInner), so that a read that fails on
+  // one of them later is put down to the copy it was read from.
+  std::vector<std::pair<XrdCl::File*, SiteFailure>> leftSources;
   // Under mu: the header read of the reader's open is in flight (UCacheFile.cc checkHeader), with
   // the client's recovery and redirects off on its File; the reader's settings of those made
   // meanwhile are kept in readerProps, from `headerProps` on, and given to the File at its end.
@@ -262,6 +271,12 @@ struct HandleState {
   // (fail-open). Opt-in; when the knob is 0 these stay false and the path is
   // unchanged. innerOpenMu serializes the one-shot lazy open off the fast path.
   bool cacheOnly = false;
+  // Set at Open when the handle is trusted (cacheOnly): its File is opened only by the cache's own
+  // open (ensureInnerOpen), never by the reader's. With adaptive_federation on, no request goes to
+  // that File until that open has succeeded, also once the handle has lost its trust (its entry
+  // gone by its first read): a request on a File that never opened fails in the client, or crashes
+  // it.
+  std::atomic<bool> trustedAtOpen{false};
   // Read without innerOpenMu on the fast path (acquireInner): set under it, and
   // atomic so a reader that sees it set also sees the open that preceded it.
   std::atomic<bool> innerOpened{false};

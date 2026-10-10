@@ -769,10 +769,11 @@ void noteReadFailure(std::vector<SiteFailure>& failed, SiteFailure f, size_t kee
     }
   failed.push_back(std::move(f));
   while (failed.size() > keep) {
-    const auto old = std::find_if(failed.begin(), failed.end(),
-                                  [](const SiteFailure& x) { return !x.bad; });
-    if (old == failed.end())
-      break; // every one was found bad: none is dropped
+    const auto newest = failed.end() - 1; // never dropped: the copy the read just failed at
+    const auto old =
+        std::find_if(failed.begin(), newest, [](const SiteFailure& x) { return !x.bad; });
+    if (old == newest)
+      break; // every older one was found bad: none is dropped
     failed.erase(old);
   }
 }
@@ -882,6 +883,19 @@ std::string noCopyServedText(const std::string& file, const std::vector<SiteFail
       out += ", " + std::to_string(failed[i].size) + " bytes";
     out += "): " + withoutQueries(failed[i].error, 160);
   }
+  return out.size() > kErrorTextMax ? out.substr(0, kErrorTextMax) : out;
+}
+
+std::string earlierMoveText(const std::string& moveText, uint64_t agoMs) {
+  static const std::string kMark = ": no copy could serve the read: ";
+  const size_t at = moveText.find(kMark);
+  if (at == std::string::npos)
+    return moveText;
+  const std::string ago = agoMs < 1000 ? std::to_string(agoMs) + " ms" : ageText(agoMs / 1000);
+  std::string out = moveText.substr(0, at + kMark.size()) + "a move made " + ago +
+                    " ago for an earlier read of the handle found none, and none is made again "
+                    "within a second; the copies it tried, as they answered that read: " +
+                    moveText.substr(at + kMark.size());
   return out.size() > kErrorTextMax ? out.substr(0, kErrorTextMax) : out;
 }
 

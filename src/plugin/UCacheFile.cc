@@ -153,8 +153,10 @@ bool headerFaultFires() {
 // instead. refuse: both, as an invalid-session error the issue call itself
 // returns, which nothing was sent for. final: the misses, with an error no
 // other site would answer differently. late: the misses, the error posted 500 ms
-// late (after the open of a move, on the loopback).
-enum class FaultKind : uint8_t { kMiss, kRelay, kRefuse, kFinal, kLate };
+// late (after the open of a move, on the loopback). again: relayed reads, as relay,
+// and also each issue of a read made again after a move (RelayHandler::goOn), so that
+// a read can fail at every copy a move takes.
+enum class FaultKind : uint8_t { kMiss, kRelay, kRefuse, kFinal, kLate, kAgain };
 static const FaultKind gFaultKind = [] {
   const char* v = ::getenv("UCACHE_TEST_READ_FAIL_KIND");
   const std::string k = v ? v : "";
@@ -162,14 +164,20 @@ static const FaultKind gFaultKind = [] {
          : k == "refuse" ? FaultKind::kRefuse
          : k == "final"  ? FaultKind::kFinal
          : k == "late"   ? FaultKind::kLate
+         : k == "again"  ? FaultKind::kAgain
                          : FaultKind::kMiss;
 }();
 // True when the fault fires at this issue site: `s` is then what the issue call
 // returns (OK when the failure is posted to `h`, which gets exactly that).
-static bool injectReadFault(bool relaySite, ResponseHandler* h, XRootDStatus& s) {
+// `relaySite`: a relayed read's first issue; `againSite`: an issue made again
+// after a move.
+static bool injectReadFault(bool relaySite, ResponseHandler* h, XRootDStatus& s,
+                            bool againSite = false) {
   const FaultKind k = gFaultKind;
   const bool here =
-      relaySite ? k == FaultKind::kRelay || k == FaultKind::kRefuse : k != FaultKind::kRelay;
+      againSite   ? k == FaultKind::kAgain
+      : relaySite ? k == FaultKind::kRelay || k == FaultKind::kRefuse || k == FaultKind::kAgain
+                  : k != FaultKind::kRelay && k != FaultKind::kAgain;
   if (!here || !readFaultFire())
     return false;
   s = XRootDStatus();
@@ -833,19 +841,20 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     // what tells a copy from a damaged one.
     const bool sizeDiffers =
         ok && want && (w.size >= 0 ? static_cast<uint64_t>(w.size) != want : seq->read);
+    SiteFailure f = siteFailure(w, s, hostPortOfUrl(sentUrl));
+    // A copy refused for what it is earlier in this sequence, or that a read of the handle found
+    // bad (it answered with bad bytes), is never taken again, wherever the redirector or the list
+    // of copies sends the open: it is refused again as it is, with no check made of it again
+    // (RetryingOpenHandler reads nothing of it), and is neither recorded nor counted again (its
+    // first refusal, or its read's failure, was); the error names it once.
+    const bool readBad = ok && !sizeDiffers && refusedBefore(seq->failed, f.server);
     // A copy with no bytes of a file named *.root is a bad copy, refused like one of another size.
-    const bool emptyRoot = ok && !sizeDiffers && emptyRootCopy(st.url, w.size);
+    const bool emptyRoot = ok && !sizeDiffers && !readBad && emptyRootCopy(st.url, w.size);
     // A copy whose first bytes say it is bad (rootHeaderVerdict: cut short of its header's end,
     // too short for a header, not beginning as a ROOT file does, or answering them short); one
     // whose header was not read, or made no claim, is not refused for it.
     const bool headerBad =
-        ok && !sizeDiffers && !emptyRoot && w.header.kind == RootHeaderVerdict::kBad;
-    SiteFailure f = siteFailure(w, s, hostPortOfUrl(sentUrl));
-    // A copy that a read of the handle found bad (it answered with bad bytes) is never taken
-    // again, wherever the redirector or the list of copies sends the open: refused as one
-    // refused at the open is, and not recorded again (its read's failure was).
-    const bool readBad = ok && seq->read && !sizeDiffers && !emptyRoot && !headerBad &&
-                         refusedBefore(seq->failed, f.server);
+        ok && !sizeDiffers && !readBad && !emptyRoot && w.header.kind == RootHeaderVerdict::kBad;
     const bool refused = emptyRoot || headerBad || readBad;
     const bool bad = sizeDiffers || refused;
     const bool offline =
@@ -860,7 +869,9 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     else if (headerBad)
       f.error = w.header.why;
     else if (readBad)
-      f.error = "a read from it answered with bad bytes; it is not taken again";
+      f.error = seq->read ? "a read from it answered with bad bytes, or it was refused already; it "
+                            "is not taken again"
+                          : "refused already at this open; it is not taken again";
     else if (offline)
       f.error = "the copy there is on tape (offline)";
     else if (repeats)
@@ -1433,10 +1444,19 @@ class RetryingOpenHandler : public ResponseHandler {
     std::unique_ptr<HostList> h(hostList);
     AttemptView w = record_ ? viewOf(*st_, *s, h.get(), nullptr) : AttemptView();
     // With a sequence, a copy of a file named *.root is looked at before the reader is shown it
-    // (an empty one is refused for its size alone).
-    if (seq_ && s->IsOK() && w.size > 0 && rootNamed(st_->url))
+    // (an empty one is refused for its size alone), unless this open refused it already: then it is
+    // refused again as it is, with nothing read of it (afterAttempt).
+    if (seq_ && s->IsOK() && w.size > 0 && rootNamed(st_->url) && !refusedAlready(w, *s))
       return checkHeader(std::move(s), std::move(r), std::move(h), std::move(w));
     finish(std::move(s), std::move(r), std::move(h), w, /*opened=*/false);
+  }
+
+  // Whether the copy an attempt that succeeded (`w`, `s`) opened is one this open refused for what
+  // it is already (a send-back of the redirector's). Throws nothing: for want of memory, false.
+  bool refusedAlready(const AttemptView& w, const XRootDStatus& s) const noexcept try {
+    return refusedBefore(seq_->failed, siteFailure(w, s, hostPortOfUrl(sentUrl_)).server);
+  } catch (...) {
+    return false;
   }
 
   // The attempt's answer goes to `ended`; a success the reader gets as it is. `opened`: the
@@ -1536,32 +1556,28 @@ class RetryingOpenHandler : public ResponseHandler {
     // the File is held.
     void restoreProps() {
       HandleState& st = *o->st_;
-      for (;;) {
-        std::string v[kProps];
-        for (int i = 0; i < kProps; ++i)
-          v[i] = saved[i];
-        size_t seen = 0;
-        bool armed = false;
-        {
-          std::lock_guard<std::mutex> g(st.mu);
-          seen = st.readerProps.size();
-          armed = st.moveOnReads;
-          for (size_t j = std::min(st.headerProps, seen); j < seen; ++j)
-            for (int i = 0; i < kProps; ++i)
-              if (st.readerProps[j].first == kPropNames[i]) {
-                v[i] = st.readerProps[j].second;
-                have[i] = true;
-              }
-        }
-        for (int i = 0; i < kProps; ++i)
-          if (have[i] && !(armed && i < 2)) // 0, 1: the recovery of reads and writes
-            f->SetProperty(kPropNames[i], v[i]);
+      // No setting of the reader's is recorded meanwhile: SetProperty holds propMu across its own.
+      std::lock_guard<std::mutex> props(st.propMu);
+      std::string v[kProps];
+      for (int i = 0; i < kProps; ++i)
+        v[i] = saved[i];
+      bool armed = false;
+      {
         std::lock_guard<std::mutex> g(st.mu);
-        if (st.readerProps.size() == seen) {
-          st.headerReading = false;
-          return;
-        }
+        const size_t seen = st.readerProps.size();
+        armed = st.moveOnReads;
+        for (size_t j = std::min(st.headerProps, seen); j < seen; ++j)
+          for (int i = 0; i < kProps; ++i)
+            if (st.readerProps[j].first == kPropNames[i]) {
+              v[i] = st.readerProps[j].second;
+              have[i] = true;
+            }
       }
+      for (int i = 0; i < kProps; ++i)
+        if (have[i] && !(armed && i < 2)) // 0, 1: the recovery of reads and writes
+          f->SetProperty(kPropNames[i], v[i]);
+      std::lock_guard<std::mutex> g(st.mu);
+      st.headerReading = false;
     }
     static constexpr int kProps = 3;
     static constexpr const char* kPropNames[kProps] = {"ReadRecovery", "WriteRecovery",
@@ -1602,21 +1618,27 @@ class RetryingOpenHandler : public ResponseHandler {
     auto* hr = new HeaderRead(this, std::move(s), std::move(r), std::move(h), std::move(w));
     XrdCl::File* f = nullptr;
     {
-      std::lock_guard<std::mutex> g(st_->mu);
-      if (st_->innerValid && !st_->closed) {
-        f = st_->inner.load();
-        ++st_->innerOps;
-        hr->held = true;
-        hr->f = f;
-        st_->headerReading = true; // the reader's settings of these wait for the reads' end
-        st_->headerProps = st_->readerProps.size();
+      // The reader's settings of these wait for the reads' end; one being recorded and set as this
+      // runs is set before they are turned off here (UCacheFile::SetProperty holds propMu across
+      // both).
+      std::lock_guard<std::mutex> props(st_->propMu);
+      {
+        std::lock_guard<std::mutex> g(st_->mu);
+        if (st_->innerValid && !st_->closed) {
+          f = st_->inner.load();
+          ++st_->innerOps;
+          hr->held = true;
+          hr->f = f;
+          st_->headerReading = true;
+          st_->headerProps = st_->readerProps.size();
+        }
       }
-    }
-    if (f) {
-      for (int i = 0; i < HeaderRead::kProps; ++i) {
-        hr->have[i] = f->GetProperty(HeaderRead::kPropNames[i], hr->saved[i]);
-        if (hr->have[i])
-          f->SetProperty(HeaderRead::kPropNames[i], "false");
+      if (f) {
+        for (int i = 0; i < HeaderRead::kProps; ++i) {
+          hr->have[i] = f->GetProperty(HeaderRead::kPropNames[i], hr->saved[i]);
+          if (hr->have[i])
+            f->SetProperty(HeaderRead::kPropNames[i], "false");
+        }
       }
     }
     sendCheckRead(hr, 0, want);
@@ -2279,8 +2301,10 @@ bool HandleState::ensureInnerOpen() {
     // access token). Other log lines that name the reader's URL print it whole.
     const auto key = UrlKey::parse(url, cfg.keepCgi);
     const std::string file = key ? key->key : url.substr(0, url.find('?'));
-    if (seq && !seq->failed.empty()) // it failed over, or a bound stopped it
-      lazyOpenError = seq->finalError(*this, file, s);
+    // Once it failed over, or a bound stopped it: the error naming every copy tried, as the
+    // read's (this handle's reader was shown the file when its own open was answered).
+    if (seq && !seq->failed.empty())
+      lazyOpenError = seq->finalError(*this, file, s, /*forRead=*/true);
     else
       UCACHE_WARN("%s: opening it at %s failed (%s); reads that need the origin fail with that "
                   "error, and the next one tries again in a second",
@@ -2302,10 +2326,21 @@ XrdCl::XRootDStatus HandleState::missError() {
   return XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errInvalidOp);
 }
 
+// With adaptive_federation on, whether the handle's File is still to be opened by the cache's own
+// open: a handle trusted at Open whose open has not succeeded, whether or not it still trusts its
+// entry. A request on that File would meet a File that never opened.
+static bool ownOpenPending(const HandleState& st) {
+  return st.trustedAtOpen.load(std::memory_order_acquire) && !st.innerOpened &&
+         globalConfig().adaptiveFederation;
+}
+
 XrdCl::File* HandleState::acquireInner() {
   // Trusted-cache handle: open the origin on first real need (fail-open —
-  // nullptr here makes the miss path return an error, never bad data).
-  if (cacheOnly && !innerOpened && !ensureInnerOpen())
+  // nullptr here makes the miss path return an error, never bad data). With
+  // adaptive_federation on, so is one that lost its trust at its first read
+  // and whose open then failed: each request gets the open's error (missError),
+  // and the next one after the cool-down opens it again.
+  if ((cacheOnly || ownOpenPending(*this)) && !innerOpened && !ensureInnerOpen())
     return nullptr;
   if (sizeRefused.load(std::memory_order_acquire))
     return nullptr; // the origin serves another size of this file: never read it here
@@ -2317,7 +2352,7 @@ XrdCl::File* HandleState::acquireInner() {
 }
 
 XrdCl::File* HandleState::acquireInnerIfOpen() {
-  if (cacheOnly && !innerOpened)
+  if ((cacheOnly || ownOpenPending(*this)) && !innerOpened)
     return nullptr; // would have to open the origin; the caller is speculative
   if (sizeRefused.load(std::memory_order_acquire))
     return nullptr;
@@ -2783,6 +2818,7 @@ static bool moveInner(HandleState& st, std::vector<SiteFailure> failed, uint64_t
   for (; props < st.readerProps.size(); ++props)
     f->SetProperty(st.readerProps[props].first, st.readerProps[props].second);
   recoveryOff(*f);
+  st.leftSources.emplace_back(st.inner.load(), st.source); // a late read on it names its copy
   st.retired.push_back(std::move(st.innerOwned));
   st.innerOwned = std::move(f);
   st.inner = st.innerOwned.get();
@@ -2826,8 +2862,11 @@ static void runMove(const std::shared_ptr<HandleState>& st, int capS, uint64_t f
       std::lock_guard<std::mutex> g(st->mu);
       st->moveFailure = adopted ? std::string() : failure;
     } else if (cooling) {
+      // That move was made for an earlier read: its error says so, since the offsets it names are
+      // that read's.
+      const uint64_t agoMs = (nowUs() - st->lazyOpenFailUs) / 1000;
       std::lock_guard<std::mutex> g(st->mu);
-      failure = st->moveFailure;
+      failure = earlierMoveText(st->moveFailure, agoMs);
     }
   }
   const std::string file = recordFile(st->url);
@@ -2853,6 +2892,30 @@ static void runMove(const std::shared_ptr<HandleState>& st, int capS, uint64_t f
     deliverExecutor().post(std::move(g));
 }
 
+// The copy the File `f` of the handle was opened at, as the handle knows it: the current File's
+// source, or the source of a File a move put aside; one with no server when it is not known. Under
+// mu.
+static SiteFailure sourceOfLocked(const HandleState& st, XrdCl::File* f) {
+  if (f == st.inner.load())
+    return st.source;
+  for (auto it = st.leftSources.rbegin(); it != st.leftSources.rend(); ++it)
+    if (it->first == f)
+      return it->second;
+  return SiteFailure();
+}
+// The read of the handle that failed with `s` on the File `on` is put on its list of copies its
+// reads failed at (OpenPolicy.h noteReadFailure), bad for a data error. Under mu.
+static void noteReadFailureLocked(HandleState& st, XrdCl::File* on, const XRootDStatus& s) {
+  SiteFailure f = sourceOfLocked(st, on);
+  if (f.server.empty())
+    return;
+  f.error = s.code == XrdCl::errDataError && !s.GetErrorMessage().empty() ? s.GetErrorMessage()
+                                                                          : s.ToString();
+  f.bad = s.code == XrdCl::errDataError;
+  noteReadFailure(st.readFailed, std::move(f),
+                  kFailoverMaxSites - 1); // room for the move's own sites
+}
+
 // A read that was issued on `on` failed with `s`. Calls `cont(true, "")` when the
 // handle's File is another by then (that read is to be issued again), or has
 // become another, or `cont(false, text)` when no other site could serve it (`text`:
@@ -2860,8 +2923,10 @@ static void runMove(const std::shared_ptr<HandleState>& st, int capS, uint64_t f
 // the move when none is under way, and names the server as one that failed -- except
 // for a session the client lost (109), which a healthy server loses at a restart -- and,
 // when the read answered with bad bytes (a data error: a short answer inside the
-// confirmed size, a basket that failed its check), as a copy the handle never opens
-// again (OpenPolicy.h noteReadFailure). Never blocks and makes no File, so it may
+// confirmed size, a basket that failed its check, a page read answered with no bytes
+// inside it), as a copy the handle never opens again (OpenPolicy.h noteReadFailure);
+// such a read marks its copy so also when it joins a move under way, or failed on a
+// File the handle has left. Never blocks and makes no File, so it may
 // run on a client callback thread; `cont` runs on the deliver executor. `capS`: what is
 // left of the failed request's time.
 static void moveOn(const std::shared_ptr<HandleState>& st, XrdCl::File* on, const XRootDStatus& s,
@@ -2869,6 +2934,13 @@ static void moveOn(const std::shared_ptr<HandleState>& st, XrdCl::File* on, cons
   std::unique_lock<std::mutex> lk(st->mu);
   ++st->parkedReads;
   const bool gone = !st->innerValid || st->closed;
+  const bool current = !gone && st->inner.load() == on && !st->moveInFlight;
+  // The copy the read failed at is put on the handle's list: a failure of the File the handle reads
+  // from, when no move is under way, as one that starts a move; and a read that answered with bad
+  // bytes (a data error) whichever File it was on, and while a move is under way too, as a copy
+  // the handle never opens again.
+  if (!gone && (current ? s.code != XrdCl::errInvalidSession : s.code == XrdCl::errDataError))
+    noteReadFailureLocked(*st, on, s);
   if (!gone && st->moveInFlight) {
     st->moveWaiters.push_back(std::move(cont));
     return;
@@ -2877,14 +2949,6 @@ static void moveOn(const std::shared_ptr<HandleState>& st, XrdCl::File* on, cons
     lk.unlock();
     deliverExecutor().post([cont = std::move(cont), gone] { cont(!gone, std::string())(); });
     return;
-  }
-  if (s.code != XrdCl::errInvalidSession && !st->source.server.empty()) {
-    SiteFailure f = st->source;
-    f.error = s.code == XrdCl::errDataError && !s.GetErrorMessage().empty() ? s.GetErrorMessage()
-                                                                             : s.ToString();
-    f.bad = s.code == XrdCl::errDataError;
-    // room for the move's own sites in its bound
-    noteReadFailure(st->readFailed, std::move(f), kFailoverMaxSites - 1);
   }
   st->moveInFlight = true;
   st->moveWaiters.push_back(std::move(cont));
@@ -3002,6 +3066,41 @@ struct RelayHandler : XrdCl::ResponseHandler {
   uint64_t startUs = 0;         // when the request was first issued
   XRootDStatus last;
   std::unique_ptr<HostList> lastHosts;
+  // The copies this request failed at, each with its size and what it answered (OpenPolicy.h
+  // noteReadFailure, one entry a copy, the newest last). When the request has moved and its own
+  // bounds (its attempts, its time) end it, the reader's error names them all (noCopyServedText),
+  // with the code of the request's last failure.
+  std::vector<SiteFailure> tried;
+  // The attempt on `on` failed with `s`: its copy goes on `tried`. Throws nothing: for want of
+  // memory the copy is not named.
+  void noteTried(const XRootDStatus& s) noexcept try {
+    SiteFailure f;
+    {
+      std::lock_guard<std::mutex> g(st->mu);
+      f = sourceOfLocked(*st, on);
+    }
+    if (f.server.empty())
+      return;
+    f.error = s.code == XrdCl::errDataError && !s.GetErrorMessage().empty() ? s.GetErrorMessage()
+                                                                            : s.ToString();
+    f.bad = s.code == XrdCl::errDataError;
+    noteReadFailure(tried, std::move(f), kReadMaxAttempts);
+  } catch (...) {
+  }
+  // The error the reader gets when this request, which moved, ends at its own bounds with `s`:
+  // one naming every copy it was read from, with `s`'s code; `s` when it never moved or no copy
+  // is known. Throws nothing: for want of memory, `s`.
+  XRootDStatus boundsError(const XRootDStatus& s, bool moved) const noexcept try {
+    if (!moved || tried.empty())
+      return s;
+    const XRootDStatus out(s.status, s.code, s.errNo, noCopyServedText(recordFile(st->url), tried));
+    UCACHE_WARN("%s: a read moved %d time(s) and its bounds are spent: %s",
+                recordFile(st->url).c_str(), attempt - 1,
+                recordText(sitesFailedList(tried), 600).c_str());
+    return out;
+  } catch (...) {
+    return s;
+  }
   // This attempt goes to `f`: its read is counted in flight, and timed from now.
   void issueOn(XrdCl::File* f) {
     on = f;
@@ -3030,15 +3129,18 @@ struct RelayHandler : XrdCl::ResponseHandler {
         moved && !processExiting() ? st->originTimeout(readerT, startUs, true) : 0;
     XrdCl::File* f = t ? st->acquireInner() : nullptr;
     st->unpark();
-    return [this, f, t, failure] { goOn(f, t, failure); };
+    return [this, f, t, failure, moved] { goOn(f, t, failure, moved); };
   }
-  void goOn(XrdCl::File* f, ucache::XrdTimeout t, const std::string& failure) {
+  void goOn(XrdCl::File* f, ucache::XrdTimeout t, const std::string& failure, bool moved) {
     if (f) {
       issueOn(f);
       ++attempt;
       const ReadAgain issue = again; // once issued, this handler may be gone at any time
       const std::shared_ptr<HandleState> keep = st;
-      const XRootDStatus s = refusedLater(keep, issue(f, this, t), this);
+      XRootDStatus s;
+      if (!injectReadFault(true, this, s, /*againSite=*/true))
+        s = issue(f, this, t);
+      s = refusedLater(keep, s, this);
       if (s.IsOK())
         return;
       st->releaseInner(); // never issued: the failure is the answer
@@ -3049,6 +3151,9 @@ struct RelayHandler : XrdCl::ResponseHandler {
     XrdCl::HostList* h = lastHosts ? lastHosts.release() : new HostList();
     if (!f && !failure.empty()) // the move found no copy: the error names every copy, with the code
       last = XRootDStatus(last.status, last.code, last.errNo, failure); // of the read's own failure
+    else if (!f &&
+             moved) // the handle moved, but the request's time is spent: the copies it failed at
+      last = boundsError(last, true);
     if (user)
       user->HandleResponseWithHosts(new XRootDStatus(last), nullptr, h);
     else
@@ -3192,11 +3297,22 @@ struct RelayHandler : XrdCl::ResponseHandler {
     }
     st->releaseInner();
     inflight.release();
-    if (again && s && !s->IsOK() && movesRead(*st, *s, checkFailed, attempt, readerT, startUs)) {
-      park(*s, h);
-      delete s;
-      delete r;
-      return;
+    if (again && s && !s->IsOK()) {
+      noteTried(*s);
+      if (movesRead(*st, *s, checkFailed, attempt, readerT, startUs)) {
+        park(*s, h);
+        delete s;
+        delete r;
+        return;
+      }
+      // A request that moved and failed again in a way that would move it, once its own bounds
+      // (its attempts, its time) are spent: the error names every copy it was read from.
+      if (attempt > 1 &&
+          (checkFailed || readStep(s->code, static_cast<int>(s->errNo)) == ReadStep::kMove)) {
+        XRootDStatus* named = new XRootDStatus(boundsError(*s, true));
+        delete s;
+        s = named;
+      }
     }
     if (user)
       user->HandleResponseWithHosts(s, r, h);
@@ -3242,6 +3358,7 @@ static bool moveRead(const std::shared_ptr<HandleState>& st, XrdCl::File* on, Re
   relay->again = std::move(again);
   relay->readerT = readerT;
   relay->startUs = startUs;
+  relay->noteTried(s);
   relay->park(s, h.release());
   return true;
 }
@@ -3297,6 +3414,7 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   }
   // Only this thread touches the state now: every other entry point waits above.
   new (&mu) std::mutex;
+  new (&propMu) std::mutex;
   new (&setupMu) std::mutex;
   new (&innerOpenMu) std::mutex;
   new (&persistMu) std::mutex;
@@ -3311,6 +3429,7 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   new (&moveWaiters) std::vector<MoveWaiter>;
   new (&source) SiteFailure; // written under mu by callback threads: a fork may have caught them mid-write
   new (&readFailed) std::vector<SiteFailure>;
+  new (&leftSources) std::vector<std::pair<XrdCl::File*, SiteFailure>>; // the same
   new (&moveFailure) std::string; // written under mu by the move executor: the same
   (void)openBytes.release();       // the parent's: an open's answer may have been storing them
   new (&openBytes) std::unique_ptr<OpenBytes>;
@@ -4259,6 +4378,7 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
         std::lock_guard<std::mutex> g(st_->mu);
         st_->cacheOnly = true;
       }
+      st_->trustedAtOpen.store(true, std::memory_order_release);
       cacheOpen_ = true;
       UCACHE_INFO("trusted recent cache for %s; serving without remote open "
                   "(UCACHE_REVALIDATE_S=%d)", url.c_str(), cfg.revalidateSeconds);
@@ -4882,7 +5002,7 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
         delete this;
       }
     };
-    if (st_->reopenPending() && !st_->ensureInnerOpen())
+    if ((st_->reopenPending() || ownOpenPending(*st_)) && !st_->ensureInnerOpen())
       return st_->missError(); // an inherited handle opens the origin afresh first
     auto* relay = new SizeRelay;
     relay->user = handler;
@@ -4892,7 +5012,7 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
       delete relay;
     return s;
   }
-  if (st_->reopenPending() && !st_->ensureInnerOpen())
+  if ((st_->reopenPending() || ownOpenPending(*st_)) && !st_->ensureInnerOpen())
     return st_->missError();
   return st_->inner.load()->Stat(force, handler, timeout);
 }
@@ -5460,14 +5580,16 @@ XrdCl::XRootDStatus UCacheFile::Truncate(uint64_t size, ResponseHandler* handler
 XrdCl::XRootDStatus UCacheFile::Fcntl(const XrdCl::Buffer& arg, ResponseHandler* handler,
                                       ucache::XrdTimeout timeout) {
   st_->syncFork();
-  if (st_->moveOnReads && st_->reopenPending() && !st_->ensureInnerOpen())
+  if (((st_->moveOnReads && st_->reopenPending()) || ownOpenPending(*st_)) &&
+      !st_->ensureInnerOpen())
     return st_->missError();
   return st_->inner.load()->Fcntl(arg, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Visa(ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
-  if (st_->moveOnReads && st_->reopenPending() && !st_->ensureInnerOpen())
+  if (((st_->moveOnReads && st_->reopenPending()) || ownOpenPending(*st_)) &&
+      !st_->ensureInnerOpen())
     return st_->missError();
   return st_->inner.load()->Visa(handler, timeout);
 }
@@ -5487,7 +5609,12 @@ bool UCacheFile::IsOpen() const {
 bool UCacheFile::SetProperty(const std::string& name, const std::string& value) {
   st_->syncFork();
   const bool recovery = name == "ReadRecovery" || name == "WriteRecovery";
+  // With adaptive_federation on, the recording and the setting below are one step for the checks
+  // made at open (checkHeader, restoreProps), which take propMu too: a setting recorded just before
+  // they turn the File's recovery off is also set before, never after.
+  std::unique_lock<std::mutex> props(st_->propMu, std::defer_lock);
   if (globalConfig().adaptiveFederation) {
+    props.lock();
     // Kept, so that a File that replaces this one -- the open retried or made
     // at another site -- is given it too (resetInner). Recorded before it is
     // set: a File swapped in after this is either given it there or is the
