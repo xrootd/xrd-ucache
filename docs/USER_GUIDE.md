@@ -765,7 +765,7 @@ overriding your defaults. Common keys:
 | `revalidate_seconds = 604800` | `UCACHE_REVALIDATE_S` | freshness window (TTL): an entry validated against the origin within this many seconds is served with **no remote contact at all**. Default 7 days — right for write-once physics data. `0` = re-check on every open; `ucache rm <url>` forces a re-check anytime |
 | `open_retries = 0`  | `UCACHE_OPEN_RETRIES`   | retry a transient open failure this many times (0 = off); backoff via `open_retry_base_ms`/`open_retry_max_ms`. With `adaptive_federation = on`, an open through a redirector that passed its deadline at a server is not retried at the same URL: it goes to another site (below) |
 | `recompress = off`  | `UCACHE_RECOMPRESS`     | `on` = the files your jobs read get fast-to-decode replicas **automatically**, created on their first pass (default off — opt-in CPU/disk). Flip it with `ucache set recompress on` |
-| `check_origin_integrity = off` | `UCACHE_CHECK_ORIGIN_INTEGRITY` | `on` = check what arrives from the origin by the file's own checksums before it is cached or served; a basket that fails is never kept or served and the read fails with "data is corrupted", naming the server. **Forced on by `recompress = on`**, which decodes what it converts anyway (`ucache settings` says "forced by recompress"), and by `adaptive_federation = on`. It covers what a first pass converts, by the baskets' checksums, and the byte cache's fetches from the origin, by key position: each basket of a TTree that starts in the fetched bytes must say in its key that it sits where the tree's record puts it (ROOT itself refuses a basket whose key does not; bytes that are not the basket, zeros among them, fail it). A read that holds such a basket fails with "failed its check ... not served", and nothing of that fetch is kept. Bytes already in the cache (among them the pages of the file's own records, which uCache reads to find the baskets), single reads of a file read straight from the origin (`max_read_fraction`), reads the cache relays to the origin (the answer to one that was moved to another site is checked, as a miss's is), read-ahead, and a key header split between two pieces of one fetch are not checked yet. To find the baskets, the first read of a file that misses waits, before its own fetch, for uCache's own reads of its records, each with that read's own timeout (a stalled origin can hold it for several of them); other handles of the file do not wait for those reads, and what they miss meanwhile is not checked. When one of those reads fails, misses go unchecked until one a second later or more reads the records again. See STATS.md for the counters |
+| `check_origin_integrity = off` | `UCACHE_CHECK_ORIGIN_INTEGRITY` | `on` = check what arrives from the origin by the file's own checksums before it is cached or served; a basket that fails is never kept or served and the read fails with "data is corrupted", naming the server. **Forced on by `recompress = on`**, which decodes what it converts anyway (`ucache settings` says "forced by recompress"), and by `adaptive_federation = on`. It covers what a first pass converts, by the baskets' checksums, and the byte cache's fetches from the origin, by key position: each basket of a TTree that starts in the fetched bytes must say in its key that it sits where the tree's record puts it (ROOT itself refuses a basket whose key does not; bytes that are not the basket, zeros among them, fail it). A read that holds such a basket fails with "failed its check ... not served", and nothing of that fetch is kept (with `adaptive_federation = on` the read is first made again at another copy; below). Bytes already in the cache (among them the pages of the file's own records, which uCache reads to find the baskets), single reads of a file read straight from the origin (`max_read_fraction`), reads the cache relays to the origin (the answer to one that was moved to another site is checked, as a miss's is), read-ahead, and a key header split between two pieces of one fetch are not checked yet. To find the baskets, the first read of a file that misses waits, before its own fetch, for uCache's own reads of its records, each with that read's own timeout (a stalled origin can hold it for several of them); other handles of the file do not wait for those reads, and what they miss meanwhile is not checked. When one of those reads fails, misses go unchecked until one a second later or more reads the records again. See STATS.md for the counters |
 | `adaptive_federation = off` | `UCACHE_ADAPTIVE_FEDERATION` | the switch for reading through a federation of sites (a redirector in front of many sites' servers). `on` = the XRootD client gives up on a server it cannot reach sooner: connection window 31 s, 2 connection retries, error window 180 s (its own defaults are 120 s, 5 and 1800 s), each only where neither an `XRD_*` variable nor a `client.conf` has set it; every read open of a file uCache serves gets a deadline of 60 s (below); an open through a redirector that fails at one site is made again at another (below); a read of such a file that fails at its site is made again at another (below); and `check_origin_integrity` is **forced on** (`ucache settings` says "forced by adaptive_federation"). The values in force are in `run_settings` (STATS.md) and in `ucache doctor` |
 | `recompress_keep_originals = off` | `UCACHE_RECOMPRESS_KEEP_ORIGINALS` | `on` = when baskets are converted into a replica, keep their original bytes in the byte cache too (by default they are not kept, and a copy held from before is released: the cache would hold the same data twice) |
 | `mixed_maps = on` | `UCACHE_MIXED_MAPS` | with `recompress = on`: each open of a TTree or RNTuple file is shown its newest map, the baskets or pages converted by then back to back at their real size (see "Recompression"); `off` = every open sees the first-pass layout, every basket at the size of its room and every RNTuple page decoded — for jobs that hand basket positions to workers on other machines with caches of their own |
@@ -826,7 +826,15 @@ read itself. A copy whose size is larger than the end its header states is not r
 ROOT reads such a file normally and ignores the bytes past that end (a file updated in
 place, bytes appended). A file not named `*.root` is not looked at. A copy whose size
 equals the end its header states confirms the file's size, which the cache entry keeps
-(FORMAT.md): another size is not accepted for it.
+(FORMAT.md) for its freshness window (`revalidate_seconds`, 7 days by default). Within
+the window a copy of another size is not accepted for the entry or for a handle that
+holds it: a job's open that the entry answers, with no open at the origin, takes the
+confirmed size from the entry and reads nothing of a copy, and a read that then needs
+the origin and finds only copies of another size fails with one error naming them (the
+next open checks the origin again). After the window the next open checks the origin
+and reads the header of the copy it lands on: a copy that fails the check is refused, and
+one that passes at another size (the file was rewritten) replaces the entry and becomes
+its confirmed size. With `revalidate_seconds = 0` every open does so.
 When no other site opens a file whose copy on tape was passed over, it is opened once
 more as the job asked for it and that answer stands, so a file that is readable
 without uCache stays readable. When every copy is refused for what it is (empty, or its first bytes not those of a whole ROOT file;
@@ -879,15 +887,19 @@ the file is being opened elsewhere; a read is tried at up to 4 servers, within
 the time it was allowed. The bytes of a read that was served elsewhere are not
 kept in the cache. When a basket of a read that missed fails the key-position
 check (`check_origin_integrity`), the read is made again at another site too,
-and its answer is checked as well; if no other site serves it, the job gets
-the error naming the server, never the damaged bytes. So is a read that a copy
-answers short, inside a file whose size was confirmed at the open (a file named
-`*.root` whose copy's header said where it ends, at the size the copy reported): the
-copy ends before the file does, which is a data failure of that copy. A short answer
-is normal when a read reaches past the end of a file, and without a confirmed size it
-is never held against a copy: the read ends as it would without uCache. If no other
-copy has the size the job was shown, the job gets one error that names each copy tried
-and what it said. Because the client's own
+and its answer is checked as well; the job never gets the damaged bytes. So is a
+read that a copy answers short, inside a file whose size is confirmed (a file named
+`*.root` whose copy's header said where it ends, at the size the copy reported: at
+this open, or, for an open the cache entry answered within its freshness window, at
+an earlier one): the copy ends before the file does, which is a data failure of that
+copy. A short answer is normal when a read reaches past the end of a file, and without
+a confirmed size it is never held against a copy: the read ends as it would without
+uCache. When no other copy of the size the job was shown serves a read that moves, for
+any of these reasons, the job gets one error, with the code of the read's own failure,
+that names each copy tried, its size where it is known, and what it said; a read that
+fails within a second after that gets the same error at once, without another attempt.
+A copy that answered a read with bad bytes (a basket that failed the check, a short
+answer inside the confirmed size) is not opened again for that file handle. Because the client's own
 recovery of a read would otherwise run first, such a file has it turned off
 (`ReadRecovery` and `WriteRecovery` read `false`, and a program cannot turn them
 back on): a call that the client used to recover on a connection that was lost

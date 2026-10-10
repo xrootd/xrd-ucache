@@ -335,7 +335,12 @@ them that fails or runs out of time is a failure of the copy, as an open's would
 another copy is tried; the client's own recovery of that read and its following of a
 redirect are off for it, so no other copy answers it. A copy whose size is larger than the
 end its header states stands, and confirms nothing: ROOT reads such a file normally (a
-file updated in place, or with bytes appended). The job is never shown a refused copy or
+file updated in place, or with bytes appended). A copy whose size equals that end confirms
+the file's size, which the cache entry keeps for its freshness window (`revalidate_seconds`):
+within it no copy of another size is taken for the entry, and a job's open that the entry
+answers (no open at the origin) takes the confirmed size from it and reads no header. The
+first open after the window checks the origin and reads the header again; a copy that passes
+at another size replaces the entry. The job is never shown a refused copy or
 its size. When no
 other copy is left (every copy is refused, or the URL names a server directly), the job's open fails with one
 error that names each copy tried, its server and its site, its size and why it was
@@ -360,15 +365,21 @@ another site, and the job gets the bytes. The log says so, once for every move:
   serve it`, when none did: the job then gets one error, with the code of the
   read that failed, that names each copy tried, its size where it is known and
   what it said (`uCache: <file>: no copy could serve the read: <site>
-  (<host>:<port>, <size> bytes): <error>; ...`).
+  (<host>:<port>, <size> bytes): <error>; ...`). This holds whatever made the read
+  move: a server's failure, a short answer (below), or a basket that failed the
+  key-position check of `check_origin_integrity`. A read that fails within a second
+  after such a move gets the same error at once, without another attempt; the next
+  one after that tries again.
 
 A read moves only to a copy of the size the job was shown at its open, also on a
 file whose reads uCache passes straight to the origin (its host is left out by the
 cache's allow and deny lists). A file whose size uCache does not know is not moved:
 the client's own recovery of its reads stays on.
 
-A read that a copy answers short, wholly inside the size the file was confirmed to
-have at the open (see "uCache opened the file at another site" above), is such a failure too: the log
+A read that a copy answers short, wholly inside the file's confirmed size (confirmed by
+the header at this open, or kept by the cache entry within its freshness window for an
+open the entry answered: see "uCache opened the file at another site" above), is such a
+failure too: the log
 says `<file>: <host>:<port> answered <n> of the <m> bytes asked at <offset>, inside the
 file's size of <size> bytes; not served`, the line in the record file is of class `data`
 (code 14), and the read is made again at a copy of that size. When none is left the job

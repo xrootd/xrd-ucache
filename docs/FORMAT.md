@@ -51,13 +51,19 @@ reach disk, in keys or file names.
 `file_size − (npages−1)·page_size` bytes; its CRC covers exactly those bytes.
 
 Flag bit2, *size confirmed*: with `adaptive_federation = on`, an open of a file
-named `*.root` (in upper or lower case) reads the first 300 bytes of the copy it landed
-on. A ROOT file's header states where the file ends; when that equals the size the copy
-reported, the size is confirmed and the entry carries the bit, and a copy of another
-size is not accepted for the entry or for a handle that holds it. A copy whose size is
-larger than that end confirms nothing (ROOT reads it normally); one whose size is
-smaller is refused (USER_GUIDE.md). The bit is only ever set, and goes with
-the entry when the origin size changes (a new entry starts unconfirmed). It is not a
+named `*.root` (in upper or lower case) at the origin reads the first 300 bytes of the
+copy it landed on. A ROOT file's header states where the file ends; when that equals the
+size the copy reported, the size is confirmed and the entry carries the bit. A copy whose
+size is larger than that end confirms nothing (ROOT reads it normally); one whose size is
+smaller is refused (USER_GUIDE.md). The bit holds for the entry's freshness window (the
+`.val` marker, below): within it a copy of another size is not accepted for the entry or
+for a handle that holds it, and a handle the entry answers without an open at the origin
+takes the size as confirmed, with no read of the header. Once the window has passed (with
+`UCACHE_REVALIDATE_S=0`, at every open) the next open validates at the origin and reads
+the copy's header again; a copy that passes at another size replaces the entry, and the
+new sidecar carries the bit when that copy confirms its own size. The bit is only ever
+set on a sidecar, and goes with the entry when the origin size changes (a new entry
+starts unconfirmed). It is not a
 format change: a build that does not know the bit ignores it and keeps it when it
 rewrites the sidecar (`format_version` stays 1, since any other version makes a reader
 treat the entry as absent), and a sidecar written before the bit reads as not confirmed.
@@ -341,6 +347,8 @@ entry like the other sidecars. At open, if the marker is younger than
 `UCACHE_REVALIDATE_S` and a `.meta` is present, the plugin trusts the local
 entry and skips the remote open+stat entirely — serving from the
 byte cache / replica, touching the origin only on a genuine miss (fail-open).
+A miss whose open of the origin ends at a copy of another size than the entry's
+removes the marker, so the next open revalidates.
 Advisory: a missing/stale marker just triggers a normal revalidation; the
 per-page CRC guarantees still hold regardless.
 
