@@ -336,13 +336,15 @@ TEST(OpenPolicy, FailedBefore) {
 
 // ---- Reading a file from another site --------------------------------------
 
-// The four conditions of a handle that moves its reads.
+// The five conditions of a handle that moves its reads.
 TEST(OpenPolicy, ArmedForReads) {
-  EXPECT_TRUE(armedForReads(true, true, true, false));
-  EXPECT_FALSE(armedForReads(false, true, true, false)) << "the switch is off";
-  EXPECT_FALSE(armedForReads(true, false, true, false)) << "a pass-through handle";
-  EXPECT_FALSE(armedForReads(true, true, false, false)) << "no redirector in any open";
-  EXPECT_FALSE(armedForReads(true, true, true, true)) << "shown a slot layout";
+  EXPECT_TRUE(armedForReads(true, true, true, false, true));
+  EXPECT_FALSE(armedForReads(false, true, true, false, true)) << "the switch is off";
+  EXPECT_FALSE(armedForReads(true, false, true, false, true)) << "a pass-through handle";
+  EXPECT_FALSE(armedForReads(true, true, false, false, true)) << "no redirector in any open";
+  EXPECT_FALSE(armedForReads(true, true, true, true, true)) << "shown a slot layout";
+  EXPECT_FALSE(armedForReads(true, true, true, false, false))
+      << "no size its reader was shown is known: no copy could be told to be its file";
 }
 
 // The deadline of a test's choosing: unset, empty, not a number, not positive
@@ -566,6 +568,96 @@ TEST(OpenPolicy, AllSitesFailedText) {
   EXPECT_NE(m.find(std::string(160, 'e') + ";"), std::string::npos);
   EXPECT_EQ(m.find(std::string(161, 'e')), std::string::npos);
   EXPECT_STREQ(openRouteName(OpenRoute::kFailover), "failover");
+}
+
+// The error of a read that no copy of the size its reader was shown could serve: every copy
+// tried, with its size where it is known.
+TEST(OpenPolicy, NoCopyServedText) {
+  SiteFailure a{"127.0.0.1:14121", "127.0.0.1", "",
+                "answered 0 of the 65536 bytes asked at 10161194, inside the file's size of "
+                "16935324 bytes"};
+  a.size = 16935324;
+  a.bad = true;
+  SiteFailure b{"b.two.org:1094", "two.org", "b.two.org",
+                "it serves 10161194 bytes, the cached file has 16935324"};
+  b.size = 10161194;
+  SiteFailure c{"c.three.org:1094", "three.org", "c.three.org", "size 0"};
+  c.size = 0;
+  const SiteFailure d{"d.four.org:1094", "four.org", "d.four.org",
+                      "[ERROR] at root://d.four.org:1094//f?authz=SECRET: not found"};
+  const std::string t = noCopyServedText("/store/mc/f.root", {a, b, c, d});
+  EXPECT_EQ(t, "uCache: /store/mc/f.root: no copy could serve the read: 127.0.0.1 "
+               "(127.0.0.1:14121, 16935324 bytes): answered 0 of the 65536 bytes asked at "
+               "10161194, inside the file's size of 16935324 bytes; two.org (b.two.org:1094, "
+               "10161194 bytes): it serves 10161194 bytes, the cached file has 16935324; three.org "
+               "(c.three.org:1094, 0 bytes): size 0; four.org (d.four.org:1094): [ERROR] at "
+               "root://d.four.org:1094//f not found");
+  EXPECT_EQ(t.find("SECRET"), std::string::npos);
+  EXPECT_EQ(t.find("no site could open it"), std::string::npos) << "a read, not an open";
+  EXPECT_EQ(noCopyServedText("/f", {}), "uCache: /f: no copy could serve the read: ");
+  // Each error at most 160 bytes, the whole at most 1024.
+  std::vector<SiteFailure> many(20, {"s.x.org:1094", "x.org", "s.x.org", std::string(500, 'e')});
+  many[0].size = 7;
+  const std::string m = noCopyServedText("/f", many);
+  EXPECT_LE(m.size(), 1024u);
+  EXPECT_NE(m.find("(s.x.org:1094, 7 bytes): " + std::string(160, 'e') + ";"), std::string::npos);
+  EXPECT_EQ(m.find(std::string(161, 'e')), std::string::npos);
+}
+
+// The copies a handle's reads failed at: one entry per server, the newest last, at most
+// `keep` of them; one that answered with bad bytes stays bad, and is never dropped.
+TEST(OpenPolicy, NoteReadFailure) {
+  const auto fail = [](const char* server, const char* error, bool bad) {
+    SiteFailure f{server, server, "", error};
+    f.bad = bad;
+    f.size = 100;
+    return f;
+  };
+  const auto servers = [](const std::vector<SiteFailure>& v) {
+    std::string s;
+    for (const SiteFailure& x : v)
+      s += x.server + (x.bad ? "!" : "") + " ";
+    return s;
+  };
+  std::vector<SiteFailure> l;
+  noteReadFailure(l, fail("a:1", "stall", false), 3);
+  noteReadFailure(l, fail("b:1", "short", true), 3);
+  EXPECT_EQ(servers(l), "a:1 b:1! ");
+  // The same server again: one entry, the newest, with the newest error.
+  noteReadFailure(l, fail("a:1", "socket", false), 3);
+  EXPECT_EQ(servers(l), "b:1! a:1 ");
+  EXPECT_EQ(l.back().error, "socket");
+  // Found bad once, bad for good, though its later failure is of another kind.
+  noteReadFailure(l, fail("b:1", "stall", false), 3);
+  EXPECT_EQ(servers(l), "a:1 b:1! ");
+  EXPECT_EQ(l.back().error, "stall");
+  // At most three: the oldest that is not bad goes first.
+  noteReadFailure(l, fail("c:1", "stall", false), 3);
+  noteReadFailure(l, fail("d:1", "stall", false), 3);
+  EXPECT_EQ(servers(l), "b:1! c:1 d:1 ") << "a went, the bad b stays though it is older";
+  noteReadFailure(l, fail("e:1", "zeros", true), 3);
+  EXPECT_EQ(servers(l), "b:1! d:1 e:1! ");
+  // Every one bad: none is dropped, so none is ever opened again.
+  noteReadFailure(l, fail("f:1", "zeros", true), 3);
+  noteReadFailure(l, fail("g:1", "zeros", true), 3);
+  EXPECT_EQ(servers(l), "b:1! e:1! f:1! g:1! ");
+  // What the list says of a server, in any case of its name.
+  EXPECT_TRUE(refusedBefore(l, "B:1"));
+  EXPECT_TRUE(refusedBefore(l, "g:1"));
+  EXPECT_FALSE(refusedBefore(l, "d:1")) << "dropped";
+  EXPECT_FALSE(refusedBefore({fail("a:1", "stall", false)}, "a:1")) << "failed, not bad";
+  EXPECT_FALSE(refusedBefore({}, "a:1"));
+  // A copy a read found bad is not given again by the list of copies, even as the last resort;
+  // one whose read merely failed still is.
+  Location la;
+  la.host = "a.one.org";
+  la.port = 1094;
+  std::vector<SiteFailure> reads;
+  noteReadFailure(reads, fail("a.one.org:1094", "zeros", true), 3);
+  EXPECT_TRUE(orderLocations({la}, {}, reads).empty());
+  std::vector<SiteFailure> stalls;
+  noteReadFailure(stalls, fail("a.one.org:1094", "stall", false), 3);
+  EXPECT_EQ(orderLocations({la}, {}, stalls).size(), 1u);
 }
 
 // The copies a locate lists, in the order they are tried.

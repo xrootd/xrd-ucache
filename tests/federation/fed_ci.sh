@@ -67,7 +67,9 @@
 #                          failing late), and a failure no other site would change, which
 #                          stays at its server. Each case checks the records: the failed
 #                          reads, each followed by an open with route read at another
-#                          server, and open_failovers equal to those opens. With the
+#                          server, and open_failovers equal to those opens. A handle whose
+#                          reads are all relayed (its host denied the cache) moves too, to a
+#                          copy of the size its reader's open was shown. With the
 #                          switch off the failed reads are relayed on the same file and
 #                          the client's read recovery stays on
 #   cut after the open     the file is named *.root, its copies are whole, and the copy the handle
@@ -75,16 +77,19 @@
 #                          past the cut is answered short, which is held against the copy (its size
 #                          was confirmed by the header at the open): the read is made again at
 #                          another copy and is exact. When every copy is cut the read fails with the
-#                          data error. A read that reaches past the end of an intact file is answered
-#                          short as it always was, and the handle does not move
+#                          data error, whose text says no copy could serve the read and names each
+#                          copy tried with its size. A read that reaches past the end of an intact
+#                          file is answered short as it always was, and the handle does not move
 #   zeros                  a copy that serves a basket as zeros (the fixture of the key-position
 #                          check, tests/data/unnamed_codec_fixture.root): with the switch on the
 #                          read fails its check and is made again at another site, for a Read and
 #                          for a VectorRead, exactly, once; when the first move lands on a copy
 #                          that is damaged too, that answer is refused as well; when every copy
 #                          is damaged the reader gets errDataError, after at most four reads and
-#                          never the zeros; with the switch off (the check on) it gets the error
-#                          and no read is moved
+#                          never the zeros; when the only copy is damaged it is never opened again
+#                          for the handle (one failed read, no move takes it), and the error names
+#                          it; with the switch off (the check on) it gets the error and no read is
+#                          moved
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD=$(cd "${1:?usage: fed_ci.sh BUILD_DIR}" && pwd)
@@ -416,14 +421,16 @@ place8() { # LFN server... (8 MiB)
 # CACHE -> the lines of one kind of its per-file records
 recs() { cat "$1"/stats/*.files.jsonl 2>/dev/null | grep "\"kind\":\"$2\""; }
 field() { sed -n "s/.*\"$1\":\"\{0,1\}\([^\",}]*\).*/\1/p"; } # a field of each line
-# rf CASE N SWITCH [KIND]: the case on a file of its own; sets RES, RFC (its cache), SV (the servers it read from)
+# rf CASE N SWITCH [KIND [TAG]]: the case on a file of its own (TAG tells two runs of one case apart);
+# sets RES, RFC (its cache), SV (the servers it read from). RFX: more of the client's environment.
+RFX=()
 rf() {
-  local c=$1 n=$2 sw=$3 kind=${4:-}
-  local l=/store/ci/rf-$c-${kind:-x}.bin
+  local c=$1 n=$2 sw=$3 kind=${4:-} tag=${5:-}
+  local l=/store/ci/rf-$c-${kind:-x}$tag.bin
   place8 $l a b c
-  RFC="$W/c-rf-$c-${kind:-x}"
-  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=$sw UCACHE_TEST_READ_FAIL_N=$n ${kind:+UCACHE_TEST_READ_FAIL_KIND=$kind})
-  RES=$(fuzz "$RFC" "$W/rf-$c-${kind:-x}.log" "root://127.0.0.1:$RX/$l" "$W/f8.bin" 1 1 1 read-failover $c)
+  RFC="$W/c-rf-$c-${kind:-x}$tag"
+  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=$sw UCACHE_TEST_READ_FAIL_N=$n ${kind:+UCACHE_TEST_READ_FAIL_KIND=$kind} "${RFX[@]}")
+  RES=$(fuzz "$RFC" "$W/rf-$c-${kind:-x}$tag.log" "root://127.0.0.1:$RX/$l" "$W/f8.bin" 1 1 1 read-failover $c)
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-220
   SV=($(echo "$RES" | sed -n 's/^SERVERS //p'))
   FL=($(recs "$RFC" origin_failure | field data_server))   # the server of each failed read
@@ -441,6 +448,18 @@ clean miss; verdict "miss: a Read and a VectorRead whose origin read failed are 
 rf relay 2 on relay
 clean relay; verdict "relay: a PgRead and a VectorRead into one buffer that failed are exact, once, and move the handle" $?
 [ "$(recs "$RFC" origin_failure | field op | tr '\n' ' ')" = "relay relay " ] && [ "${#MV[@]}" = 2 ]; verdict "relay: two failed relayed reads, two moves (${MV[*]})" $?
+
+# The same on a handle the cache does not serve (its host is denied the cache): it has no entry and no
+# stat of its own, and moves to a copy of the size its reader's open was shown. Every read of it is
+# relayed, the first one (the Read that arms a cached handle) too, so three fail.
+RFX=(UCACHE_DENY=127.0.0.1)
+rf relay 3 on relay -denied
+RFX=()
+clean relay; verdict "relay, host denied: a Read, a PgRead and a VectorRead that failed are exact, once, and move the handle" $?
+[ "$(find "$RFC" -name '*.meta' | wc -l)" = 0 ]; verdict "relay, host denied: nothing is cached" $?
+[ "$(recs "$RFC" origin_failure | field op | tr '\n' ' ')" = "relay relay relay " ] && [ "${#MV[@]}" = 3 ] &&
+  [ "$(recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | grep -c '"size":8388608,')" = 3 ]
+verdict "relay, host denied: three failed relayed reads, three moves, each to a copy of 8388608 bytes (${MV[*]})" $?
 
 rf refuse 3 on refuse
 clean refuse; verdict "refuse: reads the client refused at once are exact, once" $?
@@ -531,6 +550,15 @@ L=/store/ci/zr-all.root; placefix $L a b c; zero_at $L a b c
 zr zeroerr $L on
 clean_zr zeroerr; verdict "every copy damaged: the read fails its check, once, and never serves the zeros" $?
 [ "$F14" -ge 1 ] && [ "$F14" -le 4 ]; verdict "every copy damaged: $F14 failed reads (one to four)" $?
+# (e) the only copy is damaged: a copy a read found bad is never opened again for the handle, wherever
+# the redirector or the list of copies sends the open; the error names it and says no copy could serve
+L=/store/ci/zr-only.root; placefix $L a
+zr zeroerr $L on land
+clean_zr zeroerr; verdict "only copy damaged: the read fails its check, once, and never serves the zeros" $?
+NOK=$(recs "$RFC" open | grep '"route":"read"' | grep -c '"outcome":"ok"')
+[ "$F14" = 1 ] && [ "$NOK" = 0 ]; verdict "only copy damaged: one failed read, and no move took the copy again ($F14 failed reads, $NOK moves ended ok, $NRA attempts)" $?
+echo "$RES" | grep -q "no copy could serve the read: 127.0.0.1 (127.0.0.1:$AX, $(stat -c %s "$FIX") bytes): .*failed its check"
+verdict "only copy damaged: the error says no copy could serve the read, and names the copy with its size" $?
 # (d) the switch off, the check on: the same read fails its check and is not moved
 L=/store/ci/zr-off.root; placefix $L a b c; zero_at $L a b c
 zr zeroerr $L off
@@ -570,6 +598,8 @@ verdict "cut: a move of route read ended at a copy of $FIXW_SIZE bytes" $?
 ct cutonly cutall /store/ci/ct-all.root
 echo "$RES" | grep -q '^read-failover cutonly: clean$'; verdict "cutonly: every copy is cut, the read fails with the data error and says why" $?
 [ "$F14" -ge 1 ] && [ "$F14" -le 4 ]; verdict "cutonly: $F14 failed reads (one to four)" $?
+echo "$RES" | grep -q "no copy could serve the read: .*, $FIXW_SIZE bytes): answered .*inside the file's size of $FIXW_SIZE bytes.*, $CUTAT bytes): it serves $CUTAT bytes, the cached file has $FIXW_SIZE"
+verdict "cutonly: the error says no copy could serve the read, and names the copies tried with their sizes" $?
 ct end "" /store/ci/ct-end.root
 echo "$RES" | grep -q '^read-failover end: clean$'; verdict "end: reads that reach past the end of an intact file are answered short, exactly, and the handle stays (${SV[*]})" $?
 [ "$F14" = 0 ] && [ "$NRA" = 0 ]; verdict "end: no failed read, no move ($F14, $NRA)" $?

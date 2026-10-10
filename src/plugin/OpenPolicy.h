@@ -292,10 +292,20 @@ struct SiteFailure {
   std::string site;
   std::string name;  // what tried= may carry for it (exclusionName), "" for none
   std::string error; // the error's text
-  // The open succeeded and the copy is refused for what it is (an empty ROOT file): it is not
-  // opened again by this sequence, and the error that ends it is of class data.
+  // The copy is refused for what it is: its open succeeded and it is an empty or cut ROOT file,
+  // or a read from it answered with bad bytes (a data error). It is not opened again by this
+  // sequence, nor by the handle whose read found it, and the error that ends it is of class data.
   bool bad = false;
+  long long size = -1; // the size the copy reported at its open; -1 when it is not known
 };
+// Whether `failed` lists `server` (host:port, in any case) as a copy refused for what it is.
+bool refusedBefore(const std::vector<SiteFailure>& failed, const std::string& server);
+// A read of a handle failed at the copy `f` (its server, site and size; `f.bad` when the read
+// answered with bad bytes): it is put on the handle's list of copies its reads failed at,
+// `failed`, as its newest entry. A server listed already keeps one entry, the newest, and stays
+// bad once it was found bad. The list keeps at most `keep` entries, the oldest that is not bad
+// dropped first; one found bad is never dropped, so it is never opened again for the handle.
+void noteReadFailure(std::vector<SiteFailure>& failed, SiteFailure f, size_t keep);
 // What the sequence does after a fail-over outcome, given the sites that
 // failed before (`failed`, to which `f` is added unless its server is there):
 //   kStop    the bound of `maxSites` distinct sites is reached, or the budget is
@@ -341,16 +351,25 @@ bool failedBefore(const std::vector<SiteFailure>& failed, const SiteFailure& f);
 std::string allSitesFailedText(const std::string& file, const std::vector<SiteFailure>& failed);
 // Its list alone: "<site> (<server>): <error>; ...", each error cut likewise.
 std::string sitesFailedList(const std::vector<SiteFailure>& failed);
+// The error a read ends with when no copy of the size its reader was shown could serve it:
+// "uCache: <file>: no copy could serve the read: <site> (<server>, <size> bytes): <error>; ...",
+// a copy whose size is not known without it; each error cut to 160 bytes and without URL
+// queries, the whole at most 1024 bytes.
+std::string noCopyServedText(const std::string& file, const std::vector<SiteFailure>& failed);
 
 // ---- Reading a file from another site (adaptive_federation on) --------------
 // A handle is armed to move its reads when the cache serves it, an open of it
-// succeeded through a redirector, and it was not shown a slot layout (whose
-// addresses no other site has). The origin reads of an armed handle have a
-// deadline, and one that fails in a way another site may not share is issued
-// again, in full, at another site: the reader gets the bytes, never the error,
-// within a bound on the attempts and on the time. `slotLayout`: the handle was
-// shown one.
-bool armedForReads(bool adaptiveFederation, bool cacheServes, bool viaRedirector, bool slotLayout);
+// succeeded through a redirector, it was not shown a slot layout (whose
+// addresses no other site has), and the size its reader was shown is known. The
+// origin reads of an armed handle have a deadline, and one that fails in a way
+// another site may not share is issued again, in full, at another site of that
+// size: the reader gets the bytes, never the error, within a bound on the
+// attempts and on the time. `slotLayout`: the handle was shown one. `sizeKnown`:
+// the size its reader was shown is known; without it no copy can be told to be
+// the reader's file, nothing could move, and the client's own recovery of a read
+// stays on.
+bool armedForReads(bool adaptiveFederation, bool cacheServes, bool viaRedirector, bool slotLayout,
+                   bool sizeKnown);
 
 // The time limit of one origin read of an armed handle: a backstop, 5 minutes. A
 // server that stops answering is found by silence, not by this limit: the client's

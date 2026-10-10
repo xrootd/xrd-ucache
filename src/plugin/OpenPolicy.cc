@@ -491,6 +491,34 @@ std::vector<std::string> exclusionNames(const std::vector<SiteFailure>& failed) 
   return out;
 }
 
+bool refusedBefore(const std::vector<SiteFailure>& failed, const std::string& server) {
+  const auto lower = [](std::string s) {
+    for (char& c : s)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+  };
+  const std::string want = lower(server);
+  return std::any_of(failed.begin(), failed.end(),
+                     [&](const SiteFailure& x) { return x.bad && lower(x.server) == want; });
+}
+
+void noteReadFailure(std::vector<SiteFailure>& failed, SiteFailure f, size_t keep) {
+  for (auto it = failed.begin(); it != failed.end(); ++it)
+    if (it->server == f.server) {
+      f.bad = f.bad || it->bad; // found bad once, bad for good
+      failed.erase(it);
+      break;
+    }
+  failed.push_back(std::move(f));
+  while (failed.size() > keep) {
+    const auto old = std::find_if(failed.begin(), failed.end(),
+                                  [](const SiteFailure& x) { return !x.bad; });
+    if (old == failed.end())
+      break; // every one was found bad: none is dropped
+    failed.erase(old);
+  }
+}
+
 bool failedBefore(const std::vector<SiteFailure>& failed, const SiteFailure& f) {
   const std::string host = f.server.substr(0, f.server.rfind(':'));
   for (const SiteFailure& x : failed)
@@ -499,8 +527,9 @@ bool failedBefore(const std::vector<SiteFailure>& failed, const SiteFailure& f) 
   return false;
 }
 
-bool armedForReads(bool adaptiveFederation, bool cacheServes, bool viaRedirector, bool slotLayout) {
-  return adaptiveFederation && cacheServes && viaRedirector && !slotLayout;
+bool armedForReads(bool adaptiveFederation, bool cacheServes, bool viaRedirector, bool slotLayout,
+                   bool sizeKnown) {
+  return adaptiveFederation && cacheServes && viaRedirector && !slotLayout && sizeKnown;
 }
 
 bool shortInsideConfirmed(uint64_t confirmed, uint64_t off, uint64_t len, uint64_t got) {
@@ -576,6 +605,19 @@ std::string sitesFailedList(const std::vector<SiteFailure>& failed) {
 std::string allSitesFailedText(const std::string& file, const std::vector<SiteFailure>& failed) {
   const std::string out =
       "uCache: " + withoutQueries(file, 300) + ": no site could open it: " + sitesFailedList(failed);
+  return out.size() > 1024 ? out.substr(0, 1024) : out;
+}
+
+std::string noCopyServedText(const std::string& file, const std::vector<SiteFailure>& failed) {
+  std::string out = "uCache: " + withoutQueries(file, 300) + ": no copy could serve the read: ";
+  for (size_t i = 0; i < failed.size(); ++i) {
+    if (i)
+      out += "; ";
+    out += failed[i].site + " (" + failed[i].server;
+    if (failed[i].size >= 0)
+      out += ", " + std::to_string(failed[i].size) + " bytes";
+    out += "): " + withoutQueries(failed[i].error, 160);
+  }
   return out.size() > 1024 ? out.substr(0, 1024) : out;
 }
 

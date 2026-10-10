@@ -192,8 +192,10 @@ struct HandleState {
   bool viaRedirector = false;
   // Under mu: the server and site the current File was opened at; where reads
   // of the handle failed, the 3 newest (the next open names them in tried= and
-  // takes them last); a move in flight, which holds innerOpenMu, the reads waiting
-  // for it, and the reads waiting between attempts, which Close waits for.
+  // takes them last), and every one whose read answered with bad bytes, which no
+  // open of the handle takes again (OpenPolicy.h noteReadFailure); a move in flight,
+  // which holds innerOpenMu, the reads waiting for it, and the reads waiting
+  // between attempts, which Close waits for.
   SiteFailure source;
   std::vector<SiteFailure> readFailed;
   // Under mu: the header read of the reader's open is in flight (UCacheFile.cc checkHeader), with
@@ -201,14 +203,15 @@ struct HandleState {
   // meanwhile are kept in readerProps, from `headerProps` on, and given to the File at its end.
   bool headerReading = false;
   size_t headerProps = 0;
-  // Under mu: the text of the error that names every copy the last move tried and found none to
-  // serve the reads (OpenPolicy.h allSitesFailedText); "" when the last move succeeded.
+  // Under the move's locks (innerOpenMu, then mu): the text of the error that names every copy
+  // the last move tried, none of which could serve the reads (OpenPolicy.h noCopyServedText); ""
+  // once a move succeeded. Given to the reads of a move not made again at once (its cool-down).
   std::string moveFailure;
   bool moveInFlight = false;
-  // A read waiting for a move: given whether the handle moved, it takes the handle's
-  // File and leaves the parked count, and returns what then issues the read again or
-  // answers it (moveOn).
-  using MoveWaiter = std::function<std::function<void()>(bool)>;
+  // A read waiting for a move: given whether the handle moved and, when it did not, the text of
+  // the error that names every copy the move tried ("" for none), it takes the handle's File and
+  // leaves the parked count, and returns what then issues the read again or answers it (moveOn).
+  using MoveWaiter = std::function<std::function<void()>(bool, const std::string&)>;
   std::vector<MoveWaiter> moveWaiters;
   int parkedReads = 0;
   bool wholeCopy = false; // under mu: set up as a copy (the first read took the whole file)
@@ -257,6 +260,14 @@ struct HandleState {
   // holds positions in this one. A refusal latches for the handle and drops
   // the entry's trust, so the next open checks the origin again.
   std::atomic<uint64_t> expectedOriginSize{0};
+  // With adaptive_federation on, the size the reader's open was answered with, by the copy that
+  // open took (0: none, or not known): the size its reader was shown, which a move of its reads
+  // must find again (sizeShownLocked).
+  std::atomic<uint64_t> readerOpenSize{0};
+  // Under mu: the size the handle's reader was shown, which every copy its reads move to must
+  // have: the trusted entry's, else the entry's, else the stat's, else the reader's open's; 0
+  // when none is known (the handle is then not armed: applyReadPolicy).
+  uint64_t sizeShownLocked() const;
   // The origin size that passed the header check of a ROOT file (0: none), the copy's own header
   // saying where the file ends at the size it reported (OpenPolicy.h rootFileEnd): set by the
   // reader's open of a file named *.root with adaptive_federation on, and by a handle whose
