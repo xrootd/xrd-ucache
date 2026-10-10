@@ -194,12 +194,13 @@ struct Config {
   // cache (the cache would otherwise hold the same data twice). `on` keeps them
   // too, for comparing the two tiers on one cache.
   bool recompressKeepOriginals = false;          // UCACHE_RECOMPRESS_KEEP_ORIGINALS
-  // Check what arrives from the origin by the file's own checksums (ROOT's
-  // codec checks) before it is cached or served; a basket that fails is never
-  // kept or served, the read fails with "data is corrupted" and the failure is
-  // reported. Forced on by `recompress = on`, which decodes what it converts
-  // anyway (`settings` names it "forced by recompress"), and by
-  // `adaptive_federation = on` ("forced by adaptive_federation").
+  // A setting for tests and diagnosis: check what arrives from the origin
+  // before it is cached or served (the byte cache's fetches by the key position
+  // of each basket); a block that fails is never kept or served, the read fails
+  // with an error naming the copy and the reason, and the failure is reported.
+  // Forced on by `adaptive_federation = on` ("forced by adaptive_federation").
+  // `recompress = on` does not force it: recompression checks every block it
+  // converts by the block's own checksum whatever this says.
   bool checkOriginIntegrity = false;             // UCACHE_CHECK_ORIGIN_INTEGRITY
   // `adaptive_federation`: with it on, the XRootD client's connection settings
   // are set at load to values that give up on an unreachable server sooner

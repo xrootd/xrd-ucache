@@ -135,9 +135,10 @@ TEST(Config, MaxReadFraction) {
   }
 }
 
-// check_origin_integrity: off by default, its own setting, and forced on by
-// recompress = on whatever any layer says, which `settings` names.
-TEST(Config, CheckOriginIntegrityForcedByRecompress) {
+// check_origin_integrity: off by default, its own setting. recompress = on does not
+// force it (recompression checks every block it converts by its own checksum
+// whatever the setting says): it stays as the layers set it.
+TEST(Config, CheckOriginIntegrityNotForcedByRecompress) {
   EnvGuard g;
   {
     Config c = Config::fromEnv();
@@ -150,22 +151,31 @@ TEST(Config, CheckOriginIntegrityForcedByRecompress) {
     EXPECT_TRUE(c.checkOriginIntegrity);
     EXPECT_EQ(c.sources.at("check_origin_integrity"), "conf");
   }
+  conf = {{"recompress", "on"}};
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_TRUE(c.recompress);
+    EXPECT_FALSE(c.checkOriginIntegrity) << "recompress alone leaves it off";
+    EXPECT_EQ(c.valueOf("check_origin_integrity"), "off");
+    EXPECT_EQ(c.sources.count("check_origin_integrity"), 0u) << "nothing forced it";
+  }
   conf = {{"check_origin_integrity", "off"}, {"recompress", "on"}};
   {
     Config c = Config::fromEnv(&conf);
-    EXPECT_TRUE(c.checkOriginIntegrity) << "recompress decodes anyway: always checked";
-    EXPECT_EQ(c.sources.at("check_origin_integrity"), "forced by recompress");
+    EXPECT_FALSE(c.checkOriginIntegrity);
+    EXPECT_EQ(c.sources.at("check_origin_integrity"), "conf");
   }
+  conf = {{"check_origin_integrity", "on"}, {"recompress", "on"}};
   ::setenv("UCACHE_CHECK_ORIGIN_INTEGRITY", "off", 1);
   {
     Config c = Config::fromEnv(&conf);
-    EXPECT_TRUE(c.checkOriginIntegrity) << "no layer undoes the forcing";
+    EXPECT_FALSE(c.checkOriginIntegrity) << "the environment wins, as for any setting";
+    EXPECT_EQ(c.sources.at("check_origin_integrity"), "env");
   }
 }
 
 // adaptive_federation: off by default, set from the conf or its env twin, and
-// it forces check_origin_integrity on -- unless recompress already did, whose
-// label is kept.
+// it forces check_origin_integrity on (recompress does not).
 TEST(Config, AdaptiveFederationForcesTheIntegrityCheck) {
   EnvGuard g;
   {
@@ -196,8 +206,8 @@ TEST(Config, AdaptiveFederationForcesTheIntegrityCheck) {
   {
     Config c = Config::fromEnv(&conf);
     EXPECT_TRUE(c.checkOriginIntegrity);
-    EXPECT_EQ(c.sources.at("check_origin_integrity"), "forced by recompress")
-        << "the first forcing keeps its label";
+    EXPECT_EQ(c.sources.at("check_origin_integrity"), "forced by adaptive_federation")
+        << "recompress = on forces nothing";
   }
   conf = {{"check_origin_integrity", "on"}};
   {
@@ -238,8 +248,8 @@ TEST(Config, SetNotes) {
 
   conf = {{"recompress", "on"}};
   Config rec = Config::fromEnv(&conf);
-  const std::string off2 = rec.setNote("check_origin_integrity", "false");
-  EXPECT_NE(off2.find("stays on while recompress = on"), std::string::npos) << off2;
+  EXPECT_EQ(rec.setNote("check_origin_integrity", "false"), "")
+      << "recompress = on does not force the check: turning it off needs no note";
 }
 
 // mixed_maps: on by default. in_use_seconds: 1 day, seconds >= 0 only (0 = no

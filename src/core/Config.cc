@@ -329,15 +329,11 @@ void clampAndFinish(Config& c, bool explicitMax) {
   // budgetAuto iff NO explicit (positive) byte cap from any layer: resolve a
   // free-disk floor in CacheStore.
   c.budgetAuto = !explicitMax;
-  // Recompression decodes what it converts: checking it there costs nothing,
-  // so it is always done. Applied after every layer, so none can undo it.
-  if (c.recompress && !c.checkOriginIntegrity) {
-    c.checkOriginIntegrity = true;
-    c.sources["check_origin_integrity"] = "forced by recompress";
-  }
+  // Recompression checks every block it converts by the block's own checksum
+  // whatever this setting says (ColdRun.cc), so it does not force it.
   // Reading from more than one site is safe only when what arrives is checked:
   // a copy that differs from the file's own checksums is caught before it is
-  // kept or served.
+  // kept or served. Applied after every layer, so none can undo it.
   if (c.adaptiveFederation && !c.checkOriginIntegrity) {
     c.checkOriginIntegrity = true;
     c.sources["check_origin_integrity"] = "forced by adaptive_federation";
@@ -481,10 +477,9 @@ bool Config::stateSettable(const std::string& key) {
 }
 
 std::string Config::setNote(const std::string& key, const std::string& value) const {
-  if (key == "check_origin_integrity" && falsy(value) && (recompress || adaptiveFederation))
-    return std::string("  the check stays on while ") +
-           (recompress ? "recompress" : "adaptive_federation") +
-           " = on, which forces it on (`ucache settings` shows it)";
+  if (key == "check_origin_integrity" && falsy(value) && adaptiveFederation)
+    return "  the check stays on while adaptive_federation = on, which forces it on (`ucache "
+           "settings` shows it)";
   if (key == "adaptive_federation" && truthy(value))
     return "  the XRootD client's connection settings change too: connection window 31 s, "
            "connection retries 2, error window 180 s, each where no XRD_* variable or "

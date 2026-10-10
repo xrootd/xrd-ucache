@@ -161,10 +161,6 @@ class ColdFill : public tp::StoreMaps, public std::enable_shared_from_this<ColdF
   // slotFactor100, the slot table): StoreLayout.h; key, cacheDir, store,
   // entry, storeGone, mu, handles and the maps: StoreMaps.h.
   bool keepOriginals = false;
-  // check_origin_integrity (forced on by recompress = on, so always set on a
-  // first pass): a basket or page whose own checksum fails is never kept or
-  // served.
-  bool checkIntegrity = false;
   // max_read_fraction: null when no rule applies. Once it says direct, what
   // this process converts is served and never kept, and nothing it fetches
   // goes to the byte cache but the file's own records.
@@ -605,7 +601,6 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   cf->cacheDir = cfg.cacheDir;
   cf->entry = entry;
   cf->keepOriginals = cfg.recompressKeepOriginals;
-  cf->checkIntegrity = cfg.checkOriginIntegrity;
   cf->inUseSeconds = cfg.inUseSeconds;
   cf->fsync = cfg.fsync != FsyncMode::kOff;
   cf->rule = ReadRule::forFile(key.key, size);
@@ -1236,11 +1231,14 @@ void ColdRequest::finish() {
     complete(user, okStatus(), chunkResponse(chunks[0].offset, chunks[0].length, chunks[0].buffer));
 }
 
-// A basket or page failed its own checksum (check_origin_integrity). Bytes that
-// came from the byte cache are dropped there, and the read is asked again (the
-// retry fetches them from the origin): they may have been cached from another
-// source, or before the check was on. Bytes the origin sent for this read fail
-// it, reported with where they came from, and are never kept or served.
+// A basket or page that a first pass converts failed its own checksum. Conversion
+// always checks what it converts, whatever check_origin_integrity says: the
+// converted block would carry a new, valid checksum, and the reader could no
+// longer detect the damage. Bytes that came from the byte cache are dropped
+// there, and the read is asked again (the retry fetches them from the origin):
+// they may have been cached from another source, or by a uCache that did not
+// check them. Bytes the origin sent for this read fail it, reported with where
+// they came from, and are never kept or served.
 void failOriginCheck(const std::shared_ptr<ColdRequest>& req, uint64_t pos, uint32_t len,
                      const std::string& what, const char* why, bool fromCache, uint64_t rStart,
                      uint64_t rLen, const std::string& codec = std::string()) {
@@ -1288,18 +1286,12 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     if (!p.error.empty()) {
       // A page whose checksum or decode fails must not be served decoded: the
       // reader could no longer detect it. Fail the read, as ROOT would.
-      if (cf.checkIntegrity) {
-        failOriginCheck(req, slot.origSeek, recLen, "an RNTuple page", p.error.c_str(), fromCache,
-                        rStart, rounded->size());
-      } else {
-        UCACHE_WARN("slot run for %s: page at %llu: %s", cf.key.key.c_str(),
-                    static_cast<unsigned long long>(slot.origSeek), p.error.c_str());
-        req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError));
-      }
+      failOriginCheck(req, slot.origSeek, recLen, "an RNTuple page", p.error.c_str(), fromCache,
+                      rStart, rounded->size());
       req->done();
       return;
     }
-    if (cf.checkIntegrity && req->st->store)
+    if (req->st->store)
       (pg.hasChecksum ? req->st->store->stats().originChecksPassed
                       : req->st->store->stats().originChecksNone)
           .fetch_add(1, std::memory_order_relaxed);
@@ -1352,19 +1344,20 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     c.kind = tp::ConvertedBasket::kOriginal;
     c.record.assign(rec, rec + recLen);
   }
-  if (cf.checkIntegrity) {
-    if (c.check == tp::ConvertedBasket::kFailed) {
-      failOriginCheck(req, slot.origSeek, recLen,
-                      c.codec.empty() ? std::string("a basket") : "a basket (" + c.codec + ")",
-                      c.checkWhy, fromCache, rStart, rounded->size(), c.codec);
-      req->done();
-      return;
-    }
-    if (req->st->store)
-      (c.check == tp::ConvertedBasket::kPassed ? req->st->store->stats().originChecksPassed
-                                               : req->st->store->stats().originChecksNone)
-          .fetch_add(1, std::memory_order_relaxed);
+  // The basket's own checksum, checked by its decode whatever check_origin_integrity says: a
+  // basket that fails is never converted (convertBasket keeps it as its original record) and
+  // never kept or served; the read fails with that error.
+  if (c.check == tp::ConvertedBasket::kFailed) {
+    failOriginCheck(req, slot.origSeek, recLen,
+                    c.codec.empty() ? std::string("a basket") : "a basket (" + c.codec + ")",
+                    c.checkWhy, fromCache, rStart, rounded->size(), c.codec);
+    req->done();
+    return;
   }
+  if (req->st->store)
+    (c.check == tp::ConvertedBasket::kPassed ? req->st->store->stats().originChecksPassed
+                                             : req->st->store->stats().originChecksNone)
+        .fetch_add(1, std::memory_order_relaxed);
   const uint64_t us = nowUs() - t0;
   cf.convertUs.fetch_add(us, std::memory_order_relaxed);
   cf.inBytes.fetch_add(recLen, std::memory_order_relaxed);
