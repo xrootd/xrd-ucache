@@ -326,8 +326,9 @@ as an `origin_failure` line of op `open` (FORMAT.md). So is a copy of a file nam
 `*.root` (`.root` in upper or lower case) that the checks made at open find is not a whole
 ROOT file. Inside the job's open uCache reads the first 300 bytes of the copy (and, when
 long names place the top directory's record past them, 60 bytes more), then the file's
-list of top-level objects, all within what is left of the attempt's time (at least 5 s),
-and refuses:
+list of top-level objects (the first read within what is left of the attempt's time, at
+least 5 s; each later one within what is left of that, or at least 5 s and 1 s for each MB
+it reads), and refuses:
 
 - a copy whose size is smaller than the end its own header states (`size 10161194: its
   header says the file is 16935324 bytes`);
@@ -356,7 +357,11 @@ and refuses:
 
 A read of them that fails or runs out of time is a failure of the copy, as an open's would
 be, and another copy is tried; the client's own recovery of those reads and its following
-of a redirect are off for them, so no other copy answers them. A copy whose size is larger
+of a redirect are off for them, so no other copy answers them. Where no other copy is left to
+try (or the URL names a server directly, or it is the last open of the job's own URL after a
+copy on tape was passed over), the open is made once more at the same place when the client
+would have recovered the read (a lost connection or session): two open records at that
+server, the first an error of class `client`. A copy whose size is larger
 than the end its header states stands, and confirms nothing: ROOT reads such a file
 normally (a file updated in place, or with bytes appended, or saved with `TFile::Save`,
 which writes the list of top-level objects and not the header, and then written on; its

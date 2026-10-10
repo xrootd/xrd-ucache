@@ -349,6 +349,146 @@ TEST(RootCheck, WholeFilesStand) {
   EXPECT_EQ(check(o.build()).kind, K::kConfirmed);
 }
 
+// Every version field is read as ROOT reads it: the header's (at 4) as a signed 32-bit integer
+// (TFile::Init: below a million, 32-bit fields; TDirectoryFile::Sizeof: 40000 or more, a record of
+// 60 bytes), the top directory record's and a label's as signed 16-bit ones (TFile::Init,
+// TKey::ReadKeyBuffer: above 1000, 64-bit positions). A version whose top bit is set is negative:
+// a copy ROOT reads normally with one is never refused, and one ROOT reads otherwise is judged as
+// ROOT reads it.
+TEST(RootCheck, VersionsReadAsRootReadsThem) {
+  const auto flip = [](Image& img, int64_t part, size_t i) { img.parts.at(part).at(i) |= 0x80; };
+  // The header's version, 32-bit positions: a small file to ROOT, which opens it as it is.
+  {
+    Synth s;
+    Image img = s.build();
+    flip(img, 0, 4);
+    std::vector<std::string> reads;
+    const RootHeaderVerdict v = check(img, &reads);
+    EXPECT_EQ(v.kind, K::kConfirmed) << v.why;
+    EXPECT_LT(v.header.version, 0);
+    EXPECT_FALSE(v.header.wide());
+    EXPECT_EQ(v.end, s.end);
+    EXPECT_EQ(v.header.end, s.end);
+    ASSERT_EQ(reads.size(), 2u) << "the first bytes, then the list of top-level objects";
+    EXPECT_EQ(reads[1], std::to_string(s.seekKeys) + "+" + std::to_string(s.nbytesKeys));
+    img.size = s.end + 4096;
+    EXPECT_EQ(check(img).kind, K::kNoClaim);
+    img.size = s.end - 1;
+    EXPECT_EQ(check(img).why, "size " + std::to_string(s.end - 1) + ": its header says the " +
+                                  "file is " + std::to_string(s.end) + " bytes");
+  }
+  // The same file with long names (the directory's record past the first bytes): the record's
+  // length is ROOT's for that version (60 bytes for a version of 40000 or more, else 48; negative:
+  // 48), read in a second read.
+  {
+    Synth s;
+    s.nameLen = 400;
+    Image img = s.build();
+    flip(img, 0, 4);
+    std::vector<std::string> reads;
+    const RootHeaderVerdict v = check(img, &reads);
+    EXPECT_EQ(v.kind, K::kConfirmed) << v.why;
+    ASSERT_EQ(reads.size(), 3u);
+    EXPECT_EQ(reads[1], "500+48") << "TDirectoryFile::Sizeof for a version below 40000";
+  }
+  // The header's version, 64-bit positions: ROOT reads the fields as 32-bit ones, and the end it
+  // then finds (the top half of the 64-bit end) lies before the first record: ROOT refuses the
+  // file ("incorrect header length"), and so do the checks, for the same reason.
+  {
+    Synth s;
+    s.wide = true;
+    s.base = 5000000000LL;
+    Image img = s.build();
+    flip(img, 0, 4);
+    const RootHeaderVerdict v = check(img);
+    EXPECT_EQ(v.kind, K::kBad);
+    EXPECT_EQ(v.why, "size " + std::to_string(s.end) +
+                         ": its header says its first record begins at 100, past the end of its "
+                         "data at 1");
+  }
+  // The directory record's version, 5 with the top bit: still 32-bit positions; the file stands.
+  {
+    Synth s;
+    Image img = s.build();
+    flip(img, s.begin + s.nameLen, 0);
+    std::vector<std::string> reads;
+    const RootHeaderVerdict v = check(img, &reads);
+    EXPECT_EQ(v.kind, K::kConfirmed) << v.why;
+    EXPECT_LT(v.dir.version, 0);
+    EXPECT_EQ(reads.size(), 2u);
+  }
+  // 1005 with the top bit: ROOT reads 32-bit positions from the record, finds the list's position 0
+  // (the top half of the parent's 64-bit position) and takes the file as never completed: no claim,
+  // no list read, as ROOT recovers such a file.
+  {
+    Synth s;
+    s.wide = true;
+    s.base = 5000000000LL;
+    Image img = s.build();
+    flip(img, s.begin + s.nameLen, 0);
+    std::vector<std::string> reads;
+    const RootHeaderVerdict v = check(img, &reads);
+    EXPECT_EQ(v.kind, K::kNoClaim) << v.why;
+    EXPECT_EQ(v.dir.seekKeys, 0);
+    EXPECT_EQ(reads.size(), 1u);
+  }
+  // A label's version: the list's own, and an entry's, 4 with the top bit: still 32-bit positions;
+  // the file stands.
+  {
+    Synth s;
+    Image img = s.build();
+    const std::vector<unsigned char>& list = img.parts.at(s.seekKeys);
+    size_t at = 0;
+    RootKeyLabel own;
+    ASSERT_TRUE(parseRootKeyLabel(list.data(), list.size(), at, own));
+    Image a = img;
+    flip(a, s.seekKeys, 4); // the list's own label
+    EXPECT_EQ(check(a).kind, K::kConfirmed) << check(a).why;
+    Image b = img;
+    flip(b, s.seekKeys, at + 4 + 4); // the first entry's label (after the count)
+    EXPECT_EQ(check(b).kind, K::kConfirmed) << check(b).why;
+  }
+  // 1004 with the top bit, the list's own label in a file of 64-bit positions: ROOT reads 32-bit
+  // positions from it, which then state another place (the top half of the 64-bit one): refused,
+  // as a label that states another position is (ROOT finds no objects in the list then, and
+  // scans the copy to rebuild it).
+  {
+    Synth s;
+    s.wide = true;
+    s.base = 5000000000LL;
+    Image img = s.build();
+    flip(img, s.seekKeys, 4);
+    const RootHeaderVerdict v = check(img);
+    EXPECT_EQ(v.kind, K::kBad);
+    EXPECT_EQ(v.why, "size " + std::to_string(s.end) + ": its list of top-level objects at " +
+                         std::to_string(s.seekKeys) + " is labelled as lying at 1");
+  }
+  // The parsers alone: each version as a signed integer.
+  {
+    Synth s;
+    Image img = s.build();
+    flip(img, 0, 4);
+    flip(img, s.begin + s.nameLen, 0);
+    const auto b = img.read(0, 300);
+    RootFileHeader h;
+    ASSERT_TRUE(parseRootFileHeader(b.data(), b.size(), h));
+    EXPECT_EQ(h.version, static_cast<int32_t>(0x80000000u | 63602u));
+    EXPECT_EQ(rootHeaderFieldsEnd(h.version), 45u);
+    EXPECT_EQ(rootDirRecordBytes(h.version), 48u);
+    RootDirRecord d;
+    ASSERT_TRUE(parseRootDirRecord(b.data() + 158, 60, d));
+    EXPECT_EQ(d.version, static_cast<int16_t>(0x8005));
+    EXPECT_EQ(d.seekKeys, s.seekKeys) << "32-bit positions";
+    auto l = label({70, static_cast<int16_t>(0x8004), 0xF0000000LL, 100, "TTree", "Events", "t"});
+    size_t at = 0;
+    RootKeyLabel k;
+    ASSERT_TRUE(parseRootKeyLabel(l.data(), l.size(), at, k));
+    EXPECT_LT(k.version, 0);
+    EXPECT_EQ(k.seekKey, 0xF0000000LL) << "32-bit positions, unsigned";
+    EXPECT_EQ(at, l.size());
+  }
+}
+
 // A header never completed (the writer never saved the file: no list of top-level objects placed
 // past the header) makes no claim: no refusal for what follows, and no confirmed size.
 TEST(RootCheck, NeverCompletedMakesNoClaim) {
@@ -832,15 +972,40 @@ TEST(RootCheck, CheckReadEdges) {
   EXPECT_EQ(v.next, RootHeaderVerdict::kNone);
 }
 
-// The limit of a further read: what is left of the checks' time, rounded up; none left, none.
+// The limit of a further read: what is left of the checks' time, rounded up, or the read's own
+// floor (5 s and its length at 1 MB/s, rounded up) when that is more; never past what is left of
+// the open's own time, and none when none is left of it.
 TEST(RootCheck, CheckReadTimeout) {
-  EXPECT_EQ(checkReadTimeoutS(0), 0);
-  EXPECT_EQ(checkReadTimeoutS(-5), 0);
-  EXPECT_EQ(checkReadTimeoutS(1), 1);
-  EXPECT_EQ(checkReadTimeoutS(999), 1);
-  EXPECT_EQ(checkReadTimeoutS(1000), 1);
-  EXPECT_EQ(checkReadTimeoutS(1001), 2);
-  EXPECT_EQ(checkReadTimeoutS(59000), 59);
+  constexpr int64_t kAmple = 1000000000; // the open's time is no bound
+  EXPECT_EQ(kCheckReadMinBytesPerS, 1000000);
+  // What is left of the checks' time, when it is more than the floor.
+  EXPECT_EQ(checkReadTimeoutS(388, 59000, kAmple), 59);
+  EXPECT_EQ(checkReadTimeoutS(388, 6001, kAmple), 7) << "rounded up";
+  EXPECT_EQ(checkReadTimeoutS(60, 30000, kAmple), 30) << "the directory's record";
+  // The floor, when the checks' time is spent or nearly: a small read gets 6 s, where it got
+  // what was left (none: an expiry without a send).
+  EXPECT_EQ(checkReadTimeoutS(388, 0, kAmple), 6);
+  EXPECT_EQ(checkReadTimeoutS(388, -5000, kAmple), 6) << "past the checks' deadline";
+  EXPECT_EQ(checkReadTimeoutS(388, 1, kAmple), 6);
+  EXPECT_EQ(checkReadTimeoutS(388, 5999, kAmple), 6);
+  EXPECT_EQ(checkReadTimeoutS(0, 0, kAmple), 5) << "no length: the floor alone";
+  EXPECT_EQ(checkReadTimeoutS(1, 0, kAmple), 6);
+  EXPECT_EQ(checkReadTimeoutS(1000000, 0, kAmple), 6);
+  EXPECT_EQ(checkReadTimeoutS(1000001, 0, kAmple), 7);
+  EXPECT_EQ(checkReadTimeoutS(2400000, 0, kAmple), 8) << "the file set's longest list, 2.4 MB";
+  EXPECT_EQ(checkReadTimeoutS(kRootKeysListMaxBytes, 0, kAmple), 22) << "the longest list, 16 MiB";
+  EXPECT_EQ(checkReadTimeoutS(kRootKeysListMaxBytes, 10000, kAmple), 22);
+  EXPECT_EQ(checkReadTimeoutS(kRootKeysListMaxBytes, 30000, kAmple), 30);
+  EXPECT_EQ(checkReadTimeoutS(UINT32_MAX, 0, kAmple), 5 + 4295) << "no overflow";
+  // Never past the open's own time.
+  EXPECT_EQ(checkReadTimeoutS(388, 0, 3000), 3);
+  EXPECT_EQ(checkReadTimeoutS(388, 0, 2001), 3) << "rounded up";
+  EXPECT_EQ(checkReadTimeoutS(388, 59000, 10000), 10);
+  EXPECT_EQ(checkReadTimeoutS(kRootKeysListMaxBytes, 0, 7000), 7);
+  EXPECT_EQ(checkReadTimeoutS(388, 59000, 1), 1);
+  EXPECT_EQ(checkReadTimeoutS(388, 59000, 0), 0) << "none left of the open's time: an expiry";
+  EXPECT_EQ(checkReadTimeoutS(388, 59000, -1), 0);
+  EXPECT_EQ(checkReadTimeoutS(388, 0, -60000), 0);
 }
 
 namespace {

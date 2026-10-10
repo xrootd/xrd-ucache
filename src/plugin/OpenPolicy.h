@@ -209,6 +209,13 @@ OpenStep stepAfterHeaderRead(const ChainView& v, int code, int errNo, bool exclu
 // copy answers it; a direct URL's open is made once more for such a failure, as the client
 // would have made it.
 bool clientRecoversRead(int code);
+// Whether an open attempt whose checks' read failed (`headerFailed`) with `code`, the
+// `sourceAttempt`-th at its source, is made once more at that source where the open would
+// otherwise end with that failure (a direct URL, the last open of the reader's own URL, a
+// sequence whose bounds are spent or that has no other copy left): the first attempt there, and a
+// failure the client would have recovered (clientRecoversRead) by opening the file again, had its
+// recovery been on for the read. A file the reader opens without uCache stays readable with it.
+bool openOnceMoreAfterCheckRead(bool headerFailed, int sourceAttempt, int code);
 
 // Whether a copy of `path` that reports `size` bytes is a bad copy for that file: no
 // bytes in a file named *.root (a ROOT file is never empty). For any other name a size of
@@ -294,16 +301,22 @@ void rootCheckRead(RootHeaderVerdict& v, const unsigned char* b, size_t n);
 // floor gives a copy that answered its open at the very end of that limit a moment to answer
 // the read (one round trip to a server that has just answered). It is the margin that budgetS
 // keeps between an open's budget and the client's stream error window, so a read that starts
-// at the end of the budget still ends inside that window. The checks' further reads share it
-// (checkReadTimeoutS): the floor is given once, to all of them.
+// at the end of the budget still ends inside that window.
 inline constexpr int kHeaderReadFloorS = 5;
 static_assert(kHeaderReadFloorS >= 1 && kHeaderReadFloorS < kOpenDeadlineS,
               "the header read's floor is a moment, never a fresh open deadline");
 int headerReadTimeoutS(int attemptLimitS, int64_t elapsedMs);
-// The time limit, in seconds, of a further read of the checks made at open: what is left of the
-// time the checks were given when their first read was sent (headerReadTimeoutS), `leftMs`,
-// rounded up; 0 when none is left (the copy has run out of time, as for a read that expired).
-int checkReadTimeoutS(int64_t leftMs);
+// The time limit, in seconds, of a further read of the checks made at open (the top directory's
+// record, the list of top-level objects), of `len` bytes: what is left of the time the checks were
+// given when their first read was sent (headerReadTimeoutS), `leftMs`, or the read's own floor when
+// that is more: kHeaderReadFloorS and its length at kCheckReadMinBytesPerS, rounded up (6 s for a
+// few KB, 22 s for a list of 16 MiB), so that a slow but working copy is not refused because an
+// earlier read used the time. Never more than `openLeftMs`, what is left of the open's own time:
+// its budget (budgetS) and the margin of kHeaderReadFloorS it keeps before the client's stream
+// error window, so that the open still ends inside that window. Rounded up; 0 when none is left
+// of the open's time (the copy has run out of time, as for a read that expired).
+inline constexpr int64_t kCheckReadMinBytesPerS = 1000000;
+int checkReadTimeoutS(uint32_t len, int64_t leftMs, int64_t openLeftMs);
 
 // The host name a retry's tried= may carry for hop `i` of a chain, or "" when
 // it may not: never a redirector, nor the first host, nor an address or a

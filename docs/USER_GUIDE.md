@@ -839,11 +839,15 @@ tree, RNTuple or histogram lies; a list over 16 MiB is not read). It refuses a c
   list, and keep what it finds);
 - whose server answers any of those reads short.
 
-The reads share what is left of that attempt's time (at least 5 s), and one of them that
-fails or runs out of time is a failure of the copy, as an open's would be. For them the
-client's own recovery of a read and its following of a server's redirect are off, so that
-no other copy answers them; at a URL that names a server directly, the open is made once
-more when the client would have recovered the read itself. A copy whose size is larger
+The first read gets what is left of that attempt's time (at least 5 s); each later one gets
+what is left of that, or its own floor when that is more (5 s and 1 s for each MB it reads),
+within the open's own time; and one of them that fails or runs out of time is a failure of
+the copy, as an open's would be. For them the client's own recovery of a read and its
+following of a server's redirect are off, so that no other copy answers them. Where the open
+would end with such a failure (a URL that names a server directly, the last open of the
+job's own URL after a copy on tape was passed over, no other copy left to try, or the open's
+bounds spent), the open is made once more at the same place when the client would have
+recovered the read itself (a lost connection or session), as it would have. A copy whose size is larger
 than the end its header states is not refused: ROOT reads such a file normally and ignores
 the bytes past that end (a file updated in place, bytes appended). The list of top-level
 objects and the objects it names are held to the copy's size, not to that end, since ROOT

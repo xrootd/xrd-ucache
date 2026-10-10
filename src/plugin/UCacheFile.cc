@@ -794,7 +794,11 @@ enum class Next : uint8_t {
 // when a bound stops the sequence. An empty ROOT file is not: with no other copy to try
 // the open ends with kRefuse, and its error names every copy (FailoverSeq::finalError).
 // When no other site opens a file whose copy on tape was passed over, one last open of
-// the reader's own URL is made and its answer stands, unless the copy is empty. Counts
+// the reader's own URL is made and its answer stands, unless the copy is empty. An open
+// whose checks' read failed in a way the client would have recovered, had its recovery been
+// on for that read (OpenPolicy.h openOnceMoreAfterCheckRead), is made once more at the same
+// source wherever it would otherwise end there: at a direct URL, at the last open of the
+// reader's own URL, and when the sequence's bounds are spent or no other copy is left. Counts
 // the retries.
 // Throws nothing: for want of memory the open ends with this answer.
 Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XRootDStatus& s,
@@ -807,15 +811,18 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
   // once, the open of a direct URL whose header read failed in a way the client would have
   // recovered by opening the file again, had its recovery been on for that read.
   const bool elsewhere = w.v.viaRedirector && w.v.hops > 1;
-  const bool retried =
-      (sourceAttempt <= cfg.openRetries && isRetryableOpen(s.code, s.errNo) &&
-       !(seq && s.code == xrdwire::kErrOperationExpired && elsewhere)) ||
-      (w.headerFailed && sourceAttempt == 1 && !elsewhere && clientRecoversRead(s.code));
-  if (!ok && retried) {
+  const bool onceMore =
+      !ok && openOnceMoreAfterCheckRead(w.headerFailed, sourceAttempt, s.code) && !processExiting();
+  const auto sameSource = [&st] {
     if (st.store)
       st.store->stats().openRetries.fetch_add(1, std::memory_order_relaxed);
     return Next::kSameSource;
-  }
+  };
+  const bool retried = (sourceAttempt <= cfg.openRetries && isRetryableOpen(s.code, s.errNo) &&
+                        !(seq && s.code == xrdwire::kErrOperationExpired && elsewhere)) ||
+                       (onceMore && !elsewhere);
+  if (!ok && retried)
+    return sameSource();
   if (!ok && sourceAttempt > 1 && st.store) // retried at this source and still failed
     st.store->stats().openRetriesExhausted.fetch_add(1, std::memory_order_relaxed);
   if (!seq)
@@ -868,8 +875,9 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
         noteBadCopy(st, f.server, f.error);
       return Next::kRefuse;
     };
-    if (seq->lastResort) // the last open: whatever it answers stands, but an empty ROOT file
-      return refused ? refuse() : Next::kDone;
+    if (seq->lastResort) // the last open: whatever it answers stands, but an empty ROOT file;
+      // a failed read of its checks that the client would have recovered is made once more
+      return refused ? refuse() : onceMore ? sameSource() : Next::kDone;
     const bool onCandidate = seq->onCandidate;
     seq->onCandidate = false;
     seq->noteChain(w, s);
@@ -904,10 +912,13 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     if (!goOn) {
       if (refused)
         return refuse();
-      if (ok || !seq->sawOffline || processExiting())
-        return Next::kDone;
-      seq->lastResort = true; // see FailoverSeq::sawOffline
-      return Next::kElsewhere;
+      if (!ok && seq->sawOffline && !processExiting()) {
+        seq->lastResort = true; // see FailoverSeq::sawOffline
+        return Next::kElsewhere;
+      }
+      // The sequence ends here (its bounds are spent, or no other copy is left): a failed read of
+      // the checks that the client would have recovered is made once more, as it would have.
+      return onceMore ? sameSource() : Next::kDone;
     }
     if (offline)
       seq->sawOffline = true;
@@ -1420,8 +1431,9 @@ class RetryingOpenHandler : public ResponseHandler {
   // reader's open completes the copy's first bytes are read and judged (OpenPolicy.h
   // rootHeaderVerdict), then each further read they ask for -- the top directory's record when
   // long names place it past the first bytes, the list of top-level objects -- is made on the same
-  // File and judged (rootCheckRead), until the verdict is final. Together they get what is left of
-  // the attempt's own time when the first is sent (headerReadTimeoutS, checkReadTimeoutS). A read
+  // File and judged (rootCheckRead), until the verdict is final. The first gets what is left of the
+  // attempt's own time (headerReadTimeoutS), which the later ones share, each at least its own
+  // floor for its length, within the open's own time (checkReadTimeoutS). A read
   // that fails or runs out of time is a failure of the copy, as an open's would be. No other copy
   // may answer them: the client's recovery of a read (an open of the file again through the
   // redirector, after a lost connection) and its following of a server's redirect are off on the
@@ -1581,8 +1593,10 @@ class RetryingOpenHandler : public ResponseHandler {
     issueCheckRead(hr, at, want, fault);
   }
   // Issues the read: the first within what is left of the attempt's time (it sets the checks'
-  // deadline), each further one within what is left of that deadline; `fault`: a test's fault
-  // strikes it. A read that cannot be sent is answered here.
+  // deadline), each further one within what is left of that deadline or its own floor for its
+  // length, whichever is more, and never past the open's own time (the sequence's budget and the
+  // floor's margin); `fault`: a test's fault strikes it. A read that cannot be sent is answered
+  // here.
   void issueCheckRead(HeaderRead* hr, uint64_t at, uint32_t want, bool fault) {
     const uint64_t now = nowUs();
     int limitS = 0;
@@ -1590,8 +1604,11 @@ class RetryingOpenHandler : public ResponseHandler {
       limitS = headerReadTimeoutS(a_.timeoutS, static_cast<int64_t>((now - a_.t0) / 1000));
       hr->deadlineUs = now + static_cast<uint64_t>(limitS) * 1000000;
     } else {
+      const int64_t openLeftMs = (seq_ ? seq_->remainingMs() : int64_t(kOpenDeadlineS) * 1000) +
+                                 int64_t(kHeaderReadFloorS) * 1000;
       limitS = checkReadTimeoutS(
-          hr->deadlineUs > now ? static_cast<int64_t>((hr->deadlineUs - now) / 1000) : 0);
+          want, hr->deadlineUs > now ? static_cast<int64_t>((hr->deadlineUs - now) / 1000) : 0,
+          openLeftMs);
     }
     const bool answeredShort = fault && gHeaderFaultKind == HeaderFault::kShort && want >= 2;
     XRootDStatus rs(XrdCl::stError, XrdCl::errInvalidOp, 0, "the handle is closed");

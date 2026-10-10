@@ -973,6 +973,20 @@ TEST(OpenPolicy, RootFileEnd) {
   EXPECT_EQ(rootFileEnd(b.data(), b.size()), 2147483648ll) << "never negative";
   b = header("root", 1062002, ~0ull, true);
   EXPECT_EQ(rootFileEnd(b.data(), b.size()), LLONG_MAX) << "an end no file has: it equals no size";
+  // The version is a signed integer, as ROOT reads it: one whose top bit is set is negative,
+  // below a million, and marks a 32-bit end (ROOT opens such a file as a small one).
+  b = header("root", 0x80000000u | 62002, 123456789, false);
+  EXPECT_EQ(rootFileEnd(b.data(), b.size()), 123456789) << "the top bit of a small file's version";
+  EXPECT_EQ(rootFileEnd(b.data(), 16), 123456789) << "its 32-bit end is whole at 16 bytes";
+  b = header("root", 0x80000000u, 4242, false);
+  EXPECT_EQ(rootFileEnd(b.data(), b.size()), 4242) << "the top bit alone";
+  b = header("root", 0xFFFFFFFFu, 4242, false);
+  EXPECT_EQ(rootFileEnd(b.data(), b.size()), 4242) << "a version of -1";
+  // A 64-bit header with the top bit set in its version is read with 32-bit fields, as ROOT reads
+  // it: the end is the top half of the 64-bit end (and ROOT refuses the file, its first record
+  // lying past that end).
+  b = header("root", 0x80000000u | 1062002, 5000000000ull, true);
+  EXPECT_EQ(rootFileEnd(b.data(), b.size()), 1) << "the top 32 bits of 5000000000";
   // Not a ROOT file's first bytes, whatever follows the first four.
   for (const char* magic : {"Root", "ROOT", "toor", "roo\0", "\0\0\0\0"}) {
     b = header(magic, 62002, 4242, false);
@@ -1024,6 +1038,10 @@ TEST(OpenPolicy, RootHeaderVerdict) {
       {62002, false, 300, 299, K::kBad, "299 bytes of a file of 300"},
       {62002, false, 250, 250, K::kConfirmed, "a copy shorter than 300 bytes, whole"},
       {62002, false, 0, 6559, K::kBad, "an end of 0, before the first record: ROOT refuses it"},
+      {0x80000000u | 62002, false, 6559, 6559, K::kConfirmed,
+       "the top bit of the version set: a small file to ROOT, which opens it"},
+      {0x80000000u | 62002, false, 6559, 10561, K::kNoClaim, "the same, longer"},
+      {0x80000000u | 62002, false, 6559, 3000, K::kBad, "the same, cut"},
   };
   for (const EndRow& r : ends) {
     const auto b = first(header("root", r.version, static_cast<uint64_t>(r.end), r.wide), r.size);
@@ -1134,6 +1152,23 @@ TEST(OpenPolicy, ClientRecoversRead) {
                    kErrSocketDisconnected, kErrDataError, kErrErrorResponse, kErrNotFound,
                    kErrRedirectLimit, kErrAuthFailed})
     EXPECT_FALSE(clientRecoversRead(code)) << code;
+}
+
+// Where an open would end with a failed read of its checks, the open is made once more at the same
+// source when the client would have recovered that read: once (the first attempt there), and only
+// for a failed read of the checks.
+TEST(OpenPolicy, OpenOnceMoreAfterCheckRead) {
+  for (int code : {kErrSocketError, kErrSocketTimeout, kErrInvalidSession, kErrTlsError,
+                   kErrOperationInterrupted, kErrInternal, kErrRedirect}) {
+    EXPECT_TRUE(openOnceMoreAfterCheckRead(true, 1, code)) << code;
+    EXPECT_FALSE(openOnceMoreAfterCheckRead(true, 2, code)) << code << ": once at a source";
+    EXPECT_FALSE(openOnceMoreAfterCheckRead(true, 3, code)) << code;
+    EXPECT_FALSE(openOnceMoreAfterCheckRead(false, 1, code)) << code << ": an open's own failure";
+  }
+  // A failure the client would not have recovered either: the open ends as it would without uCache.
+  for (int code : {kErrConnectionError, kErrOperationExpired, kErrStreamDisconnect, kErrDataError,
+                   kErrErrorResponse, kErrNotFound, 0})
+    EXPECT_FALSE(openOnceMoreAfterCheckRead(true, 1, code)) << code;
 }
 
 // A short answer counts against a copy only when the request lies wholly inside the confirmed size.

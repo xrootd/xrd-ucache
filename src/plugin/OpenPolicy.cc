@@ -289,6 +289,10 @@ bool clientRecoversRead(int code) {
   }
 }
 
+bool openOnceMoreAfterCheckRead(bool headerFailed, int sourceAttempt, int code) {
+  return headerFailed && sourceAttempt == 1 && clientRecoversRead(code);
+}
+
 bool rootNamed(const std::string& path) {
   const size_t end = path.find('?');
   const size_t n = end == std::string::npos ? path.size() : end;
@@ -317,11 +321,14 @@ uint64_t bigEndian(const unsigned char* b, size_t at, int bytes) {
   return v;
 }
 // Where the end's field of a header with these first bytes ends: 16, or 20 for a 64-bit end;
-// 0 when the version is not there yet.
+// 0 when the version is not there yet. The version is a signed 32-bit integer, as TFile::Init
+// reads it (`fVersion < 1000000`: 32-bit fields), so one whose top bit is set is negative and
+// marks 32-bit fields, as for ROOT.
 size_t endFieldEnd(const unsigned char* b, size_t n) {
   if (n < 8)
     return 0;
-  return bigEndian(b, 4, 4) >= 1000000 ? 20 : 16;
+  const int32_t version = static_cast<int32_t>(static_cast<uint32_t>(bigEndian(b, 4, 4)));
+  return version >= 1000000 ? 20 : 16;
 }
 } // namespace
 
@@ -522,10 +529,14 @@ int headerReadTimeoutS(int attemptLimitS, int64_t elapsedMs) {
   return static_cast<int>(std::max<int64_t>(kHeaderReadFloorS, std::min<int64_t>(leftS, limitMs / 1000)));
 }
 
-int checkReadTimeoutS(int64_t leftMs) {
-  if (leftMs <= 0)
+int checkReadTimeoutS(uint32_t len, int64_t leftMs, int64_t openLeftMs) {
+  if (openLeftMs <= 0)
     return 0;
-  return static_cast<int>(std::min<int64_t>((leftMs + 999) / 1000, INT_MAX));
+  const int64_t floorS =
+      kHeaderReadFloorS + (int64_t(len) + kCheckReadMinBytesPerS - 1) / kCheckReadMinBytesPerS;
+  const int64_t leftS = leftMs > 0 ? (leftMs + 999) / 1000 : 0;
+  const int64_t capS = openLeftMs / 1000 + (openLeftMs % 1000 ? 1 : 0);
+  return static_cast<int>(std::min<int64_t>({std::max(leftS, floorS), capS, INT_MAX}));
 }
 
 std::string exclusionName(const std::vector<Hop>& hops, int i) {
