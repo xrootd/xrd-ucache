@@ -892,7 +892,10 @@ stalls as well), uCache asks the regional redirector where the file is (a
 (a copy on tape is not opened; a copy that does not answer within 10 s has
 failed), and opens the first that answers directly,
 or through its own redirector when it is one, naming the servers that failed
-there; hosts the cache's allow and deny lists refuse are never tried. The
+there. For a file uCache caches, hosts its allow and deny lists refuse are never
+tried; for a file whose reads it passes straight to the origin (the lists leave the
+host of the job's URL out) the lists say nothing of where it is read, and every
+copy listed may be tried. The
 copies listed are tried within the same bounds. A server that failed, and the
 other servers in the domain of its name, are left to the end: when only copies
 at such places are left, they are tried too, the oldest failure first.
@@ -917,10 +920,12 @@ answering, the connection was lost, the request expired, or the server
 reported a fault of its own or of its storage, is not the job's to see: uCache
 opens the file again at another site as it does for an open (above), takes only
 a copy of the size the job was shown, and issues the read again in full, so the
-job gets the bytes. The server it left is tried last from then on; the cache's
-allow and deny lists narrow the copies a read moves to as they do an open's, so when
-the redirector sends the open back to a server that failed and the lists refuse
-every other copy the regional redirector lists, that server is taken. A read that
+job gets the bytes. The server it left is tried last from then on. For a file
+uCache caches, its allow and deny lists narrow the copies a read moves to as they do
+an open's, so when the redirector sends the open back to a server that failed and the
+lists refuse every other copy the regional redirector lists, that server is taken; for
+a file whose reads it passes straight to the origin they do not, and a read moves to
+any copy listed. A read that
 failed because of what it asked for (an unsupported or invalid request) fails
 as it does without uCache. One failed read serves every read that fails while
 the file is being opened elsewhere; a read is tried at up to 4 servers, within

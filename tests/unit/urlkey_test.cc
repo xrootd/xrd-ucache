@@ -86,6 +86,15 @@ TEST(UrlKey, HostGlobs) {
   EXPECT_FALSE(hostMatchesAny({"*.cern.ch"}, "cern.ch"));
   EXPECT_FALSE(hostMatchesAny({}, "anything"));
   EXPECT_TRUE(hostMatchesAny({"a", "b", "eos*"}, "eospublic.cern.ch"));
+  // Both lists: on the allow list (or none given) and not on the deny list.
+  EXPECT_TRUE(hostPassesLists({}, {}, "eospublic.cern.ch")) << "no lists: every host";
+  EXPECT_TRUE(hostPassesLists({"*.cern.ch"}, {}, "eospublic.cern.ch"));
+  EXPECT_FALSE(hostPassesLists({"*.cern.ch"}, {}, "xrootd.example.org")) << "not on the allow list";
+  EXPECT_FALSE(hostPassesLists({}, {"eos*"}, "eospublic.cern.ch")) << "on the deny list";
+  EXPECT_FALSE(hostPassesLists({"*.cern.ch"}, {"eos*"}, "eospublic.cern.ch")) << "deny wins";
+  EXPECT_TRUE(hostPassesLists({"*.cern.ch"}, {"eos*"}, "xrootd.cern.ch"));
+  EXPECT_TRUE(hostPassesLists({}, {"127.0.0.1"}, "::1")) << "an address is a host like any other";
+  EXPECT_FALSE(hostPassesLists({"nohost.invalid"}, {}, "127.0.0.1"));
 }
 
 // Removing named parameters leaves everything else byte for byte (auth tokens

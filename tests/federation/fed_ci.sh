@@ -88,7 +88,9 @@
 #                          the cache) moves too, to a copy of the size its reader's open was
 #                          shown, never back to the server its read failed at, and once every
 #                          server has failed, to the oldest failure (servers named as IPv6
-#                          addresses where localhost is IPv6 first). With the
+#                          addresses where localhost is IPv6 first); so does one whose host no allow
+#                          list names (the lists, which say which files uCache caches, do not narrow
+#                          where the reads of a file they leave out move). With the
 #                          switch off the failed reads are relayed on the same file and
 #                          the client's read recovery stays on
 #   cut after the open     the file is named *.root, its copies are whole, and the copy the handle
@@ -610,9 +612,8 @@ clean relay; verdict "relay: a PgRead and a VectorRead into one buffer that fail
 # stat of its own, and moves to a copy of the size its reader's open was shown. Every read of it is
 # relayed, the first one (the Read that arms a cached handle) too, so three fail. The reader opens
 # the regional as localhost and that name is denied; the servers the regional lists answer from
-# 127.0.0.1, which the lists leave alone. (The lists also narrow the copies a move may take: had they
-# refused 127.0.0.1 too, a move the regional sends back to the server it left would have no other
-# copy to take, and would take that one.)
+# 127.0.0.1. (The lists say which files uCache caches; for a file they leave out they do not narrow
+# the copies a move may take: see "no host allowed" below.)
 RFX=(UCACHE_DENY=localhost) RFHOST=localhost
 rf relay 3 on relay -denied
 RFX=() RFHOST=127.0.0.1
@@ -631,6 +632,23 @@ SB=$(recs "$RFC" open | grep '"route":"read"' | grep -vc '"attempt":1,')
 [ "$away" = 1 ]; verdict "relay, host denied: each move landed away from the server its read failed at (failed ${FL[*]}; landed ${MV[*]}; $SB later attempts of moves)" $?
 [ "${#FL[@]}" = 3 ] && [ "$(printf '%s\n' "${FL[@]}" | sort -u | wc -l)" = 3 ] && [ "${MV[2]:-}" = "${FL[0]}" ] && [ "$SB" -ge 1 ]
 verdict "relay, host denied: with every server failed, the third move was sent back and then took the oldest failure, ${FL[0]} (landed ${MV[2]:-none})" $?
+# The same with an allow list that names no host at all, so it leaves out the regional's name and every copy's
+# address too: the file is not cached, and the lists, which say which files uCache caches, do not narrow where
+# its reads move: each move takes a copy the regional lists, as above. (Were the lists to narrow them, every
+# copy would be refused, and a move the regional sends back to the server it left would take that one.)
+RFX=(UCACHE_ALLOW=nohost.invalid) RFHOST=localhost
+rf relay 3 on relay -allownone
+RFX=() RFHOST=127.0.0.1
+clean relay; verdict "relay, no host allowed: a Read, a PgRead and a VectorRead that failed are exact, once, and move the handle" $?
+[ "$(find "$RFC" -name '*.meta' | wc -l)" = 0 ]; verdict "relay, no host allowed: nothing is cached" $?
+[ "$(recs "$RFC" origin_failure | field op | tr '\n' ' ')" = "relay relay relay " ] && [ "${#MV[@]}" = 3 ] &&
+  [ "$(recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | grep -c '"size":8388608,')" = 3 ]
+verdict "relay, no host allowed: three failed relayed reads, three moves, each to a copy of 8388608 bytes (${MV[*]})" $?
+away=1; for i in 0 1 2; do [ -n "${MV[$i]:-}" ] && [ "${MV[$i]}" != "${FL[$i]:-}" ] || away=0; done
+SB=$(recs "$RFC" open | grep '"route":"read"' | grep -vc '"attempt":1,')
+[ "$away" = 1 ]; verdict "relay, no host allowed: each move landed away from the server its read failed at (failed ${FL[*]}; landed ${MV[*]}; $SB later attempts of moves)" $?
+[ "${#FL[@]}" = 3 ] && [ "$(printf '%s\n' "${FL[@]}" | sort -u | wc -l)" = 3 ] && [ "${MV[2]:-}" = "${FL[0]}" ] && [ "$SB" -ge 1 ]
+verdict "relay, no host allowed: with every server failed, the third move was sent back and then took the oldest failure from the regional's list, ${FL[0]} (landed ${MV[2]:-none})" $?
 
 rf refuse 3 on refuse
 clean refuse; verdict "refuse: reads the client refused at once are exact, once" $?

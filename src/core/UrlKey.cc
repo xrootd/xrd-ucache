@@ -135,6 +135,11 @@ bool hostMatchesAny(const std::vector<std::string>& globs, const std::string& ho
   return false;
 }
 
+bool hostPassesLists(const std::vector<std::string>& allow, const std::vector<std::string>& deny,
+                     const std::string& host) {
+  return (allow.empty() || hostMatchesAny(allow, host)) && !hostMatchesAny(deny, host);
+}
+
 std::string stripCgiParams(const std::string& url, const std::vector<std::string>& names) {
   auto q = url.find('?');
   if (q == std::string::npos)

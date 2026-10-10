@@ -32,6 +32,11 @@ struct UrlKey {
 
 // fnmatch-style glob matching for UCACHE_ALLOW/DENY host lists.
 bool hostMatchesAny(const std::vector<std::string>& globs, const std::string& host);
+// Whether `host` passes the cache's allow and deny lists: on the allow list (or the list is
+// empty), and not on the deny list. Matched against the host of a job's URL, it says whether
+// uCache caches the file.
+bool hostPassesLists(const std::vector<std::string>& allow, const std::vector<std::string>& deny,
+                     const std::string& host);
 
 // Remove the named CGI parameters from a URL, preserving everything else
 // (auth tokens, xrd.* options) byte-for-byte.

@@ -1084,10 +1084,15 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
   const Config& cfg = globalConfig();
   if (!q.located) {
     q.located = true;
+    // The cache's allow and deny lists say which files it caches: they are matched against the
+    // host of the job's URL (ensureEntry). For a file it caches they also narrow the copies the
+    // regional lists; for a file it passes straight to the origin they do not, and its open's
+    // failover and its reads' moves may take every copy listed.
+    const auto key = UrlKey::parse(st.url, cfg.keepCgi);
+    const bool cached = key && hostPassesLists(cfg.allowHosts, cfg.denyHosts, key->host);
     std::vector<Location> listed;
     for (const Location& l : locateCopies(st, q, XrdCl::URL(base).GetPath()))
-      if ((cfg.allowHosts.empty() || hostMatchesAny(cfg.allowHosts, l.host)) &&
-          !hostMatchesAny(cfg.denyHosts, l.host))
+      if (!cached || hostPassesLists(cfg.allowHosts, cfg.denyHosts, l.host))
         listed.push_back(l);
     q.cands = orderLocations(listed, triedHosts(base), q.failed);
   }
@@ -4310,9 +4315,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
                                     // cost 65k opens multiply on a slow disk
   const Config& cfg = globalConfig();
   auto key = UrlKey::parse(st_->url, cfg.keepCgi);
-  bool allowed = key &&
-                 (cfg.allowHosts.empty() || hostMatchesAny(cfg.allowHosts, key->host)) &&
-                 !hostMatchesAny(cfg.denyHosts, key->host);
+  bool allowed = key && hostPassesLists(cfg.allowHosts, cfg.denyHosts, key->host);
   std::shared_ptr<FileEntry> entry;
   std::shared_ptr<ColdFill> cold;
   std::unique_ptr<XrdCl::StatInfo> statClone;
