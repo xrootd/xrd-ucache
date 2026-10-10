@@ -1328,6 +1328,20 @@ void noteAnswer(const OpenAttempt& a, const OpenAnswer& ans, const std::string& 
     noteRefusedOpen(a, ans.status, url);
 }
 
+// The advice the error of a failed open carries when the cache holds an earlier copy of the file
+// (defined below, beside the freshness marker).
+std::string staleEntryAdviceFor(const std::string& url) noexcept;
+
+// Whether the cache caches the file `st` reads: it has a store, and the host of the reader's URL
+// passes the allow and deny lists, as ensureEntry asks. (A handle the cache passes straight to the
+// origin, a copy's or a writer's, never gets this far.)
+bool cachesFile(const HandleState& st, const Config& cfg) {
+  if (!st.store)
+    return false;
+  const auto key = UrlKey::parse(st.url, cfg.keepCgi);
+  return key && hostPassesLists(cfg.allowHosts, cfg.denyHosts, key->host);
+}
+
 // ---- The reader's open, retried --------------------------------------------
 // Wraps the reader's open handler to retry an open that failed, each time on a
 // FRESH inner file (a failed open is terminal on the object):
@@ -1348,16 +1362,6 @@ void noteAnswer(const OpenAttempt& a, const OpenAnswer& ans, const std::string& 
 // failed over, an error naming every site that failed. Then deletes itself.
 // Captures only st_ (never the plugin object): a posted step may run after
 // Open has returned.
-// Whether the cache caches the file `st` reads: it has a store, and the host of the reader's URL
-// passes the allow and deny lists, as ensureEntry asks. (A handle the cache passes straight to the
-// origin, a copy's or a writer's, never gets this far.)
-bool cachesFile(const HandleState& st, const Config& cfg) {
-  if (!st.store)
-    return false;
-  const auto key = UrlKey::parse(st.url, cfg.keepCgi);
-  return key && hostPassesLists(cfg.allowHosts, cfg.denyHosts, key->host);
-}
-
 class RetryingOpenHandler : public ResponseHandler {
  public:
   RetryingOpenHandler(std::shared_ptr<HandleState> st, std::string url,
@@ -1763,6 +1767,8 @@ class RetryingOpenHandler : public ResponseHandler {
     case Next::kDone:
       if (opened) // the copy whose header could not be read is open
         moveExecutor().post([self] { self->doRefuse(); });
+      else if (seq_ && record_) // its error looks for an earlier copy in the cache: not on this thread
+        moveExecutor().post([self] { self->forwardFailure(); });
       else
         forwardFailure();
       break;
@@ -1832,8 +1838,17 @@ class RetryingOpenHandler : public ResponseHandler {
 
   void forwardFailure() {
     // Once it has failed over, an error naming every site that failed.
-    const XRootDStatus out =
-        seq_ ? seq_->finalError(*st_, recordFile(st_->url), lastStatus_) : lastStatus_;
+    XRootDStatus out = seq_ ? seq_->finalError(*st_, recordFile(st_->url), lastStatus_) : lastStatus_;
+    // With adaptive_federation on, no copy passed: when the cache holds an earlier copy of the file,
+    // the error says so, and how to read it without asking an origin. The entry is left as it is.
+    if (seq_ && record_) {
+      const std::string advice = staleEntryAdviceFor(st_->url);
+      if (!advice.empty()) {
+        out = XRootDStatus(out.status, out.code, out.errNo,
+                           withAdvice(out.GetErrorMessage(), advice));
+        UCACHE_INFO("%s: %s", recordFile(st_->url).c_str(), advice.c_str());
+      }
+    }
     // The hosts of the last attempt that went through any, else a non-null
     // empty HostList: the native completion contract (see complete()).
     HostList* hosts = lastHosts_ ? lastHosts_.release() : new HostList();
@@ -2001,6 +2016,31 @@ void touchVal(const UrlKey& key, const std::string& cacheDir) {
   if (fd >= 0)
     RealIO::instance().close(fd);
 }
+// The advice of an open that failed with adaptive_federation on (OpenPolicy.h staleEntryAdvice):
+// the cache holds an entry of the file that a job with a longer freshness window would be served,
+// as Open trusts one (cacheFresh) and ensureEntry sets it up: the allow and deny lists let the cache
+// cache the file, its freshness marker says when it was last confirmed at an origin, and its
+// sidecar loads, of the file's key. "" otherwise (an entry made with a window of 0 has no marker).
+// Reads the sidecar's summary (no page checksums): not for a client callback thread.
+std::string staleEntryAdviceFor(const std::string& url) noexcept try {
+  const Config& cfg = globalConfig();
+  const auto key = UrlKey::parse(url, cfg.keepCgi);
+  if (!key || cfg.cacheDir.empty() || !hostPassesLists(cfg.allowHosts, cfg.denyHosts, key->host))
+    return std::string();
+  struct ::stat vs;
+  if (RealIO::instance().stat(valPath(*key, cfg.cacheDir), &vs) != 0)
+    return std::string();
+  const auto m = MetaFile::loadSummary(RealIO::instance(), key->metaPath(cfg.cacheDir));
+  if (!m || m->key != key->key)
+    return std::string();
+  const int64_t now = static_cast<int64_t>(::time(nullptr));
+  const int64_t at = static_cast<int64_t>(vs.st_mtime);
+  return staleEntryAdvice(now > at ? static_cast<uint64_t>(now - at) : 0, m->cachedBytes(),
+                          m->fileSize);
+} catch (...) {
+  return std::string();
+}
+
 bool cacheFresh(const UrlKey& key, const std::string& cacheDir, int revalidateSeconds) {
   struct ::stat st;
   if (RealIO::instance().stat(valPath(key, cacheDir), &st) != 0)

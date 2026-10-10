@@ -552,6 +552,78 @@ ByteSpan checkReadSpan(bool keep, uint32_t pageSize, uint64_t size, uint64_t at,
   return ByteSpan{r.first, r.second - r.first, true};
 }
 
+std::string ageText(uint64_t s) {
+  struct Unit {
+    uint64_t secs;
+    const char* name;
+  };
+  static constexpr Unit kUnits[] = {{86400, "day"}, {3600, "hour"}, {60, "minute"}, {1, "second"}};
+  for (const Unit& u : kUnits)
+    if (s >= u.secs || u.secs == 1) {
+      const uint64_t n = s / u.secs;
+      return std::to_string(n) + " " + u.name + (n == 1 ? "" : "s");
+    }
+  return std::string(); // not reached: the last unit takes any value
+}
+
+std::string bytesText(uint64_t n) {
+  if (n < 1000)
+    return std::to_string(n) + (n == 1 ? " byte" : " bytes");
+  static constexpr const char* kUnits[] = {"kB", "MB", "GB", "TB", "PB"};
+  double v = static_cast<double>(n) / 1000.0;
+  size_t k = 0;
+  while (v >= 999.95 && k + 1 < sizeof kUnits / sizeof kUnits[0]) {
+    v /= 1000.0;
+    ++k;
+  }
+  char b[48];
+  std::snprintf(b, sizeof b, "%.1f %s", v, kUnits[k]);
+  return b;
+}
+
+uint64_t suggestedWindowS(uint64_t ageS) {
+  constexpr uint64_t kDay = 86400;
+  constexpr uint64_t kMax = uint64_t(INT_MAX) / kDay * kDay;
+  if (ageS >= kMax)
+    return kMax;
+  return std::min(kMax, (ageS + kDay + kDay - 1) / kDay * kDay);
+}
+
+std::string staleEntryAdvice(uint64_t ageS, uint64_t held, uint64_t size) {
+  if (held == 0 && size > 0)
+    return std::string(); // nothing of the file to read from the cache
+  const bool whole = held >= size;
+  std::string out = "uCache holds an earlier copy of this file, last confirmed at an origin " +
+                    ageText(ageS) + " ago, holding ";
+  if (whole) {
+    out += "the whole file (" + bytesText(size) + ")";
+  } else {
+    const uint64_t pct = size ? static_cast<uint64_t>((static_cast<long double>(held) * 100) / size) : 0;
+    out += bytesText(held) + " of its " + bytesText(size) + " (" +
+           (pct == 0 ? std::string("less than 1%") : std::to_string(pct) + "%") + ")";
+  }
+  out += ": a job run with a freshness window longer than that (UCACHE_REVALIDATE_S=" +
+         std::to_string(suggestedWindowS(ageS)) +
+         ", or revalidate_seconds in ucache.conf) reads ";
+  out += whole ? "it" : "the parts it holds";
+  out += " from the cache without asking an origin";
+  if (!whole)
+    out += "; reads of the parts it does not hold will still fail";
+  return out;
+}
+
+std::string withAdvice(const std::string& text, const std::string& advice, size_t max) {
+  if (advice.empty())
+    return text;
+  if (text.empty())
+    return advice.size() <= max ? advice : text;
+  const std::string join = text.back() == '.' ? " " : ". ";
+  if (advice.size() + join.size() > max)
+    return text;
+  const size_t room = max - advice.size() - join.size();
+  return (text.size() > room ? text.substr(0, room) : text) + join + advice;
+}
+
 std::string exclusionName(const std::vector<Hop>& hops, int i) {
   if (i <= 0 || static_cast<size_t>(i) >= hops.size())
     return std::string();
@@ -797,7 +869,7 @@ std::string sitesFailedList(const std::vector<SiteFailure>& failed) {
 std::string allSitesFailedText(const std::string& file, const std::vector<SiteFailure>& failed) {
   const std::string out =
       "uCache: " + withoutQueries(file, 300) + ": no site could open it: " + sitesFailedList(failed);
-  return out.size() > 1024 ? out.substr(0, 1024) : out;
+  return out.size() > kErrorTextMax ? out.substr(0, kErrorTextMax) : out;
 }
 
 std::string noCopyServedText(const std::string& file, const std::vector<SiteFailure>& failed) {
@@ -810,7 +882,7 @@ std::string noCopyServedText(const std::string& file, const std::vector<SiteFail
       out += ", " + std::to_string(failed[i].size) + " bytes";
     out += "): " + withoutQueries(failed[i].error, 160);
   }
-  return out.size() > 1024 ? out.substr(0, 1024) : out;
+  return out.size() > kErrorTextMax ? out.substr(0, kErrorTextMax) : out;
 }
 
 std::string escapeForJson(const std::string& s) {

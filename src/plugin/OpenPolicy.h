@@ -341,6 +341,40 @@ struct ByteSpan {
 ByteSpan checkReadSpan(bool keep, uint32_t pageSize, uint64_t size, uint64_t at, uint64_t len,
                        uint64_t room);
 
+// ---- An earlier copy of the file, when no copy passes at the open (adaptive_federation on) ----
+// When the freshness window of the file's entry has expired and no copy passes at the open (each
+// is refused by a check or cannot be reached), the open fails with the one error that names the
+// copies, and uCache does not serve the entry on its own judgment. When it holds one, the error
+// says so and how to go on: a job run with a freshness window longer than the entry's age reads it
+// from the cache without asking an origin (that window applies to every file the job opens). The
+// entry is kept.
+//
+// `seconds` in plain words, in the largest unit it fills: "1 second", "59 seconds", "1 minute",
+// "59 minutes", "1 hour", "23 hours", "1 day", "400 days" (each rounded down).
+std::string ageText(uint64_t seconds);
+// A number of bytes in plain words: "1 byte", "999 bytes", then one decimal in kB, MB, GB, TB, PB
+// (powers of 1000): "1.0 kB", "1.8 MB".
+std::string bytesText(uint64_t n);
+// The freshness window to suggest for an entry `ageS` seconds old: its age and a day, rounded up to
+// whole days (86400 for an age of 0, 172800 for an age of 5 s); never more than INT_MAX rounded
+// down to whole days, the most the setting holds.
+uint64_t suggestedWindowS(uint64_t ageS);
+// The advice for an entry `ageS` seconds after its last confirmation at an origin, holding `held`
+// bytes of the file's `size`: "uCache holds an earlier copy of this file, last confirmed at an
+// origin <age> ago, holding the whole file (<size>): a job run with a freshness window longer than
+// that (UCACHE_REVALIDATE_S=<suggestedWindowS>, or revalidate_seconds in ucache.conf) reads it from
+// the cache without asking an origin". An entry that holds only part of the file: "holding <held>
+// of its <size> (<percent>)", "reads the parts it holds from the cache without asking an origin;
+// reads of the parts it does not hold will still fail". "" for an entry that holds nothing.
+std::string staleEntryAdvice(uint64_t ageS, uint64_t held, uint64_t size);
+// The bound on the text of the error that names every copy (allSitesFailedText, noCopyServedText).
+inline constexpr size_t kErrorTextMax = 1024;
+// `text` and then `advice`, the whole at most `max` bytes: `text` is cut first, so the advice is
+// whole at the end (joined with ". ", or a blank after a text that ends with "."). `text` alone when
+// `advice` is empty or longer than `max` with its join; `advice` alone when `text` is empty.
+std::string withAdvice(const std::string& text, const std::string& advice,
+                       size_t max = kErrorTextMax);
+
 // The host name a retry's tried= may carry for hop `i` of a chain, or "" when
 // it may not: never a redirector, nor the first host, nor an address or a
 // name without a dot (neither masks a server at a redirector), nor a data

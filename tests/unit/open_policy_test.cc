@@ -1257,3 +1257,95 @@ TEST(OpenPolicy, CheckReadSpan) {
       << "wraps";
   EXPECT_EQ(kOpenCheckKeepBytes, 1u << 20);
 }
+
+// The age, the size and the window the advice of a failed open gives, in plain words.
+TEST(OpenPolicy, AgeBytesAndWindowText) {
+  EXPECT_EQ(ageText(0), "0 seconds");
+  EXPECT_EQ(ageText(1), "1 second");
+  EXPECT_EQ(ageText(59), "59 seconds");
+  EXPECT_EQ(ageText(60), "1 minute");
+  EXPECT_EQ(ageText(119), "1 minute");
+  EXPECT_EQ(ageText(120), "2 minutes");
+  EXPECT_EQ(ageText(3599), "59 minutes");
+  EXPECT_EQ(ageText(3600), "1 hour");
+  EXPECT_EQ(ageText(86399), "23 hours");
+  EXPECT_EQ(ageText(86400), "1 day");
+  EXPECT_EQ(ageText(8 * 86400 + 5000), "8 days");
+  EXPECT_EQ(ageText(400 * 86400), "400 days");
+  EXPECT_EQ(bytesText(0), "0 bytes");
+  EXPECT_EQ(bytesText(1), "1 byte");
+  EXPECT_EQ(bytesText(999), "999 bytes");
+  EXPECT_EQ(bytesText(1000), "1.0 kB");
+  EXPECT_EQ(bytesText(131072), "131.1 kB");
+  EXPECT_EQ(bytesText(999949), "999.9 kB");
+  EXPECT_EQ(bytesText(999950), "1.0 MB") << "never 1000.0 kB";
+  EXPECT_EQ(bytesText(1756917), "1.8 MB");
+  EXPECT_EQ(bytesText(16935324), "16.9 MB");
+  EXPECT_EQ(bytesText(4200000000ull), "4.2 GB");
+  EXPECT_EQ(bytesText(3000000000000ull), "3.0 TB");
+  EXPECT_EQ(bytesText(UINT64_MAX), "18446.7 PB") << "the largest unit stays";
+  // The window: the age and a day, rounded up to whole days.
+  EXPECT_EQ(suggestedWindowS(0), 86400u);
+  EXPECT_EQ(suggestedWindowS(5), 172800u);
+  EXPECT_EQ(suggestedWindowS(86399), 172800u);
+  EXPECT_EQ(suggestedWindowS(86400), 172800u);
+  EXPECT_EQ(suggestedWindowS(86401), 259200u);
+  EXPECT_EQ(suggestedWindowS(8 * 86400 + 5000), 10u * 86400);
+  for (uint64_t a : {0ull, 1ull, 59ull, 86399ull, 86400ull, 700000ull, 9ull * 86400 + 1}) {
+    EXPECT_GT(suggestedWindowS(a), a + 86399) << a << ": at least a day longer than the age";
+    EXPECT_EQ(suggestedWindowS(a) % 86400, 0u) << a;
+  }
+  constexpr uint64_t kMax = uint64_t(INT_MAX) / 86400 * 86400;
+  EXPECT_EQ(suggestedWindowS(kMax - 86400), kMax);
+  EXPECT_EQ(suggestedWindowS(kMax), kMax) << "the most the setting holds";
+  EXPECT_EQ(suggestedWindowS(UINT64_MAX), kMax);
+}
+
+// The advice of an open that no copy passed, when the cache holds an earlier copy of the file.
+TEST(OpenPolicy, StaleEntryAdvice) {
+  EXPECT_EQ(staleEntryAdvice(5, 1756917, 1756917),
+            "uCache holds an earlier copy of this file, last confirmed at an origin 5 seconds ago, "
+            "holding the whole file (1.8 MB): a job run with a freshness window longer than that "
+            "(UCACHE_REVALIDATE_S=172800, or revalidate_seconds in ucache.conf) reads it from the "
+            "cache without asking an origin");
+  EXPECT_EQ(staleEntryAdvice(8 * 86400 + 5000, 131072, 1756917),
+            "uCache holds an earlier copy of this file, last confirmed at an origin 8 days ago, "
+            "holding 131.1 kB of its 1.8 MB (7%): a job run with a freshness window longer than "
+            "that (UCACHE_REVALIDATE_S=864000, or revalidate_seconds in ucache.conf) reads the "
+            "parts it holds from the cache without asking an origin; reads of the parts it does "
+            "not hold will still fail");
+  // A part rounds down, never to the whole file; a sliver says so.
+  EXPECT_NE(staleEntryAdvice(1, 999999, 1000000).find("(99%)"), std::string::npos);
+  EXPECT_NE(staleEntryAdvice(1, 4096, 4000000000ull).find("(less than 1%)"), std::string::npos);
+  EXPECT_NE(staleEntryAdvice(1, 999999, 1000000).find("will still fail"), std::string::npos);
+  // An entry that holds nothing gives no advice (nothing could be read from it); an empty file is
+  // held whole.
+  EXPECT_EQ(staleEntryAdvice(5, 0, 1756917), "");
+  EXPECT_NE(staleEntryAdvice(5, 0, 0).find("holding the whole file (0 bytes)"), std::string::npos);
+  // Short enough to fit beside the copies (kErrorTextMax).
+  EXPECT_LE(staleEntryAdvice(UINT64_MAX, UINT64_MAX - 1, UINT64_MAX).size(), 400u);
+}
+
+// The advice goes after the error's text, whole: the text is cut first, within the bound.
+TEST(OpenPolicy, WithAdvice) {
+  const std::string advice = staleEntryAdvice(5, 131072, 1756917);
+  EXPECT_EQ(withAdvice("uCache: /f.root: no site could open it: a (a:1): refused", advice),
+            "uCache: /f.root: no site could open it: a (a:1): refused. " + advice);
+  EXPECT_EQ(withAdvice("ends with a period.", "Advice"), "ends with a period. Advice");
+  EXPECT_EQ(withAdvice("text", ""), "text") << "no advice";
+  EXPECT_EQ(withAdvice("", advice), advice) << "no text";
+  // A text of every copy at the bound: cut, so the whole stays at the bound and the advice is whole.
+  std::vector<SiteFailure> many(20, {"s.x.org:1094", "x.org", "s.x.org", std::string(500, 'e')});
+  const std::string list = allSitesFailedText("root://r//store/f.root", many);
+  ASSERT_EQ(list.size(), kErrorTextMax);
+  const std::string t = withAdvice(list, advice);
+  EXPECT_EQ(t.size(), kErrorTextMax);
+  EXPECT_EQ(t.substr(t.size() - advice.size()), advice) << "the advice is never cut";
+  EXPECT_EQ(t.rfind("uCache: root://r//store/f.root: no site could open it: x.org (s.x.org:1094): ", 0), 0u)
+      << "the text's start, which names the file and the first copy, stays";
+  EXPECT_EQ(withAdvice(std::string(5000, 't'), advice, 2048).size(), 2048u);
+  // An advice that does not fit the bound with its join is not added.
+  EXPECT_EQ(withAdvice("text", std::string(1023, 'a')), "text");
+  EXPECT_EQ(withAdvice("text", std::string(1022, 'a')).size(), 1024u);
+  EXPECT_EQ(withAdvice("", std::string(1025, 'a')), "");
+}

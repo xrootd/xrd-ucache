@@ -708,7 +708,14 @@ it.
   even when the remote is down or flaky. When the window expires, the next
   open re-checks the origin file's size (and, with
   `UCACHE_VALIDATE=size+mtime`, its mtime); a changed file is re-cached. Set
-  `revalidate_seconds = 0` to re-check on every open.
+  `revalidate_seconds = 0` to re-check on every open. With
+  `adaptive_federation = on`, when that re-check finds no copy that passes
+  (each refused by the checks at open, or none reachable), the open fails and
+  the old entry is not served; the error then says that uCache holds an earlier
+  copy, how long ago it was last confirmed at an origin, how much of the file it
+  holds, and the window with which a job reads it from the cache without asking
+  an origin (`UCACHE_REVALIDATE_S=<seconds>`; TROUBLESHOOTING.md). The entry is
+  kept.
 - **Fail-open.** Every failure path degrades to a normal uncached read.
 - **Servers to avoid (`?tried=`).** A reader can keep a redirector from
   sending it to a given server by adding `?tried=<full host name>` (a comma
@@ -878,7 +885,10 @@ the origin and finds only copies of another size fails with one error naming the
 next open checks the origin again). After the window the next open checks the origin
 and reads the header of the copy it lands on: a copy that fails the check is refused, and
 one that passes at another size (the file was rewritten) replaces the entry and becomes
-its confirmed size. With `revalidate_seconds = 0` every open does so.
+its confirmed size. With `revalidate_seconds = 0` every open does so. When no copy passes at
+that open, the job's open fails with the one error that names the copies, and the entry is
+not served; when uCache holds one, the error says so and how to read it from the cache
+(TROUBLESHOOTING.md, "The open fails, and the error says uCache holds an earlier copy").
 When no other site opens a file whose copy on tape was passed over, it is opened once
 more as the job asked for it and that answer stands, so a file that is readable
 without uCache stays readable. When every copy is refused for what it is (empty, or its header or its list of top-level objects not those of a whole ROOT file;

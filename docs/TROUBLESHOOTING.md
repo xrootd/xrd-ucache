@@ -383,6 +383,41 @@ The counters `open_failovers`, `opens_recovered`, `opens_failed_everywhere`,
 per-file record file has a line per attempt (FORMAT.md, routes `failover` and
 `candidate`).
 
+## The open fails, and the error says uCache holds an earlier copy
+
+With `adaptive_federation = on`, once the freshness window of the cache's entry for a file
+has passed (`revalidate_seconds`, 7 days by default), the next open checks the file at an
+origin. When no copy passes (each is refused by the checks made at open, or none can be
+reached), the open fails with the one error that names every copy tried, and uCache does
+not serve the entry it holds on its own judgment: it cannot tell a bad copy from a file
+that changed. When it holds one, the error ends with, for example:
+
+```
+uCache holds an earlier copy of this file, last confirmed at an origin 8 days ago, holding
+the whole file (1.8 MB): a job run with a freshness window longer than that
+(UCACHE_REVALIDATE_S=864000, or revalidate_seconds in ucache.conf) reads it from the cache
+without asking an origin
+```
+
+The age is the time since an open last validated the entry at an origin; the window
+suggested is that age and a day, rounded up to whole days. The copies named come first: a
+site that is down may come back, and a copy refused for what it is is worth reporting to its
+site. To go on meanwhile with what uCache holds, run the job with the window suggested
+(`UCACHE_REVALIDATE_S=864000 ./my_job`, or `revalidate_seconds` in ucache.conf): its opens
+of files whose entries were confirmed within that window are answered from the cache, with
+no request to any origin. That window applies to every file the job opens, not only this
+one, so a file rewritten at its origin within it is read as cached: set it for that job
+only. When the entry holds only part of the file, the error says how much (`holding 131.1 kB
+of its 1.8 MB (7%)`) and that reads of the parts it does not hold will still fail: they need
+an origin, and no copy passes. When the copies such a read then finds are of another size
+than the entry's, the read fails with the error that names them and the entry's freshness
+marker is removed, so later opens check an origin again (and the advice is not given again
+for that entry). The entry itself is kept: this failure does not drop it, an open that later
+finds a copy that passes validates it again (a copy that passes at another size replaces
+it), and eviction removes it as any other. An entry made only by jobs run with
+`revalidate_seconds = 0` has no record of when it was confirmed (no marker is written), and
+the error gives no advice for it.
+
 ## uCache read the file at another site
 
 With `adaptive_federation = on`, a read that fails at the server a file was
