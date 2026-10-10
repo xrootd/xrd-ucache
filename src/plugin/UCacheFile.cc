@@ -5606,6 +5606,11 @@ bool UCacheFile::IsOpen() const {
   return cacheOpen_ || st_->inner.load()->IsOpen();
 }
 
+// UCACHE_TEST_PROP_DELAY_MS (inert unless set, read at load): a test's wait, in SetProperty,
+// between the recording of a reader's setting and its setting on the File, so that a test can have
+// the checks made at open begin in between.
+static const int gPropDelayMs = envAtLoad("UCACHE_TEST_PROP_DELAY_MS");
+
 bool UCacheFile::SetProperty(const std::string& name, const std::string& value) {
   st_->syncFork();
   const bool recovery = name == "ReadRecovery" || name == "WriteRecovery";
@@ -5626,6 +5631,8 @@ bool UCacheFile::SetProperty(const std::string& name, const std::string& value) 
     if (st_->headerReading && (recovery || name == "FollowRedirects"))
       return true;
   }
+  if (gPropDelayMs > 0)
+    std::this_thread::sleep_for(std::chrono::milliseconds(gPropDelayMs));
   // On an armed handle the reader cannot turn the client's read recovery back
   // on: the handle's own reads depend on it being off.
   if (recovery && st_->moveOnReads)

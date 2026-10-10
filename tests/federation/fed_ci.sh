@@ -46,7 +46,9 @@
 #                          connection error, or _KIND=short, answered short): at every copy the
 #                          open fails naming each, at the first copy only the open goes on to
 #                          another; either way the reader's open gets exactly one completion,
-#                          and uCache closes each copy it opened
+#                          and uCache closes each copy it opened. A ReadRecovery the reader sets
+#                          just as the checks begin is on the File before they turn it off: it
+#                          reads false during their reads, and the reader's value after them
 #   zeros at the size      one server holds as many zero bytes as the file has (a, b and c in
 #                          turn), the other two the file: the copy of zeros does not begin as a
 #                          ROOT file does and is refused; the open goes on to a whole copy
@@ -408,7 +410,21 @@ for kind in error short; do
   verdict "header read failing ($kind) at the first copy: the fault struck there and the open went on to another attempt" $?
   echo "$res" | grep -q '^open-failover: clean$'; verdict "header read failing ($kind) at the first copy: exactly one completion, a success, the file's own bytes" $?
   records "$W/c20-$kind" | tail -1 | grep -q "\"status\":\"ok\".*\"size\":$FIXW_SIZE,.*\"outcome\":\"ok\""; verdict "header read failing ($kind) at the first copy: the last attempt is ok, at a whole copy" $?
+  # Each copy opened was closed: the ones refused by uCache, the one taken by the reader's own close (open-failover
+  # closes its File after its read).
+  NATT=$(records "$W/c20-$kind" | wc -l); CC=$(copies_closed "$W/f20-$kind.log")
+  [ "${CC% *}" = "$NATT" ] && [ "${CC#* }" = "$NATT" ]; verdict "header read failing ($kind) at the first copy: each copy that was opened was closed (opened, closed: $CC; $NATT attempts)" $?
 done
+# A ReadRecovery the reader sets just as the checks begin (UCACHE_TEST_PROP_DELAY_MS holds it between its
+# recording and its setting on the File; the checks' first read is sent 5 s late): it is on the File before the
+# checks turn the recovery off, so it reads false while their reads are in flight, and the reader's true after.
+L=/store/ci/prop-race.root
+placew $L a b c
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_PROP_DELAY_MS=2000 UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay)
+res=$(fuzz "$W/c24" "$W/f24.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-property-race)
+echo "$res" | sed 's/^/    /' | cut -c1-300
+echo "$res" | grep -q '^open-property-race: clean$'; verdict "a setting made as the checks at open begin: ReadRecovery false during their reads, the reader's true after, one completion" $?
+[ "$(nheader "$W/f24.log")" = 1 ] && records "$W/c24" | grep -q '"status":"ok"'; verdict "the checks' first read was sent once, late, and the open succeeded (the fault was in place)" $?
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on) # the cases below have no header fault
 
 echo; echo "=== a copy that is zeros at the file's size is refused"
@@ -603,6 +619,10 @@ place8() { # LFN server... (8 MiB)
 # CACHE -> the lines of one kind of its per-file records
 recs() { cat "$1"/stats/*.files.jsonl 2>/dev/null | grep "\"kind\":\"$2\""; }
 field() { sed -n "s/.*\"$1\":\"\{0,1\}\([^\",}]*\).*/\1/p"; } # a field of each line
+# A server as its port: the three data servers share one address, and the form of that address in a record or a
+# property depends on the address family the client reached the regional over (localhost may be 127.0.0.1 or
+# ::1, which names them 127.0.0.1:P, [::1]:P or [::ffff:127.0.0.1]:P), so the port is what tells them apart.
+pnorm() { sed -E 's/(^| )[^ ]*:([0-9]+)/\1\2/g'; }
 # rf CASE N SWITCH [KIND [TAG]]: the case on a file of its own (TAG tells two runs of one case apart);
 # sets RES, RFC (its cache), SV (the servers it read from). RFX: more of the client's environment;
 # RFHOST: the name the reader opens the regional by.
@@ -615,9 +635,9 @@ rf() {
   FEDENV=(UCACHE_ADAPTIVE_FEDERATION=$sw UCACHE_TEST_READ_FAIL_N=$n ${kind:+UCACHE_TEST_READ_FAIL_KIND=$kind} "${RFX[@]}")
   RES=$(fuzz "$RFC" "$W/rf-$c-${kind:-x}$tag.log" "root://$RFHOST:$RX/$l" "$W/f8.bin" 1 1 1 read-failover $c)
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-220
-  SV=($(echo "$RES" | sed -n 's/^SERVERS //p'))
-  FL=($(recs "$RFC" origin_failure | field data_server))   # the server of each failed read
-  MV=($(recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | field data_server)) # where each move landed
+  SV=($(echo "$RES" | sed -n 's/^SERVERS //p' | pnorm))       # as ports (pnorm), as FL and MV
+  FL=($(recs "$RFC" origin_failure | field data_server | pnorm))   # the server of each failed read
+  MV=($(recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | field data_server | pnorm)) # where each move landed
   NRA=$(recs "$RFC" open | grep -c '"route":"read"')       # open attempts of moves
 }
 clean() { echo "$RES" | grep -q "^read-failover $1: clean\$"; }
@@ -650,7 +670,9 @@ verdict "relay, host denied: three failed relayed reads, three moves, each to a 
 # open back there (it cannot be told to avoid an address): the move then takes another copy the regional
 # lists. By the third every server has failed, so the regional's answer is always sent back, and the list
 # gives the failed servers the oldest failure first: the third move lands where the first read failed.
-# The reader reaches the servers as the regional names them, [::1] where localhost is IPv6 first.
+# The reader reaches the servers as the regional names them, [::1] where localhost is IPv6 first: the checks
+# compare servers by their ports (pnorm), so they hold whichever address localhost gives. The deny list names
+# localhost, the host of the job's URL, never a server's address, so the file is not cached either way.
 away=1; for i in 0 1 2; do [ -n "${MV[$i]:-}" ] && [ "${MV[$i]}" != "${FL[$i]:-}" ] || away=0; done
 SB=$(recs "$RFC" open | grep '"route":"read"' | grep -vc '"attempt":1,')
 [ "$away" = 1 ]; verdict "relay, host denied: each move landed away from the server its read failed at (failed ${FL[*]}; landed ${MV[*]}; $SB later attempts of moves)" $?
@@ -744,10 +766,10 @@ zr() {
   FEDENV=(UCACHE_ADAPTIVE_FEDERATION=$sw UCACHE_CHECK_ORIGIN_INTEGRITY=on ${land:+UCACHE_ZERO_CMD=$W/zero.sh ZERO_LFN=$l})
   RES=$(fuzz "$RFC" "$W/zr$n.log" "root://127.0.0.1:$RX/$l" "$FIX" 1 1 1 read-failover $c)
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-220
-  SV=($(echo "$RES" | sed -n 's/^SERVERS //p'))
+  SV=($(echo "$RES" | sed -n 's/^SERVERS //p' | pnorm))
   F14=$(recs "$RFC" origin_failure | grep -c '"code":14,')
-  FL=($(recs "$RFC" origin_failure | grep '"code":14,' | field data_server))
-  MV=($(recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | field data_server))
+  FL=($(recs "$RFC" origin_failure | grep '"code":14,' | field data_server | pnorm))
+  MV=($(recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | field data_server | pnorm))
   NRA=$(recs "$RFC" open | grep -c '"route":"read"')
 }
 clean_zr() { echo "$RES" | grep -q "^read-failover $1: clean\$"; }
@@ -810,7 +832,7 @@ ct() {
   FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on ${script:+UCACHE_CUT_CMD=$W/$script.sh CUT_LFN=$l})
   RES=$(fuzz "$RFC" "$W/ct$n.log" "root://127.0.0.1:$RX/$l" "$FIXW" 1 1 1 read-failover $c)
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-300
-  SV=($(echo "$RES" | sed -n 's/^SERVERS //p'))
+  SV=($(echo "$RES" | sed -n 's/^SERVERS //p' | pnorm))
   F14=$(recs "$RFC" origin_failure | grep -c '"op":"read".*"code":14,\|"op":"relay".*"code":14,')
   F14OPS=$(recs "$RFC" origin_failure | grep '"code":14,' | field op | tr '\n' ' ')
   NRA=$(recs "$RFC" open | grep -c '"route":"read"')

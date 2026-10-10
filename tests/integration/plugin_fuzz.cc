@@ -25,6 +25,9 @@
 // Two more cover an open made again, with adaptive_federation on:
 //   open-property      a property set while the open is retried reaches the
 //                      File that replaces the first (see runOpenProperty)
+//   open-property-race a ReadRecovery set just as the checks made at open
+//                      begin does not land on the File during their reads
+//                      (see runOpenPropertyRace)
 //   open-failover [N]  N opens through a redirector where a server refuses
 //                      the file: exactly one completion each (see runOpenFailover)
 //   open-denied        one open of a file that every server refuses: Open()
@@ -1193,6 +1196,53 @@ int runOpenProperty(const char* url) {
   return good ? 0 : 1;
 }
 
+// open-property-race: ReadRecovery set by the reader just as the checks made at open begin (a file
+// named *.root, adaptive_federation on). The checks turn the File's recovery off for their reads
+// and give the reader's setting back after them; a setting recorded just before they begin must
+// be on the File before they turn it off, never after. UCACHE_TEST_PROP_DELAY_MS (2000 or more)
+// holds the setting between its recording and its setting on the File, and the checks' first read
+// is sent late (UCACHE_TEST_HEADER_FAIL_N=1, _KIND=delay: 5 s), so that their reads are in flight
+// when the reader looks: 3.5 s after the open is issued, ReadRecovery must read false; after the
+// open, the reader's true.
+int runOpenPropertyRace(const char* url) {
+  const char* mode = "open-property-race";
+  if (envInt("UCACHE_TEST_PROP_DELAY_MS", 0) < 2000 ||
+      envInt("UCACHE_TEST_HEADER_FAIL_N", 0) != 1) {
+    std::printf("%s: SETUP: needs UCACHE_TEST_PROP_DELAY_MS>=2000 and UCACHE_TEST_HEADER_FAIL_N=1 "
+                "(_KIND=delay)\n",
+                mode);
+    return 2;
+  }
+  auto* f = new XrdCl::File(); // leaked with its handler: a late completion lands safely
+  auto* h = new StrictOpenHandler();
+  const auto t0 = std::chrono::steady_clock::now();
+  const XrdCl::XRootDStatus st = f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h);
+  bool set = false;
+  std::thread setter([&] { set = f->SetProperty("ReadRecovery", "true"); });
+  std::this_thread::sleep_until(t0 + std::chrono::milliseconds(3500));
+  std::string during;
+  const bool gotDuring = f->GetProperty("ReadRecovery", during);
+  const bool doneEarly = h->count() > 0; // the checks' reads were still in flight
+  setter.join();
+  if (!st.IsOK() || !h->succeededWithin(std::chrono::seconds(60))) {
+    std::printf("%s: FAIL: the open (Open() %s, %d completion(s))\n", mode, st.ToString().c_str(),
+                h->count());
+    return 1;
+  }
+  std::string after;
+  const bool gotAfter = f->GetProperty("ReadRecovery", after);
+  std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a second completion
+  std::printf("%s: SetProperty %s; ReadRecovery during the checks' reads: %s%s, after the open: "
+              "%s; %d completion(s)\n",
+              mode, set ? "ok" : "refused", gotDuring ? during.c_str() : "(none)",
+              doneEarly ? " (the open had already completed)" : "",
+              gotAfter ? after.c_str() : "(none)", h->count());
+  const bool good = set && !doneEarly && gotDuring && during == "false" && gotAfter &&
+                    after == "true" && h->exactlyOne();
+  std::printf(good ? "%s: clean\n" : "%s: FAIL\n", mode);
+  return good ? 0 : 1;
+}
+
 // open-failover N: N opens, one after another, each with its own handler,
 // through a redirector where a server refuses the file (the gate's fault):
 // every open must get exactly one completion, a success, with a host list,
@@ -1725,12 +1775,12 @@ int runReadFailover(const char* url, const char* local, const std::string& which
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    std::fprintf(
-        stderr,
-        "usage: %s <root-url> <local-path> [ops] [threads] [seed] "
-        "[fuzz|inner-race|inner-race-relay|open-refused|open-property|open-failover|open-denied|"
-        "key-check <off> <len>|read-failover <case>]\n",
-        argv[0]);
+    std::fprintf(stderr,
+                 "usage: %s <root-url> <local-path> [ops] [threads] [seed] "
+                 "[fuzz|inner-race|inner-race-relay|open-refused|open-property|open-property-race|"
+                 "open-failover|open-denied|"
+                 "key-check <off> <len>|read-failover <case>]\n",
+                 argv[0]);
     return 2;
   }
   const char* url = argv[1];
@@ -1746,6 +1796,8 @@ int main(int argc, char** argv) {
     return runOpenRefused(url);
   if (mode == "open-property")
     return runOpenProperty(url);
+  if (mode == "open-property-race")
+    return runOpenPropertyRace(url);
   if (mode == "open-failover")
     return runOpenFailover(url, argv[2], argc > 3 ? ::atoi(argv[3]) : 12);
   if (mode == "open-denied")
