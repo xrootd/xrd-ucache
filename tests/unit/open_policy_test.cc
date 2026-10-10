@@ -907,6 +907,10 @@ TEST(OpenPolicy, RootNamed) {
 }
 
 namespace {
+// The first 300 bytes of a ROOT file whose header states `end`: a completed header (the first
+// record at 100, a name record of 58 bytes, no class descriptions or free list placed), and the
+// top directory's record at 158, which places a list of top-level objects of 30 bytes at 218. The
+// rest is filler. (root_check_test.cc builds whole files; these rows are about the first read.)
 std::vector<unsigned char> header(const char* magic, uint32_t version, uint64_t end, bool wide,
                                   size_t n = kRootHeaderBytes) {
   std::vector<unsigned char> b(magic, magic + 4);
@@ -917,6 +921,24 @@ std::vector<unsigned char> header(const char* magic, uint32_t version, uint64_t 
   put(version, 4);
   put(100, 4); // where the first record begins
   put(end, wide ? 8 : 4);
+  put(0, wide ? 8 : 4); // no list of free space
+  put(0, 4);
+  put(1, 4);
+  put(58, 4); // the top directory's name record
+  put(wide ? 8 : 4, 1);
+  put(505, 4);
+  put(0, wide ? 8 : 4); // no class descriptions
+  put(0, 4);
+  while (b.size() < 158)
+    b.push_back(0x5a);
+  put(wide ? 1005 : 5, 2); // the top directory's record
+  put(0x12345678, 4);
+  put(0x12345678, 4);
+  put(30, 4); // the list's length
+  put(58, 4);
+  put(100, wide ? 8 : 4);
+  put(0, wide ? 8 : 4);
+  put(218, wide ? 8 : 4); // the list's position
   while (b.size() < kRootHeaderBytes)
     b.push_back(0x5a);
   b.resize(n);
@@ -1001,7 +1023,7 @@ TEST(OpenPolicy, RootHeaderVerdict) {
       {62002, false, 300, 300, K::kConfirmed, "a copy of exactly 300 bytes"},
       {62002, false, 300, 299, K::kBad, "299 bytes of a file of 300"},
       {62002, false, 250, 250, K::kConfirmed, "a copy shorter than 300 bytes, whole"},
-      {62002, false, 0, 6559, K::kNoClaim, "an end of 0 says nothing yet"},
+      {62002, false, 0, 6559, K::kBad, "an end of 0, before the first record: ROOT refuses it"},
   };
   for (const EndRow& r : ends) {
     const auto b = first(header("root", r.version, static_cast<uint64_t>(r.end), r.wide), r.size);
@@ -1009,6 +1031,14 @@ TEST(OpenPolicy, RootHeaderVerdict) {
     EXPECT_EQ(v.kind, r.kind) << r.why;
     EXPECT_EQ(v.end, r.end) << r.why;
     EXPECT_EQ(v.kind == K::kBad, !v.why.empty()) << r.why;
+    // A kind that stands asks for the list of top-level objects next (the verdict is not final).
+    if (v.kind != K::kBad) {
+      EXPECT_EQ(v.next, RootHeaderVerdict::kKeysList) << r.why;
+      EXPECT_EQ(v.nextAt, 218) << r.why;
+      EXPECT_EQ(v.nextLen, 30u) << r.why;
+    } else {
+      EXPECT_EQ(v.next, RootHeaderVerdict::kNone) << r.why;
+    }
   }
   // The cut copy's text names both sizes, as the records and the error say it.
   EXPECT_EQ(verdict(header("root", 62002, 16935324, false), 10161194).why,

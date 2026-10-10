@@ -119,6 +119,8 @@ bool readFaultFire() {
 // UCACHE_TEST_HEADER_FAIL_KIND=short: it is sent for one byte fewer than it needs instead, so
 // the copy's server answers it short; =delay: it is sent kHeaderFaultDelayMs late, so that a
 // test can break the copy's connection between the open's answer and the read.
+// UCACHE_TEST_HEADER_FAIL_STAGE=list: the faults strike the checks' read of the list of top-level
+// objects instead (=dir: the read of the top directory's record, when one is made).
 static std::atomic<int> gHeaderFaultBudget{[] {
   const char* v = ::getenv("UCACHE_TEST_HEADER_FAIL_N");
   return v ? ::atoi(v) : 0;
@@ -128,6 +130,13 @@ static const HeaderFault gHeaderFaultKind = [] {
   const char* v = ::getenv("UCACHE_TEST_HEADER_FAIL_KIND");
   const std::string k = v ? v : "";
   return k == "short" ? HeaderFault::kShort : k == "delay" ? HeaderFault::kDelay : HeaderFault::kError;
+}();
+static const RootHeaderVerdict::Next gHeaderFaultStage = [] {
+  const char* v = ::getenv("UCACHE_TEST_HEADER_FAIL_STAGE");
+  const std::string k = v ? v : "";
+  return k == "list" ? RootHeaderVerdict::kKeysList
+         : k == "dir" ? RootHeaderVerdict::kDirRecord
+                      : RootHeaderVerdict::kNone; // kNone: the first read
 }();
 constexpr uint64_t kHeaderFaultDelayMs = 5000;
 bool headerFaultFires() {
@@ -427,9 +436,10 @@ struct AttemptView {
   std::vector<Hop> hops;
   ChainView v;
   long long statFlags = -1, size = -1;
-  // What the copy's first bytes say of it, when they were read (the reader's open of a file
-  // named *.root, rootHeaderVerdict); kNoClaim when they were not. `headerFailed`: the read of
-  // them failed (the attempt's status is the read's), which is a failure of the copy.
+  // What the checks made at open say of the copy, when they were made (the reader's open of a file
+  // named *.root: rootHeaderVerdict, rootCheckRead); kNoClaim when they were not. `headerFailed`:
+  // one of their reads failed or ran out of time (the attempt's status is the read's), which is a
+  // failure of the copy.
   RootHeaderVerdict header;
   bool headerFailed = false;
 };
@@ -1406,14 +1416,17 @@ class RetryingOpenHandler : public ResponseHandler {
     delete this;
   }
 
-  // The header check: the open succeeded at a copy of a file named *.root, and before the
-  // reader's open completes the first bytes of that copy are read (OpenPolicy.h
-  // rootHeaderVerdict), within what is left of the attempt's own time (headerReadTimeoutS). A
-  // read that fails or runs out of time is a failure of the copy, as an open's would be. No
-  // other copy may answer it: the client's recovery of the read (an open of the file again
-  // through the redirector, after a lost connection) and its following of a server's redirect
-  // are off on the File for the read, and given back when it ends (restoreProps). Never blocks:
-  // the answer is given by the read's completion, on the client's thread, to `finish`.
+  // The checks made at open: the open succeeded at a copy of a file named *.root, and before the
+  // reader's open completes the copy's first bytes are read and judged (OpenPolicy.h
+  // rootHeaderVerdict), then each further read they ask for -- the top directory's record when
+  // long names place it past the first bytes, the list of top-level objects -- is made on the same
+  // File and judged (rootCheckRead), until the verdict is final. Together they get what is left of
+  // the attempt's own time when the first is sent (headerReadTimeoutS, checkReadTimeoutS). A read
+  // that fails or runs out of time is a failure of the copy, as an open's would be. No other copy
+  // may answer them: the client's recovery of a read (an open of the file again through the
+  // redirector, after a lost connection) and its following of a server's redirect are off on the
+  // File for the reads, and given back when the last ends (restoreProps). Never blocks: the answer
+  // is given by the last read's completion, on the client's thread, to `finish`.
   struct HeaderRead : ResponseHandler {
     HeaderRead(RetryingOpenHandler* o, std::unique_ptr<XRootDStatus> s,
                std::unique_ptr<AnyObject> r, std::unique_ptr<HostList> h, AttemptView w)
@@ -1428,22 +1441,44 @@ class RetryingOpenHandler : public ResponseHandler {
                                               : new XRootDStatus(XrdCl::stError, XrdCl::errInternal));
       std::unique_ptr<AnyObject> resp(response);
       std::unique_ptr<HostList> unused(hosts);
-      if (held) {
-        restoreProps();
-        o->st_->releaseInner();
+      if (rs->IsOK()) {
+        XrdCl::ChunkInfo* ci = nullptr;
+        if (resp)
+          resp->Get(ci);
+        const size_t n = ci ? std::min<size_t>(ci->length, buf.size()) : 0;
+        if (stage == RootHeaderVerdict::kNone)
+          w.header = rootHeaderVerdict(buf.data(), n, w.size);
+        else
+          rootCheckRead(w.header, buf.data(), n);
+        resp.reset();
+        if (w.header.next != RootHeaderVerdict::kNone && f) { // the next read, on the same File
+          self.release();
+          o->nextCheckRead(this);
+          return;
+        }
       }
-      if (!rs->IsOK()) { // the copy failed the read: the open's own answer is not the reader's
-        r.reset();
-        w.headerFailed = true;
-        o->finish(std::move(rs), std::move(r), std::move(h), w, /*opened=*/true);
+      end(std::move(self), std::move(rs));
+    }
+    // The checks end with the last read's status `rs`: OK, the verdict in `w` stands; else the copy
+    // failed a read. The File's settings are given back and it is let go; then `finish`.
+    static void end(std::unique_ptr<HeaderRead> self, std::unique_ptr<XRootDStatus> rs) {
+      HeaderRead& hr = *self;
+      if (hr.w.header.next != RootHeaderVerdict::kNone) { // not judged to the end: no claim stands
+        if (hr.w.header.kind == RootHeaderVerdict::kConfirmed)
+          hr.w.header.kind = RootHeaderVerdict::kNoClaim;
+        hr.w.header.next = RootHeaderVerdict::kNone;
+      }
+      if (hr.held) {
+        hr.restoreProps();
+        hr.o->st_->releaseInner();
+      }
+      if (!rs->IsOK()) { // the copy failed a read: the open's own answer is not the reader's
+        hr.r.reset();
+        hr.w.headerFailed = true;
+        hr.o->finish(std::move(rs), std::move(hr.r), std::move(hr.h), hr.w, /*opened=*/true);
         return;
       }
-      XrdCl::ChunkInfo* ci = nullptr;
-      if (resp)
-        resp->Get(ci);
-      const size_t n = ci ? std::min<size_t>(ci->length, sizeof buf) : 0;
-      w.header = rootHeaderVerdict(buf, n, w.size);
-      o->finish(std::move(s), std::move(r), std::move(h), w, /*opened=*/false);
+      hr.o->finish(std::move(hr.s), std::move(hr.r), std::move(hr.h), hr.w, /*opened=*/false);
     }
     // The File's own recovery and redirect settings, as they were before the read, given back
     // to it; the reader's settings of them made meanwhile (kept in readerProps, from
@@ -1486,16 +1521,20 @@ class RetryingOpenHandler : public ResponseHandler {
     std::unique_ptr<AnyObject> r;
     std::unique_ptr<HostList> h;
     AttemptView w;
-    bool held = false;          // the inner file `f` is held for the read (innerOps)
+    bool held = false; // the inner file `f` is held for the reads (innerOps)
     XrdCl::File* f = nullptr;
-    std::string saved[kProps];  // its settings before the read
-    bool have[kProps] = {};     // which of them it answered
-    unsigned char buf[kRootHeaderBytes] = {};
+    std::string saved[kProps]; // its settings before the first read
+    bool have[kProps] = {};    // which of them it answered
+    // The read in flight: kNone for the first, else the one the verdict asked for; its buffer.
+    RootHeaderVerdict::Next stage = RootHeaderVerdict::kNone;
+    std::vector<unsigned char> buf;
+    uint64_t deadlineUs = 0; // the end of the time the checks were given (steady µs)
   };
   void checkHeader(std::unique_ptr<XRootDStatus> s, std::unique_ptr<AnyObject> r,
                    std::unique_ptr<HostList> h, AttemptView w) {
     const size_t want = rootHeaderBytes(w.size);
     auto* hr = new HeaderRead(this, std::move(s), std::move(r), std::move(h), std::move(w));
+    hr->buf.assign(kRootHeaderBytes, 0);
     XrdCl::File* f = nullptr;
     {
       std::lock_guard<std::mutex> g(st_->mu);
@@ -1504,7 +1543,7 @@ class RetryingOpenHandler : public ResponseHandler {
         ++st_->innerOps;
         hr->held = true;
         hr->f = f;
-        st_->headerReading = true; // the reader's settings of these wait for the read's end
+        st_->headerReading = true; // the reader's settings of these wait for the reads' end
         st_->headerProps = st_->readerProps.size();
       }
     }
@@ -1515,26 +1554,55 @@ class RetryingOpenHandler : public ResponseHandler {
           f->SetProperty(HeaderRead::kPropNames[i], "false");
       }
     }
-    const bool fault = f && headerFaultFires();
+    sendCheckRead(hr, 0, want);
+  }
+  // The checks' next read, which the verdict asks for, on the File the first was made on (still
+  // held, its settings still off). Without the memory for its buffer the checks end where they are.
+  void nextCheckRead(HeaderRead* hr) {
+    RootHeaderVerdict& v = hr->w.header;
+    hr->stage = v.next;
+    try {
+      hr->buf.assign(v.nextLen, 0);
+    } catch (...) {
+      return HeaderRead::end(std::unique_ptr<HeaderRead>(hr), std::make_unique<XRootDStatus>());
+    }
+    sendCheckRead(hr, static_cast<uint64_t>(v.nextAt), v.nextLen);
+  }
+  // Sends the read of `hr`'s stage, `want` bytes at `at`, or the test's fault in its place; a
+  // delayed one is posted (never waited for on a client thread) and sent later.
+  void sendCheckRead(HeaderRead* hr, uint64_t at, uint32_t want) {
+    const bool fault = hr->f && hr->stage == gHeaderFaultStage && headerFaultFires();
     if (fault && gHeaderFaultKind == HeaderFault::kDelay) { // a test's: the read is sent late
       RetryingOpenHandler* self = this;
       moveExecutor().postAfter(kHeaderFaultDelayMs,
-                               [self, hr, f, want] { self->issueHeaderRead(hr, f, want, false); });
+                               [self, hr, at, want] { self->issueCheckRead(hr, at, want, false); });
       return;
     }
-    issueHeaderRead(hr, f, want, fault);
+    issueCheckRead(hr, at, want, fault);
   }
-  // Sends the header read of `hr` on `f` (null: the handle closed), `want` bytes, within what is
-  // left of the attempt's time; `fault`: a test's fault strikes it.
-  void issueHeaderRead(HeaderRead* hr, XrdCl::File* f, size_t want, bool fault) {
-    const int limitS = headerReadTimeoutS(a_.timeoutS, static_cast<int64_t>((nowUs() - a_.t0) / 1000));
+  // Issues the read: the first within what is left of the attempt's time (it sets the checks'
+  // deadline), each further one within what is left of that deadline; `fault`: a test's fault
+  // strikes it. A read that cannot be sent is answered here.
+  void issueCheckRead(HeaderRead* hr, uint64_t at, uint32_t want, bool fault) {
+    const uint64_t now = nowUs();
+    int limitS = 0;
+    if (hr->stage == RootHeaderVerdict::kNone) {
+      limitS = headerReadTimeoutS(a_.timeoutS, static_cast<int64_t>((now - a_.t0) / 1000));
+      hr->deadlineUs = now + static_cast<uint64_t>(limitS) * 1000000;
+    } else {
+      limitS = checkReadTimeoutS(
+          hr->deadlineUs > now ? static_cast<int64_t>((hr->deadlineUs - now) / 1000) : 0);
+    }
     const bool answeredShort = fault && gHeaderFaultKind == HeaderFault::kShort && want >= 2;
     XRootDStatus rs(XrdCl::stError, XrdCl::errInvalidOp, 0, "the handle is closed");
     if (fault && !answeredShort)
       rs = XRootDStatus(XrdCl::stError, XrdCl::errConnectionError);
-    else if (f)
-      rs = f->Read(0, static_cast<uint32_t>(answeredShort ? want - 1 : want), hr->buf, hr,
-                   static_cast<ucache::XrdTimeout>(limitS));
+    else if (limitS == 0)
+      rs = XRootDStatus(XrdCl::stError, XrdCl::errOperationExpired, 0,
+                        "the checks made at open ran out of time");
+    else if (hr->f)
+      rs = hr->f->Read(at, answeredShort ? want - 1 : want, hr->buf.data(), hr,
+                       static_cast<ucache::XrdTimeout>(limitS));
     if (!rs.IsOK()) // nothing was sent, so no completion will come: the failure is the answer
       hr->HandleResponseWithHosts(new XRootDStatus(rs), nullptr, nullptr);
   }
@@ -1570,7 +1638,8 @@ class RetryingOpenHandler : public ResponseHandler {
         if (w.size > 0) // the size the reader is shown: its reads move only to a copy of it
           st_->readerOpenSize.store(static_cast<uint64_t>(w.size), std::memory_order_relaxed);
       }
-      if (w.header.kind == RootHeaderVerdict::kConfirmed) // the header says what the copy has
+      if (w.header.kind == RootHeaderVerdict::kConfirmed &&
+          w.header.next == RootHeaderVerdict::kNone) // the header says what the copy has
         st_->confirmedSize.store(static_cast<uint64_t>(w.size), std::memory_order_relaxed);
       return false;
     }

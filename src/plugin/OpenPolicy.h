@@ -13,6 +13,8 @@
 // Thread-safety: pure functions of their arguments; no state.
 #pragma once
 
+#include "RootFormat.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -227,36 +229,75 @@ size_t rootHeaderBytes(long long size);
 // The end of the data the first `n` bytes of `b` state, or -1 when they state none: they do
 // not begin with "root", or end before the end's own field (16 bytes, 20 for a 64-bit end).
 long long rootFileEnd(const unsigned char* b, size_t n);
-// What the header check says of a copy that reports `size` (> 0) bytes, given the `n` bytes
-// that a read of its first rootHeaderBytes(size) answered with:
-//  - kBad, refused (`why` says what is wrong, in words): the read answered fewer bytes than
-//    it asked for inside the copy's size (the copy ends before its reported size); the copy
-//    does not begin with "root" (no ROOT file is without it: ROOT and uproot refuse such a
-//    file; a copy of zeros at the right size is one); it is too short to hold its own header,
-//    up to the end's field; or its size is smaller than the end its header states (a cut copy:
-//    ROOT reports it truncated);
-//  - kConfirmed: its size equals that end, which confirms the file's size;
-//  - kNoClaim: its size is larger than that end. ROOT reads such a file normally and ignores
-//    the bytes past the end (a file updated in place, bytes appended, a writer that stopped
-//    after a save): the copy stands, and nothing is confirmed.
-// The other fields of the header and the top directory's record are not looked at yet.
+// What the checks made at open say of a copy that reports `size` (> 0) bytes. They read what ROOT
+// reads when it opens a file (TFile::Init, TDirectoryFile::ReadKeys): the copy's first bytes, which
+// hold the file's header and, unless long names push it further, the top directory's record; and
+// then the list of top-level objects. rootHeaderVerdict judges the first read, and asks for each
+// further read it needs in `next`; rootCheckRead judges each answer. The verdict is final when
+// `next` is kNone:
+//  - kBad, refused (`why` says what is wrong, in words):
+//     - a read answered fewer bytes than it asked for, inside the copy's size (the copy ends before
+//       its reported size);
+//     - the copy does not begin with "root" (no ROOT file is without it: ROOT and uproot refuse
+//       such a file; a copy of zeros at the right size is one), or is too short to hold its own
+//       header;
+//     - its size is smaller than the end its header states (a cut copy: ROOT reports it truncated);
+//     - the header contradicts itself where ROOT refuses a file for it: the first record begins
+//       inside the header's own fields or past the end of the data; the top directory's name
+//       record is shorter than 10 or longer than 10000 bytes, in the header or in the directory's
+//       record; the directory's record ends past the end of the data;
+//     - in a completed header (one that places the list of top-level objects past the header), a
+//       record it places lies outside the file's records (from the header's begin to the end of
+//       the data): the list of top-level objects, the class descriptions, the list of free space
+//       (a position of 0 for the last two means there is none);
+//     - the list of top-level objects does not carry its own label (its position, its length, and
+//       the top directory as its directory), or an object it lists lies outside the file's records
+//       (its position from the begin to before the end, and its end at or before the end), or has
+//       another directory than the top one, or the list ends inside its entries.
+//  - kConfirmed: its size equals the end its header states, which confirms the file's size;
+//  - kNoClaim: its size is larger than that end (ROOT reads such a file normally and ignores the
+//    bytes past the end: a file updated in place, bytes appended, a writer that stopped after a
+//    save), or the header was never completed: it places no list of top-level objects past the
+//    header (the writer never saved the file; every copy is the same, and ROOT recovers what it
+//    can), which makes no claim on what follows. The copy stands, and nothing is confirmed.
+// The top directory is the record at the header's begin, where ROOT writes it. A list of top-level
+// objects longer than kRootKeysListMaxBytes is not read: the verdict stands as the header gives it.
 struct RootHeaderVerdict {
   enum Kind : uint8_t { kNoClaim, kConfirmed, kBad };
   Kind kind = kNoClaim;
   long long end = -1; // the end the header states; -1 for none
   std::string why;    // kBad: what is wrong with the copy
+  // The read the check needs next, before the verdict is final: the top directory's record (when
+  // it lies past the first bytes) or the list of top-level objects; `nextLen` bytes at `nextAt`.
+  enum Next : uint8_t { kNone, kDirRecord, kKeysList };
+  Next next = kNone;
+  long long nextAt = 0;
+  uint32_t nextLen = 0;
+  long long size = 0;    // the size the copy reported
+  RootFileHeader header; // what the header says, once read
+  RootDirRecord dir;     // what the top directory's record says, once read
 };
+inline constexpr uint32_t kRootKeysListMaxBytes = 16u << 20;
 RootHeaderVerdict rootHeaderVerdict(const unsigned char* b, size_t n, long long size);
+// Judges the answer to the read `v.next` asked for: the `n` bytes of `b`, which a read of
+// `v.nextLen` bytes at `v.nextAt` answered with (fewer than asked: the copy ends there, kBad).
+// Sets the next read the check needs, or kNone. Does nothing when `v` asks for no read.
+void rootCheckRead(RootHeaderVerdict& v, const unsigned char* b, size_t n);
 // The time limit of the header read, in seconds: what is left of the open attempt's own limit
 // (`attemptLimitS`, the attempt issued `elapsedMs` ago), and at least kHeaderReadFloorS. The
 // floor gives a copy that answered its open at the very end of that limit a moment to answer
 // the read (one round trip to a server that has just answered). It is the margin that budgetS
 // keeps between an open's budget and the client's stream error window, so a read that starts
-// at the end of the budget still ends inside that window.
+// at the end of the budget still ends inside that window. The checks' further reads share it
+// (checkReadTimeoutS): the floor is given once, to all of them.
 inline constexpr int kHeaderReadFloorS = 5;
 static_assert(kHeaderReadFloorS >= 1 && kHeaderReadFloorS < kOpenDeadlineS,
               "the header read's floor is a moment, never a fresh open deadline");
 int headerReadTimeoutS(int attemptLimitS, int64_t elapsedMs);
+// The time limit, in seconds, of a further read of the checks made at open: what is left of the
+// time the checks were given when their first read was sent (headerReadTimeoutS), `leftMs`,
+// rounded up; 0 when none is left (the copy has run out of time, as for a read that expired).
+int checkReadTimeoutS(int64_t leftMs);
 
 // The host name a retry's tried= may carry for hop `i` of a chain, or "" when
 // it may not: never a redirector, nor the first host, nor an address or a

@@ -36,6 +36,7 @@ add_executable(ucache-unit-tests
   unit/fault_test.cc
   unit/open_retry_test.cc
   unit/open_policy_test.cc
+  unit/root_check_test.cc
   unit/executor_test.cc
   unit/copyguard_test.cc
   unit/runlog_test.cc
@@ -51,6 +52,7 @@ add_executable(ucache-unit-tests
   ${CMAKE_SOURCE_DIR}/src/plugin/CopyGuard.cc  # the truncated-copy guard (pure policy)
   ${CMAKE_SOURCE_DIR}/src/plugin/OpenRetry.cc  # pure policy TU (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/OpenPolicy.cc # what an open's answer says (no XrdCl)
+  ${CMAKE_SOURCE_DIR}/src/plugin/RootFormat.cc # a ROOT file's header and labels (pure parsing)
   ${CMAKE_SOURCE_DIR}/src/plugin/Executor.cc   # thread pool (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/OriginInFlight.cc # per-server read counts (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/cli/RunLog.cc        # run reader (pure file parsing)
@@ -83,14 +85,15 @@ target_compile_definitions(ucache-unit-tests PRIVATE
   UCACHE_COPYFAKE_RIO="$<TARGET_FILE:ucache-copyfake-rio>")
 target_include_directories(ucache-unit-tests PRIVATE ${CMAKE_SOURCE_DIR}/src/plugin
                                                     ${CMAKE_SOURCE_DIR}/src/cli)
+# The ROOT files under tests/data (the checks made at open read them with or without the codecs).
+target_compile_definitions(ucache-unit-tests PRIVATE
+                           UCACHE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 if (TARGET ucache-transpose) # learner + seek-width + hole-verification contracts
   target_sources(ucache-unit-tests PRIVATE unit/learner_test.cc unit/transpose_width_test.cc
                  unit/transpose_hole_test.cc unit/rntuple_meta_test.cc
                  unit/rntuple_rewrite_test.cc unit/fill_layout_test.cc unit/readmap_test.cc
                  unit/slot_table_test.cc unit/store_layout_test.cc unit/store_maps_test.cc
                  unit/store_sweep_test.cc unit/frame_check_test.cc)
-  target_compile_definitions(ucache-unit-tests PRIVATE
-                             UCACHE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
   target_link_libraries(ucache-unit-tests PRIVATE ucache-transpose)
   target_include_directories(ucache-unit-tests PRIVATE ${CMAKE_SOURCE_DIR}/src/cli) # CacheSource.h
   target_compile_definitions(ucache-unit-tests PRIVATE UCACHE_CPUBENCH_CODECS=1)

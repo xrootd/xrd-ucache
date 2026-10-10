@@ -333,40 +333,181 @@ long long rootFileEnd(const unsigned char* b, size_t n) {
   return end > static_cast<uint64_t>(LLONG_MAX) ? LLONG_MAX : static_cast<long long>(end);
 }
 
+namespace {
+std::string num(long long v) {
+  return std::to_string(v);
+}
+void refuse(RootHeaderVerdict& v, const std::string& why) {
+  v.kind = RootHeaderVerdict::kBad;
+  v.why = "size " + num(v.size) + ": " + why;
+  v.next = RootHeaderVerdict::kNone;
+}
+// Whether the record of `len` bytes at `at` lies inside the file's records, from the header's
+// begin to the end of the data; never overflows.
+bool inside(const RootFileHeader& h, int64_t at, int64_t len) {
+  return at >= h.begin && len >= 0 && at <= h.end && len <= h.end - at;
+}
+std::string span(const RootFileHeader& h) {
+  return "outside the file's records (" + num(h.begin) + " to " + num(h.end) + ")";
+}
+// The top directory's record, read: ROOT's own refusal of a name record out of range, then whether
+// the header was completed, then where the records it places lie (TFile::Init).
+void judgeDirRecord(RootHeaderVerdict& v, const RootDirRecord& d) {
+  const RootFileHeader& h = v.header;
+  v.dir = d;
+  if (d.nbytesName < 10 || d.nbytesName > 10000)
+    return refuse(v, "its top directory's record gives its name record " + num(d.nbytesName) +
+                         " bytes; ROOT reads 10 to 10000");
+  if (d.seekKeys <= h.begin) { // never completed: no claim on what follows, nothing confirmed
+    v.kind = RootHeaderVerdict::kNoClaim;
+    v.next = RootHeaderVerdict::kNone;
+    return;
+  }
+  if (!inside(h, d.seekKeys, d.nbytesKeys) || d.nbytesKeys <= 0)
+    return refuse(v, "its list of top-level objects lies at " + num(d.seekKeys) + ", " +
+                         num(d.nbytesKeys) + " bytes, " + span(h));
+  if (h.seekInfo != 0 && !inside(h, h.seekInfo, h.nbytesInfo))
+    return refuse(v, "its class descriptions lie at " + num(h.seekInfo) + ", " + num(h.nbytesInfo) +
+                         " bytes, " + span(h));
+  if (h.seekFree != 0 && !inside(h, h.seekFree, h.nbytesFree))
+    return refuse(v, "its list of free space lies at " + num(h.seekFree) + ", " +
+                         num(h.nbytesFree) + " bytes, " + span(h));
+  if (static_cast<uint32_t>(d.nbytesKeys) > kRootKeysListMaxBytes) { // not read: the verdict stands
+    v.next = RootHeaderVerdict::kNone;
+    return;
+  }
+  v.next = RootHeaderVerdict::kKeysList;
+  v.nextAt = d.seekKeys;
+  v.nextLen = static_cast<uint32_t>(d.nbytesKeys);
+}
+// The list of top-level objects, read whole (TDirectoryFile::ReadKeys): its own label, the count,
+// and each object's label.
+void judgeKeysList(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
+  const RootFileHeader& h = v.header;
+  const std::string list = "its list of top-level objects at " + num(v.dir.seekKeys);
+  size_t at = 0;
+  RootKeyLabel own;
+  if (!parseRootKeyLabel(b, n, at, own))
+    return refuse(v, list + " does not hold its own label");
+  if (own.nbytes != v.dir.nbytesKeys || own.seekKey != v.dir.seekKeys || own.seekPdir != h.begin)
+    return refuse(v, list + " is labelled as " + num(own.nbytes) + " bytes at " + num(own.seekKey) +
+                         " in the directory at " + num(own.seekPdir) + ", not as " +
+                         num(v.dir.nbytesKeys) + " bytes at " + num(v.dir.seekKeys) +
+                         " in the top directory at " + num(h.begin));
+  if (n < 4 || at > n - 4)
+    return refuse(v, list + " ends before its count of objects");
+  const int32_t count = static_cast<int32_t>(static_cast<uint32_t>(b[at]) << 24 |
+                                             static_cast<uint32_t>(b[at + 1]) << 16 |
+                                             static_cast<uint32_t>(b[at + 2]) << 8 | b[at + 3]);
+  at += 4;
+  if (count < 0)
+    return refuse(v, list + " gives a count of " + num(count) + " objects");
+  for (int32_t i = 0; i < count; ++i) {
+    RootKeyLabel k;
+    if (!parseRootKeyLabel(b, n, at, k))
+      return refuse(v, list + " ends inside its entry " + num(i + 1) + " of " + num(count));
+    if (k.nbytes <= 0 || k.seekKey >= h.end || !inside(h, k.seekKey, k.nbytes))
+      return refuse(v, list + " names an object at " + num(k.seekKey) + ", " + num(k.nbytes) +
+                           " bytes, " + span(h));
+    if (k.seekPdir != h.begin)
+      return refuse(v, list + " names an object at " + num(k.seekKey) + " whose directory is at " +
+                           num(k.seekPdir) + ", not the top directory at " + num(h.begin));
+  }
+  v.next = RootHeaderVerdict::kNone;
+}
+} // namespace
+
 RootHeaderVerdict rootHeaderVerdict(const unsigned char* b, size_t n, long long size) {
   RootHeaderVerdict v;
-  const std::string sz = "size " + std::to_string(size) + ": ";
+  v.size = size;
   const size_t want = rootHeaderBytes(size);
   if (n < want) {
-    v.kind = RootHeaderVerdict::kBad;
-    v.why = sz + "a read of its first " + std::to_string(want) + " bytes answered " +
-            std::to_string(n);
+    refuse(v,
+           "a read of its first " + std::to_string(want) + " bytes answered " + std::to_string(n));
     return v;
   }
   if (std::memcmp(b, "root", std::min<size_t>(n, 4)) != 0) {
-    v.kind = RootHeaderVerdict::kBad;
-    v.why = sz + "it does not begin with \"root\", as every ROOT file does";
+    refuse(v, "it does not begin with \"root\", as every ROOT file does");
     return v;
   }
   v.end = rootFileEnd(b, n);
   if (v.end < 0) {
-    v.kind = RootHeaderVerdict::kBad;
-    v.why = sz + "too short to hold a ROOT file's header";
+    refuse(v, "too short to hold a ROOT file's header");
     return v;
   }
   if (v.end > size) {
-    v.kind = RootHeaderVerdict::kBad;
-    v.why = sz + "its header says the file is " + std::to_string(v.end) + " bytes";
+    refuse(v, "its header says the file is " + std::to_string(v.end) + " bytes");
     return v;
   }
   v.kind = v.end == size ? RootHeaderVerdict::kConfirmed : RootHeaderVerdict::kNoClaim;
+  // The header's own fields, as TFile::Init reads and refuses them.
+  RootFileHeader& h = v.header;
+  if (!parseRootFileHeader(b, n, h)) {
+    refuse(v, "too short to hold a ROOT file's header");
+    return v;
+  }
+  const size_t fields = rootHeaderFieldsEnd(h.version);
+  if (h.begin < static_cast<int64_t>(fields)) {
+    refuse(v, "its header says its first record begins at " + num(h.begin) + ", inside the header");
+    return v;
+  }
+  if (h.begin > h.end) {
+    refuse(v, "its header says its first record begins at " + num(h.begin) +
+                  ", past the end of its data at " + num(h.end));
+    return v;
+  }
+  if (h.nbytesName < 10 || h.nbytesName > 10000) {
+    refuse(v, "its header gives the top directory's name record " + num(h.nbytesName) +
+                  " bytes; ROOT reads 10 to 10000");
+    return v;
+  }
+  const int64_t dirAt = h.begin + h.nbytesName; // both bounded: no overflow
+  const int64_t dirLen = static_cast<int64_t>(rootDirRecordBytes(h.version));
+  if (dirLen > h.end - dirAt) {
+    refuse(v, "its top directory's record ends at " + num(dirAt + dirLen) +
+                  ", past the end of its data at " + num(h.end));
+    return v;
+  }
+  if (dirAt + dirLen <= static_cast<int64_t>(n)) { // in the first bytes, as for most files
+    RootDirRecord d;
+    if (!parseRootDirRecord(b + dirAt, static_cast<size_t>(dirLen), d)) {
+      refuse(v, "its top directory's record cannot be read");
+      return v;
+    }
+    judgeDirRecord(v, d);
+    return v;
+  }
+  v.next = RootHeaderVerdict::kDirRecord; // long names place it further: one more read
+  v.nextAt = dirAt;
+  v.nextLen = static_cast<uint32_t>(dirLen);
   return v;
+}
+
+void rootCheckRead(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
+  if (v.next == RootHeaderVerdict::kNone || v.kind == RootHeaderVerdict::kBad)
+    return;
+  if (!b || n < v.nextLen)
+    return refuse(v, "a read of " + num(v.nextLen) + " bytes at " + num(v.nextAt) + " answered " +
+                         num(static_cast<long long>(b ? n : 0)));
+  if (v.next == RootHeaderVerdict::kDirRecord) {
+    RootDirRecord d;
+    if (!parseRootDirRecord(b, v.nextLen, d))
+      return refuse(v, "its top directory's record cannot be read");
+    return judgeDirRecord(v, d);
+  }
+  judgeKeysList(v, b, v.nextLen);
 }
 
 int headerReadTimeoutS(int attemptLimitS, int64_t elapsedMs) {
   const int64_t limitMs = int64_t(attemptLimitS > 0 ? attemptLimitS : kOpenDeadlineS) * 1000;
   const int64_t leftS = (limitMs - std::max<int64_t>(elapsedMs, 0) + 999) / 1000;
   return static_cast<int>(std::max<int64_t>(kHeaderReadFloorS, std::min<int64_t>(leftS, limitMs / 1000)));
+}
+
+int checkReadTimeoutS(int64_t leftMs) {
+  if (leftMs <= 0)
+    return 0;
+  return static_cast<int>(std::min<int64_t>((leftMs + 999) / 1000, INT_MAX));
 }
 
 std::string exclusionName(const std::vector<Hop>& hops, int i) {
