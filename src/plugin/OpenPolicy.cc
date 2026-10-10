@@ -342,13 +342,24 @@ void refuse(RootHeaderVerdict& v, const std::string& why) {
   v.why = "size " + num(v.size) + ": " + why;
   v.next = RootHeaderVerdict::kNone;
 }
-// Whether the record of `len` bytes at `at` lies inside the file's records, from the header's
-// begin to the end of the data; never overflows.
-bool inside(const RootFileHeader& h, int64_t at, int64_t len) {
-  return at >= h.begin && len >= 0 && at <= h.end && len <= h.end - at;
+// Whether the record of `len` bytes at `at` lies from `from` to `to`; never overflows.
+bool within(int64_t from, int64_t to, int64_t at, int64_t len) {
+  return at >= from && len >= 0 && at <= to && len <= to - at;
 }
-std::string span(const RootFileHeader& h) {
-  return "outside the file's records (" + num(h.begin) + " to " + num(h.end) + ")";
+std::string span(int64_t from, int64_t to) {
+  return "outside the file's records (" + num(from) + " to " + num(to) + ")";
+}
+// Where the list of top-level objects and the objects it lists may end: the copy's size, which is
+// the header's end when the two are equal (an end past the size is refused before). The list
+// and the directory's record that places it are rewritten by ROOT without the header
+// (TFile::Save and TDirectory::SaveSelf write the list and that record, not the header): a file
+// saved so and then written on, or whose writer stopped there, holds its list and its newest
+// objects past the end its header states. ROOT reads such a file normally (TFile::Init takes
+// it as complete, and TDirectoryFile::ReadKeys bounds each object by the file's size). The class
+// descriptions and the list of free space are placed by the header itself, in the same write
+// as its end (TFile::WriteHeader), so they stay within that end.
+int64_t listBound(const RootHeaderVerdict& v) {
+  return std::max<int64_t>(v.header.end, v.size);
 }
 // The top directory's record, read: ROOT's own refusal of a name record out of range, then whether
 // the header was completed, then where the records it places lie (TFile::Init).
@@ -363,15 +374,16 @@ void judgeDirRecord(RootHeaderVerdict& v, const RootDirRecord& d) {
     v.next = RootHeaderVerdict::kNone;
     return;
   }
-  if (!inside(h, d.seekKeys, d.nbytesKeys) || d.nbytesKeys <= 0)
+  const int64_t to = listBound(v);
+  if (!within(h.begin, to, d.seekKeys, d.nbytesKeys) || d.nbytesKeys <= 0)
     return refuse(v, "its list of top-level objects lies at " + num(d.seekKeys) + ", " +
-                         num(d.nbytesKeys) + " bytes, " + span(h));
-  if (h.seekInfo != 0 && !inside(h, h.seekInfo, h.nbytesInfo))
+                         num(d.nbytesKeys) + " bytes, " + span(h.begin, to));
+  if (h.seekInfo != 0 && !within(h.begin, h.end, h.seekInfo, h.nbytesInfo))
     return refuse(v, "its class descriptions lie at " + num(h.seekInfo) + ", " + num(h.nbytesInfo) +
-                         " bytes, " + span(h));
-  if (h.seekFree != 0 && !inside(h, h.seekFree, h.nbytesFree))
+                         " bytes, " + span(h.begin, h.end));
+  if (h.seekFree != 0 && !within(h.begin, h.end, h.seekFree, h.nbytesFree))
     return refuse(v, "its list of free space lies at " + num(h.seekFree) + ", " +
-                         num(h.nbytesFree) + " bytes, " + span(h));
+                         num(h.nbytesFree) + " bytes, " + span(h.begin, h.end));
   if (static_cast<uint32_t>(d.nbytesKeys) > kRootKeysListMaxBytes) { // not read: the verdict stands
     v.next = RootHeaderVerdict::kNone;
     return;
@@ -380,8 +392,12 @@ void judgeDirRecord(RootHeaderVerdict& v, const RootDirRecord& d) {
   v.nextAt = d.seekKeys;
   v.nextLen = static_cast<uint32_t>(d.nbytesKeys);
 }
-// The list of top-level objects, read whole (TDirectoryFile::ReadKeys): its own label, the count,
-// and each object's label.
+// The list of top-level objects, read whole (TDirectoryFile::ReadKeys): its own label (its
+// position and its directory), the count, and each object's label. The label's length is not
+// compared with the directory's record: ROOT reads the record's length of bytes and never the
+// label's, and a writer stopped inside a save (TDirectory::SaveSelf: the new list written, the
+// directory's record not yet) leaves the old list, which ROOT reads normally, with ROOT's mark
+// of a freed record in that field.
 void judgeKeysList(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
   const RootFileHeader& h = v.header;
   const std::string list = "its list of top-level objects at " + num(v.dir.seekKeys);
@@ -391,9 +407,6 @@ void judgeKeysList(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
     return refuse(v, list + " does not hold its own label");
   if (own.seekKey != v.dir.seekKeys)
     return refuse(v, list + " is labelled as lying at " + num(own.seekKey));
-  if (own.nbytes != v.dir.nbytesKeys)
-    return refuse(v, list + " is labelled as " + num(own.nbytes) + " bytes long, not " +
-                         num(v.dir.nbytesKeys));
   if (own.seekPdir != h.begin)
     return refuse(v, list + " is labelled with the directory at " + num(own.seekPdir) +
                          ", not the top directory at " + num(h.begin));
@@ -405,13 +418,14 @@ void judgeKeysList(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
   at += 4;
   if (count < 0)
     return refuse(v, list + " gives a count of " + num(count) + " objects");
+  const int64_t to = listBound(v);
   for (int32_t i = 0; i < count; ++i) {
     RootKeyLabel k;
     if (!parseRootKeyLabel(b, n, at, k))
       return refuse(v, list + " ends inside its entry " + num(i + 1) + " of " + num(count));
-    if (k.nbytes <= 0 || k.seekKey >= h.end || !inside(h, k.seekKey, k.nbytes))
+    if (k.nbytes <= 0 || !within(h.begin, to, k.seekKey, k.nbytes))
       return refuse(v, "its list of top-level objects names an object at " + num(k.seekKey) + ", " +
-                           num(k.nbytes) + " bytes, " + span(h));
+                           num(k.nbytes) + " bytes, " + span(h.begin, to));
     if (k.seekPdir != h.begin)
       return refuse(v, "its list of top-level objects names an object at " + num(k.seekKey) +
                            " in the directory at " + num(k.seekPdir) +

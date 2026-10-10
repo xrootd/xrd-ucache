@@ -823,17 +823,20 @@ tree, RNTuple or histogram lies; a list over 16 MiB is not read). It refuses a c
 - whose size is smaller than the end its own header states (a transfer that was cut);
 - that does not begin with `root` as every ROOT file does (a copy of zeros at the right
   size is one), or is too short to hold its own header;
-- whose header contradicts itself where ROOT refuses a file for it: its first record
-  begins inside the header or past the end of the data, the top directory's name record
-  is shorter than 10 or longer than 10000 bytes, or the directory's record runs past the
-  end of the data;
-- whose header places the list of top-level objects, the class descriptions or the list
-  of free space outside the file's records (from the first record to the end of the data);
+- whose header contradicts itself: its first record begins past the end of the data,
+  the top directory's name record is shorter than 10 or longer than 10000 bytes, or the
+  directory's record runs past the end of the data (ROOT refuses such a file too), or its
+  first record begins inside the header's own fields (ROOT checks only that it is not
+  negative; no ROOT file has it there);
+- whose header places the class descriptions or the list of free space outside the file's
+  records (from the first record to the end of the data), or whose top directory's record
+  places the list of top-level objects outside the copy (from the first record to the
+  copy's size);
 - whose list of top-level objects does not carry its own label (every record of a ROOT
-  file begins with one, giving its position, its length and its directory), or names an
-  object outside the file's records or in another directory than the top one: a list
-  zeroed, or overwritten with other bytes, is refused here (without uCache, ROOT would
-  scan the copy to rebuild such a list, and keep what it finds);
+  file begins with one, giving its position and its directory), or names an object outside
+  the copy or in another directory than the top one: a list zeroed, or overwritten with
+  other bytes, is refused here (without uCache, ROOT would scan the copy to rebuild such a
+  list, and keep what it finds);
 - whose server answers any of those reads short.
 
 The reads share what is left of that attempt's time (at least 5 s), and one of them that
@@ -842,7 +845,14 @@ client's own recovery of a read and its following of a server's redirect are off
 no other copy answers them; at a URL that names a server directly, the open is made once
 more when the client would have recovered the read itself. A copy whose size is larger
 than the end its header states is not refused: ROOT reads such a file normally and ignores
-the bytes past that end (a file updated in place, bytes appended). Nor is a copy whose
+the bytes past that end (a file updated in place, bytes appended). The list of top-level
+objects and the objects it names are held to the copy's size, not to that end, since ROOT
+writes them without the header when a file is saved with `TFile::Save` or
+`TDirectory::SaveSelf`: a file saved so, and then written on or left by its writer, has its
+list and its newest objects past the end its header states, and ROOT reads it normally.
+Nor is the length a list's own label gives compared (ROOT reads the length the directory's
+record gives): a writer stopped in the middle of such a save leaves the earlier list with
+its length overwritten, and ROOT reads that list. Nor is a copy whose
 header places no list of top-level objects (its writer stopped before it ever saved the
 file): every copy of such a file is the same, ROOT recovers what it can of it, and the
 check makes no claim on it. A file not named `*.root` is not looked at. A copy that passes

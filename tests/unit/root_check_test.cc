@@ -115,6 +115,7 @@ std::vector<unsigned char> label(const Label& l) {
 // holds.
 struct Synth {
   bool wide = false; // 64-bit positions in the header, the directory's record and the labels
+  bool narrowHeader = false; // with wide: the header keeps 32-bit fields (written before 2 GiB)
   int64_t base = 0;  // where the records begin (past 2^32 for a 64-bit file)
   int32_t version = 63602;
   int64_t begin = 100;
@@ -206,7 +207,7 @@ struct Synth {
     img.put(dirAt, dir);
     // The header.
     std::vector<unsigned char> h = {'r', 'o', 'o', 't'};
-    const int32_t ver = wide && version < 1000000 ? version + 1000000 : version;
+    const int32_t ver = wide && !narrowHeader && version < 1000000 ? version + 1000000 : version;
     be(h, static_cast<uint32_t>(ver), 4);
     be(h, static_cast<uint32_t>(begin), 4);
     const int w = ver >= 1000000 ? 8 : 4;
@@ -328,7 +329,7 @@ TEST(RootCheck, WholeFilesStand) {
     EXPECT_EQ(v.dir.seekKeys, s.seekKeys);
     img.size = s.end + 4096; // bytes past the end (appended, or a file updated in place)
     EXPECT_EQ(check(img).kind, K::kNoClaim) << wide;
-    img.size = s.end - 1; // cut short of its end: F1
+    img.size = s.end - 1; // cut short of its end
     v = check(img);
     EXPECT_EQ(v.kind, K::kBad);
     EXPECT_EQ(v.why, "size " + std::to_string(s.end - 1) + ": its header says the file is " +
@@ -361,7 +362,7 @@ TEST(RootCheck, NeverCompletedMakesNoClaim) {
     EXPECT_EQ(v.kind, K::kNoClaim) << "not confirmed, though the end equals the size";
     EXPECT_EQ(reads.size(), 1u) << "no list to read";
     img.size = s.end - 10;
-    EXPECT_EQ(check(img).kind, K::kBad) << "a cut copy is still refused (F1)";
+    EXPECT_EQ(check(img).kind, K::kBad) << "a cut copy is still refused (its end past its size)";
   }
   // The list placed at the header's begin, or before it, is no position: never completed.
   for (int64_t at : {int64_t(100), int64_t(50), int64_t(-5)}) {
@@ -584,6 +585,114 @@ TEST(RootCheck, RecordsThePlacesLieInside) {
   EXPECT_EQ(reads.size(), 1u);
 }
 
+// A file saved without its header (TFile::Save, TDirectory::SaveSelf: the list and the directory's
+// record rewritten, the header left as it was) and then written on, or whose writer stopped: the
+// header's end lies before the list and the newest objects, and ROOT reads the file normally.
+// The list and its objects are held to the copy's size; nothing is confirmed. The class
+// descriptions and the free list, which the header places in the same write as its end, are
+// still held to that end.
+TEST(RootCheck, SavedWithoutTheHeader) {
+  Synth base;
+  base.build();
+  const int64_t full = base.end;              // where the file's data end now
+  const int64_t stale = base.seekInfo + 400;  // the header's end: after the class descriptions
+  const auto saved = [&](Synth& s) {
+    s.set["end"] = stale;
+    s.set["seekFree"] = 0;
+    s.set["size"] = full;
+  };
+  {
+    Synth s;
+    saved(s);
+    std::vector<std::string> reads;
+    const RootHeaderVerdict v = check(s.build(), &reads);
+    EXPECT_EQ(v.kind, K::kNoClaim) << v.why;
+    EXPECT_EQ(v.end, stale);
+    ASSERT_EQ(reads.size(), 2u) << "the list is read and judged";
+    EXPECT_EQ(reads[1], std::to_string(s.seekKeys) + "+" + std::to_string(s.nbytesKeys));
+    EXPECT_GT(s.seekKeys, stale) << "the list lies past the header's end";
+    EXPECT_GE(s.listed[0].seekKey, stale) << "and so do the objects, from that end on";
+  }
+  {
+    Synth s; // the list past the copy's size
+    saved(s);
+    s.set["seekKeys"] = full + 1000;
+    const RootHeaderVerdict v = check(s.build());
+    EXPECT_EQ(v.kind, K::kBad);
+    EXPECT_EQ(v.why, "size " + std::to_string(full) + ": its list of top-level objects lies at " +
+                         std::to_string(full + 1000) + ", " + std::to_string(base.nbytesKeys) +
+                         " bytes, outside the file's records (100 to " + std::to_string(full) +
+                         ")");
+  }
+  for (int64_t at : {full - 10, int64_t(99), int64_t(0)}) {
+    Synth s; // running past the size, or before the first record
+    saved(s);
+    s.set["seekKeys"] = at;
+    EXPECT_EQ(check(s.build()).kind, at <= 100 ? K::kNoClaim : K::kBad) << at;
+  }
+  {
+    Synth s; // an object listed past the copy's size
+    saved(s);
+    s.set["entrySeek"] = full - 1;
+    const RootHeaderVerdict v = check(s.build());
+    EXPECT_EQ(v.kind, K::kBad);
+    EXPECT_EQ(v.why, "size " + std::to_string(full) +
+                         ": its list of top-level objects names an object at " +
+                         std::to_string(full - 1) +
+                         ", 1037 bytes, outside the file's records (100 to " +
+                         std::to_string(full) + ")");
+  }
+  {
+    Synth s; // an object listed between the header's end and the size: as ROOT, read
+    saved(s);
+    s.set["entrySeek"] = full - 1037;
+    EXPECT_EQ(check(s.build()).kind, K::kNoClaim);
+  }
+  {
+    Synth s; // the class descriptions past the header's end: refused, though inside the size
+    saved(s);
+    s.set["seekInfo"] = stale + 100;
+    const RootHeaderVerdict v = check(s.build());
+    EXPECT_EQ(v.kind, K::kBad);
+    EXPECT_EQ(v.why, "size " + std::to_string(full) + ": its class descriptions lie at " +
+                         std::to_string(stale + 100) +
+                         ", 400 bytes, outside the file's records (100 to " +
+                         std::to_string(stale) + ")");
+  }
+  {
+    Synth s; // with the size equal to the header's end, the list past that end is refused
+    s.set["seekKeys"] = base.end + 10;
+    EXPECT_EQ(check(s.build()).kind, K::kBad);
+  }
+  {
+    // Past 2 GiB: the header written at creation (32-bit, its end right after the directory's
+    // record, no class descriptions), the directory's record, the list and its labels 64-bit.
+    Synth w;
+    w.wide = true;
+    w.narrowHeader = true;
+    w.base = 3000000000LL;
+    w.build();
+    const int64_t wfull = w.end;
+    w.set["end"] = 100 + 58 + 60;
+    w.set["seekInfo"] = 0;
+    w.set["seekFree"] = 0;
+    w.set["size"] = wfull;
+    std::vector<std::string> reads;
+    const Image img = w.build();
+    std::vector<unsigned char> h = img.read(0, 300);
+    RootFileHeader fh;
+    ASSERT_TRUE(parseRootFileHeader(h.data(), h.size(), fh));
+    EXPECT_FALSE(fh.wide()) << "a 32-bit header";
+    const RootHeaderVerdict v = check(img, &reads);
+    EXPECT_EQ(v.kind, K::kNoClaim) << v.why;
+    EXPECT_EQ(v.dir.version, 1005);
+    ASSERT_EQ(reads.size(), 2u);
+    EXPECT_EQ(reads[1], std::to_string(w.seekKeys) + "+" + std::to_string(w.nbytesKeys));
+    w.set["entrySeek"] = wfull + 5;
+    EXPECT_EQ(check(w.build()).kind, K::kBad) << "an object past the size";
+  }
+}
+
 // The list of top-level objects: its own label, the count, each object inside the records with the
 // top directory as its parent.
 TEST(RootCheck, ListOfTopLevelObjects) {
@@ -600,9 +709,12 @@ TEST(RootCheck, ListOfTopLevelObjects) {
     std::string why; // "" to skip the text
   };
   const Row rows[] = {
-      {"ownNbytes", base.nbytesKeys + 1, K::kBad,
-       sz + " is labelled as " + std::to_string(base.nbytesKeys + 1) + " bytes long, not " +
-           std::to_string(base.nbytesKeys)},
+      // The label's length is not compared (ROOT reads the directory record's length): another
+      // length, and ROOT's mark of a freed record (a writer stopped inside a save left the old
+      // list).
+      {"ownNbytes", base.nbytesKeys + 1, K::kConfirmed, ""},
+      {"ownNbytes", -base.nbytesKeys, K::kConfirmed, ""},
+      {"ownNbytes", 0, K::kConfirmed, ""},
       {"ownSeek", base.seekKeys - 1, K::kBad,
        sz + " is labelled as lying at " + std::to_string(base.seekKeys - 1)},
       {"ownSeek", 0, K::kBad, ""},
@@ -681,7 +793,6 @@ TEST(RootCheck, TextsFitTheError) {
       {"seekKeys", 9999999999LL},
       {"nbytesKeys", 0},
       {"ownSeek", 9999999998LL},
-      {"ownNbytes", 2147483647LL},
       {"ownPdir", 9999999997LL},
       {"count", -2147483647LL},
       {"entrySeek", 9999999996LL},

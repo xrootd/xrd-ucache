@@ -133,9 +133,16 @@ FAILS=0
 verdict() { if [ "$2" = 0 ]; then echo "PASS: $1"; else echo "FAIL: $1"; FAILS=$((FAILS + 1)); fi; }
 # A label with a command substitution in it is expanded before the $? that follows it, so that
 # verdict would test the substitution, not the check: the caller captures r=$? first. The script
-# reads its own source for the mistake.
-lint=$(grep -nE '(^|[ ;])verdict ".*\$\([^(].*" \$\?[[:space:]]*$' "${BASH_SOURCE[0]}" | grep -v 'lint=')
-[ -z "$lint" ]; verdict "lint: no verdict reads \$? after a command substitution in its label" $?
+# reads its own source for the mistake, by its full path (the working directory has changed), and
+# fails when it cannot read it.
+SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"
+if [ -r "$SELF" ]; then
+  lint=$(grep -nE '(^|[ ;])verdict ".*\$\([^(].*" \$\?[[:space:]]*$' "$SELF" | grep -v 'lint=')
+else
+  lint="cannot read $SELF"
+fi
+[ -z "$lint" ] || echo "$lint"
+[ -z "$lint" ]; verdict "lint: no verdict reads \$? after a command substitution ($SELF)" $?
 
 cfg() { # name role port [cms-port]
   local n=$1 role=$2 port=$3 cport=${4:-}

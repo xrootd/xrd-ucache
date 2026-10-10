@@ -242,24 +242,28 @@ long long rootFileEnd(const unsigned char* b, size_t n);
 //       such a file; a copy of zeros at the right size is one), or is too short to hold its own
 //       header;
 //     - its size is smaller than the end its header states (a cut copy: ROOT reports it truncated);
-//     - the header contradicts itself where ROOT refuses a file for it: the first record begins
-//       inside the header's own fields or past the end of the data; the top directory's name
-//       record is shorter than 10 or longer than 10000 bytes, in the header or in the directory's
-//       record; the directory's record ends past the end of the data;
-//     - in a completed header (one that places the list of top-level objects past the header), a
-//       record it places lies outside the file's records (from the header's begin to the end of
-//       the data): the list of top-level objects, the class descriptions, the list of free space
-//       (a position of 0 for the last two means there is none);
-//     - the list of top-level objects does not carry its own label (its position, its length, and
-//       the top directory as its directory), or an object it lists lies outside the file's records
-//       (its position from the begin to before the end, and its end at or before the end), or has
-//       another directory than the top one, or the list ends inside its entries.
+//     - the header contradicts itself: the first record begins past the end of the data; the top
+//       directory's name record is shorter than 10 or longer than 10000 bytes, in the header or in
+//       the directory's record; the directory's record ends past the end of the data (ROOT refuses
+//       a file for each of these); or the first record begins inside the header's own fields (ROOT
+//       checks only that it is not negative; no ROOT file has it there);
+//     - in a completed header (one that places the list of top-level objects past the header): the
+//       class descriptions or the list of free space lie outside the file's records, from the
+//       header's begin to the end of the data (a position of 0 means there is none); or the list of
+//       top-level objects lies outside the copy, from the header's begin to the copy's size;
+//     - the list of top-level objects does not carry its own label (its position, and the top
+//       directory as its directory; its length is not compared), or an object it lists lies outside
+//       the copy (its position from the begin, its length above 0, its end at or before the copy's
+//       size), or has another directory than the top one, or the list ends inside its entries.
 //  - kConfirmed: its size equals the end its header states, which confirms the file's size;
 //  - kNoClaim: its size is larger than that end (ROOT reads such a file normally and ignores the
 //    bytes past the end: a file updated in place, bytes appended, a writer that stopped after a
-//    save), or the header was never completed: it places no list of top-level objects past the
-//    header (the writer never saved the file; every copy is the same, and ROOT recovers what it
-//    can), which makes no claim on what follows. The copy stands, and nothing is confirmed.
+//    save; a save with TFile::Save or TDirectory::SaveSelf writes the list of top-level objects
+//    and the directory's record but not the header, so such a file holds its list and newest
+//    objects past that end, which is why they are held to the copy's size), or the header was
+//    never completed: it places no list of top-level objects past the header (the writer never
+//    saved the file; every copy is the same, and ROOT recovers what it can), which makes no claim
+//    on what follows. The copy stands, and nothing is confirmed.
 // The top directory is the record at the header's begin, where ROOT writes it. A list of top-level
 // objects longer than kRootKeysListMaxBytes is not read: the verdict stands as the header gives it.
 // Each text names one thing wrong and stays short (the error that names every copy keeps 160

@@ -338,16 +338,19 @@ and refuses:
   1756918, past the end of its data at 1756917`, `its header gives the top directory's
   name record 20000 bytes; ROOT reads 10 to 10000`, `its top directory's record ends at
   ..., past the end of its data at ...`, the same of the directory's own record);
-- one whose header places a record outside the file's records (`its list of top-level
-  objects lies at 1757917, 159 bytes, outside the file's records (100 to 1756917)`, and
-  the same of `its class descriptions` and `its list of free space`);
+- one whose header places a record outside the file's records (`its class descriptions lie
+  at ..., ... bytes, outside the file's records (100 to 1756917)`, the same of `its list of
+  free space`), the last number being the end the header states; or whose top directory's
+  record places the list of top-level objects outside the copy (`its list of top-level
+  objects lies at 1757917, 159 bytes, outside the file's records (100 to 1756917)`), the
+  last number being the copy's size;
 - one whose list of top-level objects is damaged: zeroed or overwritten (`its list of
   top-level objects at 1750173 is labelled as lying at 0`, `... does not hold its own
-  label`, `... is labelled as 120 bytes long, not 159`, `... is labelled with the directory
-  at 0, not the top directory at 100`), or naming an object outside the file's records or
-  in another directory (`its list of top-level objects names an object at ..., ... bytes,
-  outside the file's records (100 to ...)`, `... in the directory at ..., not the top
-  directory at 100`), or ending inside its own entries;
+  label`, `... is labelled with the directory at 0, not the top directory at 100`), or
+  naming an object outside the copy or in another directory (`its list of top-level objects
+  names an object at ..., ... bytes, outside the file's records (100 to ...)`, the last
+  number being the copy's size; `... in the directory at ..., not the top directory at
+  100`), or ending inside its own entries;
 - one whose server answers any of those reads short (`size 16935324: a read of its first
   300 bytes answered 120`, `size 1756917: a read of 159 bytes at 1750173 answered 158`).
 
@@ -355,7 +358,9 @@ A read of them that fails or runs out of time is a failure of the copy, as an op
 be, and another copy is tried; the client's own recovery of those reads and its following
 of a redirect are off for them, so no other copy answers them. A copy whose size is larger
 than the end its header states stands, and confirms nothing: ROOT reads such a file
-normally (a file updated in place, or with bytes appended). So does a copy whose header
+normally (a file updated in place, or with bytes appended, or saved with `TFile::Save`,
+which writes the list of top-level objects and not the header, and then written on; its
+list and newest objects may lie past that end, inside the copy). So does a copy whose header
 places no list of top-level objects (its writer never saved the file): ROOT recovers what
 it can of it, and every copy is the same. A copy that passes the checks and whose size
 equals that end confirms the file's size, which the cache entry keeps for its freshness window (`revalidate_seconds`):
