@@ -74,9 +74,9 @@ bool parseRootFileHeader(const unsigned char* b, size_t n, RootFileHeader& h) {
   return true;
 }
 
-size_t rootDirRecordBytes(int32_t fileVersion) {
+size_t rootDirRecordBytes(int32_t version) {
   // 22 bytes of fields, two dates of 4, a UUID of 18; 12 more (64-bit room) since version 40000.
-  return fileVersion >= 40000 ? 60 : 48;
+  return version >= 40000 ? 60 : 48;
 }
 
 bool parseRootDirRecord(const unsigned char* b, size_t n, RootDirRecord& d) {

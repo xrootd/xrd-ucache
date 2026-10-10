@@ -50,6 +50,15 @@
 #   zeros at the size      one server holds as many zero bytes as the file has (a, b and c in
 #                          turn), the other two the file: the copy of zeros does not begin as a
 #                          ROOT file does and is refused; the open goes on to a whole copy
+#   damaged header or list the file is named *.root; one server holds it with its header's first-record
+#                          position set past the end of its data, or with its list of top-level objects
+#                          zeroed (a, b and c in turn), the other two the file: the open that lands on the
+#                          damaged copy reads it (its first 300 bytes, then the list) and refuses it as
+#                          ROOT's own reading would (op open, class data, the reason in the record), and
+#                          ends at a whole copy; when the zeroed list is the only copy, the open fails with
+#                          one error naming it. When the read of the list fails (UCACHE_TEST_HEADER_FAIL_N
+#                          with _STAGE=list), that copy is a failed one and the open goes on, with one
+#                          completion
 #   longer than its header every copy is the file with bytes appended, so its header states an end
 #                          before its size (as for a file updated in place, which ROOT reads
 #                          normally): the open stands at the copy it landed on, nothing is refused,
@@ -122,6 +131,11 @@ cd "$W" || exit 2 # the servers' runtime directories stay here, not in the calle
 echo "fed_ci: working in $W (ports $BASE..$((BASE + 23)))"
 FAILS=0
 verdict() { if [ "$2" = 0 ]; then echo "PASS: $1"; else echo "FAIL: $1"; FAILS=$((FAILS + 1)); fi; }
+# A label with a command substitution in it is expanded before the $? that follows it, so that
+# verdict would test the substitution, not the check: the caller captures r=$? first. The script
+# reads its own source for the mistake.
+lint=$(grep -nE '(^|[ ;])verdict ".*\$\([^(].*" \$\?[[:space:]]*$' "${BASH_SOURCE[0]}" | grep -v 'lint=')
+[ -z "$lint" ]; verdict "lint: no verdict reads \$? after a command substitution in its label" $?
 
 cfg() { # name role port [cms-port]
   local n=$1 role=$2 port=$3 cport=${4:-}
@@ -224,7 +238,7 @@ if [ "$got" != 0 ]; then
   direct_read c $L; r=$?; [ "$r" != 0 ]; verdict "c refuses the file (a direct read fails)" $?
   NL=$(grep 'MsgHandler created' "$W/f5-$got.log" | grep -c 'kXR_locate ')
   [ "$NL" -ge 1 ]; verdict "the client's log shows kXR_locate ($NL)" $?
-  [ "$(regional_locates $L)" -ge "$NL" ]; verdict "the regional's log shows the locate ($(regional_locates $L) requests)" $?
+  [ "$(regional_locates $L)" -ge "$NL" ]; r=$?; verdict "the regional's log shows the locate ($(regional_locates $L) requests)" $r
   FL=$(counter "$W/c5-$got" failover_locates)
   [ "${FL:-0}" = "$NL" ]; verdict "failover_locates is ${FL:-0}, the locates the client sent ($NL)" $?
   records "$W/c5-$got" | tail -1 | grep -q '"outcome":"ok"'; verdict "the last record line says outcome ok" $?
@@ -389,6 +403,79 @@ if [ "$got" != 0 ]; then
   records "$W/c17-$got" | tail -1 | grep -q "\"status\":\"ok\".*\"size\":$FIXW_SIZE,"; verdict "the open ended at a whole copy" $?
 fi
 
+echo; echo "=== a copy whose header or list of top-level objects is damaged is refused"
+# The fixture's header and its top directory's record (32-bit positions): the first record at 8, the
+# end at 12, the name record's length at 28; the directory's record at begin + that length gives the
+# list's length at 10 and its position at 26.
+be32() { od -An -tu1 -j "$2" -N4 "$1" | awk '{print (($1 * 256 + $2) * 256 + $3) * 256 + $4}'; }
+put32() { # FILE OFF VALUE: four bytes, big-endian, in place
+  printf "$(printf '\\%03o\\%03o\\%03o\\%03o' $(($3 >> 24 & 255)) $(($3 >> 16 & 255)) $(($3 >> 8 & 255)) $(($3 & 255)))" |
+    dd of="$1" bs=1 seek="$2" conv=notrunc status=none
+}
+W_BEGIN=$(be32 "$FIXW" 8); W_END=$(be32 "$FIXW" 12); W_DIR=$((W_BEGIN + $(be32 "$FIXW" 28)))
+W_NK=$(be32 "$FIXW" $((W_DIR + 10))); W_SK=$(be32 "$FIXW" $((W_DIR + 26)))
+echo "    fixture: begin $W_BEGIN, end $W_END, directory record at $W_DIR, list at $W_SK ($W_NK bytes)"
+cp "$FIXW" "$W/fixw-begin.bin"; put32 "$W/fixw-begin.bin" 8 $((W_END + 1))
+cp "$FIXW" "$W/fixw-list.bin"; dd if=/dev/zero of="$W/fixw-list.bin" bs=1 seek="$W_SK" count="$W_NK" conv=notrunc status=none
+[ "$W_END" = "$FIXW_SIZE" ] && [ "$W_SK" -gt "$W_BEGIN" ] && [ $((W_SK + W_NK)) -le "$W_END" ] && [ "$(be32 "$W/fixw-begin.bin" 8)" = $((W_END + 1)) ] &&
+  od -v -An -tu1 -j "$W_SK" -N "$W_NK" "$W/fixw-list.bin" | awk '{ for (i = 1; i <= NF; i++) if ($i != 0) bad = 1 } END { exit bad }' &&
+  [ "$(stat -c %s "$W/fixw-begin.bin")" = "$FIXW_SIZE" ] && [ "$(stat -c %s "$W/fixw-list.bin")" = "$FIXW_SIZE" ]
+verdict "the damaged copies: the header's first record past its end ($((W_END + 1))), and the list's $W_NK bytes at $W_SK zeroed, both at the fixture's size" $?
+# reads of the list in a client's log
+nlist() { grep -c "MsgHandler created.*kXR_read (handle: 0x[0-9a-f]*, offset: $W_SK, size: $W_NK)" "$1"; }
+for dmg in begin list; do
+  case $dmg in
+    begin) why="size $FIXW_SIZE: its header says its first record begins at $((W_END + 1)), past the end of its data at $W_END" ;;
+    list) why="size $FIXW_SIZE: its list of top-level objects at $W_SK is labelled as lying at 0" ;;
+  esac
+  got=0 allok=1
+  for i in $(seq 60); do
+    L=/store/ci/dmg-$dmg-$i.root
+    z=$(echo a b c | cut -d' ' -f$((i % 3 + 1)))
+    copyw "$W/fixw-$dmg.bin" $L $z; placew $L $(others $z)
+    res=$(fuzz "$W/c21-$dmg-$i" "$W/f21-$dmg-$i.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
+    echo "$res" | grep -q '^open-failover: clean$' || { allok=0; echo "$res" | sed 's/^/    /'; break; }
+    if records "$W/c21-$dmg-$i" | head -1 | grep -q "\"data_server\":\"127.0.0.1:$(port_of $z)\""; then got=$i; break; fi
+  done
+  [ "$allok" = 1 ]; verdict "$dmg: every open succeeded, one completion, right bytes" $?
+  [ "$got" != 0 ]; verdict "$dmg: an open landed on the damaged copy first (file $got of at most 60)" $?
+  if [ "$got" != 0 ]; then
+    records "$W/c21-$dmg-$got" | sed 's/^/    rec: /' | cut -c1-230
+    cat "$W/c21-$dmg-$got"/stats/*.files.jsonl | grep '"kind":"origin_failure"' | head -1 | grep -q "\"op\":\"open\".*\"class\":\"data\".*$why"
+    verdict "$dmg: the damaged copy is recorded as a failure of op open, class data: $why" $?
+    records "$W/c21-$dmg-$got" | tail -1 | grep -q "\"status\":\"ok\".*\"size\":$FIXW_SIZE,.*\"outcome\":\"ok\""; verdict "$dmg: the open ended at a whole copy" $?
+    # (a and b answer from 127.0.0.1, which tried= cannot name: the open may be sent back to a damaged
+    # copy there, which is then read and refused again)
+    NL=$(nlist "$W/f21-$dmg-$got.log")
+    if [ $dmg = list ]; then [ "$NL" -ge 2 ]; else [ "$NL" = 1 ]; fi; r=$? # (read before the label's expansions)
+    verdict "$dmg: the list of top-level objects was read $NL times ($( [ $dmg = list ] && echo "at the damaged copy, and " )at the copy taken)" $r
+    [ "$(confirmed "$W/c21-$dmg-$got")" = 1 ]; verdict "$dmg: the copy taken confirmed the size" $?
+  fi
+done
+# the zeroed list is the only copy: the open fails, naming it
+L=/store/ci/dmg-list-only.root
+copyw "$W/fixw-list.bin" $L a
+res=$(fuzz "$W/c22" "$W/f22.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-denied)
+echo "$res" | sed 's/^/    /' | cut -c1-700
+echo "$res" | grep -q '^open-denied: clean$'; verdict "only the copy with the zeroed list: Open() returned OK and the reader got one completion, a failure" $?
+echo "$res" | grep -q "(127.0.0.1:$AX): size $FIXW_SIZE: its list of top-level objects at $W_SK is labelled as lying at 0" && echo "$res" | grep -q 'Received corrupted data'
+verdict "the error is a data error that names the copy and why" $?
+[ -z "$(find "$W/c22" \( -name '*.meta' -o -name '*.data' \) -print -quit)" ]; verdict "nothing of the file is cached" $?
+CC=$(copies_closed "$W/f22.log")
+[ "${CC% *}" -ge 1 ] && [ "${CC% *}" = "${CC#* }" ]; verdict "the copy that was opened was closed by uCache (opened, closed: $CC)" $?
+# the read of the list fails at the first copy: a failed copy, the open goes on
+L=/store/ci/dmg-listread.root
+placew $L a b c
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_STAGE=list)
+res=$(fuzz "$W/c23" "$W/f23.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
+echo "$res" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-300
+records "$W/c23" | sed 's/^/    rec: /' | cut -c1-230
+records "$W/c23" | head -1 | grep -q '"code":108,' && [ "$(nheader "$W/f23.log")" = 2 ]
+verdict "the list read failing at the first copy: that attempt failed (108) after its 300 bytes were read (two 300-byte reads in all: the fault struck the list read)" $?
+echo "$res" | grep -q '^open-failover: clean$'; verdict "the list read failing at the first copy: exactly one completion, a success, the file's own bytes" $?
+records "$W/c23" | tail -1 | grep -q "\"status\":\"ok\".*\"size\":$FIXW_SIZE,.*\"outcome\":\"ok\""; verdict "the list read failing at the first copy: the last attempt is ok, at a whole copy" $?
+
 echo; echo "=== every copy is longer than its header says: the open stands"
 cat "$FIXW" > "$W/fixw-long.bin"; head -c 4096 /dev/urandom >> "$W/fixw-long.bin"
 LONG_SIZE=$(stat -c %s "$W/fixw-long.bin")
@@ -506,7 +593,7 @@ rf miss 2 on
 clean miss; verdict "miss: a Read and a VectorRead whose origin read failed are exact, once, and move the handle" $?
 [ "${#FL[@]}" = 2 ] && [ "${FL[0]}" = "${SV[0]}" ] && [ "${FL[1]}" = "${SV[1]}" ]; verdict "miss: the failed reads name the servers the handle was at (${FL[*]})" $?
 [ "${#MV[@]}" = 2 ] && [ "${MV[0]}" = "${SV[1]}" ] && [ "${MV[1]}" = "${SV[2]}" ]; verdict "miss: a move of route read after each landed at the next server (${MV[*]})" $?
-[ "$(counter "$RFC" open_failovers)" = "$NRA" ]; verdict "miss: open_failovers $(counter "$RFC" open_failovers) equals the attempts of route read ($NRA)" $?
+[ "$(counter "$RFC" open_failovers)" = "$NRA" ]; r=$?; verdict "miss: open_failovers $(counter "$RFC" open_failovers) equals the attempts of route read ($NRA)" $r
 
 rf relay 2 on relay
 clean relay; verdict "relay: a PgRead and a VectorRead into one buffer that failed are exact, once, and move the handle" $?

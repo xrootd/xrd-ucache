@@ -51,11 +51,13 @@ reach disk, in keys or file names.
 `file_size − (npages−1)·page_size` bytes; its CRC covers exactly those bytes.
 
 Flag bit2, *size confirmed*: with `adaptive_federation = on`, an open of a file
-named `*.root` (in upper or lower case) at the origin reads the first 300 bytes of the
-copy it landed on. A ROOT file's header states where the file ends; when that equals the
-size the copy reported, the size is confirmed and the entry carries the bit. A copy whose
-size is larger than that end confirms nothing (ROOT reads it normally); one whose size is
-smaller is refused (USER_GUIDE.md). The bit holds for the entry's freshness window (the
+named `*.root` (in upper or lower case) at the origin checks the copy it landed on: its
+first 300 bytes, and the list of the file's top-level objects (USER_GUIDE.md). A ROOT
+file's header states where the file ends; when that equals the size the copy reported and
+the copy passes the checks, the size is confirmed and the entry carries the bit. A copy whose
+size is larger than that end confirms nothing (ROOT reads it normally), nor does one whose
+header places no list of top-level objects (never saved); one whose size is smaller, or that
+fails a check, is refused (USER_GUIDE.md). The bit holds for the entry's freshness window (the
 `.val` marker, below): within it a copy of another size is not accepted for the entry or
 for a handle that holds it, and a handle the entry answers without an open at the origin
 takes the size as confirmed, with no read of the header. Once the window has passed (with

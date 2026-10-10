@@ -323,20 +323,42 @@ bytes is a bad copy: the open is made again at another site, with the log line
 `... could not open it (size 0: the copy is empty, and a ROOT file never is); trying
 another site`, and the empty copy is counted in `origin_failures_data` and recorded
 as an `origin_failure` line of op `open` (FORMAT.md). So is a copy of a file named
-`*.root` (`.root` in upper or lower case) whose first bytes show it is not a whole ROOT
-file: inside the job's open uCache reads the first 300 bytes of the copy, within what is
-left of the attempt's time (at least 5 s), and refuses a copy whose size is smaller than
-the end its own header states (`size 10161194: its header says the file is 16935324
-bytes`), one that does not begin with `root` (`size 16935324: it does not begin with
-"root", as every ROOT file does`, a copy of zeros among them), one too short to hold the
-header (`size 14: too short to hold a ROOT file's header`) and one whose server answers
-those bytes short (`size 16935324: a read of its first 300 bytes answered 120`). A read of
-them that fails or runs out of time is a failure of the copy, as an open's would be, and
-another copy is tried; the client's own recovery of that read and its following of a
-redirect are off for it, so no other copy answers it. A copy whose size is larger than the
-end its header states stands, and confirms nothing: ROOT reads such a file normally (a
-file updated in place, or with bytes appended). A copy whose size equals that end confirms
-the file's size, which the cache entry keeps for its freshness window (`revalidate_seconds`):
+`*.root` (`.root` in upper or lower case) that the checks made at open find is not a whole
+ROOT file. Inside the job's open uCache reads the first 300 bytes of the copy (and, when
+long names place the top directory's record past them, 60 bytes more), then the file's
+list of top-level objects, all within what is left of the attempt's time (at least 5 s),
+and refuses:
+
+- a copy whose size is smaller than the end its own header states (`size 10161194: its
+  header says the file is 16935324 bytes`);
+- one that does not begin with `root` (`size 16935324: it does not begin with "root", as
+  every ROOT file does`, a copy of zeros among them), or too short to hold the header
+  (`size 14: too short to hold a ROOT file's header`);
+- one whose header contradicts itself (`its header says its first record begins at
+  1756918, past the end of its data at 1756917`, `its header gives the top directory's
+  name record 20000 bytes; ROOT reads 10 to 10000`, `its top directory's record ends at
+  ..., past the end of its data at ...`, the same of the directory's own record);
+- one whose header places a record outside the file's records (`its list of top-level
+  objects lies at 1757917, 159 bytes, outside the file's records (100 to 1756917)`, and
+  the same of `its class descriptions` and `its list of free space`);
+- one whose list of top-level objects is damaged: zeroed or overwritten (`its list of
+  top-level objects at 1750173 is labelled as lying at 0`, `... does not hold its own
+  label`, `... is labelled as 120 bytes long, not 159`, `... is labelled with the directory
+  at 0, not the top directory at 100`), or naming an object outside the file's records or
+  in another directory (`its list of top-level objects names an object at ..., ... bytes,
+  outside the file's records (100 to ...)`, `... in the directory at ..., not the top
+  directory at 100`), or ending inside its own entries;
+- one whose server answers any of those reads short (`size 16935324: a read of its first
+  300 bytes answered 120`, `size 1756917: a read of 159 bytes at 1750173 answered 158`).
+
+A read of them that fails or runs out of time is a failure of the copy, as an open's would
+be, and another copy is tried; the client's own recovery of those reads and its following
+of a redirect are off for them, so no other copy answers them. A copy whose size is larger
+than the end its header states stands, and confirms nothing: ROOT reads such a file
+normally (a file updated in place, or with bytes appended). So does a copy whose header
+places no list of top-level objects (its writer never saved the file): ROOT recovers what
+it can of it, and every copy is the same. A copy that passes the checks and whose size
+equals that end confirms the file's size, which the cache entry keeps for its freshness window (`revalidate_seconds`):
 within it no copy of another size is taken for the entry, and a job's open that the entry
 answers (no open at the origin) takes the confirmed size from it and reads no header. The
 first open after the window checks the origin and reads the header again; a copy that passes

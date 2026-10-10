@@ -51,7 +51,7 @@ struct RootDirRecord {
 };
 // The record's length as ROOT reads it (TDirectoryFile::Sizeof): 60 bytes, or 48 in a file of a
 // version below 40000.
-size_t rootDirRecordBytes(int32_t fileVersion);
+size_t rootDirRecordBytes(int32_t version);
 // The record in the `n` bytes of `b`: false when they end before its fields do.
 bool parseRootDirRecord(const unsigned char* b, size_t n, RootDirRecord& d);
 
