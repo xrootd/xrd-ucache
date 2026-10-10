@@ -373,8 +373,11 @@ another site, and the job gets the bytes. The log says so, once for every move:
 
 A read moves only to a copy of the size the job was shown at its open, also on a
 file whose reads uCache passes straight to the origin (its host is left out by the
-cache's allow and deny lists). A file whose size uCache does not know is not moved:
-the client's own recovery of its reads stays on.
+cache's allow and deny lists). The lists narrow the copies a read moves to as they do
+an open's: when the redirector sends the read's open back to a server that failed and the
+lists refuse every other copy the regional redirector lists, that server is taken again.
+A file whose size uCache does not know is not moved: the client's own recovery of its
+reads stays on.
 
 A read that a copy answers short, wholly inside the file's confirmed size (confirmed by
 the header at this open, or kept by the cache entry within its freshness window for an
@@ -385,8 +388,9 @@ file's size of <size> bytes; not served`, the line in the record file is of clas
 (code 14), and the read is made again at a copy of that size. When none is left the job
 gets one error naming each copy tried and what it said. A copy whose read answered with
 bad bytes (such a short answer, or a basket that failed the key-position check of
-`check_origin_integrity`) is not opened again for that file handle, wherever the
-redirector or the regional redirector's list of copies would send the next attempt. A read that reaches past the end
+`check_origin_integrity`) is never taken again for that file handle: the regional
+redirector's list of copies no longer offers it, and an open the redirector sends back
+to it is refused. A read that reaches past the end
 of the file, and any short answer of a file whose size was not confirmed (a file not named
 `*.root`, or one whose header made no claim), is answered as it would be without uCache.
 The per-file record file has the `origin_failure` line of each read that

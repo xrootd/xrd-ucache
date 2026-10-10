@@ -868,9 +868,10 @@ switch off nothing of this happens: an open's failure is the job's, as without
 uCache.
 
 **Reading a file from another site (part of `adaptive_federation`).** With
-`adaptive_federation = on`, a file that uCache serves, that was opened through
-a redirector, and that is not shown in a layout of uCache's own (`recompress`),
-has the reads it makes of the origin bounded: one that has not been answered
+`adaptive_federation = on`, a file that was opened through a redirector and is
+not shown in a layout of uCache's own (`recompress`), whether uCache serves it or
+passes its reads straight to the origin (its host left out by the cache's allow and
+deny lists), has the reads it makes of the origin bounded: one that has not been answered
 after 5 minutes (a backstop: a server that goes quiet is found sooner, by the
 client's own check of a quiet connection, 60 s plus its timeout resolution of
 15 s), or the job's own timeout of that read when that is shorter (the
@@ -880,7 +881,10 @@ answering, the connection was lost, the request expired, or the server
 reported a fault of its own or of its storage, is not the job's to see: uCache
 opens the file again at another site as it does for an open (above), takes only
 a copy of the size the job was shown, and issues the read again in full, so the
-job gets the bytes. The server it left is tried last from then on. A read that
+job gets the bytes. The server it left is tried last from then on; the cache's
+allow and deny lists narrow the copies a read moves to as they do an open's, so when
+the redirector sends the open back to a server that failed and the lists refuse
+every other copy the regional redirector lists, that server is taken. A read that
 failed because of what it asked for (an unsupported or invalid request) fails
 as it does without uCache. One failed read serves every read that fails while
 the file is being opened elsewhere; a read is tried at up to 4 servers, within
@@ -899,7 +903,9 @@ any of these reasons, the job gets one error, with the code of the read's own fa
 that names each copy tried, its size where it is known, and what it said; a read that
 fails within a second after that gets the same error at once, without another attempt.
 A copy that answered a read with bad bytes (a basket that failed the check, a short
-answer inside the confirmed size) is not opened again for that file handle. Because the client's own
+answer inside the confirmed size) is never taken again for that file handle: the
+regional redirector's list of copies no longer offers it, and an open the redirector
+sends back to it is refused. Because the client's own
 recovery of a read would otherwise run first, such a file has it turned off
 (`ReadRecovery` and `WriteRecovery` read `false`, and a program cannot turn them
 back on): a call that the client used to recover on a connection that was lost

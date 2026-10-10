@@ -42,6 +42,11 @@
 #                          the header's end, and uCache has closed the copy. The copy of a file not
 #                          named *.root is not looked at;
 #                          the name is checked in any case (*.ROOT)
+#   header read fails      the header read of a copy fails (UCACHE_TEST_HEADER_FAIL_N, with a
+#                          connection error, or _KIND=short, answered short): at every copy the
+#                          open fails naming each, at the first copy only the open goes on to
+#                          another; either way the reader's open gets exactly one completion,
+#                          and uCache closes each copy it opened
 #   zeros at the size      one server holds as many zero bytes as the file has (a, b and c in
 #                          turn), the other two the file: the copy of zeros does not begin as a
 #                          ROOT file does and is refused; the open goes on to a whole copy
@@ -70,8 +75,11 @@
 #                          stays at its server. Each case checks the records: the failed
 #                          reads, each followed by an open with route read at another
 #                          server, and open_failovers equal to those opens. A handle whose
-#                          reads are all relayed (its host denied the cache) moves too, to a
-#                          copy of the size its reader's open was shown. With the
+#                          reads are all relayed (the name it was opened by, localhost, denied
+#                          the cache) moves too, to a copy of the size its reader's open was
+#                          shown, never back to the server its read failed at, and once every
+#                          server has failed, to the oldest failure (servers named as IPv6
+#                          addresses where localhost is IPv6 first). With the
 #                          switch off the failed reads are relayed on the same file and
 #                          the client's read recovery stays on
 #   cut after the open     the file is named *.root, its copies are whole, and the copy the handle
@@ -176,8 +184,9 @@ REGLOG=$(ls "$W"/regional/*/xrootd.log "$W"/regional/xrootd.log 2>/dev/null | he
 [ -s "$REGLOG" ]; verdict "the regional's log exists ($REGLOG)" $?
 
 mkdir -p "$W/conf"
-printf 'url = 127.0.0.1:%s;127.0.0.1:%s;127.0.0.1:%s;127.0.0.1:%s\nlib = %s\nenable = true\n' \
-  $RX $AX $BX $CX "$LIB" > "$W/conf/u.conf"
+# localhost:$RX too: the regional under another name than the address its servers answer from
+printf 'url = 127.0.0.1:%s;127.0.0.1:%s;127.0.0.1:%s;127.0.0.1:%s;localhost:%s\nlib = %s\nenable = true\n' \
+  $RX $AX $BX $CX $RX "$LIB" > "$W/conf/u.conf"
 direct_read() { # server lfn -> 0 when a read at the server's own port succeeds
   host timeout 30 "$XBIN/xrdcp" -f -s "root://127.0.0.1:$(port_of "$1")/$2" /dev/null >/dev/null 2>&1
 }
@@ -322,6 +331,44 @@ echo "$res" | sed 's/^/    /' | cut -c1-700
 echo "$res" | grep -q '^open-denied: clean$' && echo "$res" | grep -q "(127.0.0.1:$AX): size $CUT: its header says the file is $FIXW_SIZE bytes"
 verdict "the cut copy of a file named *.ROOT is refused too, and the error names it" $?
 
+echo; echo "=== the header read fails: the reader's open gets exactly one completion"
+# UCACHE_TEST_HEADER_FAIL_N fails the header read of the first N opens with a connection error
+# (_KIND=short: the read is sent one byte short, so the copy answers it short). Each such copy is a
+# failed copy, and the open goes on to another; when no copy is left the open fails. Either way the
+# reader's open gets one completion, through the handler's HandleResponseWithHosts, with a host list.
+L=/store/ci/hf-all.root
+placew $L a b c
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=99)
+res=$(fuzz "$W/c19" "$W/f19.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-denied)
+echo "$res" | sed 's/^/    /' | cut -c1-700
+records "$W/c19" | sed 's/^/    rec: /' | cut -c1-230
+NH=$(nheader "$W/f19.log"); NATT=$(records "$W/c19" | wc -l)
+[ "$NATT" -ge 3 ] && [ "$(records "$W/c19" | grep -c '"status":"ok"')" = 0 ] && [ "$NH" = 0 ]
+verdict "header read failing at every copy: each attempt failed ($NATT attempts; the fault struck: no read of 300 bytes was sent, $NH)" $?
+echo "$res" | grep -q '^open-denied: clean$'; verdict "header read failing at every copy: Open() returned OK and the reader got exactly one completion, a failure" $?
+n=0; for s in a b c; do echo "$res" | grep -q "(127.0.0.1:$(port_of $s)): \[ERROR\] Connection error" && n=$((n + 1)); done
+[ "$n" = 3 ] && echo "$res" | grep -q 'no site could open it'; verdict "header read failing at every copy: the error names each copy and its failure ($n of 3)" $?
+CC=$(copies_closed "$W/f19.log")
+[ "${CC% *}" = "$NATT" ] && [ "${CC#* }" = "$NATT" ]; verdict "header read failing at every copy: each copy that was opened was closed by uCache (opened, closed: $CC; $NATT attempts)" $?
+for kind in error short; do
+  L=/store/ci/hf-one-$kind.root
+  placew $L a b c
+  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=$kind)
+  res=$(fuzz "$W/c20-$kind" "$W/f20-$kind.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
+  echo "$res" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-300
+  records "$W/c20-$kind" | sed 's/^/    rec: /' | cut -c1-230
+  case $kind in
+    error) records "$W/c20-$kind" | head -1 | grep -q '"code":108,'; r=$? ;;
+    short) records "$W/c20-$kind" | head -1 | grep -q '"status":"ok".*"class":"none"' &&
+             cat "$W/c20-$kind"/stats/*.files.jsonl | grep '"kind":"origin_failure"' | head -1 | grep -q '"op":"open".*"class":"data".*a read of its first 300 bytes answered 299'; r=$? ;;
+  esac
+  [ "$r" = 0 ] && [ "$(records "$W/c20-$kind" | wc -l)" -ge 2 ]
+  verdict "header read failing ($kind) at the first copy: the fault struck there and the open went on to another attempt" $?
+  echo "$res" | grep -q '^open-failover: clean$'; verdict "header read failing ($kind) at the first copy: exactly one completion, a success, the file's own bytes" $?
+  records "$W/c20-$kind" | tail -1 | grep -q "\"status\":\"ok\".*\"size\":$FIXW_SIZE,.*\"outcome\":\"ok\""; verdict "header read failing ($kind) at the first copy: the last attempt is ok, at a whole copy" $?
+done
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on) # the cases below have no header fault
+
 echo; echo "=== a copy that is zeros at the file's size is refused"
 head -c "$FIXW_SIZE" /dev/zero > "$W/fixw-zero.bin"
 got=0 allok=1
@@ -437,15 +484,16 @@ place8() { # LFN server... (8 MiB)
 recs() { cat "$1"/stats/*.files.jsonl 2>/dev/null | grep "\"kind\":\"$2\""; }
 field() { sed -n "s/.*\"$1\":\"\{0,1\}\([^\",}]*\).*/\1/p"; } # a field of each line
 # rf CASE N SWITCH [KIND [TAG]]: the case on a file of its own (TAG tells two runs of one case apart);
-# sets RES, RFC (its cache), SV (the servers it read from). RFX: more of the client's environment.
-RFX=()
+# sets RES, RFC (its cache), SV (the servers it read from). RFX: more of the client's environment;
+# RFHOST: the name the reader opens the regional by.
+RFX=() RFHOST=127.0.0.1
 rf() {
   local c=$1 n=$2 sw=$3 kind=${4:-} tag=${5:-}
   local l=/store/ci/rf-$c-${kind:-x}$tag.bin
   place8 $l a b c
   RFC="$W/c-rf-$c-${kind:-x}$tag"
   FEDENV=(UCACHE_ADAPTIVE_FEDERATION=$sw UCACHE_TEST_READ_FAIL_N=$n ${kind:+UCACHE_TEST_READ_FAIL_KIND=$kind} "${RFX[@]}")
-  RES=$(fuzz "$RFC" "$W/rf-$c-${kind:-x}$tag.log" "root://127.0.0.1:$RX/$l" "$W/f8.bin" 1 1 1 read-failover $c)
+  RES=$(fuzz "$RFC" "$W/rf-$c-${kind:-x}$tag.log" "root://$RFHOST:$RX/$l" "$W/f8.bin" 1 1 1 read-failover $c)
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-220
   SV=($(echo "$RES" | sed -n 's/^SERVERS //p'))
   FL=($(recs "$RFC" origin_failure | field data_server))   # the server of each failed read
@@ -466,15 +514,29 @@ clean relay; verdict "relay: a PgRead and a VectorRead into one buffer that fail
 
 # The same on a handle the cache does not serve (its host is denied the cache): it has no entry and no
 # stat of its own, and moves to a copy of the size its reader's open was shown. Every read of it is
-# relayed, the first one (the Read that arms a cached handle) too, so three fail.
-RFX=(UCACHE_DENY=127.0.0.1)
+# relayed, the first one (the Read that arms a cached handle) too, so three fail. The reader opens
+# the regional as localhost and that name is denied; the servers the regional lists answer from
+# 127.0.0.1, which the lists leave alone. (The lists also narrow the copies a move may take: had they
+# refused 127.0.0.1 too, a move the regional sends back to the server it left would have no other
+# copy to take, and would take that one.)
+RFX=(UCACHE_DENY=localhost) RFHOST=localhost
 rf relay 3 on relay -denied
-RFX=()
+RFX=() RFHOST=127.0.0.1
 clean relay; verdict "relay, host denied: a Read, a PgRead and a VectorRead that failed are exact, once, and move the handle" $?
 [ "$(find "$RFC" -name '*.meta' | wc -l)" = 0 ]; verdict "relay, host denied: nothing is cached" $?
 [ "$(recs "$RFC" origin_failure | field op | tr '\n' ' ')" = "relay relay relay " ] && [ "${#MV[@]}" = 3 ] &&
   [ "$(recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | grep -c '"size":8388608,')" = 3 ]
 verdict "relay, host denied: three failed relayed reads, three moves, each to a copy of 8388608 bytes (${MV[*]})" $?
+# Each move lands at a server other than the one its read failed at, also when the regional sends the move's
+# open back there (it cannot be told to avoid an address): the move then takes another copy the regional
+# lists. By the third every server has failed, so the regional's answer is always sent back, and the list
+# gives the failed servers the oldest failure first: the third move lands where the first read failed.
+# The reader reaches the servers as the regional names them, [::1] where localhost is IPv6 first.
+away=1; for i in 0 1 2; do [ -n "${MV[$i]:-}" ] && [ "${MV[$i]}" != "${FL[$i]:-}" ] || away=0; done
+SB=$(recs "$RFC" open | grep '"route":"read"' | grep -vc '"attempt":1,')
+[ "$away" = 1 ]; verdict "relay, host denied: each move landed away from the server its read failed at (failed ${FL[*]}; landed ${MV[*]}; $SB later attempts of moves)" $?
+[ "${#FL[@]}" = 3 ] && [ "$(printf '%s\n' "${FL[@]}" | sort -u | wc -l)" = 3 ] && [ "${MV[2]:-}" = "${FL[0]}" ] && [ "$SB" -ge 1 ]
+verdict "relay, host denied: with every server failed, the third move was sent back and then took the oldest failure, ${FL[0]} (landed ${MV[2]:-none})" $?
 
 rf refuse 3 on refuse
 clean refuse; verdict "refuse: reads the client refused at once are exact, once" $?
