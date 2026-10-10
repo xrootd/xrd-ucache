@@ -41,8 +41,8 @@
 // right bytes, once, with adaptive_federation on and the file's copies behind a
 // redirector (see runReadFailover). The caller checks the records. The cases
 // zero, zerov and zeroerr do the same for a read of a basket that a server serves
-// as zeros (see runZero), and cut, cutpg, cutonly and end for a copy that is cut short after
-// the open (see runCut).
+// as zeros (see runZero), and cut, cutpg, cutpgpast, cutonly and end for a copy that is cut
+// short after the open (see runCut).
 #include <XrdCl/XrdClFile.hh>
 #include <XrdCl/XrdClURL.hh>
 #ifdef UCACHE_FUZZ_HAVE_TRANSPOSE
@@ -1436,23 +1436,29 @@ int runZero(const char* url, const char* local, const std::string& which) {
   return fails ? 1 : 0;
 }
 
-// read-failover cut | cutpg | cutonly | end: <local-path> is a ROOT file of at least 64 KiB, whose
-// header says where it ends, and <root-url> serves it from the servers of a federation that
-// do not use sendfile (a copy cut under an open file then answers short, where sendfile would
-// break the connection). The handle is opened (adaptive_federation on: the open reads the
-// header, so the file's size is confirmed), then UCACHE_CUT_CMD, when set, is run with the port
-// of the server the handle landed on and cuts that copy short. Then 64 KiB are read inside the
-// file's size, past the cut:
+// read-failover cut | cutpg | cutpgpast | cutonly | end: <local-path> is a ROOT file of at least
+// 64 KiB, whose header says where it ends, and <root-url> serves it from the servers of a
+// federation that do not use sendfile (a copy cut under an open file then answers short, where
+// sendfile would break the connection). The handle is opened (adaptive_federation on: the open
+// reads the header, so the file's size is confirmed), then UCACHE_CUT_CMD, when set, is run with
+// the port of the server the handle landed on and cuts that copy short. Then 64 KiB are read
+// inside the file's size, past the cut:
 //   cut      the read is the file's own bytes, from another server than the cut one
 //   cutpg    the same with a PgRead, which the cache passes straight to the origin, from 20000, so
 //            that the caller's cut falls inside it (fed_ci.sh cuts at 30000) and the copy answers it
 //            with the bytes before the cut: the short answer of a page read is held against the copy
-//            as a plain read's is. (A page read that a copy answers with no bytes at all fails in the
-//            client itself, with an invalid response, before uCache sees an answer.)
+//            as a plain read's is
+//   cutpgpast the same with a PgRead from 40000, wholly past the cut: the copy answers it with no
+//            bytes, which the client fails itself with an invalid response (it cannot take an
+//            empty page answer); inside the file's size that is held against the copy too, and
+//            the read is made again at another copy (a client that took the empty answer would
+//            give a short one, held against the copy as well)
 //   cutonly  every copy was cut: the read fails with errDataError, and its message says the
 //            answer was short inside the file's size
 //   end      nothing is cut. A Read and a PgRead that reach past the end of the file are answered
-//            with the bytes that exist, short, as they always were, and the handle stays put
+//            with the bytes that exist, short, as they always were, and the handle stays put; a
+//            PgRead wholly past the end is answered as without uCache (no bytes, or the client's
+//            own invalid response for that empty answer), and does not move the handle
 int runCut(const char* url, const char* local, const std::string& which) {
   const char* mode = "read-failover";
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -1495,11 +1501,21 @@ int runCut(const char* url, const char* local, const std::string& which) {
     verdict(s.IsOK() && got == 0, "a Read past the end is answered with no bytes (" + s.ToString() + ")");
     file->GetProperty("DataServer", now);
     verdict(now == landed, "the handle is still read from " + landed + " (now " + now + ")");
+    // Last: a client that fails an empty page answer leaves its File unusable.
+    s = file->PgRead(size + 5000, 65536, buf.data(), cksums, got);
+    verdict((s.IsOK() && got == 0) || s.code == XrdCl::errInvalidResponse,
+            "a PgRead past the end is answered as without uCache: no bytes, or the client's "
+            "invalid response (" + s.ToString() + ")");
+    std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a move, were one made
+    file->GetProperty("DataServer", now);
+    verdict(now == landed,
+            "the handle is still read from " + landed + " after it (now " + now + ")");
   } else {
     auto* w = new ReadWait(); // leaked with its buffer: a late completion lands safely
+    const bool pg = which == "cutpg" || which == "cutpgpast";
     const uint64_t off = which == "cutpg" ? 20000 : 40000;
-    const XrdCl::XRootDStatus s = which == "cutpg" ? file->PgRead(off, 65536, buf.data(), w)
-                                                   : file->Read(off, 65536, buf.data(), w);
+    const XrdCl::XRootDStatus s =
+        pg ? file->PgRead(off, 65536, buf.data(), w) : file->Read(off, 65536, buf.data(), w);
     const bool answered = s.IsOK() && w->wait();
     std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a second completion
     file->GetProperty("DataServer", now);
@@ -1532,7 +1548,8 @@ int runReadFailover(const char* url, const char* local, const std::string& which
   const char* mode = "read-failover";
   if (which.rfind("zero", 0) == 0)
     return runZero(url, local, which);
-  if (which == "cut" || which == "cutpg" || which == "cutonly" || which == "end")
+  if (which == "cut" || which == "cutpg" || which == "cutpgpast" || which == "cutonly" ||
+      which == "end")
     return runCut(url, local, which);
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   Source src(local);

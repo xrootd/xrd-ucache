@@ -709,6 +709,12 @@ bool shortInsideConfirmed(uint64_t confirmed, uint64_t off, uint64_t len, uint64
   return confirmed && len && got < len && off + len >= off && off + len <= confirmed;
 }
 
+bool emptyPageReadInsideConfirmed(bool armed, bool pageRead, int code, uint64_t confirmed,
+                                  uint64_t off, uint64_t len) {
+  return armed && pageRead && code == kErrInvalidResponse &&
+         shortInsideConfirmed(confirmed, off, len, 0);
+}
+
 int readDeadlineS(const char* text) {
   char* end = nullptr;
   const long v = text ? std::strtol(text, &end, 10) : 0;

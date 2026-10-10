@@ -1171,6 +1171,32 @@ TEST(OpenPolicy, OpenOnceMoreAfterCheckRead) {
     EXPECT_FALSE(openOnceMoreAfterCheckRead(true, 1, code)) << code;
 }
 
+// A page read the client failed with an invalid response (its answer to a copy's empty answer) is
+// a failure of the copy only on an armed handle, inside the confirmed size; anything else is as it
+// was.
+TEST(OpenPolicy, EmptyPageReadInsideConfirmed) {
+  constexpr uint64_t N = 106379; // the confirmed size
+  EXPECT_EQ(kErrInvalidResponse, 303);
+  EXPECT_TRUE(emptyPageReadInsideConfirmed(true, true, 303, N, 40000, 65536)) << "past a cut";
+  EXPECT_TRUE(emptyPageReadInsideConfirmed(true, true, 303, N, 0, 4096));
+  EXPECT_TRUE(emptyPageReadInsideConfirmed(true, true, 303, N, N - 4096, 4096)) << "to the end";
+  // Not an armed handle, not a page read, no confirmed size: as without uCache.
+  EXPECT_FALSE(emptyPageReadInsideConfirmed(false, true, 303, N, 40000, 65536)) << "not armed";
+  EXPECT_FALSE(emptyPageReadInsideConfirmed(true, false, 303, N, 40000, 65536)) << "a plain read";
+  EXPECT_FALSE(emptyPageReadInsideConfirmed(true, true, 303, 0, 40000, 65536)) << "no size";
+  // Another failure: as it was (a data error, a short answer, are judged elsewhere).
+  for (int code : {0, kErrDataError, kErrSocketError, kErrOperationExpired, kErrNotFound, 302, 305,
+                   kErrErrorResponse})
+    EXPECT_FALSE(emptyPageReadInsideConfirmed(true, true, code, N, 40000, 65536)) << code;
+  // A page read that reaches past the confirmed size: every copy answers it with no bytes past the
+  // end of the file, so it says nothing of the copy.
+  EXPECT_FALSE(emptyPageReadInsideConfirmed(true, true, 303, N, N - 1000, 65536)) << "across it";
+  EXPECT_FALSE(emptyPageReadInsideConfirmed(true, true, 303, N, N + 5000, 65536)) << "past the end";
+  EXPECT_FALSE(emptyPageReadInsideConfirmed(true, true, 303, N, N, 1)) << "at the end";
+  EXPECT_FALSE(emptyPageReadInsideConfirmed(true, true, 303, N, 40000, 0)) << "nothing asked";
+  EXPECT_FALSE(emptyPageReadInsideConfirmed(true, true, 303, N, UINT64_MAX - 10, 65536)) << "wraps";
+}
+
 // A short answer counts against a copy only when the request lies wholly inside the confirmed size.
 TEST(OpenPolicy, ShortInsideConfirmed) {
   constexpr uint64_t N = 1000000; // the confirmed size

@@ -42,6 +42,7 @@ constexpr int kErrTlsError = 110;
 constexpr int kErrAuthFailed = 204;
 constexpr int kErrOperationExpired = 206;
 constexpr int kErrOperationInterrupted = 207;
+constexpr int kErrInvalidResponse = 303;
 constexpr int kErrNotFound = 304;
 constexpr int kErrRedirectLimit = 306;
 constexpr int kErrErrorResponse = 400; // the server answered with an error: errNo holds its code
@@ -473,6 +474,17 @@ inline constexpr int kReadMaxAttempts = 4;
 // a request that reaches past the confirmed size, and any request when no size was confirmed, never
 // counts.
 bool shortInsideConfirmed(uint64_t confirmed, uint64_t off, uint64_t len, uint64_t got);
+// Whether a page read of `len` bytes at `off` that the client failed with `code` is a failure of
+// the copy that answered it: a page read (`pageRead`), on a handle armed for reads (`armed`: its
+// reads move), wholly inside the file's confirmed size (`confirmed`, 0 for none), failed with an
+// invalid response. The client (XrdCl 5.6 to 5.8 at least) fails so a page read that a copy
+// answers with no bytes (the data length of the empty answer underflows: "user supplied buffer is
+// too small for the received data"), and leaves its File unusable: inside the confirmed size the
+// copy lacks bytes the file has, as a copy that answers short does (shortInsideConfirmed). Any
+// other failure, any other read, and a page read that reaches past the confirmed size (past the
+// end of the file every copy answers it with no bytes) are as without uCache.
+bool emptyPageReadInsideConfirmed(bool armed, bool pageRead, int code, uint64_t confirmed,
+                                  uint64_t off, uint64_t len);
 
 // What follows a failed origin read of an armed handle. This is every status the
 // client's own recovery of a read handles, which is off on such a handle, and

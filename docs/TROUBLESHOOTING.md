@@ -420,7 +420,12 @@ open the entry answered: see "uCache opened the file at another site" above), is
 failure too: the log
 says `<file>: <host>:<port> answered <n> of the <m> bytes asked at <offset>, inside the
 file's size of <size> bytes; not served`, the line in the record file is of class `data`
-(code 14), and the read is made again at a copy of that size. When none is left the job
+(code 14), and the read is made again at a copy of that size. So is a page read (`PgRead`,
+which uCache passes straight to the origin) that the copy answers with no bytes there: the
+XRootD client fails such an answer itself (`[ERROR] Invalid response`, "user supplied buffer
+is too small for the received data", and its File is unusable after it); uCache logs
+`answered a page read of <m> bytes at <offset> with no bytes, inside the file's size of
+<size> bytes` and moves the read in full. When none is left the job
 gets one error naming each copy tried and what it said. A copy whose read answered with
 bad bytes (such a short answer, or a basket that failed the key-position check of
 `check_origin_integrity`) is never taken again for that file handle: the regional

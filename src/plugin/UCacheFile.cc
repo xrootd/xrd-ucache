@@ -76,6 +76,7 @@ static_assert(XrdCl::errInternal == xrdwire::kErrInternal &&
                   XrdCl::errTlsError == xrdwire::kErrTlsError &&
                   XrdCl::errAuthFailed == xrdwire::kErrAuthFailed &&
                   XrdCl::errOperationExpired == xrdwire::kErrOperationExpired &&
+                  XrdCl::errInvalidResponse == xrdwire::kErrInvalidResponse &&
                   XrdCl::errNotFound == xrdwire::kErrNotFound &&
                   XrdCl::errRedirectLimit == xrdwire::kErrRedirectLimit &&
                   XrdCl::errErrorResponse == xrdwire::kErrErrorResponse &&
@@ -2817,6 +2818,26 @@ static XRootDStatus* shortAnswer(HandleState& st, ServerTally* tally, const char
   return refused;
 }
 
+// The status a page read the client failed with an invalid response inside the confirmed size, on
+// an armed handle, becomes (OpenPolicy.h emptyPageReadInsideConfirmed): a data failure of the copy,
+// recorded and counted as one, as shortAnswer's. `client`: the client's own failure.
+static XRootDStatus* emptyPageAnswer(HandleState& st, ServerTally* tally, uint64_t off,
+                                     uint64_t len, const XRootDStatus& client,
+                                     const std::string& server) {
+  char msg[400];
+  std::snprintf(msg, sizeof msg,
+                "answered a page read of %llu bytes at %llu with no bytes, inside the file's size "
+                "of %llu bytes (the client: %s)",
+                static_cast<unsigned long long>(len), static_cast<unsigned long long>(off),
+                static_cast<unsigned long long>(st.confirmedSize.load(std::memory_order_relaxed)),
+                recordText(client.ToString(), 120).c_str());
+  UCACHE_WARN("%s: %s %s; not served", recordFile(st.url).c_str(),
+              server.empty() ? "the origin" : server.c_str(), msg);
+  auto* refused = new XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, msg);
+  noteOriginFailure(st, tally, "relay", off, len, *refused, server);
+  return refused;
+}
+
 namespace {
 // check_origin_integrity's failed check, defined with the miss handlers below.
 [[maybe_unused]] XRootDStatus* originCheckFailed(HandleState& st, ServerTally* tally,
@@ -2850,6 +2871,7 @@ struct RelayHandler : XrdCl::ResponseHandler {
   uint64_t t0 = 0;      // when the read was issued
   uint64_t readLen = 0; // a plain read's length (Read, PgRead), else 0
   uint64_t off = 0, len = 0; // what was asked, for a failure's record
+  bool pageRead = false;     // a PgRead (OpenPolicy.h emptyPageReadInsideConfirmed)
   // On an armed handle (moveOn): `again` issues the request on a File of the
   // handle, `on` is the File this attempt went to, and a failure that another
   // site may not share is not the reader's to see: the handler waits for the
@@ -3017,6 +3039,22 @@ struct RelayHandler : XrdCl::ResponseHandler {
         checkFailed = true;
       }
     }
+    // A page read the client failed for an answer with no bytes, inside the file's confirmed size,
+    // on a handle whose reads move: a data failure of the copy, moved as a short answer is. Its
+    // File is left unusable by the client; the move gives the handle another.
+    if (s && !s->IsOK() && !checkFailed && again &&
+        emptyPageReadInsideConfirmed(st->moveOnReads.load(), pageRead, s->code,
+                                     st->confirmedSize.load(std::memory_order_relaxed), off, len)) {
+      std::string server = answeredBy(*st, h);
+      if (server.empty())
+        server = st->relayServers.topServer();
+      XRootDStatus* refused = emptyPageAnswer(*st, &st->relayServers, off, len, *s, server);
+      delete s;
+      delete r;
+      s = refused;
+      r = nullptr;
+      checkFailed = true;
+    }
     // Timed before the inner file is given back, so a Close that waits for
     // this read finds its time already on the handle.
     if (st->store && t0 && s && s->IsOK()) {
@@ -3102,16 +3140,18 @@ static std::shared_ptr<const ChunkList> keepChunks(const HandleState& st, const 
 // anything else. `off` and `len`: what is asked, for a failure's record.
 // `issue`: the call, given a File, the handler and the timeout. `reissuable`: it
 // may be made again after this call returned (a vector read's chunk list is kept
-// for that: keepChunks).
+// for that: keepChunks). `pageRead`: it is a PgRead (a failure of the client for
+// an empty answer inside the confirmed size moves it).
 template <typename Issue>
 static XrdCl::XRootDStatus relayToInner(const std::shared_ptr<HandleState>& st,
                                         XrdCl::ResponseHandler* user, int readerT, Issue issue,
                                         uint64_t readLen = 0, uint64_t off = 0, uint64_t len = 0,
-                                        bool reissuable = true) {
+                                        bool reissuable = true, bool pageRead = false) {
   noteWaitTier(user, ReaderWait::kOrigin);
   if (XrdCl::File* f = st->acquireInner()) {
     auto* relay = newRelay(st, f, user, off, len);
     relay->readLen = readLen;
+    relay->pageRead = pageRead;
     if (reissuable && st->moveOnReads) {
       relay->again = issue;
       relay->readerT = readerT;
@@ -4960,7 +5000,7 @@ XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void
       [=](XrdCl::File* f, ResponseHandler* rh, ucache::XrdTimeout t) {
         return f->PgRead(offset, size, buffer, rh, t);
       },
-      entry ? 0 : size, offset, size);
+      entry ? 0 : size, offset, size, /*reissuable=*/true, /*pageRead=*/true);
 }
 
 // The plain byte-cache vector-read serve, as a free function so a request that

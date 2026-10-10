@@ -98,7 +98,10 @@
 #                          past the cut is answered short, which is held against the copy (its size
 #                          was confirmed by the header at the open): the read is made again at
 #                          another copy and is exact, for a Read the cache serves and for a PgRead it
-#                          passes straight to the origin. When every copy is cut the read fails with the
+#                          passes straight to the origin, across the cut or wholly past it (the copy
+#                          answers the latter with no bytes, which the client itself fails with an
+#                          invalid response; inside the file's size uCache holds that against the copy
+#                          too). When every copy is cut the read fails with the
 #                          data error, whose text says no copy could serve the read and names each
 #                          copy tried with its size. A read that reaches past the end of an intact
 #                          file is answered short as it always was, and the handle does not move
@@ -791,13 +794,25 @@ echo "$RES" | grep -q '^read-failover cutpg: clean$'; verdict "cutpg: a PgRead a
 [ "$F14" = 1 ] && [ "$F14OPS" = "relay " ]; verdict "cutpg: the short answer is one failed read of class data, code 14, op relay: the passed-through PgRead ($F14, $F14OPS)" $?
 recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | tail -1 | grep -q "\"size\":$FIXW_SIZE,"
 verdict "cutpg: a move of route read ended at a copy of $FIXW_SIZE bytes" $?
+# the same with a PgRead wholly past the cut (from 40000): the copy answers it with no bytes, which the client
+# fails itself with an invalid response (303) and leaves its File unusable; inside the file's confirmed size that
+# is a data failure of the copy, and the read moves
+ct cutpgpast cut /store/ci/ct-cutpgpast.root
+echo "$RES" | grep -q '^read-failover cutpgpast: clean$'; verdict "cutpgpast: a PgRead wholly past the cut is the file's own bytes, from another server, once (${SV[*]})" $?
+[ "$F14" = 1 ] && [ "$F14OPS" = "relay " ]; verdict "cutpgpast: the empty answer is one failed read of class data, code 14, op relay ($F14, $F14OPS)" $?
+# the fault: the client itself failed the page read for the copy's empty answer (when a client takes such an
+# answer, it is a short one, held against the copy as cutpg's is)
+grep -q 'kXR_pgread (handle: [^,]*, offset: 40000, size: 65536): user supplied buffer is too small' "$W/ct_store_ci_ct-cutpgpast.root.log"
+verdict "cutpgpast: the client failed the page read at 40000 itself, for an empty answer (its log): the fault was in place" $?
+recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | tail -1 | grep -q "\"size\":$FIXW_SIZE,"
+verdict "cutpgpast: a move of route read ended at a copy of $FIXW_SIZE bytes" $?
 ct cutonly cutall /store/ci/ct-all.root
 echo "$RES" | grep -q '^read-failover cutonly: clean$'; verdict "cutonly: every copy is cut, the read fails with the data error and says why" $?
 [ "$F14" -ge 1 ] && [ "$F14" -le 4 ]; verdict "cutonly: $F14 failed reads (one to four)" $?
 echo "$RES" | grep -q "no copy could serve the read: .*, $FIXW_SIZE bytes): answered .*inside the file's size of $FIXW_SIZE bytes.*, $CUTAT bytes): it serves $CUTAT bytes, the cached file has $FIXW_SIZE"
 verdict "cutonly: the error says no copy could serve the read, and names the copies tried with their sizes" $?
 ct end "" /store/ci/ct-end.root
-echo "$RES" | grep -q '^read-failover end: clean$'; verdict "end: reads that reach past the end of an intact file are answered short, exactly, and the handle stays (${SV[*]})" $?
+echo "$RES" | grep -q '^read-failover end: clean$'; verdict "end: reads that reach past the end of an intact file are answered short, exactly (a PgRead wholly past it as without uCache), and the handle stays (${SV[*]})" $?
 [ "$F14" = 0 ] && [ "$NRA" = 0 ]; verdict "end: no failed read, no move ($F14, $NRA)" $?
 
 echo; echo "fed_ci: $FAILS failure(s)"

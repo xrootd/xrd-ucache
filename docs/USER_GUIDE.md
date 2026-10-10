@@ -937,7 +937,9 @@ read that a copy answers short, inside a file whose size is confirmed (a file na
 `*.root` whose copy's header said where it ends, at the size the copy reported: at
 this open, or, for an open the cache entry answered within its freshness window, at
 an earlier one): the copy ends before the file does, which is a data failure of that
-copy. A short answer is normal when a read reaches past the end of a file, and without
+copy. So is a page read (`PgRead`, passed straight to the origin) that the copy answers
+with no bytes inside that size, which the XRootD client fails itself as an invalid
+response: the read is made again in full at another copy. A short answer is normal when a read reaches past the end of a file, and without
 a confirmed size it is never held against a copy: the read ends as it would without
 uCache. When no other copy of the size the job was shown serves a read that moves, for
 any of these reasons, the job gets one error, with the code of the read's own failure,
