@@ -590,6 +590,7 @@ TEST(RootCheck, ListOfTopLevelObjects) {
   Synth base;
   base.build();
   const int64_t end = base.end;
+  const std::string obj = "size " + std::to_string(end) + ": its list of top-level objects";
   const std::string sz = "size " + std::to_string(end) + ": its list of top-level objects at " +
                          std::to_string(base.seekKeys);
   struct Row {
@@ -600,13 +601,13 @@ TEST(RootCheck, ListOfTopLevelObjects) {
   };
   const Row rows[] = {
       {"ownNbytes", base.nbytesKeys + 1, K::kBad,
-       sz + " is labelled as " + std::to_string(base.nbytesKeys + 1) + " bytes at " +
-           std::to_string(base.seekKeys) + " in the directory at 100, not as " +
-           std::to_string(base.nbytesKeys) + " bytes at " + std::to_string(base.seekKeys) +
-           " in the top directory at 100"},
-      {"ownSeek", base.seekKeys - 1, K::kBad, ""},
+       sz + " is labelled as " + std::to_string(base.nbytesKeys + 1) + " bytes long, not " +
+           std::to_string(base.nbytesKeys)},
+      {"ownSeek", base.seekKeys - 1, K::kBad,
+       sz + " is labelled as lying at " + std::to_string(base.seekKeys - 1)},
       {"ownSeek", 0, K::kBad, ""},
-      {"ownPdir", 0, K::kBad, ""},
+      {"ownPdir", 0, K::kBad,
+       sz + " is labelled with the directory at 0, not the top directory at 100"},
       {"ownPdir", 158, K::kBad, ""},
       {"count", -1, K::kBad, sz + " gives a count of -1 objects"},
       {"count", 4, K::kBad, sz + " ends inside its entry 4 of 4"},
@@ -616,7 +617,7 @@ TEST(RootCheck, ListOfTopLevelObjects) {
       {"entrySeek", 0, K::kBad, ""},
       {"entrySeek", end, K::kBad, ""},
       {"entrySeek", end - 1, K::kBad,
-       sz + " names an object at " + std::to_string(end - 1) +
+       obj + " names an object at " + std::to_string(end - 1) +
            ", 1037 bytes, outside the file's records (100 to " + std::to_string(end) + ")"},
       {"entryNbytes", 0, K::kBad, ""},
       {"entryNbytes", -1, K::kBad, ""},
@@ -624,8 +625,8 @@ TEST(RootCheck, ListOfTopLevelObjects) {
       {"entryPdir", 0, K::kBad, ""},
       {"entryPdir", 101, K::kBad, ""},
       {"entryPdir", 4000, K::kBad,
-       sz + " names an object at " + std::to_string(base.listed[1].seekKey) +
-           " whose directory is at 4000, not the top directory at 100"},
+       obj + " names an object at " + std::to_string(base.listed[1].seekKey) +
+           " in the directory at 4000, not the top directory at 100"},
   };
   for (const Row& r : rows) {
     Synth s;
@@ -668,6 +669,40 @@ TEST(RootCheck, ListOfTopLevelObjects) {
   EXPECT_EQ(check(t.build()).why, "size " + std::to_string(end) +
                                       ": its list of top-level objects at " +
                                       std::to_string(t.seekKeys) + " does not hold its own label");
+}
+
+// Every refusal's text fits in what the error naming every copy keeps of it (160 characters), with
+// positions of 10 digits: 64-bit files of many GB, every rule broken in turn.
+TEST(RootCheck, TextsFitTheError) {
+  std::vector<std::pair<std::string, int64_t>> breaks = {
+      {"end", 9999999999LL},
+      {"seekInfo", 50},
+      {"seekFree", 9999999999LL},
+      {"seekKeys", 9999999999LL},
+      {"nbytesKeys", 0},
+      {"ownSeek", 9999999998LL},
+      {"ownNbytes", 2147483647LL},
+      {"ownPdir", 9999999997LL},
+      {"count", -2147483647LL},
+      {"entrySeek", 9999999996LL},
+      {"entryNbytes", -2147483647LL},
+      {"entryPdir", 9999999995LL},
+  };
+  size_t longest = 0;
+  for (const auto& b : breaks) {
+    Synth s;
+    s.wide = true;
+    s.base = 9000000000LL;
+    s.build();
+    s.set[b.first] = b.second;
+    if (b.first == "end")
+      s.set["size"] = 9999999998LL;
+    const RootHeaderVerdict v = check(s.build());
+    EXPECT_EQ(v.kind, K::kBad) << b.first;
+    EXPECT_LE(v.why.size(), 150u) << b.first << ": " << v.why;
+    longest = std::max(longest, v.why.size());
+  }
+  EXPECT_GT(longest, 130u) << "the rows reached the long texts";
 }
 
 // rootCheckRead on a verdict that asks for nothing, or with no bytes: no change, or a short answer.

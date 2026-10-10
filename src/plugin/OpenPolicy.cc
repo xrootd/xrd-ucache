@@ -389,11 +389,14 @@ void judgeKeysList(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
   RootKeyLabel own;
   if (!parseRootKeyLabel(b, n, at, own))
     return refuse(v, list + " does not hold its own label");
-  if (own.nbytes != v.dir.nbytesKeys || own.seekKey != v.dir.seekKeys || own.seekPdir != h.begin)
-    return refuse(v, list + " is labelled as " + num(own.nbytes) + " bytes at " + num(own.seekKey) +
-                         " in the directory at " + num(own.seekPdir) + ", not as " +
-                         num(v.dir.nbytesKeys) + " bytes at " + num(v.dir.seekKeys) +
-                         " in the top directory at " + num(h.begin));
+  if (own.seekKey != v.dir.seekKeys)
+    return refuse(v, list + " is labelled as lying at " + num(own.seekKey));
+  if (own.nbytes != v.dir.nbytesKeys)
+    return refuse(v, list + " is labelled as " + num(own.nbytes) + " bytes long, not " +
+                         num(v.dir.nbytesKeys));
+  if (own.seekPdir != h.begin)
+    return refuse(v, list + " is labelled with the directory at " + num(own.seekPdir) +
+                         ", not the top directory at " + num(h.begin));
   if (n < 4 || at > n - 4)
     return refuse(v, list + " ends before its count of objects");
   const int32_t count = static_cast<int32_t>(static_cast<uint32_t>(b[at]) << 24 |
@@ -407,11 +410,12 @@ void judgeKeysList(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
     if (!parseRootKeyLabel(b, n, at, k))
       return refuse(v, list + " ends inside its entry " + num(i + 1) + " of " + num(count));
     if (k.nbytes <= 0 || k.seekKey >= h.end || !inside(h, k.seekKey, k.nbytes))
-      return refuse(v, list + " names an object at " + num(k.seekKey) + ", " + num(k.nbytes) +
-                           " bytes, " + span(h));
+      return refuse(v, "its list of top-level objects names an object at " + num(k.seekKey) + ", " +
+                           num(k.nbytes) + " bytes, " + span(h));
     if (k.seekPdir != h.begin)
-      return refuse(v, list + " names an object at " + num(k.seekKey) + " whose directory is at " +
-                           num(k.seekPdir) + ", not the top directory at " + num(h.begin));
+      return refuse(v, "its list of top-level objects names an object at " + num(k.seekKey) +
+                           " in the directory at " + num(k.seekPdir) +
+                           ", not the top directory at " + num(h.begin));
   }
   v.next = RootHeaderVerdict::kNone;
 }

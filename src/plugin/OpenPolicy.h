@@ -262,6 +262,8 @@ long long rootFileEnd(const unsigned char* b, size_t n);
 //    can), which makes no claim on what follows. The copy stands, and nothing is confirmed.
 // The top directory is the record at the header's begin, where ROOT writes it. A list of top-level
 // objects longer than kRootKeysListMaxBytes is not read: the verdict stands as the header gives it.
+// Each text names one thing wrong and stays short (the error that names every copy keeps 160
+// characters of each): 150 characters at most with 10-digit positions.
 struct RootHeaderVerdict {
   enum Kind : uint8_t { kNoClaim, kConfirmed, kBad };
   Kind kind = kNoClaim;
