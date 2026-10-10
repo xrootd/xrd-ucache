@@ -365,10 +365,22 @@ std::string span(int64_t from, int64_t to) {
 // saved so and then written on, or whose writer stopped there, holds its list and its newest
 // objects past the end its header states. ROOT reads such a file normally (TFile::Init takes
 // it as complete, and TDirectoryFile::ReadKeys bounds each object by the file's size). The class
-// descriptions and the list of free space are placed by the header itself, in the same write
-// as its end (TFile::WriteHeader), so they stay within that end.
+// descriptions are bounded the same way: ROOT reads them (TFile::GetStreamerInfoListImpl) within
+// the file's size, whatever the header's end says.
 int64_t listBound(const RootHeaderVerdict& v) {
   return std::max<int64_t>(v.header.end, v.size);
+}
+// The least position TDirectoryFile::ReadKeys takes for an object it lists, and for its directory:
+// it stops reading the list at an entry below it ("reading illegal key").
+constexpr int64_t kRootKeyMinPos = 64;
+// Whether `at` is the top directory: where its record lies by the header (fBEGIN, where TFile::Init
+// reads it and where ROOT writes it), or by its own record (fSeekDir, which TFile::Init takes as
+// the directory's position once it has read the record, and which ROOT writes as the directory of
+// the objects it adds to the file). The two agree in every file ROOT writes; ROOT itself compares
+// an object's directory with neither, so a copy whose record names another position than fBEGIN,
+// which ROOT reads, is not refused for it.
+bool topDirectory(const RootHeaderVerdict& v, int64_t at) {
+  return at == v.header.begin || at == v.dir.seekDir;
 }
 // The top directory's record, read: ROOT's own refusal of a name record out of range, then whether
 // the header was completed, then where the records it places lie (TFile::Init).
@@ -387,12 +399,13 @@ void judgeDirRecord(RootHeaderVerdict& v, const RootDirRecord& d) {
   if (!within(h.begin, to, d.seekKeys, d.nbytesKeys) || d.nbytesKeys <= 0)
     return refuse(v, "its list of top-level objects lies at " + num(d.seekKeys) + ", " +
                          num(d.nbytesKeys) + " bytes, " + span(h.begin, to));
-  if (h.seekInfo != 0 && !within(h.begin, h.end, h.seekInfo, h.nbytesInfo))
+  // The class descriptions, which TFile::Init reads when their position is past the first record
+  // (one at or before it is not read, and makes no claim), within the copy's size: a copy ROOT
+  // cannot read them from is one it cannot open. The list of free space is not looked at: ROOT
+  // reads it only for a file opened to be written, and ignores it when it is out of bounds.
+  if (h.seekInfo > h.begin && !within(h.begin, to, h.seekInfo, h.nbytesInfo))
     return refuse(v, "its class descriptions lie at " + num(h.seekInfo) + ", " + num(h.nbytesInfo) +
-                         " bytes, " + span(h.begin, h.end));
-  if (h.seekFree != 0 && !within(h.begin, h.end, h.seekFree, h.nbytesFree))
-    return refuse(v, "its list of free space lies at " + num(h.seekFree) + ", " +
-                         num(h.nbytesFree) + " bytes, " + span(h.begin, h.end));
+                         " bytes, " + span(h.begin, to));
   if (static_cast<uint32_t>(d.nbytesKeys) > kRootKeysListMaxBytes) { // not read: the verdict stands
     v.next = RootHeaderVerdict::kNone;
     return;
@@ -416,7 +429,7 @@ void judgeKeysList(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
     return refuse(v, list + " does not hold its own label");
   if (own.seekKey != v.dir.seekKeys)
     return refuse(v, list + " is labelled as lying at " + num(own.seekKey));
-  if (own.seekPdir != h.begin)
+  if (!topDirectory(v, own.seekPdir))
     return refuse(v, list + " is labelled with the directory at " + num(own.seekPdir) +
                          ", not the top directory at " + num(h.begin));
   if (n < 4 || at > n - 4)
@@ -432,13 +445,21 @@ void judgeKeysList(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
     RootKeyLabel k;
     if (!parseRootKeyLabel(b, n, at, k))
       return refuse(v, list + " ends inside its entry " + num(i + 1) + " of " + num(count));
-    if (k.nbytes <= 0 || !within(h.begin, to, k.seekKey, k.nbytes))
+    // An object ROOT can read: inside the copy, from the first record on and never below
+    // ReadKeys' own least position, and of a length (TKey::ReadFile reads that many bytes; ROOT
+    // writes the key's own header and its data in it, never less than one byte).
+    const int64_t from = std::max(h.begin, kRootKeyMinPos);
+    if (k.nbytes <= 0 || !within(from, to, k.seekKey, k.nbytes))
       return refuse(v, "its list of top-level objects names an object at " + num(k.seekKey) + ", " +
-                           num(k.nbytes) + " bytes, " + span(h.begin, to));
-    if (k.seekPdir != h.begin)
+                           num(k.nbytes) + " bytes, " + span(from, to));
+    if (!topDirectory(v, k.seekPdir))
       return refuse(v, "its list of top-level objects names an object at " + num(k.seekKey) +
                            " in the directory at " + num(k.seekPdir) +
                            ", not the top directory at " + num(h.begin));
+    if (k.seekPdir < kRootKeyMinPos) // the top directory, but ROOT stops reading the list there
+      return refuse(v, "its list of top-level objects names an object at " + num(k.seekKey) +
+                           " in the directory at " + num(k.seekPdir) + ", below the " +
+                           num(kRootKeyMinPos) + " ROOT reads a list from");
   }
   v.next = RootHeaderVerdict::kNone;
 }
@@ -473,9 +494,14 @@ RootHeaderVerdict rootHeaderVerdict(const unsigned char* b, size_t n, long long 
     refuse(v, "too short to hold a ROOT file's header");
     return v;
   }
-  const size_t fields = rootHeaderFieldsEnd(h.version);
-  if (h.begin < static_cast<int64_t>(fields)) {
-    refuse(v, "its header says its first record begins at " + num(h.begin) + ", inside the header");
+  // ROOT's own bound (TFile::Init): a first record before the start of the file. One inside the
+  // header's own fields is no file ROOT writes (it places it at 100), but nothing ROOT reads needs
+  // it past them: TFile::Init reads the directory's record at the first record and its name
+  // record's length, and a header damaged there misplaces that record, which then fails its own
+  // checks.
+  if (h.begin < 0) {
+    refuse(v, "its header says its first record begins at " + num(h.begin) +
+                  ", before the start of the file");
     return v;
   }
   if (h.begin > h.end) {

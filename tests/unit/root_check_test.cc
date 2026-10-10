@@ -530,9 +530,17 @@ TEST(RootCheck, HeaderFields) {
   };
   const Row rows[] = {
       {false, 100, 58, K::kConfirmed, "as written"},
-      {false, 45, 58, K::kConfirmed, "the first record right after the 32-bit header's fields"},
-      {false, 44, 58, K::kBad, "inside the 32-bit header's fields"},
-      {true, 57, 58, K::kConfirmed, "right after the 64-bit header's fields"},
+      {false, 64, 58, K::kConfirmed,
+       "the first record at the least position ROOT reads a list from"},
+      // A first record below 64, laid out whole there: TFile::Init takes it (it refuses only a
+      // negative one), but its objects then name a directory below 64, where ROOT's ReadKeys stops
+      // ("reading illegal key"): refused for that, as ROOT would read none of them.
+      {false, 63, 58, K::kBad, "the first record laid out below 64"},
+      {false, 45, 58, K::kBad, "laid out right after the 32-bit header's fields"},
+      {true, 57, 58, K::kBad, "laid out right after the 64-bit header's fields"},
+      // The header's field alone changed (the records where they were written): the directory's
+      // record is then read from the wrong place and fails ROOT's own checks.
+      {false, 44, 58, K::kBad, "the header's first record moved inside the 32-bit header's fields"},
       {true, 56, 58, K::kBad, "inside the 64-bit header's fields"},
       {false, 0, 58, K::kBad, "at 0"},
       {false, -100, 58, K::kBad, "negative"},
@@ -577,9 +585,28 @@ TEST(RootCheck, HeaderFields) {
   h[8] = h[9] = h[10] = 0;
   h[11] = 44;
   img.put(0, h);
-  EXPECT_EQ(check(img).why,
-            "size " + std::to_string(s.end) +
-                ": its header says its first record begins at 44, inside the header");
+  EXPECT_EQ(check(img).why, "size " + std::to_string(s.end) +
+                                ": its top directory's record gives its name record 65536 bytes; "
+                                "ROOT reads 10 to 10000")
+      << "a first record inside the header is not refused for its place, as ROOT does not; the "
+         "directory's record it then places is refused, as ROOT refuses it";
+  {
+    Synth low; // laid out whole at 45: its objects' directory is below 64
+    low.begin = 45;
+    const std::string why = check(low.build()).why;
+    EXPECT_NE(why.find("in the directory at 45, below the 64 ROOT reads a list from"),
+              std::string::npos)
+        << why;
+  }
+  {
+    std::vector<unsigned char> neg = img.read(0, 45);
+    neg[8] = neg[9] = neg[10] = neg[11] = 0xFF; // -1
+    Image ni = img;
+    ni.put(0, neg);
+    EXPECT_EQ(check(ni).why, "size " + std::to_string(s.end) +
+                                 ": its header says its first record begins at -1, before the "
+                                 "start of the file");
+  }
   Synth p;
   p.set["end"] = 90;
   p.set["size"] = 6559;
@@ -679,14 +706,21 @@ TEST(RootCheck, RecordsThePlacesLieInside) {
       {"nbytesKeys", 0, K::kBad, "a list of no bytes"},
       {"nbytesKeys", -5, K::kBad, "of negative length"},
       {"seekInfo", 0, K::kConfirmed, "no class descriptions"},
-      {"seekInfo", 50, K::kBad, "class descriptions inside the header"},
+      // At or before the first record ROOT does not read them (TFile::Init reads them only past
+      // it).
+      {"seekInfo", 50, K::kConfirmed, "class descriptions inside the header: not read"},
+      {"seekInfo", 100, K::kConfirmed, "at the first record: not read"},
+      {"seekInfo", -8, K::kConfirmed, "at a negative position: not read"},
       {"seekInfo", end - 1, K::kBad, "class descriptions running past the end"},
-      {"seekInfo", -8, K::kBad, "class descriptions at a negative position"},
+      {"seekInfo", end + 1, K::kBad, "class descriptions past the end"},
       {"nbytesInfo", -1, K::kBad, "class descriptions of negative length"},
+      // The list of free space is not looked at: ROOT reads it only for a file opened to be
+      // written, and ignores it when it is out of bounds.
       {"seekFree", 0, K::kConfirmed, "no list of free space"},
-      {"seekFree", 99, K::kBad, "the free list before the first record"},
-      {"seekFree", end + 1, K::kBad, "the free list past the end"},
-      {"nbytesFree", 1000000, K::kBad, "the free list running past the end"},
+      {"seekFree", 99, K::kConfirmed, "the free list before the first record: not looked at"},
+      {"seekFree", end + 1, K::kConfirmed, "the free list past the end: not looked at"},
+      {"nbytesFree", 1000000, K::kConfirmed, "the free list running past the end: not looked at"},
+      {"nbytesFree", -1, K::kConfirmed, "of negative length: not looked at"},
   };
   for (const Row& r : rows) {
     Synth s;
@@ -695,18 +729,11 @@ TEST(RootCheck, RecordsThePlacesLieInside) {
     EXPECT_EQ(v.kind, r.kind) << r.what << ": " << v.why;
   }
   Synth s;
-  s.set["seekInfo"] = 50;
-  EXPECT_EQ(
-      check(s.build()).why,
-      "size " + std::to_string(end) +
-          ": its class descriptions lie at 50, 400 bytes, outside the file's records (100 to " +
-          std::to_string(end) + ")");
-  Synth f;
-  f.set["seekFree"] = end + 1;
-  EXPECT_EQ(check(f.build()).why,
-            "size " + std::to_string(end) + ": its list of free space lies at " +
-                std::to_string(end + 1) + ", 60 bytes, outside the file's records (100 to " +
-                std::to_string(end) + ")");
+  s.set["seekInfo"] = end - 1;
+  EXPECT_EQ(check(s.build()).why, "size " + std::to_string(end) +
+                                      ": its class descriptions lie at " + std::to_string(end - 1) +
+                                      ", 400 bytes, outside the file's records (100 to " +
+                                      std::to_string(end) + ")");
   Synth k;
   k.set["seekKeys"] = end + 1000;
   EXPECT_EQ(check(k.build()).why,
@@ -728,9 +755,8 @@ TEST(RootCheck, RecordsThePlacesLieInside) {
 // A file saved without its header (TFile::Save, TDirectory::SaveSelf: the list and the directory's
 // record rewritten, the header left as it was) and then written on, or whose writer stopped: the
 // header's end lies before the list and the newest objects, and ROOT reads the file normally.
-// The list and its objects are held to the copy's size; nothing is confirmed. The class
-// descriptions and the free list, which the header places in the same write as its end, are
-// still held to that end.
+// The list and its objects are held to the copy's size, and so are the class descriptions, which
+// ROOT reads within the file's size too; nothing is confirmed.
 TEST(RootCheck, SavedWithoutTheHeader) {
   Synth base;
   base.build();
@@ -789,15 +815,22 @@ TEST(RootCheck, SavedWithoutTheHeader) {
     EXPECT_EQ(check(s.build()).kind, K::kNoClaim);
   }
   {
-    Synth s; // the class descriptions past the header's end: refused, though inside the size
+    Synth s; // the class descriptions past the header's end, inside the size: as ROOT, read
     saved(s);
     s.set["seekInfo"] = stale + 100;
     const RootHeaderVerdict v = check(s.build());
+    EXPECT_EQ(v.kind, K::kNoClaim) << v.why;
+  }
+  {
+    Synth s; // the class descriptions past the copy's size: refused
+    saved(s);
+    s.set["seekInfo"] = full - 10;
+    const RootHeaderVerdict v = check(s.build());
     EXPECT_EQ(v.kind, K::kBad);
     EXPECT_EQ(v.why, "size " + std::to_string(full) + ": its class descriptions lie at " +
-                         std::to_string(stale + 100) +
-                         ", 400 bytes, outside the file's records (100 to " +
-                         std::to_string(stale) + ")");
+                         std::to_string(full - 10) +
+                         ", 400 bytes, outside the file's records (100 to " + std::to_string(full) +
+                         ")");
   }
   {
     Synth s; // with the size equal to the header's end, the list past that end is refused
@@ -831,6 +864,23 @@ TEST(RootCheck, SavedWithoutTheHeader) {
     w.set["entrySeek"] = wfull + 5;
     EXPECT_EQ(check(w.build()).kind, K::kBad) << "an object past the size";
   }
+}
+
+// The top directory as the record names it, and as the header places it: either is the top
+// directory of the list and of its objects.
+TEST(RootCheck, TopDirectoryByEitherPosition) {
+  Synth s;
+  s.set["seekDir"] = 4000;
+  s.set["entryPdir"] = 4000;
+  s.set["ownPdir"] = 4000;
+  EXPECT_EQ(check(s.build()).kind, K::kConfirmed) << "labelled with the record's position";
+  Synth t;
+  t.set["seekDir"] = 4000;
+  t.set["entryPdir"] = 4001;
+  const RootHeaderVerdict v = check(t.build());
+  EXPECT_EQ(v.kind, K::kBad);
+  EXPECT_NE(v.why.find("in the directory at 4001, not the top directory at 100"), std::string::npos)
+      << v.why;
 }
 
 // The list of top-level objects: its own label, the count, each object inside the records with the
@@ -879,6 +929,14 @@ TEST(RootCheck, ListOfTopLevelObjects) {
       {"entryPdir", 4000, K::kBad,
        obj + " names an object at " + std::to_string(base.listed[1].seekKey) +
            " in the directory at 4000, not the top directory at 100"},
+      // Between ReadKeys' least position (64) and the first record: no object ROOT writes, and one
+      // that overlaps the header and the top directory's own record.
+      {"entrySeek", 64, K::kBad, ""},
+      // The top directory's record naming another position than the header's first record (ROOT
+      // reads the record at the latter and then takes the former as the directory's position): an
+      // object or the list labelled with either is in the top directory; the record's own value
+      // alone is not compared.
+      {"seekDir", 4000, K::kConfirmed, ""},
   };
   for (const Row& r : rows) {
     Synth s;
@@ -927,16 +985,9 @@ TEST(RootCheck, ListOfTopLevelObjects) {
 // positions of 10 digits: 64-bit files of many GB, every rule broken in turn.
 TEST(RootCheck, TextsFitTheError) {
   std::vector<std::pair<std::string, int64_t>> breaks = {
-      {"end", 9999999999LL},
-      {"seekInfo", 50},
-      {"seekFree", 9999999999LL},
-      {"seekKeys", 9999999999LL},
-      {"nbytesKeys", 0},
-      {"ownSeek", 9999999998LL},
-      {"ownPdir", 9999999997LL},
-      {"count", -2147483647LL},
-      {"entrySeek", 9999999996LL},
-      {"entryNbytes", -2147483647LL},
+      {"end", 9999999999LL},       {"seekInfo", 9999999999LL},  {"seekKeys", 9999999999LL},
+      {"nbytesKeys", 0},           {"ownSeek", 9999999998LL},   {"ownPdir", 9999999997LL},
+      {"count", -2147483647LL},    {"entrySeek", 9999999996LL}, {"entryNbytes", -2147483647LL},
       {"entryPdir", 9999999995LL},
   };
   size_t longest = 0;

@@ -830,18 +830,20 @@ tree, RNTuple or histogram lies; a list over 16 MiB is not read). It refuses a c
 - whose size is smaller than the end its own header states (a transfer that was cut);
 - that does not begin with `root` as every ROOT file does (a copy of zeros at the right
   size is one), or is too short to hold its own header;
-- whose header contradicts itself: its first record begins past the end of the data,
-  the top directory's name record is shorter than 10 or longer than 10000 bytes, or the
-  directory's record runs past the end of the data (ROOT refuses such a file too), or its
-  first record begins inside the header's own fields (ROOT checks only that it is not
-  negative; no ROOT file has it there);
-- whose header places the class descriptions or the list of free space outside the file's
-  records (from the first record to the end of the data), or whose top directory's record
-  places the list of top-level objects outside the copy (from the first record to the
-  copy's size);
+- whose header contradicts itself where ROOT refuses a file for it: its first record
+  begins before the start of the file or past the end of the data, the top directory's
+  name record is shorter than 10 or longer than 10000 bytes, or the directory's record runs
+  past the end of the data;
+- whose top directory's record places the list of top-level objects, or whose header places
+  the class descriptions, outside the copy (from the first record to the copy's size; class
+  descriptions placed at or before the first record are not read by ROOT, and not looked
+  at). The list of free space is not looked at: ROOT reads it only for a file opened to be
+  written;
 - whose list of top-level objects does not carry its own label (every record of a ROOT
   file begins with one, giving its position and its directory), or names an object outside
-  the copy or in another directory than the top one: a list zeroed, or overwritten with
+  the copy or in another directory than the top one (where the header places the top
+  directory's record, or where that record says it is), or in one below 64, where ROOT stops
+  reading a list: a list zeroed, or overwritten with
   other bytes, is refused here (without uCache, ROOT would scan the copy to rebuild such a
   list, and keep what it finds);
 - whose server answers any of those reads short.

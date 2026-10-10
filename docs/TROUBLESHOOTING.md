@@ -335,21 +335,24 @@ it reads), and refuses:
 - one that does not begin with `root` (`size 16935324: it does not begin with "root", as
   every ROOT file does`, a copy of zeros among them), or too short to hold the header
   (`size 14: too short to hold a ROOT file's header`);
-- one whose header contradicts itself (`its header says its first record begins at
-  1756918, past the end of its data at 1756917`, `its header gives the top directory's
-  name record 20000 bytes; ROOT reads 10 to 10000`, `its top directory's record ends at
-  ..., past the end of its data at ...`, the same of the directory's own record);
-- one whose header places a record outside the file's records (`its class descriptions lie
-  at ..., ... bytes, outside the file's records (100 to 1756917)`, the same of `its list of
-  free space`), the last number being the end the header states; or whose top directory's
-  record places the list of top-level objects outside the copy (`its list of top-level
-  objects lies at 1757917, 159 bytes, outside the file's records (100 to 1756917)`), the
-  last number being the copy's size;
+- one whose header contradicts itself where ROOT refuses a file for it (`its header says
+  its first record begins at 1756918, past the end of its data at 1756917`, `... begins at
+  -1, before the start of the file`, `its header gives the top directory's name record 20000
+  bytes; ROOT reads 10 to 10000`, `its top directory's record ends at ..., past the end of
+  its data at ...`, the same of the directory's own record);
+- one whose top directory's record places the list of top-level objects, or whose header
+  places the class descriptions, outside the copy (`its list of top-level objects lies at
+  1757917, 159 bytes, outside the file's records (100 to 1756917)`, `its class descriptions
+  lie at ..., ... bytes, outside the file's records (100 to ...)`), the last number being the
+  copy's size (class descriptions placed at or before the first record are not looked at, as
+  ROOT does not read them; nor is the list of free space, which ROOT reads only for a file
+  opened to be written);
 - one whose list of top-level objects is damaged: zeroed or overwritten (`its list of
   top-level objects at 1750173 is labelled as lying at 0`, `... does not hold its own
   label`, `... is labelled with the directory at 0, not the top directory at 100`), or
-  naming an object outside the copy or in another directory (`its list of top-level objects
-  names an object at ..., ... bytes, outside the file's records (100 to ...)`, the last
+  naming an object outside the copy, in another directory, or in one below 64, where ROOT
+  stops reading a list (`its list of top-level objects names an object at ..., ... bytes,
+  outside the file's records (100 to ...)`, the last
   number being the copy's size; `... in the directory at ..., not the top directory at
   100`), or ending inside its own entries;
 - one whose server answers any of those reads short (`size 16935324: a read of its first
