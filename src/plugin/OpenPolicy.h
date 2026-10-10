@@ -337,6 +337,8 @@ bool copyOffline(uint32_t statFlags, const std::string& server, const std::strin
 // left, online copies come before pending ones, each in the answer's order.
 // When nothing is left, the failed ones are given, the oldest failure first,
 // except a server whose copy was refused for what it is (`bad`): that one is final.
+// `failed` names an IPv6 server in brackets ("[2001:db8::1]:1094"), as the client does;
+// a Location holds the bare address.
 std::vector<Location> orderLocations(const std::vector<Location>& listed,
                                      const std::vector<std::string>& readerTried,
                                      const std::vector<SiteFailure>& failed);

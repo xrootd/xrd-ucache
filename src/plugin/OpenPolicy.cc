@@ -450,7 +450,10 @@ std::vector<Location> orderLocations(const std::vector<Location>& listed,
   std::vector<Location> online, pending;
   std::vector<std::pair<size_t, Location>> excluded; // with the position of its failure
   for (const Location& l : listed) {
-    const std::string host = lower(l.host), server = host + ":" + std::to_string(l.port);
+    // A failed server is named as the client names it, an IPv6 address in brackets.
+    const std::string host = lower(l.host),
+                      server = (host.find(':') == std::string::npos ? host : "[" + host + "]") + ":" +
+                               std::to_string(l.port);
     if (std::find(tried.begin(), tried.end(), host) != tried.end())
       continue;
     const bool literal = isIpv4(host) || isIpv6(host);

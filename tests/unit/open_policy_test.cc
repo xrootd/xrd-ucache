@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <climits>
+#include <cstring>
 #include <vector>
 
 using namespace ucache;
@@ -724,6 +725,20 @@ TEST(OpenPolicy, OrderLocations) {
   const SiteFailure failedOnly{"a.two.org:1094", "two.org", "a.two.org", "refused"};
   EXPECT_EQ(names(orderLocations({loc("a.two.org", 1094)}, {}, {failedOnly})), "a.two.org:1094 ")
       << "a server that merely failed is still the last resort";
+  // IPv6 servers: the client names a failed one in brackets, the locate's answer gives the bare
+  // address. A server that failed is left to the end, the oldest failure first, and one refused for
+  // what it is is never given again.
+  SiteFailure v6old{"[::1]:21121", "[::1]", "", "stall"}, v6new{"[::1]:21123", "[::1]", "", "stall"};
+  SiteFailure v6bad{"[2001:DB8::7]:1094", "[2001:db8::7]", "", "zeros"};
+  v6bad.bad = true;
+  const std::vector<Location> v6 = {loc("::1", 21123), loc("::1", 21121), loc("2001:db8::7", 1094),
+                                    loc("::1", 21122)};
+  EXPECT_EQ(names(orderLocations(v6, {}, {v6old, v6new, v6bad})), "::1:21122 ")
+      << "the one IPv6 server that did not fail";
+  EXPECT_EQ(names(orderLocations({loc("::1", 21123), loc("::1", 21121), loc("2001:db8::7", 1094)}, {},
+                                 {v6old, v6new, v6bad})),
+            "::1:21121 ::1:21123 ")
+      << "only failed ones left: the oldest failure first; the refused one never";
   EXPECT_STREQ(openRouteName(OpenRoute::kCandidate), "candidate");
 }
 
@@ -776,7 +791,7 @@ TEST(OpenPolicy, FailedBeforeAndTheListOfCopiesAgree) {
   const std::vector<SiteFailure> failed = {
       {"a.one.org:1094", "one.org", "a.one.org", "e"},
       {"127.0.0.1:1095", "127.0.0.1", "", "e"},
-      {"::1:1093", "::1", "", "e"},
+      {"[::1]:1093", "[::1]", "", "e"}, // an IPv6 server as the client names it
       {"d.four.org:1094", "d.four.org:1094", "d.four.org", "never answered"}};
   const auto excludedByList = [&](const std::string& host, int port) {
     Location l, other;
@@ -810,9 +825,10 @@ TEST(OpenPolicy, FailedBeforeAndTheListOfCopiesAgree) {
       {"e.four.org", 1094, false, true, "a sibling in its domain"},
   };
   for (const auto& r : rows) {
-    SiteFailure f;
-    f.server = std::string(r.host) + ":" + std::to_string(r.port);
-    f.site = siteOf(r.host);
+    SiteFailure f; // as siteFailure makes it from a hop: an IPv6 host in brackets
+    const std::string h = std::strchr(r.host, ':') ? "[" + std::string(r.host) + "]" : r.host;
+    f.server = h + ":" + std::to_string(r.port);
+    f.site = siteOf(h);
     EXPECT_EQ(failedBefore(failed, f), r.before) << r.host << ":" << r.port << " " << r.why;
     EXPECT_EQ(excludedByList(r.host, r.port), r.list) << r.host << ":" << r.port << " " << r.why;
   }
