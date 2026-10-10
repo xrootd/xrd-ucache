@@ -272,8 +272,17 @@ emptyw() { # LFN server... (an empty copy)
   local lfn=$1 s; shift
   for s in "$@"; do install -d -m 777 "$W/data/$s/$(dirname "$lfn" | sed 's|^/||')"; : > "$W/data/$s$lfn"; chmod 666 "$W/data/$s$lfn"; done
 }
-# the 300-byte reads at 0 (the header check) in a client's log
-nheader() { grep -c 'MsgHandler created.*kXR_read (handle: 0x[0-9a-f]*, offset: 0, size: 300)' "$1"; }
+# the header check's reads at 0 in a client's log: its first 300 bytes; for a file named *.root that the cache
+# caches, the check reads the first page whole (4096 bytes) and the cache keeps it for the reader. (The key-position
+# check's parse reads that page too, but from the page kept, so in a log of such a file every read of 4096 bytes at
+# 0 is the header check's.)
+nheader() {
+  if grep -qiE 'kXR_open \(file: [^,?]*\.root[,?]' "$1"; then
+    grep -cE 'MsgHandler created.*kXR_read \(handle: 0x[0-9a-f]*, offset: 0, size: (300|4096)\)' "$1"
+  else
+    grep -c 'MsgHandler created.*kXR_read (handle: 0x[0-9a-f]*, offset: 0, size: 300)' "$1"
+  fi
+}
 # bit 2 of a sidecar's flags (offset 12): the size confirmed; "none" without a sidecar
 confirmed() {
   local m; m=$(find "$1" -name '*.meta' | head -1)
@@ -433,8 +442,13 @@ cp "$FIXW" "$W/fixw-list.bin"; dd if=/dev/zero of="$W/fixw-list.bin" bs=1 seek="
   od -v -An -tu1 -j "$W_SK" -N "$W_NK" "$W/fixw-list.bin" | awk '{ for (i = 1; i <= NF; i++) if ($i != 0) bad = 1 } END { exit bad }' &&
   [ "$(stat -c %s "$W/fixw-begin.bin")" = "$FIXW_SIZE" ] && [ "$(stat -c %s "$W/fixw-list.bin")" = "$FIXW_SIZE" ]
 verdict "the damaged copies: the header's first record past its end ($((W_END + 1))), and the list's $W_NK bytes at $W_SK zeroed, both at the fixture's size" $?
-# reads of the list in a client's log
-nlist() { grep -c "MsgHandler created.*kXR_read (handle: 0x[0-9a-f]*, offset: $W_SK, size: $W_NK)" "$1"; }
+# reads of the list in a client's log: as the check needs it, or its whole pages (4096 bytes each, to the copy's
+# end), which the cache keeps for the reader
+W_PO=$((W_SK / 4096 * 4096)); W_PE=$(( (W_SK + W_NK + 4095) / 4096 * 4096 )); [ "$W_PE" -gt "$FIXW_SIZE" ] && W_PE=$FIXW_SIZE
+nlist() {
+  echo $(( $(grep -c "MsgHandler created.*kXR_read (handle: 0x[0-9a-f]*, offset: $W_SK, size: $W_NK)" "$1") +
+           $(grep -c "MsgHandler created.*kXR_read (handle: 0x[0-9a-f]*, offset: $W_PO, size: $((W_PE - W_PO)))" "$1") ))
+}
 for dmg in begin list; do
   case $dmg in
     begin) why="size $FIXW_SIZE: its header says its first record begins at $((W_END + 1)), past the end of its data at $W_END" ;;

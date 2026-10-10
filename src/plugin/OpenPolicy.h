@@ -319,6 +319,28 @@ int headerReadTimeoutS(int attemptLimitS, int64_t elapsedMs);
 inline constexpr int64_t kCheckReadMinBytesPerS = 1000000;
 int checkReadTimeoutS(uint32_t len, int64_t leftMs, int64_t openLeftMs);
 
+// The bytes the checks made at open read are kept in the cache for a file uCache caches, from the
+// copy the open takes (UCacheFile.cc): the reader's ROOT reads the same records right after its
+// open (the header, the top directory's record, the list of top-level objects) and then finds them
+// cached instead of asking the origin for them again. The cache stores whole pages and nothing
+// else, so a read of the checks whose bytes are to be kept asks for the whole pages it touches,
+// within the copy's size, as a read the cache makes for a reader does (ReadRounding.h roundSpan);
+// the checks judge only the bytes they need of it. At most kOpenCheckKeepBytes of one copy are
+// kept: a read that would take more is made exactly as the checks need it, and nothing of it is
+// kept.
+inline constexpr uint64_t kOpenCheckKeepBytes = 1u << 20;
+struct ByteSpan {
+  uint64_t off = 0;
+  uint64_t len = 0;
+  bool kept = false; // the bytes the read answers are kept
+};
+// The span a read of the checks asks for: `len` bytes at `at` of a copy that reports `size`
+// bytes, widened to whole pages of `pageSize` and kept when its bytes are to be kept (`keep`)
+// and the widened span is at most `room` bytes; otherwise, and for a span that does not lie
+// inside the copy, exactly as asked, and not kept.
+ByteSpan checkReadSpan(bool keep, uint32_t pageSize, uint64_t size, uint64_t at, uint64_t len,
+                       uint64_t room);
+
 // The host name a retry's tried= may carry for hop `i` of a chain, or "" when
 // it may not: never a redirector, nor the first host, nor an address or a
 // name without a dot (neither masks a server at a redirector), nor a data

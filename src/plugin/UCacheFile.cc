@@ -1348,6 +1348,16 @@ void noteAnswer(const OpenAttempt& a, const OpenAnswer& ans, const std::string& 
 // failed over, an error naming every site that failed. Then deletes itself.
 // Captures only st_ (never the plugin object): a posted step may run after
 // Open has returned.
+// Whether the cache caches the file `st` reads: it has a store, and the host of the reader's URL
+// passes the allow and deny lists, as ensureEntry asks. (A handle the cache passes straight to the
+// origin, a copy's or a writer's, never gets this far.)
+bool cachesFile(const HandleState& st, const Config& cfg) {
+  if (!st.store)
+    return false;
+  const auto key = UrlKey::parse(st.url, cfg.keepCgi);
+  return key && hostPassesLists(cfg.allowHosts, cfg.denyHosts, key->host);
+}
+
 class RetryingOpenHandler : public ResponseHandler {
  public:
   RetryingOpenHandler(std::shared_ptr<HandleState> st, std::string url,
@@ -1363,6 +1373,7 @@ class RetryingOpenHandler : public ResponseHandler {
     if (record && cfg.adaptiveFederation) {
       seq_ = std::make_unique<FailoverSeq>(readerTimeoutS, timeout);
       base_ = mergeTried(url_); // the reader's excluded servers stay excluded
+      keep_ = cachesFile(*st_, cfg);
     }
   }
 
@@ -1390,6 +1401,8 @@ class RetryingOpenHandler : public ResponseHandler {
   XRootDStatus issueOn(XrdCl::File* f, bool& fresh) {
     ++attempt_;
     ++sourceAttempt_;
+    kept_.clear(); // what an earlier attempt's checks read is never kept
+    kept_.shrink_to_fit();
     a_.attempt = attempt_;
     a_.t0 = nowUs();
     a_.endUs = 0;
@@ -1428,6 +1441,7 @@ class RetryingOpenHandler : public ResponseHandler {
               std::unique_ptr<HostList> h, const AttemptView& w, bool opened) {
     if (ended(*s, h, w, /*sent=*/true, /*fresh=*/false, opened))
       return;
+    keepOpenBytes(w); // the reader is given this copy: what its checks read waits for the entry
     // Transparent on success: forward exactly what we got.
     real_->HandleResponseWithHosts(s.release(), r.release(), h ? h.release() : new HostList());
     delete this;
@@ -1444,7 +1458,9 @@ class RetryingOpenHandler : public ResponseHandler {
   // may answer them: the client's recovery of a read (an open of the file again through the
   // redirector, after a lost connection) and its following of a server's redirect are off on the
   // File for the reads, and given back when the last ends (restoreProps). Never blocks: the answer
-  // is given by the last read's completion, on the client's thread, to `finish`.
+  // is given by the last read's completion, on the client's thread, to `finish`. For a file the
+  // cache caches, each read asks for the whole pages it touches and its bytes are kept with the
+  // attempt (OpenPolicy.h checkReadSpan), for the entry, should the open take this copy.
   struct HeaderRead : ResponseHandler {
     HeaderRead(RetryingOpenHandler* o, std::unique_ptr<XRootDStatus> s,
                std::unique_ptr<AnyObject> r, std::unique_ptr<HostList> h, AttemptView w)
@@ -1463,12 +1479,22 @@ class RetryingOpenHandler : public ResponseHandler {
         XrdCl::ChunkInfo* ci = nullptr;
         if (resp)
           resp->Get(ci);
-        const size_t n = ci ? std::min<size_t>(ci->length, buf.size()) : 0;
+        const size_t got = ci ? std::min<size_t>(ci->length, buf.size()) : 0;
+        // The checks judge the bytes they asked for (`want` at `at`), of what the read answered
+        // from `readAt`: a read widened to whole pages starts at or before them.
+        const size_t skip = static_cast<size_t>(at - readAt);
+        const size_t n = got > skip ? std::min<size_t>(want, got - skip) : 0;
         if (stage == RootHeaderVerdict::kNone)
-          w.header = rootHeaderVerdict(buf.data(), n, w.size);
+          w.header = rootHeaderVerdict(buf.data() + skip, n, w.size);
         else
-          rootCheckRead(w.header, buf.data(), n);
+          rootCheckRead(w.header, buf.data() + skip, n);
         resp.reset();
+        if (widened && got) { // kept with the attempt, for the entry (keepOpenBytes)
+          keptBytes += got;
+          kept.push_back(HandleState::OpenBytes::Span{
+              readAt, std::vector<char>(buf.begin(), buf.begin() + static_cast<long>(got)), sentUs,
+              nowUs() - sentUs});
+        }
         if (w.header.next != RootHeaderVerdict::kNone && f) { // the next read, on the same File
           self.release();
           o->nextCheckRead(this);
@@ -1496,6 +1522,8 @@ class RetryingOpenHandler : public ResponseHandler {
         hr.o->finish(std::move(rs), std::move(hr.r), std::move(hr.h), hr.w, /*opened=*/true);
         return;
       }
+      hr.o->kept_ = std::move(hr.kept); // kept by the open only if it takes this copy (finish)
+      hr.o->keptOn_ = hr.f;
       hr.o->finish(std::move(hr.s), std::move(hr.r), std::move(hr.h), hr.w, /*opened=*/false);
     }
     // The File's own recovery and redirect settings, as they were before the read, given back
@@ -1547,12 +1575,27 @@ class RetryingOpenHandler : public ResponseHandler {
     RootHeaderVerdict::Next stage = RootHeaderVerdict::kNone;
     std::vector<unsigned char> buf;
     uint64_t deadlineUs = 0; // the end of the time the checks were given (steady µs)
+    // The read in flight asks for `buf.size()` bytes at `readAt`, of which the checks need `want`
+    // at `at`; `widened`: it asks for the whole pages around them, and its bytes are kept. Sent at
+    // `sentUs`.
+    uint64_t readAt = 0, at = 0, sentUs = 0;
+    uint32_t want = 0;
+    bool widened = false;
+    // What the reads so far read, whole pages, to be kept should the open take this copy.
+    std::vector<HandleState::OpenBytes::Span> kept;
+    uint64_t keptBytes = 0;
+    // Whether the bytes kept so far hold all of `len` bytes at `off`.
+    bool keptHolds(uint64_t off, uint64_t len) const {
+      for (const auto& k : kept)
+        if (off >= k.off && off - k.off <= k.bytes.size() && len <= k.bytes.size() - (off - k.off))
+          return true;
+      return false;
+    }
   };
   void checkHeader(std::unique_ptr<XRootDStatus> s, std::unique_ptr<AnyObject> r,
                    std::unique_ptr<HostList> h, AttemptView w) {
     const size_t want = rootHeaderBytes(w.size);
     auto* hr = new HeaderRead(this, std::move(s), std::move(r), std::move(h), std::move(w));
-    hr->buf.assign(kRootHeaderBytes, 0);
     XrdCl::File* f = nullptr;
     {
       std::lock_guard<std::mutex> g(st_->mu);
@@ -1575,36 +1618,49 @@ class RetryingOpenHandler : public ResponseHandler {
     sendCheckRead(hr, 0, want);
   }
   // The checks' next read, which the verdict asks for, on the File the first was made on (still
-  // held, its settings still off). Without the memory for its buffer the checks end where they are.
+  // held, its settings still off).
   void nextCheckRead(HeaderRead* hr) {
     RootHeaderVerdict& v = hr->w.header;
     hr->stage = v.next;
-    try {
-      hr->buf.assign(v.nextLen, 0);
-    } catch (...) {
-      return HeaderRead::end(std::unique_ptr<HeaderRead>(hr), std::make_unique<XRootDStatus>());
-    }
     sendCheckRead(hr, static_cast<uint64_t>(v.nextAt), v.nextLen);
   }
   // Sends the read of `hr`'s stage, `want` bytes at `at`, or the test's fault in its place; a
-  // delayed one is posted (never waited for on a client thread) and sent later.
+  // delayed one is posted (never waited for on a client thread) and sent later. The read asks for
+  // the whole pages around them when its bytes are to be kept (OpenPolicy.h checkReadSpan): for a
+  // file the cache caches, unless the bytes kept already hold them (a read the checks need inside
+  // them is made as they need it), or the read is a test's fault. Without the memory for its
+  // buffer the checks end where they are.
   void sendCheckRead(HeaderRead* hr, uint64_t at, uint32_t want) {
     const bool fault = hr->f && hr->stage == gHeaderFaultStage && headerFaultFires();
+    const ByteSpan span =
+        checkReadSpan(keep_ && !fault && !hr->keptHolds(at, want), globalConfig().pageSize,
+                      hr->w.size > 0 ? static_cast<uint64_t>(hr->w.size) : 0, at, want,
+                      kOpenCheckKeepBytes - std::min(hr->keptBytes, kOpenCheckKeepBytes));
+    hr->at = at;
+    hr->want = want;
+    hr->readAt = span.off;
+    hr->widened = span.kept;
+    try {
+      hr->buf.assign(static_cast<size_t>(span.len), 0);
+    } catch (...) {
+      return HeaderRead::end(std::unique_ptr<HeaderRead>(hr), std::make_unique<XRootDStatus>());
+    }
     if (fault && gHeaderFaultKind == HeaderFault::kDelay) { // a test's: the read is sent late
       RetryingOpenHandler* self = this;
-      moveExecutor().postAfter(kHeaderFaultDelayMs,
-                               [self, hr, at, want] { self->issueCheckRead(hr, at, want, false); });
+      moveExecutor().postAfter(kHeaderFaultDelayMs, [self, hr] { self->issueCheckRead(hr, false); });
       return;
     }
-    issueCheckRead(hr, at, want, fault);
+    issueCheckRead(hr, fault);
   }
   // Issues the read: the first within what is left of the attempt's time (it sets the checks'
   // deadline), each further one within what is left of that deadline or its own floor for its
   // length, whichever is more, and never past the open's own time (the sequence's budget and the
   // floor's margin); `fault`: a test's fault strikes it. A read that cannot be sent is answered
   // here.
-  void issueCheckRead(HeaderRead* hr, uint64_t at, uint32_t want, bool fault) {
+  void issueCheckRead(HeaderRead* hr, bool fault) {
     const uint64_t now = nowUs();
+    const uint32_t want = static_cast<uint32_t>(hr->buf.size()); // what the read asks for
+    hr->sentUs = now;
     int limitS = 0;
     if (hr->stage == RootHeaderVerdict::kNone) {
       limitS = headerReadTimeoutS(a_.timeoutS, static_cast<int64_t>((now - a_.t0) / 1000));
@@ -1624,10 +1680,27 @@ class RetryingOpenHandler : public ResponseHandler {
       rs = XRootDStatus(XrdCl::stError, XrdCl::errOperationExpired, 0,
                         "the checks made at open ran out of time");
     else if (hr->f)
-      rs = hr->f->Read(at, answeredShort ? want - 1 : want, hr->buf.data(), hr,
+      rs = hr->f->Read(hr->readAt, answeredShort ? want - 1 : want, hr->buf.data(), hr,
                        static_cast<ucache::XrdTimeout>(limitS));
     if (!rs.IsOK()) // nothing was sent, so no completion will come: the failure is the answer
       hr->HandleResponseWithHosts(new XRootDStatus(rs), nullptr, nullptr);
+  }
+
+  // The open takes the copy `w` is of: what its checks read (`kept_`) is given to the handle, with
+  // the copy's size, its server and the File it was read on, to be stored when the handle's entry
+  // is set up (storeOpenBytes). Throws nothing: for want of memory nothing is kept.
+  void keepOpenBytes(const AttemptView& w) noexcept try {
+    if (kept_.empty() || w.size <= 0)
+      return;
+    auto ob = std::make_unique<HandleState::OpenBytes>();
+    ob->file = keptOn_;
+    ob->size = static_cast<uint64_t>(w.size);
+    ob->server = lastServer(w);
+    ob->spans = std::move(kept_);
+    std::lock_guard<std::mutex> g(st_->mu);
+    if (!st_->closed)
+      st_->openBytes = std::move(ob);
+  } catch (...) {
   }
 
   // The client refused the attempt at once: no completion will come. Runs off
@@ -1794,6 +1867,11 @@ class RetryingOpenHandler : public ResponseHandler {
   // retry elsewhere starts from it.
   std::unique_ptr<FailoverSeq> seq_;
   std::string base_;
+  // With it on, for a file the cache caches (`keep_`): what the checks of the current attempt read,
+  // whole pages read on `keptOn_`, which the handle keeps for its entry if the open takes the copy.
+  bool keep_ = false;
+  std::vector<HandleState::OpenBytes::Span> kept_;
+  XrdCl::File* keptOn_ = nullptr;
 };
 
 } // namespace
@@ -3194,6 +3272,8 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   new (&source) SiteFailure; // written under mu by callback threads: a fork may have caught them mid-write
   new (&readFailed) std::vector<SiteFailure>;
   new (&moveFailure) std::string; // written under mu by the move executor: the same
+  (void)openBytes.release();       // the parent's: an open's answer may have been storing them
+  new (&openBytes) std::unique_ptr<OpenBytes>;
   // The layout its reader was shown, unless the handle has not been set up
   // since an earlier fork (a grandchild forked while a child was at it): then
   // that one is still the one to keep, and so is a layout lost for good.
@@ -3988,11 +4068,13 @@ UCacheFile::~UCacheFile() {
   st_->drainPersists();
   std::shared_ptr<FileEntry> e;
   std::shared_ptr<ColdFill> cold;
+  std::unique_ptr<HandleState::OpenBytes> openBytes; // never stored now: let go without the lock
   {
     std::lock_guard<std::mutex> g(st_->mu);
     st_->closed = true;
     e.swap(st_->entry);
     cold.swap(st_->cold);
+    openBytes = std::move(st_->openBytes);
   }
 #ifdef UCACHE_HAVE_COLDRUN
   coldDetach(cold);
@@ -4332,6 +4414,59 @@ bool guardAllowsChunks(const std::shared_ptr<HandleState>& st, uint64_t originSi
 #endif
 } // namespace
 
+// What the checks made at the reader's open read of the copy the open took (HandleState::
+// openBytes, whole pages), stored in the handle's new entry as any bytes fetched from the origin
+// are, before the reader's first read is looked up, so that its reads of the same records are
+// served from the cache: only when the entry is of the size the copy reported and the handle's
+// File is still the one they were read on; with check_origin_integrity's key-position check where
+// the handle has the file's table of baskets (a span with a misplaced basket in it is not kept);
+// counted as reads from the origin for the entry, as the metadata parsers' reads are (OriginSource).
+// Pages the entry holds already are left as they are. The bytes go in any case; a failure to store
+// them fails nothing.
+static void storeOpenBytes(HandleState& st, const std::shared_ptr<FileEntry>& entry) noexcept try {
+  std::unique_ptr<HandleState::OpenBytes> ob;
+  {
+    std::lock_guard<std::mutex> g(st.mu);
+    ob = std::move(st.openBytes);
+  }
+  if (!ob || !entry || ob->size != entry->fileSize() || st.inner.load() != ob->file ||
+      st.innerStale.load(std::memory_order_acquire))
+    return;
+#ifdef UCACHE_HAVE_COLDRUN
+  const auto seeks = keySeeksOf(st);
+#endif
+  uint64_t stored = 0;
+  for (const auto& sp : ob->spans) {
+    if (sp.bytes.empty())
+      continue;
+#ifdef UCACHE_HAVE_COLDRUN
+    if (seeks) {
+      const auto m = transpose::firstMisplacedKey(*seeks, sp.off, sp.bytes.data(), sp.bytes.size(),
+                                                  sp.off, sp.off);
+      if (m.count || m.outside)
+        continue;
+    }
+#endif
+    if (st.store) {
+      auto& stats = st.store->stats();
+      stats.originBytes.fetch_add(sp.bytes.size(), std::memory_order_relaxed);
+      stats.originReads.fetch_add(1, std::memory_order_relaxed);
+      stats.originRtUs.add(sp.rtUs);
+      entry->obs().originRtUs.add(sp.rtUs);
+      entry->obs().servers.add(ob->server, sp.bytes.size(), sp.rtUs, 0);
+      if (stats.tracer)
+        stats.tracer->rec("wire", entry->key().key, sp.off, sp.bytes.size(), sp.rtUs, true,
+                          wireTraceFields(ob->server, sp.t0Us, 1));
+      stats.openCheckBytesKept.fetch_add(sp.bytes.size(), std::memory_order_relaxed);
+    }
+    entry->writePages(sp.off, sp.bytes.size(), sp.bytes.data());
+    stored += sp.bytes.size();
+  }
+  if (stored)
+    entry->flushMeta(false);
+} catch (...) {
+}
+
 std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uint64_t>* firstRead) {
   // Pass-through handles -- write opens, UCACHE_DISABLE, no store, and copies
   // (CopyDetect.h) -- never get an entry: nothing is created, stored or
@@ -4499,6 +4634,9 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
                 key ? key->key.c_str() : st_->url.c_str());
     entry.reset();
   }
+  // What the checks at the reader's open read is stored before its first read is looked up (and
+  // let go when there is no entry for it).
+  storeOpenBytes(*st_, entry);
 #ifdef UCACHE_HAVE_COLDRUN
   // The mixed map the handle is shown, chosen once for its life: a handle a
   // forked child set up again keeps the one it had (null: the slot layout).
@@ -4588,11 +4726,13 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
   st_->drainPersists();
   std::shared_ptr<FileEntry> e;
   std::shared_ptr<ColdFill> cold;
+  std::unique_ptr<HandleState::OpenBytes> openBytes; // never stored now: let go without the lock
   {
     std::lock_guard<std::mutex> g(st_->mu);
     st_->closed = true;
     e.swap(st_->entry);
     cold.swap(st_->cold);
+    openBytes = std::move(st_->openBytes);
   }
 #ifdef UCACHE_HAVE_COLDRUN
   coldDetach(cold); // the process's last handle on the file commits what it converted

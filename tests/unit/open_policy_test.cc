@@ -1218,3 +1218,42 @@ TEST(OpenPolicy, ShortInsideConfirmed) {
   EXPECT_FALSE(shortInsideConfirmed(N, 500000, 0, 0));
   EXPECT_FALSE(shortInsideConfirmed(N, ~0ull - 10, 100, 0)) << "off + len wraps";
 }
+
+// The span a read of the checks made at open asks for: whole pages when its bytes are to be kept,
+// within the copy's size and the room left; exactly what the checks need otherwise.
+TEST(OpenPolicy, CheckReadSpan) {
+  constexpr uint64_t N = 1756917; // a copy's size
+  const auto span = [](bool keep, uint32_t page, uint64_t size, uint64_t at, uint64_t len,
+                       uint64_t room) {
+    const ByteSpan s = checkReadSpan(keep, page, size, at, len, room);
+    return std::to_string(s.off) + "+" + std::to_string(s.len) + (s.kept ? " kept" : "");
+  };
+  // The header: the first page.
+  EXPECT_EQ(span(true, 4096, N, 0, 300, kOpenCheckKeepBytes), "0+4096 kept");
+  EXPECT_EQ(span(true, 16384, N, 0, 300, kOpenCheckKeepBytes), "0+16384 kept") << "another page size";
+  // The list of top-level objects: both ends widened to pages, the last one to the copy's end.
+  EXPECT_EQ(span(true, 4096, N, 1755000, 1600, kOpenCheckKeepBytes), "1753088+3829 kept");
+  EXPECT_EQ(span(true, 4096, N, 1700000, 5000, kOpenCheckKeepBytes), "1699840+8192 kept");
+  EXPECT_EQ(span(true, 4096, N, 4096, 4096, kOpenCheckKeepBytes), "4096+4096 kept") << "pages already";
+  // A copy smaller than a page: all of it; one smaller than the first read, too (its tail page).
+  EXPECT_EQ(span(true, 4096, 1000, 0, 300, kOpenCheckKeepBytes), "0+1000 kept");
+  EXPECT_EQ(span(true, 4096, 300, 0, 300, kOpenCheckKeepBytes), "0+300 kept");
+  EXPECT_EQ(span(true, 4096, 200, 0, 200, kOpenCheckKeepBytes), "0+200 kept");
+  // As asked: the bytes are not kept, the widened span takes more than the room left, no page size,
+  // nothing asked, or the span does not lie inside the copy.
+  EXPECT_EQ(span(false, 4096, N, 0, 300, kOpenCheckKeepBytes), "0+300");
+  EXPECT_EQ(span(true, 4096, N, 0, 300, 4095), "0+300") << "no room for the page";
+  EXPECT_EQ(span(true, 4096, N, 0, 300, 4096), "0+4096 kept") << "just room for it";
+  EXPECT_EQ(span(true, 4096, 30000000, 1000000, 2400000, kOpenCheckKeepBytes), "1000000+2400000")
+      << "a list longer than the bytes kept for a copy";
+  EXPECT_EQ(span(true, 0, N, 0, 300, kOpenCheckKeepBytes), "0+300");
+  EXPECT_EQ(span(true, 4096, N, 100, 0, kOpenCheckKeepBytes), "100+0");
+  EXPECT_EQ(span(true, 4096, N, N - 10, 300, kOpenCheckKeepBytes), std::to_string(N - 10) + "+300")
+      << "past the copy's end";
+  EXPECT_EQ(span(true, 4096, N, N, 1, kOpenCheckKeepBytes), std::to_string(N) + "+1");
+  EXPECT_EQ(span(true, 4096, 0, 0, 300, kOpenCheckKeepBytes), "0+300") << "no size";
+  EXPECT_EQ(span(true, 4096, N, UINT64_MAX - 5, 300, kOpenCheckKeepBytes),
+            std::to_string(UINT64_MAX - 5) + "+300")
+      << "wraps";
+  EXPECT_EQ(kOpenCheckKeepBytes, 1u << 20);
+}

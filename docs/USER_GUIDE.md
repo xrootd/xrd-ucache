@@ -859,7 +859,15 @@ record gives): a writer stopped in the middle of such a save leaves the earlier 
 its length overwritten, and ROOT reads that list. Nor is a copy whose
 header places no list of top-level objects (its writer stopped before it ever saved the
 file): every copy of such a file is the same, ROOT recovers what it can of it, and the
-check makes no claim on it. A file not named `*.root` is not looked at. A copy that passes
+check makes no claim on it. A file not named `*.root` is not looked at. For a file uCache
+caches, what the checks read of the copy the open takes is kept in the cache, so the job's
+own reads of the header and of the list of top-level objects right after its open (ROOT
+reads both when it opens a file) are served from it instead of from the origin again: each
+read of the checks then asks for the whole pages it touches (the cache keeps whole pages
+only; 4 KiB each by default), within the copy's size and at most 1 MiB of a copy, and the
+bytes go into the file's entry when the job first reads it, if the entry is of that copy's
+size (`open_check_bytes_kept`, STATS.md). Nothing a refused copy's checks read is kept, nor
+anything of a file the cache does not cache, whose checks read only what they need. A copy that passes
 the checks and whose size equals the end its header states confirms the file's size (a
 header that places no list of top-level objects confirms nothing), which the cache entry keeps
 (FORMAT.md) for its freshness window (`revalidate_seconds`, 7 days by default). Within

@@ -1,5 +1,7 @@
 #include "OpenPolicy.h"
 
+#include "ReadRounding.h"
+
 #include <algorithm>
 #include <cctype>
 #include <climits>
@@ -537,6 +539,17 @@ int checkReadTimeoutS(uint32_t len, int64_t leftMs, int64_t openLeftMs) {
   const int64_t leftS = leftMs > 0 ? (leftMs + 999) / 1000 : 0;
   const int64_t capS = openLeftMs / 1000 + (openLeftMs % 1000 ? 1 : 0);
   return static_cast<int>(std::min<int64_t>({std::max(leftS, floorS), capS, INT_MAX}));
+}
+
+ByteSpan checkReadSpan(bool keep, uint32_t pageSize, uint64_t size, uint64_t at, uint64_t len,
+                       uint64_t room) {
+  const ByteSpan asked{at, len, false};
+  if (!keep || pageSize == 0 || len == 0 || at >= size || len > size - at)
+    return asked;
+  const std::pair<uint64_t, uint64_t> r = roundSpan(pageSize, size, at, len);
+  if (r.first > at || r.second < at + len || r.second - r.first > room)
+    return asked;
+  return ByteSpan{r.first, r.second - r.first, true};
 }
 
 std::string exclusionName(const std::vector<Hop>& hops, int i) {

@@ -203,6 +203,7 @@ TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
   s.openDeadlineExpiries = 2;
   s.failoverLocates = 6;
   s.offlineCopiesSkipped = 7;
+  s.openCheckBytesKept = 8192;
   const std::string body = s.toJsonBody();
   for (const char* f :
        {"\"origin_open_attempts\":7", "\"origin_open_failures\":2",
@@ -212,7 +213,7 @@ TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
         "\"records_dropped\":3", "\"hist_origin_open_us\":[0,0,0,0,0,0,0,0,0,1]",
         "\"open_failovers\":5", "\"opens_recovered\":4", "\"opens_failed_everywhere\":1",
         "\"open_deadline_expiries\":2", "\"failover_locates\":6",
-        "\"offline_copies_skipped\":7"})
+        "\"offline_copies_skipped\":7", "\"open_check_bytes_kept\":8192"})
     EXPECT_NE(body.find(f), std::string::npos) << f;
   EXPECT_EQ(("{" + body + "}").find(",}"), std::string::npos);
   test::TempDir td;
@@ -234,6 +235,7 @@ TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
   EXPECT_EQ(t.openDeadlineExpiries, 4u);
   EXPECT_EQ(t.failoverLocates, 12u);
   EXPECT_EQ(t.offlineCopiesSkipped, 14u);
+  EXPECT_EQ(t.openCheckBytesKept, 16384u);
   EXPECT_EQ(t.histOriginOpen, (std::vector<uint64_t>{0, 0, 0, 0, 0, 0, 0, 0, 0, 2}));
   EXPECT_EQ(t.opens, 4u) << "no new counter collides with an older one's name";
 }

@@ -203,6 +203,25 @@ struct HandleState {
   // meanwhile are kept in readerProps, from `headerProps` on, and given to the File at its end.
   bool headerReading = false;
   size_t headerProps = 0;
+  // With adaptive_federation on, for a file the cache caches: what the checks made at the reader's
+  // open read of the copy the open took, as whole pages of the file (OpenPolicy.h checkReadSpan),
+  // kept here from the open's answer until the handle's entry is set up (ensureEntry), which stores
+  // them as it stores any bytes fetched from the origin, when the entry is of the size the copy
+  // reported and the handle's File is still the one they were read on; then, or at Close, they go.
+  // Under mu.
+  struct OpenBytes {
+    XrdCl::File* file = nullptr; // the File the checks read on
+    uint64_t size = 0;           // the size the copy reported at its open
+    std::string server;          // the copy's server, host:port ("" when not known)
+    struct Span {
+      uint64_t off = 0;
+      std::vector<char> bytes;
+      uint64_t t0Us = 0; // the read was sent (steady µs)
+      uint64_t rtUs = 0; // its answer time
+    };
+    std::vector<Span> spans;
+  };
+  std::unique_ptr<OpenBytes> openBytes;
   // Under the move's locks (innerOpenMu, then mu): the text of the error that names every copy
   // the last move tried, none of which could serve the reads (OpenPolicy.h noCopyServedText); ""
   // once a move succeeded. Given to the reads of a move not made again at once (its cool-down).

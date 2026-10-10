@@ -92,6 +92,7 @@ the consumers together.
  "records_dropped": 0, "hist_origin_open_us": [..],
  "open_failovers": 0, "opens_recovered": 0, "opens_failed_everywhere": 0,
  "open_deadline_expiries": 0, "failover_locates": 0, "offline_copies_skipped": 0,
+ "open_check_bytes_kept": 0,
  "entries": [{"key": "root://host:1094/path", "file_size": 0,
               "cached_bytes": 0, "page_size": 4096}],
  "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ... adaptive_federation=off"}
@@ -252,6 +253,14 @@ ones included, so a run with caching disabled shows its origin failures too.
   no copy after servers were left out; one request answers every open waiting
   for the same answer), and listed copies not opened because the server says
   they are on tape.
+- `open_check_bytes_kept` — with `adaptive_federation = on`, for files the
+  cache caches: bytes the checks made inside a job's open read of the copy the
+  open took (its first page, and the pages of its list of top-level objects;
+  whole pages, at most 1 MiB of a copy), kept in the file's entry so that the
+  job's own reads of them right after the open are served from the cache.
+  They are also counted in `origin_bytes` and `origin_reads` (one read each),
+  which is where a read the job makes of them would otherwise have been
+  counted. Nothing a refused copy's checks read is kept.
 
 `run_settings`, on the counter line, is the settings that decide how the
 origin is reached, as the plugin found them at load, one string:
