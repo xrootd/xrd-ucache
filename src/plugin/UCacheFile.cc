@@ -918,10 +918,7 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     f.bad = refused;
     // The copy is refused and no other is tried: it goes on the list the error names, and is counted.
     const auto refuse = [&] {
-      const bool listed = std::any_of(seq->failed.begin(), seq->failed.end(),
-                                      [&](const SiteFailure& x) { return x.server == f.server; });
-      if (!listed)
-        seq->failed.push_back(f);
+      listOpenFailure(seq->failed, f);
       if (!readBad)
         noteBadCopy(st, f.server, f.error);
       return Next::kRefuse;
@@ -1061,13 +1058,18 @@ LocateTable& locateTable() {
   static LocateTable* t = new LocateTable;
   return *t;
 }
+// UCACHE_TEST_LOCATE_REFRESH=1 (inert unless set, read at load): every ask of a regional's list
+// is made with Refresh, so that a test can have the regional keep a list of one copy for the opens
+// it answers and still list every copy when uCache asks it.
+const int gTestLocateRefresh = envAtLoad("UCACHE_TEST_LOCATE_REFRESH");
 // The copies `q.regional` lists for `path`, with Refresh after a NotFound. Asks
 // are coalesced: an ask for the same (regional, path, refresh) that is in
 // flight is waited for instead of repeated, and counted once. Empty when the
 // answer fails or does not come.
 std::vector<Location> locateCopies(HandleState& st, FailoverSeq& q, const std::string& path) {
   const LocateTable table = locateTable();
-  const std::string key = q.regional + ' ' + path + (q.lastNotFound ? " refresh" : "");
+  const bool refresh = q.lastNotFound || gTestLocateRefresh > 0;
+  const std::string key = q.regional + ' ' + path + (refresh ? " refresh" : "");
   std::shared_ptr<LocateOp> op;
   bool mine = false;
   {
@@ -1103,7 +1105,7 @@ std::vector<Location> locateCopies(HandleState& st, FailoverSeq& q, const std::s
     XRootDStatus s;
     std::unique_ptr<AnyObject> resp;
     const XrdCl::OpenFlags::Flags flags =
-        XrdCl::OpenFlags::PrefName | (q.lastNotFound ? XrdCl::OpenFlags::Refresh : XrdCl::OpenFlags::None);
+        XrdCl::OpenFlags::PrefName | (refresh ? XrdCl::OpenFlags::Refresh : XrdCl::OpenFlags::None);
     const bool answered = fsCall(
         q.regional, t, 2 * q.trS,
         [&](XrdCl::FileSystem& fs, ResponseHandler* h) {
@@ -1397,6 +1399,63 @@ bool cachesFile(const HandleState& st, const Config& cfg) {
   return key && hostPassesLists(cfg.allowHosts, cfg.denyHosts, key->host);
 }
 
+// The client's recovery of reads and writes and its following of a server's redirect, held off on
+// a File for the reads of the checks made at open, so that no other copy answers them.
+static constexpr int kCheckProps = 3;
+static constexpr const char* kCheckPropNames[kCheckProps] = {"ReadRecovery", "WriteRecovery",
+                                                             "FollowRedirects"};
+// Turns them off on `f`, keeping in `saved` what it had (`have`: which it answered). Under propMu,
+// with the handle's headerReading set (UCacheFile::SetProperty keeps the reader's settings of
+// them made meanwhile for giveBackCheckProps).
+static void holdCheckPropsLocked(XrdCl::File* f, std::string* saved, bool* have) {
+  for (int i = 0; i < kCheckProps; ++i) {
+    have[i] = f->GetProperty(kCheckPropNames[i], saved[i]);
+    if (have[i])
+      f->SetProperty(kCheckPropNames[i], "false");
+  }
+}
+// The File's own recovery and redirect settings, as they were before the checks' reads, given back
+// to it; the reader's settings of them made meanwhile (kept in readerProps, from `headerProps` on)
+// win, and on a handle armed meanwhile the recovery stays off. Runs while the File is held.
+static void giveBackCheckProps(HandleState& st, XrdCl::File* f, const std::string* saved,
+                               const bool* had) {
+  // No setting of the reader's is recorded meanwhile: SetProperty holds propMu across its own.
+  std::lock_guard<std::mutex> props(st.propMu);
+  std::string v[kCheckProps];
+  bool have[kCheckProps];
+  for (int i = 0; i < kCheckProps; ++i) {
+    v[i] = saved[i];
+    have[i] = had[i];
+  }
+  bool armed = false;
+  {
+    std::lock_guard<std::mutex> g(st.mu);
+    const size_t seen = st.readerProps.size();
+    armed = st.moveOnReads;
+    for (size_t j = std::min(st.headerProps, seen); j < seen; ++j)
+      for (int i = 0; i < kCheckProps; ++i)
+        if (st.readerProps[j].first == kCheckPropNames[i]) {
+          v[i] = st.readerProps[j].second;
+          have[i] = true;
+        }
+  }
+  for (int i = 0; i < kCheckProps; ++i)
+    if (have[i] && !(armed && i < 2)) // 0, 1: the recovery of reads and writes
+      f->SetProperty(kCheckPropNames[i], v[i]);
+  bool armedSince = false;
+  {
+    std::lock_guard<std::mutex> g(st.mu);
+    st.headerReading = false;
+    armedSince = !armed && st.moveOnReads && (have[0] || have[1]);
+  }
+  // Armed after `armed` was read (applyReadPolicy arms under mu and then turns the recovery off,
+  // without propMu): the recovery given back above is turned off again (SetProperty's way).
+  if (armedSince) {
+    f->SetProperty(kCheckPropNames[0], "false");
+    f->SetProperty(kCheckPropNames[1], "false");
+  }
+}
+
 // ---- The reader's open, retried --------------------------------------------
 // Wraps the reader's open handler to retry an open that failed, each time on a
 // FRESH inner file (a failed open is terminal on the object):
@@ -1433,6 +1492,8 @@ class RetryingOpenHandler : public ResponseHandler {
       seq_ = std::make_unique<FailoverSeq>(readerTimeoutS, timeout);
       base_ = mergeTried(url_); // the reader's excluded servers stay excluded
       keep_ = cachesFile(*st_, cfg);
+      std::lock_guard<std::mutex> g(st_->mu);
+      st_->readerOpenPending = true; // until the reader is answered (answered())
     }
   }
 
@@ -1510,9 +1571,23 @@ class RetryingOpenHandler : public ResponseHandler {
     if (ended(*s, h, w, /*sent=*/true, /*fresh=*/false, opened))
       return;
     keepOpenBytes(w); // the reader is given this copy: what its checks read waits for the entry
+    answered();
     // Transparent on success: forward exactly what we got.
     real_->HandleResponseWithHosts(s.release(), r.release(), h ? h.release() : new HostList());
     delete this;
+  }
+
+  // The reader is about to be answered: a request waiting for the open (ensureEntry) may set the
+  // handle up now. Before the answer, so that a reader's handler that makes a request at once
+  // never waits for itself.
+  void answered() noexcept {
+    if (!seq_)
+      return;
+    {
+      std::lock_guard<std::mutex> g(st_->mu);
+      st_->readerOpenPending = false;
+    }
+    st_->openCv.notify_all();
   }
 
   // The checks made at open: the open succeeded at a copy of a file named *.root, and before the
@@ -1598,34 +1673,8 @@ class RetryingOpenHandler : public ResponseHandler {
     // to it; the reader's settings of them made meanwhile (kept in readerProps, from
     // `headerProps` on) win, and on a handle armed meanwhile the recovery stays off. Runs while
     // the File is held.
-    void restoreProps() {
-      HandleState& st = *o->st_;
-      // No setting of the reader's is recorded meanwhile: SetProperty holds propMu across its own.
-      std::lock_guard<std::mutex> props(st.propMu);
-      std::string v[kProps];
-      for (int i = 0; i < kProps; ++i)
-        v[i] = saved[i];
-      bool armed = false;
-      {
-        std::lock_guard<std::mutex> g(st.mu);
-        const size_t seen = st.readerProps.size();
-        armed = st.moveOnReads;
-        for (size_t j = std::min(st.headerProps, seen); j < seen; ++j)
-          for (int i = 0; i < kProps; ++i)
-            if (st.readerProps[j].first == kPropNames[i]) {
-              v[i] = st.readerProps[j].second;
-              have[i] = true;
-            }
-      }
-      for (int i = 0; i < kProps; ++i)
-        if (have[i] && !(armed && i < 2)) // 0, 1: the recovery of reads and writes
-          f->SetProperty(kPropNames[i], v[i]);
-      std::lock_guard<std::mutex> g(st.mu);
-      st.headerReading = false;
-    }
-    static constexpr int kProps = 3;
-    static constexpr const char* kPropNames[kProps] = {"ReadRecovery", "WriteRecovery",
-                                                      "FollowRedirects"};
+    void restoreProps() { giveBackCheckProps(*o->st_, f, saved, have); }
+    static constexpr int kProps = kCheckProps;
     RetryingOpenHandler* o;
     std::unique_ptr<XRootDStatus> s;
     std::unique_ptr<AnyObject> r;
@@ -1677,13 +1726,8 @@ class RetryingOpenHandler : public ResponseHandler {
           st_->headerProps = st_->readerProps.size();
         }
       }
-      if (f) {
-        for (int i = 0; i < HeaderRead::kProps; ++i) {
-          hr->have[i] = f->GetProperty(HeaderRead::kPropNames[i], hr->saved[i]);
-          if (hr->have[i])
-            f->SetProperty(HeaderRead::kPropNames[i], "false");
-        }
-      }
+      if (f)
+        holdCheckPropsLocked(f, hr->saved, hr->have);
     }
     sendCheckRead(hr, 0, want);
   }
@@ -1867,8 +1911,9 @@ class RetryingOpenHandler : public ResponseHandler {
     case Next::kDone:
       if (opened) // the copy whose header could not be read is open
         moveExecutor().post([self] { self->doRefuse(); });
-      else if (seq_ && record_) // its error looks for an earlier copy in the cache: not on this thread
-        moveExecutor().post([self] { self->forwardFailure(); });
+      else if (seq_ && record_) // its error looks for an earlier copy in the cache: not on this
+        // thread, and not behind the moves, which can hold the move pool for their whole budget
+        deliverExecutor().post([self] { self->forwardFailure(); });
       else
         forwardFailure();
       break;
@@ -1954,6 +1999,7 @@ class RetryingOpenHandler : public ResponseHandler {
     // The hosts of the last attempt that went through any, else a non-null
     // empty HostList: the native completion contract (see complete()).
     HostList* hosts = lastHosts_ ? lastHosts_.release() : new HostList();
+    answered();
     real_->HandleResponseWithHosts(new XRootDStatus(out), nullptr, hosts);
     delete this;
   }
@@ -2123,12 +2169,48 @@ void touchVal(const UrlKey& key, const std::string& cacheDir) {
   if (fd >= 0)
     RealIO::instance().close(fd);
 }
+// The bytes of the file `m` is the sidecar of that the cache holds: the byte entry's pages and,
+// where the file has a slot store a job would read it through (transpose on), the original extent
+// of every basket or page the store holds converted, which the byte entry no longer holds (a
+// converted basket's whole pages are let go of there). Counted once where they overlap.
+static uint64_t heldBytes(const UrlKey& key, const Config& cfg, const MetaData& m) {
+  std::vector<std::pair<uint64_t, uint64_t>> spans;
+  const uint64_t np = m.npages();
+  for (uint64_t i = 0; i < np && i < m.bitmap.npages(); ++i)
+    if (m.bitmap.get(i)) {
+      const uint64_t b = i * m.pageSize;
+      if (!spans.empty() && spans.back().second == b)
+        spans.back().second = b + m.pageBytes(i);
+      else
+        spans.emplace_back(b, b + m.pageBytes(i));
+    }
+#ifdef UCACHE_HAVE_COLDRUN
+  if (cfg.transpose)
+    coldHeldOriginal(key, cfg.cacheDir, m.fileSize, m.originMtime, m.cksumKind, m.originCksum,
+                     spans);
+#else
+  (void)key;
+  (void)cfg;
+#endif
+  std::sort(spans.begin(), spans.end());
+  uint64_t held = 0, end = 0;
+  for (const auto& sp : spans) {
+    const uint64_t b = std::max(sp.first, end);
+    const uint64_t e = std::min(sp.second, m.fileSize);
+    if (e > b) {
+      held += e - b;
+      end = e;
+    }
+  }
+  return held;
+}
 // The advice of an open that failed with adaptive_federation on (OpenPolicy.h staleEntryAdvice):
 // the cache holds an entry of the file that a job with a longer freshness window would be served,
 // as Open trusts one (cacheFresh) and ensureEntry sets it up: the allow and deny lists let the cache
 // cache the file, its freshness marker says when it was last confirmed at an origin, and its
 // sidecar loads, of the file's key. "" otherwise (an entry made with a window of 0 has no marker).
-// Reads the sidecar's summary (no page checksums): not for a client callback thread.
+// Reads the sidecar's summary (no page checksums) and the file's slot store: not for a client
+// callback thread.
 std::string staleEntryAdviceFor(const std::string& url) noexcept try {
   const Config& cfg = globalConfig();
   const auto key = UrlKey::parse(url, cfg.keepCgi);
@@ -2142,7 +2224,7 @@ std::string staleEntryAdviceFor(const std::string& url) noexcept try {
     return std::string();
   const int64_t now = static_cast<int64_t>(::time(nullptr));
   const int64_t at = static_cast<int64_t>(vs.st_mtime);
-  return staleEntryAdvice(now > at ? static_cast<uint64_t>(now - at) : 0, m->cachedBytes(),
+  return staleEntryAdvice(now > at ? static_cast<uint64_t>(now - at) : 0, heldBytes(*key, cfg, *m),
                           m->fileSize);
 } catch (...) {
   return std::string();
@@ -2181,6 +2263,80 @@ static std::vector<std::string> failedHostsOf(HandleState& st) {
     e = st.entry;
   }
   return e ? e->obs().servers.failedHosts() : std::vector<std::string>();
+}
+
+// The checks made at open (RetryingOpenHandler::checkHeader), made by the cache's own open of a
+// file named *.root when no size is known that the copy must have (a handle trusted at Open whose
+// entry was gone by its first read, or a forked child's open afresh of a handle shown no size): the
+// copy's first bytes and each further read they ask for, read on `f` and waited for here, with the
+// client's recovery and redirects off on `f` meanwhile, the first within what is left of the
+// attempt's time (`a`), each later one as the reader's open gives it. Their verdict goes to `w`. A
+// read that fails or runs out of time is a failure of the copy, as at the reader's open: `s`
+// becomes its status and `w.headerFailed` is set; `f` stays open. Nothing they read is kept.
+static void checkOwnOpen(HandleState& st, XrdCl::File* f, const OpenAttempt& a,
+                         const FailoverSeq& seq, AttemptView& w, XRootDStatus& s) {
+  std::string saved[kCheckProps];
+  bool have[kCheckProps] = {};
+  {
+    std::lock_guard<std::mutex> props(st.propMu);
+    {
+      std::lock_guard<std::mutex> g(st.mu);
+      st.headerReading = true;
+      st.headerProps = st.readerProps.size();
+    }
+    holdCheckPropsLocked(f, saved, have);
+  }
+  XRootDStatus rs;
+  std::vector<unsigned char> buf;
+  uint64_t deadlineUs = 0;
+  bool first = true;
+  for (;;) {
+    const uint64_t at = first ? 0 : static_cast<uint64_t>(w.header.nextAt);
+    const uint32_t len =
+        first ? static_cast<uint32_t>(rootHeaderBytes(w.size)) : w.header.nextLen;
+    const uint64_t now = nowUs();
+    const int64_t openLeftMs = seq.remainingMs() + int64_t(kHeaderReadFloorS) * 1000;
+    int limitS = 0;
+    if (first) {
+      limitS = headerReadTimeoutS(a.timeoutS, static_cast<int64_t>((now - a.t0) / 1000));
+      deadlineUs = now + static_cast<uint64_t>(limitS) * 1000000;
+    } else {
+      limitS = checkReadTimeoutS(
+          len, deadlineUs > now ? static_cast<int64_t>((deadlineUs - now) / 1000) : 0, openLeftMs);
+    }
+    if (limitS == 0) {
+      rs = XRootDStatus(XrdCl::stError, XrdCl::errOperationExpired, 0,
+                        "the checks made at open ran out of time");
+      break;
+    }
+    try {
+      buf.assign(len, 0);
+    } catch (...) {
+      break; // without the memory for it, the checks end where they are
+    }
+    uint32_t got = 0;
+    rs = f->Read(at, len, buf.data(), got, static_cast<ucache::XrdTimeout>(limitS));
+    if (!rs.IsOK())
+      break;
+    const size_t n = std::min<size_t>(got, len);
+    if (first)
+      w.header = rootHeaderVerdict(buf.data(), n, w.size);
+    else
+      rootCheckRead(w.header, buf.data(), n);
+    first = false;
+    if (w.header.next == RootHeaderVerdict::kNone)
+      break;
+  }
+  if (w.header.next != RootHeaderVerdict::kNone) { // not judged to the end: no claim stands
+    if (w.header.kind == RootHeaderVerdict::kConfirmed)
+      w.header.kind = RootHeaderVerdict::kNoClaim;
+    w.header.next = RootHeaderVerdict::kNone;
+  }
+  giveBackCheckProps(st, f, saved, have);
+  if (!rs.IsOK()) {
+    w.headerFailed = true;
+    s = rs;
+  }
 }
 
 bool HandleState::ensureInnerOpen() {
@@ -2229,7 +2385,12 @@ bool HandleState::ensureInnerOpen() {
   // A source of another size is another copy of the file -- a damaged or
   // truncated one, or the file rewritten -- and its bytes must not complete
   // this entry. The open already returns the source's stat.
-  const uint64_t want = expectedOriginSize.load(std::memory_order_relaxed);
+  // With adaptive_federation on, a forked child's open afresh of a handle whose reader was shown
+  // the size its own open answered (and that has no trusted entry's) must find that size again.
+  const uint64_t want = expectedOriginSize.load(std::memory_order_relaxed)
+                            ? expectedOriginSize.load(std::memory_order_relaxed)
+                            : fo ? readerOpenSize.load(std::memory_order_relaxed)
+                                 : 0;
   // With adaptive_federation on, the attempts are one sequence (FailoverSeq):
   // each has the open deadline, or what is left of the budget when that is
   // less; an answer that never comes is waited for a few seconds past its
@@ -2264,13 +2425,26 @@ bool HandleState::ensureInnerOpen() {
   // miss path only and innerOpened latches, so a handle runs at most one
   // sequence. open_retries == 0 (default) skips the retries.
   Next n = Next::kDone;
+  bool lastOpen = false;     // the last attempt's File is open (its checks' read may have failed)
+  uint64_t lastConfirmed = 0; // the size the last attempt's checks confirmed, 0 for none
   for (int sourceAttempt = 1;; ++sourceAttempt) {
     const std::string sent = faultOpenUrl(source, ++lazyOpenAttempt);
     ans = openAndWait(f, sent, a, seq ? seq->timeout() : static_cast<ucache::XrdTimeout>(0),
                       seq ? 2 * seq->trS : 0);
     reached = ans.hosts && !ans.hosts->empty() ? hostPortOf(ans.hosts->back().url) : std::string();
-    const AttemptView w = viewOf(*this, ans.status, ans.hosts.get(), f);
+    AttemptView w = viewOf(*this, ans.status, ans.hosts.get(), f);
+    const bool fileOpen = ans.status.IsOK(); // still so when a read of the checks fails
+    // With adaptive_federation on and no size the copy must have, a copy of a file named *.root
+    // passes the checks made at open before it is taken, as at the reader's open (not one this
+    // open refused already: it is refused again as it is).
+    if (seq && fileOpen && !want && w.size > 0 && rootNamed(url) &&
+        !refusedBefore(seq->failed, siteFailure(w, ans.status, hostPortOfUrl(sent)).server))
+      checkOwnOpen(*this, f, a, *seq, w, ans.status);
     n = afterAttempt(*this, cfg, seq ? &*seq : nullptr, ans.status, w, sent, sourceAttempt, want);
+    lastOpen = fileOpen;
+    lastConfirmed = w.header.kind == RootHeaderVerdict::kConfirmed && w.size > 0
+                        ? static_cast<uint64_t>(w.size)
+                        : 0;
     a.endUs = nowUs();
     // Whether this attempt ends the sequence, known before it is recorded: its last line
     // says how the open ended. Asking for the next listed copy waits, here.
@@ -2283,7 +2457,7 @@ bool HandleState::ensureInnerOpen() {
       a.budgetS = seq->budget;
     }
     noteAnswer(a, ans, sent, f, w);
-    if (abandoned(f, ans.status.IsOK()))
+    if (abandoned(f, fileOpen))
       return false;
     if (end)
       break; // done, or the exit handler has begun: nothing more is issued
@@ -2295,7 +2469,7 @@ bool HandleState::ensureInnerOpen() {
     // A copy refused after it opened (on tape) is closed without waiting, in
     // the swap.
     XrdCl::File* fresh = resetInner(/*leakOld=*/ans.unfinished, /*onlyIfIdle=*/false,
-                                    /*closeOld=*/ans.status.IsOK());
+                                    /*closeOld=*/fileOpen);
     if (!fresh)
       break; // the handle is shut down: the last answer stands
     f = fresh;
@@ -2307,7 +2481,7 @@ bool HandleState::ensureInnerOpen() {
     }
   }
   XRootDStatus s = ans.status;
-  if (abandoned(f, s.IsOK()))
+  if (abandoned(f, lastOpen))
     return false;
   if (n == Next::kRefuse) // refused for what the copy is, and no other to try: the open fails
     s = XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, "the copy is refused");
@@ -2332,8 +2506,13 @@ bool HandleState::ensureInnerOpen() {
         store->stats().sizeDisagreements.fetch_add(1, std::memory_order_relaxed);
       if (fo)
         noteSizeDisagreement(*this, reached.empty() ? server : reached, si->GetSize(), want);
-      if (!trustMarker.empty())
-        RealIO::instance().unlink(trustMarker);
+      std::string marker;
+      {
+        std::lock_guard<std::mutex> g(mu);
+        marker = trustMarker;
+      }
+      if (!marker.empty())
+        RealIO::instance().unlink(marker);
       lazyOpenError = XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, msg);
       // With adaptive_federation on the sequence may have tried several copies, each of another
       // size: the read's error names every one of them, this one included, with its size.
@@ -2367,6 +2546,8 @@ bool HandleState::ensureInnerOpen() {
   }
   innerOpenOk = s.IsOK();
   if (innerOpenOk) {
+    if (seq && lastConfirmed) // the checks made at this open confirmed the copy's size
+      confirmedSize.store(lastConfirmed, std::memory_order_relaxed);
     innerOpened = true; // success latches; failure only arms the cool-down
     lazyOpenFailUs = 0;
     applyReadPolicy();
@@ -2380,8 +2561,8 @@ bool HandleState::ensureInnerOpen() {
     // for what it is, which is open, is swapped out and closed even while a request of the
     // cache's holds the handle's File: it must never be read, nor stat, as the handle's
     // (a request still in it fails with the close).
-    resetInner(/*leakOld=*/ans.unfinished, /*onlyIfIdle=*/n != Next::kRefuse,
-               /*closeOld=*/n == Next::kRefuse);
+    resetInner(/*leakOld=*/ans.unfinished, /*onlyIfIdle=*/n != Next::kRefuse && !lastOpen,
+               /*closeOld=*/n == Next::kRefuse || lastOpen);
     // Named by its cache key, which carries no query (a query can carry an
     // access token). Other log lines that name the reader's URL print it whole.
     const auto key = UrlKey::parse(url, cfg.keepCgi);
@@ -3510,6 +3691,8 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   pendingPersists = 0; // tasks queued on the parent's pool, which never run here
   moveInFlight = false; // a move is the parent's: its reads wait there, and are left behind
   headerReading = false; // so is the header read of an open: its end never comes here
+  readerOpenPending = false; // and the open itself: its answer never comes here
+  new (&openCv) std::condition_variable;
   parkedReads = 0;
   new (&moveWaiters) std::vector<MoveWaiter>;
   new (&source) SiteFailure; // written under mu by callback threads: a fork may have caught them mid-write
@@ -3542,9 +3725,10 @@ void HandleState::startOverAfterFork(uint64_t gen) {
     std::shared_ptr<ReadRule> rule;
     std::unique_ptr<XrdCl::StatInfo> statInfo;
     std::vector<std::unique_ptr<XrdCl::File>> retired;
+    std::vector<std::pair<std::unique_ptr<XrdCl::File>, uint64_t>> retiredFailed;
   };
   new LeftBehind{std::move(entry), std::move(cold), std::move(rule), std::move(statInfo),
-                 std::move(retired)}; // leaked on purpose: the parent's
+                 std::move(retired), std::move(retiredFailed)}; // leaked on purpose: the parent's
   setupDone = closed || tripped || layoutLost; // nothing to set up again
   prefetchSeen.store(false, std::memory_order_relaxed);
   // This process's own account of the handle starts here.
@@ -3592,6 +3776,9 @@ void HandleState::shutdownInner(bool leak) {
     inner = nullptr;
     dead = std::move(innerOwned);
     old.swap(retired);
+    for (auto& r : retiredFailed)
+      old.push_back(std::move(r.first));
+    retiredFailed.clear();
   }
   if (leak || openLive)
     (void)dead.release();
@@ -3604,17 +3791,26 @@ XrdCl::File* HandleState::resetInner(bool leakOld, bool onlyIfIdle, bool closeOl
   // old one is kept, not destroyed: a call that read `inner` without the lock
   // may still be inside it. The validity check sits in the same section as the
   // swap, so a handle shut down meanwhile gets no File that nothing destroys.
+  std::vector<std::unique_ptr<XrdCl::File>> expired; // destroyed once mu is released
   std::lock_guard<std::mutex> g(mu);
   if (!innerValid || (onlyIfIdle && innerOps != 0))
     return nullptr;
+  const uint64_t now = nowUs();
   if (leakOld) {
     (void)innerOwned.release(); // the parent's file, which calls without the lock may still use
+  } else if (!closeOld && !innerOwned->IsOpen()) {
+    // Its open failed (an open still in flight is left alone: leakOld). Destroyed later (below).
+    retiredFailed.emplace_back(std::move(innerOwned), now);
   } else {
     if (closeOld) {
       const XRootDStatus cs = innerOwned->Close(nullptr, static_cast<ucache::XrdTimeout>(0));
       (void)cs; // only queued: the close is not waited for
     }
     retired.push_back(std::move(innerOwned));
+  }
+  while (!retiredFailed.empty() && now - retiredFailed.front().second >= kRetiredFailedKeepUs) {
+    expired.push_back(std::move(retiredFailed.front().first));
+    retiredFailed.erase(retiredFailed.begin());
   }
   innerOwned = makeInner();
   inner = innerOwned.get();
@@ -4748,9 +4944,16 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
   if (passthroughOnly_ || !st_->store)
     return nullptr;
   {
-    std::lock_guard<std::mutex> g(st_->mu);
+    std::unique_lock<std::mutex> g(st_->mu);
     if (st_->setupDone)
       return (st_->closed || st_->tripped) ? nullptr : st_->entry;
+    // With adaptive_federation on, a request made while the reader's open is in flight waits for
+    // its answer: the File may be open at a copy the checks made at open have yet to judge, or have
+    // refused, and neither the entry nor the reader may be given its size. Bounded: the open's
+    // attempts end within its budget (a wait that ends at the bound sets the handle up as it is).
+    if (st_->readerOpenPending)
+      st_->openCv.wait_for(g, std::chrono::seconds(kFailoverMaxS + 120),
+                           [&] { return !st_->readerOpenPending || st_->closed; });
   }
   std::lock_guard<std::mutex> setup(st_->setupMu);
   {
@@ -4793,7 +4996,10 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
         meta && meta->key == key->key) {
       // Set before anything here can open the origin lazily (the layout choice
       // reads the file's records): that open must serve this size or nothing.
-      st_->trustMarker = valPath(*key, cfg.cacheDir);
+      {
+        std::lock_guard<std::mutex> g(st_->mu);
+        st_->trustMarker = valPath(*key, cfg.cacheDir);
+      }
       st_->expectedOriginSize.store(meta->fileSize, std::memory_order_relaxed);
       const WholeFirstRead whole = wholeFirstRead(firstRead, meta->fileSize, *key, cfg, forkLayout);
       keepOriginal = keepOriginal || whole == WholeFirstRead::kAsStored;
@@ -5085,7 +5291,14 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
   // reading, and a handle shown a slot layout must report its size from the
   // very first answer -- forced or not, and for a handle a forked child is
   // setting up again as much as for a new one.
-  if (st_->inner.load()->IsOpen() || cacheOpen_ || st_->reopenPending())
+  // A Stat made while the reader's open is in flight (adaptive_federation on) waits for its
+  // answer there, whether or not its File is open yet.
+  bool openPending = false;
+  {
+    std::lock_guard<std::mutex> g(st_->mu);
+    openPending = st_->readerOpenPending;
+  }
+  if (st_->inner.load()->IsOpen() || cacheOpen_ || st_->reopenPending() || openPending)
     ensureEntry();
   if (st_->layoutLost.load(std::memory_order_acquire))
     return lostLayoutError(st_);
@@ -5694,12 +5907,23 @@ XrdCl::XRootDStatus UCacheFile::Truncate(uint64_t size, ResponseHandler* handler
   return st_->inner.load()->Truncate(size, handler, timeout);
 }
 
+// With adaptive_federation on, a handle trusted at Open that has not been set up yet is set up
+// before a request that needs the cache's own open of the origin (Stat's way): that open must
+// find the size the entry holds (expectedOriginSize, which the set-up reads from the entry's
+// sidecar), and without it would take a copy of any size. With the switch off nothing changes:
+// such a request waits for that open only once the set-up has run (ownOpenPending).
+void UCacheFile::setUpBeforeOwnOpen() {
+  if (cacheOpen_ && globalConfig().adaptiveFederation && ownOpenPending(*st_))
+    ensureEntry();
+}
+
 // An armed handle's File a forked child inherited is in the client's Error state, where a
 // call returns the File's old status (OK) and never completes its handler: such a handle
 // opens the origin afresh first (Stat's way).
 XrdCl::XRootDStatus UCacheFile::Fcntl(const XrdCl::Buffer& arg, ResponseHandler* handler,
                                       ucache::XrdTimeout timeout) {
   st_->syncFork();
+  setUpBeforeOwnOpen();
   if (((st_->moveOnReads && st_->reopenPending()) || ownOpenPending(*st_)) &&
       !st_->ensureInnerOpen())
     return st_->missError();
@@ -5708,6 +5932,7 @@ XrdCl::XRootDStatus UCacheFile::Fcntl(const XrdCl::Buffer& arg, ResponseHandler*
 
 XrdCl::XRootDStatus UCacheFile::Visa(ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
+  setUpBeforeOwnOpen();
   if (((st_->moveOnReads && st_->reopenPending()) || ownOpenPending(*st_)) &&
       !st_->ensureInnerOpen())
     return st_->missError();

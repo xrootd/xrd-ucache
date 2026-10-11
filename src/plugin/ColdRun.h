@@ -112,6 +112,15 @@ void coldForkPrepare();
 void coldForkParent();
 void coldAfterForkChild();
 
+// The original extent, [begin, end), of every basket or page the slot store of `key`'s file holds
+// converted, appended to `out`: when the file has a store that would be served for an entry of
+// `size` bytes with these validators (a job reading the file through it reads those parts from the
+// cache). Nothing for a file without one. Reads the store's header, layout and entries; waits
+// for a commit in progress. Throws nothing.
+void coldHeldOriginal(const UrlKey& key, const std::string& cacheDir, uint64_t size,
+                      uint64_t originMtime, uint8_t cksumKind, uint32_t originCksum,
+                      std::vector<std::pair<uint64_t, uint64_t>>& out) noexcept;
+
 // The file size the reader is shown.
 uint64_t coldVirtualSize(const ColdFill& cf);
 // The size a handle shown `map` (null: the slot layout itself) is shown: a

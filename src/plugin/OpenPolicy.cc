@@ -729,15 +729,27 @@ bool budgetSpent(int64_t remainingMs, int attemptDeadlineS, int readerTimeoutS) 
   return remainingMs < floorMs;
 }
 
+bool listOpenFailure(std::vector<SiteFailure>& failed, const SiteFailure& f) {
+  for (SiteFailure& x : failed)
+    if (x.server == f.server) {
+      if (f.bad && !x.bad) {
+        x.bad = true;
+        x.error = f.error;
+        if (f.size >= 0)
+          x.size = f.size;
+      }
+      return true;
+    }
+  failed.push_back(f);
+  return false;
+}
+
 AfterFailure afterFailure(std::vector<SiteFailure>& failed, const SiteFailure& f, int maxSites,
                           bool spent) {
-  bool seen = false, sameSite = false;
-  for (const SiteFailure& x : failed) {
-    seen = seen || x.server == f.server;
+  bool sameSite = false;
+  for (const SiteFailure& x : failed)
     sameSite = sameSite || x.site == f.site;
-  }
-  if (!seen)
-    failed.push_back(f);
+  const bool seen = listOpenFailure(failed, f);
   std::vector<std::string> sites;
   for (const SiteFailure& x : failed)
     if (std::find(sites.begin(), sites.end(), x.site) == sites.end())
@@ -964,15 +976,18 @@ std::string noCopyServedText(const std::string& file, const std::vector<SiteFail
 }
 
 std::string earlierMoveText(const std::string& moveText, uint64_t agoMs) {
-  static const std::string kMark = ": no copy could serve the read: ";
-  const size_t at = moveText.find(kMark);
+  // A literal, never a static std::string: this runs on the move pool's detached threads, which
+  // may still run while exit() destroys function-local statics.
+  static constexpr const char kMark[] = ": no copy could serve the read: ";
+  static constexpr size_t kMarkLen = sizeof kMark - 1;
+  const size_t at = moveText.find(kMark, 0, kMarkLen);
   if (at == std::string::npos)
     return moveText;
   const std::string ago = agoMs < 1000 ? std::to_string(agoMs) + " ms" : ageText(agoMs / 1000);
-  std::string out = moveText.substr(0, at + kMark.size()) + "a move made " + ago +
+  std::string out = moveText.substr(0, at + kMarkLen) + "a move made " + ago +
                     " ago for an earlier read of the handle found none, and none is made again "
                     "within a second; the copies it tried, as they answered that read: " +
-                    moveText.substr(at + kMark.size());
+                    moveText.substr(at + kMarkLen);
   return out.size() > kErrorTextMax ? out.substr(0, kErrorTextMax) : out;
 }
 

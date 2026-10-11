@@ -172,13 +172,19 @@ struct HandleState {
   // calls) read it without `mu`; such a call may still be inside the File it
   // loaded when a retry replaces it, so a replaced File is never destroyed
   // while the handle lives: it moves to `retired` (under `mu`), and
-  // shutdownInner destroys those once no call can be in them. The cost: a
-  // handle keeps every File it replaced until it closes, at most
-  // open_retries + 1 per lazy-open cool-down (1 s) while its opens keep
-  // failing and its reader keeps missing, plus open_retries per reader open.
+  // shutdownInner destroys those once no call can be in them. A File whose
+  // open failed (it was never open) goes to `retiredFailed` instead, with the
+  // time it was replaced, and a later resetInner destroys it once
+  // kRetiredFailedKeepUs have passed: such a File answers every call at once,
+  // from its own state, without the network, so no call can still be in it
+  // by then. Otherwise a handle whose opens keep failing while its reader
+  // keeps asking would keep one File (about 1.3 kB) per lazy-open cool-down
+  // (1 s) until it closes. Under mu.
   std::unique_ptr<XrdCl::File> innerOwned;
   std::atomic<XrdCl::File*> inner{nullptr};
   std::vector<std::unique_ptr<XrdCl::File>> retired;
+  static constexpr uint64_t kRetiredFailedKeepUs = 600ull * 1000000;
+  std::vector<std::pair<std::unique_ptr<XrdCl::File>, uint64_t>> retiredFailed;
   // With adaptive_federation on, the properties the reader set (SetProperty),
   // in order, given again to every File resetInner makes: an open made again
   // at another site would otherwise lose them. Under mu.
@@ -212,6 +218,13 @@ struct HandleState {
   // meanwhile are kept in readerProps, from `headerProps` on, and given to the File at its end.
   bool headerReading = false;
   size_t headerProps = 0;
+  // Under mu: with adaptive_federation on, the reader's open of a handle the cache serves is in
+  // flight (RetryingOpenHandler), from its first attempt to the completion the reader gets. Its
+  // File may meanwhile be open at a copy the checks made at open have yet to judge, or have
+  // refused: a request made on the handle then waits for the answer (openCv) before the handle is
+  // set up, so that neither its entry nor its reader is given that copy's size (ensureEntry).
+  bool readerOpenPending = false;
+  std::condition_variable openCv;
   // With adaptive_federation on, for a file the cache caches: what the checks made at the reader's
   // open read of the copy the open took, as whole pages of the file (OpenPolicy.h checkReadSpan),
   // kept here from the open's answer until the handle's entry is set up (ensureEntry), which stores
@@ -272,11 +285,15 @@ struct HandleState {
   // file is then opened LAZILY only if a genuine miss needs the origin
   // (fail-open). Opt-in; when the knob is 0 these stay false and the path is
   // unchanged. innerOpenMu serializes the one-shot lazy open off the fast path.
-  bool cacheOnly = false;
+  // Written under mu; atomic, because requests read it without (ownOpenPending, acquireInner).
+  std::atomic<bool> cacheOnly{false};
   // Set at Open when the handle is trusted (cacheOnly): its File is opened only by the cache's own
-  // open (ensureInnerOpen), never by the reader's. No request goes to that File until that open has
-  // succeeded, also once the handle has lost its trust (its entry gone by its first read): a request
-  // on a File that never opened fails in the client, or crashes it.
+  // open (ensureInnerOpen), never by the reader's. With adaptive_federation on, no request goes to
+  // that File until that open has succeeded. With it off, the same holds once the handle has lost
+  // its trust (its entry gone by its first read): a request on a File that never opened fails in
+  // the client, or crashes it. A handle that still trusts its entry gives an Fcntl, a Visa or a
+  // write to that File as it is, as 1.4.0 did (the client answers "invalid operation" and sends
+  // nothing); its Stat is answered from the entry, and a read that misses waits for the open.
   std::atomic<bool> trustedAtOpen{false};
   // Read without innerOpenMu on the fast path (acquireInner): set under it, and
   // atomic so a reader that sees it set also sees the open that preceded it.
@@ -308,7 +325,7 @@ struct HandleState {
   // reader's open of a file named *.root with adaptive_federation on, and by a handle whose
   // entry carries the size confirmed (MetaData::kFlagSizeConfirmed).
   std::atomic<uint64_t> confirmedSize{0};
-  std::string trustMarker;              // the entry's .val path, removed on such a refusal
+  std::string trustMarker; // under mu: the entry's .val path, removed on such a refusal
   std::atomic<bool> sizeRefused{false}; // set: no origin read of this handle reaches that source
   bool ensureInnerOpen(); // lazy origin open on first miss; the caller waits for it
   // The status a cache miss should fail with when the inner file is
@@ -417,6 +434,9 @@ class UCacheFile : public XrdCl::FilePlugIn {
                                       XrdCl::ResponseHandler* handler,
                                       ucache::XrdTimeout timeout);
   void invalidateOnWrite();
+  // Sets up a handle trusted at Open before a request that would make the cache's own open of the
+  // origin (adaptive_federation on only): that open must find the entry's size.
+  void setUpBeforeOwnOpen();
   // Lazily create the cache entry on the caller's thread (first read), doing
   // a synchronous inner Stat. Returns the entry, or nullptr for
   // pass-through (write-open, disabled, denied host, Stat failure, closed).

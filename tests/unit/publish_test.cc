@@ -156,6 +156,10 @@ TEST(Publish, RegistrableDomainAndUrlCoarsening) {
   EXPECT_EQ(registrableDomain("localhost"), "localhost");
   EXPECT_EQ(registrableDomain("127.0.0.1"), "unknown");
   EXPECT_EQ(registrableDomain("::1"), "unknown");
+  // How the client names a server it reached by an address: never a piece of the address.
+  EXPECT_EQ(registrableDomain("[::ffff:188.184.21.7]"), "unknown");
+  EXPECT_EQ(registrableDomain("::ffff:188.184.21.7"), "unknown");
+  EXPECT_EQ(registrableDomain("[2001:db8::7]"), "unknown");
   EXPECT_EQ(registrableDomain(""), "unknown");
   EXPECT_EQ(coarsenRootUrl("root://eoscms.cern.ch:1094//eos/cms/store/x.root"), "root://cern.ch");
   EXPECT_EQ(coarsenRootUrl("root://xrootd-cms.infn.it//store/y"), "root://infn.it");

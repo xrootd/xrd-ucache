@@ -551,6 +551,34 @@ TEST(OpenPolicy, AfterFailure) {
   EXPECT_EQ(late.size(), 1u) << "the failure is still named";
 }
 
+// A server listed for an earlier failure of the open whose copy is then refused for what it is:
+// its entry says so (bad, the refusal's text and the copy's size), so that it is not taken again
+// and the open's error names the refusal; a refusal is never undone by a later plain failure.
+TEST(OpenPolicy, ListOpenFailureRefusedLater) {
+  std::vector<SiteFailure> failed;
+  SiteFailure first{"a.one.org:1094", "one.org", "a.one.org", "[ERROR] Operation expired"};
+  EXPECT_FALSE(listOpenFailure(failed, first));
+  EXPECT_FALSE(refusedBefore(failed, "a.one.org:1094"));
+  SiteFailure cut{"a.one.org:1094", "one.org", "a.one.org",
+                  "its header says the file is 2000 bytes, and the copy has 1000"};
+  cut.bad = true;
+  cut.size = 1000;
+  EXPECT_TRUE(listOpenFailure(failed, cut)) << "listed already";
+  ASSERT_EQ(failed.size(), 1u) << "a server is listed once";
+  EXPECT_TRUE(failed[0].bad);
+  EXPECT_EQ(failed[0].error, cut.error);
+  EXPECT_EQ(failed[0].size, 1000);
+  EXPECT_TRUE(refusedBefore(failed, "a.one.org:1094"));
+  EXPECT_EQ(afterFailure(failed, first, 4, false), AfterFailure::kRepeat);
+  EXPECT_TRUE(failed[0].bad) << "a later plain failure does not undo the refusal";
+  EXPECT_EQ(failed[0].error, cut.error);
+  // afterFailure lists a refusal the same way.
+  std::vector<SiteFailure> f2{first};
+  EXPECT_EQ(afterFailure(f2, cut, 4, false), AfterFailure::kRepeat);
+  EXPECT_TRUE(f2[0].bad);
+  EXPECT_EQ(f2[0].error, cut.error);
+}
+
 // The error of an open that failed at every site it tried.
 TEST(OpenPolicy, AllSitesFailedText) {
   const std::vector<SiteFailure> failed = {

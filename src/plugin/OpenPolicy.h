@@ -457,8 +457,13 @@ bool refusedBefore(const std::vector<SiteFailure>& failed, const std::string& se
 // neither is the newest, so that a move never goes straight back to the copy it leaves: when every
 // older entry was found bad, the list keeps one more than `keep`.
 void noteReadFailure(std::vector<SiteFailure>& failed, SiteFailure f, size_t keep);
+// Puts the failure `f` of an open on the sequence's list `failed`, unless its server is listed
+// already; returns whether it was. A listed server whose copy `f` refuses for what it is (`f.bad`)
+// is marked so from then on, with `f`'s error and size in place of its earlier failure's: it is
+// not taken again, and the error that ends the sequence names that refusal.
+bool listOpenFailure(std::vector<SiteFailure>& failed, const SiteFailure& f);
 // What the sequence does after a fail-over outcome, given the sites that
-// failed before (`failed`, to which `f` is added unless its server is there):
+// failed before (`failed`, to which `f` is added as listOpenFailure adds it):
 //   kStop    the bound of `maxSites` distinct sites is reached, or the budget is
 //            spent (`spent`)
 //   kRepeat  the attempt landed on a server or site that had failed already:

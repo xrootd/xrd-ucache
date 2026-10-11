@@ -2114,6 +2114,29 @@ TEST(CacheStore, ACapKeyAdmitsAFixedNumberOfLinesPerProcess) {
   EXPECT_EQ(store.stats().recordsDropped.load(), 0u) << "the cap is not the queue's bound";
 }
 
+// The keys of the cap are bounded: once kRecordCapKeys are remembered, a line with a new key is
+// dropped and counted; the keys already there keep their own cap.
+TEST(CacheStore, TheCapKeysAreBounded) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  store.disableStatsDump();
+  const size_t n = CacheStore::kRecordCapKeys;
+  for (size_t i = 0; i < n + 5; ++i) {
+    store.enqueueRecord("{\"kind\":\"origin_failure\",\"v\":1}\n", "k" + std::to_string(i));
+    if (i % 1000 == 999)
+      store.drainRecords(); // the queue's own bound is not what is tested
+  }
+  EXPECT_EQ(store.stats().recordsDropped.load(), 5u) << "the five keys past the bound";
+  store.enqueueRecord("{\"kind\":\"origin_failure\",\"v\":1,\"k\":\"k0\"}\n", "k0");
+  EXPECT_EQ(store.stats().recordsDropped.load(), 5u) << "a key already remembered is admitted";
+  store.drainRecords();
+  const auto recs = fileRecords(io, td.path());
+  EXPECT_EQ(recs.size(), n + 1);
+}
+
 TEST(CacheStore, TheFinalDumpWritesQueuedRecordsAndRunSettings) {
   TempDir td;
   RealIO io;

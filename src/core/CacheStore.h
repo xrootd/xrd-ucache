@@ -259,9 +259,14 @@ class CacheStore {
   // blocking. A full queue drops the line and counts records_dropped. A
   // non-empty `capKey` admits at most kRecordsPerCapKey lines with that key in
   // this process (the failure lines of one file, server and class), the rest
-  // being dropped uncounted (the per-file record counts every failure).
+  // being dropped uncounted (the per-file record counts every failure). At
+  // most kRecordCapKeys such keys are remembered: once that many are, a line
+  // with a key not among them is dropped and counted in records_dropped, so
+  // that a process meeting failures of very many files holds no more memory
+  // for it (about 100 bytes a key).
   static constexpr size_t kRecordQueueMax = 4096;
   static constexpr uint32_t kRecordsPerCapKey = 16;
+  static constexpr size_t kRecordCapKeys = 16384;
   void enqueueRecord(std::string line, const std::string& capKey = std::string());
   // Writes the queued lines to the per-file record file, in queue order. The
   // periodic checkpoint and the final dump call it, and nothing else does: a

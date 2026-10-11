@@ -161,6 +161,11 @@ class ColdFill : public tp::StoreMaps, public std::enable_shared_from_this<ColdF
   // slotFactor100, the slot table): StoreLayout.h; key, cacheDir, store,
   // entry, storeGone, mu, handles and the maps: StoreMaps.h.
   bool keepOriginals = false;
+  // Whether a block that fails its own checksum holds the read back (failOriginCheck): with
+  // recompress = on, which checks every block it converts, or with check_origin_integrity on. A
+  // job with neither that fills the unfilled slots of a store made earlier keeps such a block as
+  // stored and serves it, and the reader's own decoder finds the damage, as without the cache.
+  bool checkConverted = false;
   // max_read_fraction: null when no rule applies. Once it says direct, what
   // this process converts is served and never kept, and nothing it fetches
   // goes to the byte cache but the file's own records.
@@ -601,6 +606,7 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   cf->cacheDir = cfg.cacheDir;
   cf->entry = entry;
   cf->keepOriginals = cfg.recompressKeepOriginals;
+  cf->checkConverted = cfg.recompress || cfg.checkOriginIntegrity;
   cf->inUseSeconds = cfg.inUseSeconds;
   cf->fsync = cfg.fsync != FsyncMode::kOff;
   cf->rule = ReadRule::forFile(key.key, size);
@@ -1231,14 +1237,14 @@ void ColdRequest::finish() {
     complete(user, okStatus(), chunkResponse(chunks[0].offset, chunks[0].length, chunks[0].buffer));
 }
 
-// A basket or page that a first pass converts failed its own checksum. Conversion
-// always checks what it converts, whatever check_origin_integrity says: the
-// converted block would carry a new, valid checksum, and the reader could no
-// longer detect the damage. Bytes that came from the byte cache are dropped
-// there, and the read is asked again (the retry fetches them from the origin):
-// they may have been cached from another source, or by a uCache that did not
-// check them. Bytes the origin sent for this read fail it, reported with where
-// they came from, and are never kept or served.
+// A basket or page that a first pass converts failed its own checksum, with
+// recompress = on (which checks what it converts, whatever check_origin_integrity
+// says: the converted block would carry a new, valid checksum, and the reader
+// could no longer detect the damage) or check_origin_integrity on. Bytes that
+// came from the byte cache are dropped there, and the read is asked again (the
+// retry fetches them from the origin): they may have been cached from another
+// source, or by a uCache that did not check them. Bytes the origin sent for this
+// read fail it, reported with where they came from, and are never kept or served.
 void failOriginCheck(const std::shared_ptr<ColdRequest>& req, uint64_t pos, uint32_t len,
                      const std::string& what, const char* why, bool fromCache, uint64_t rStart,
                      uint64_t rLen, const std::string& codec = std::string()) {
@@ -1286,12 +1292,18 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     if (!p.error.empty()) {
       // A page whose checksum or decode fails must not be served decoded: the
       // reader could no longer detect it. Fail the read, as ROOT would.
-      failOriginCheck(req, slot.origSeek, recLen, "an RNTuple page", p.error.c_str(), fromCache,
-                      rStart, rounded->size());
+      if (cf.checkConverted) {
+        failOriginCheck(req, slot.origSeek, recLen, "an RNTuple page", p.error.c_str(), fromCache,
+                        rStart, rounded->size());
+      } else {
+        UCACHE_WARN("slot run for %s: page at %llu: %s", cf.key.key.c_str(),
+                    static_cast<unsigned long long>(slot.origSeek), p.error.c_str());
+        req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError));
+      }
       req->done();
       return;
     }
-    if (req->st->store)
+    if (cf.checkConverted && req->st->store)
       (pg.hasChecksum ? req->st->store->stats().originChecksPassed
                       : req->st->store->stats().originChecksNone)
           .fetch_add(1, std::memory_order_relaxed);
@@ -1344,17 +1356,18 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     c.kind = tp::ConvertedBasket::kOriginal;
     c.record.assign(rec, rec + recLen);
   }
-  // The basket's own checksum, checked by its decode whatever check_origin_integrity says: a
-  // basket that fails is never converted (convertBasket keeps it as its original record) and
-  // never kept or served; the read fails with that error.
-  if (c.check == tp::ConvertedBasket::kFailed) {
+  // The basket's own checksum, checked by its decode: a basket that fails is never converted
+  // (convertBasket keeps it as its original record). With recompress = on, or
+  // check_origin_integrity on, it is never kept or served either, and the read fails with that
+  // error; otherwise it is served as stored (checkConverted).
+  if (cf.checkConverted && c.check == tp::ConvertedBasket::kFailed) {
     failOriginCheck(req, slot.origSeek, recLen,
                     c.codec.empty() ? std::string("a basket") : "a basket (" + c.codec + ")",
                     c.checkWhy, fromCache, rStart, rounded->size(), c.codec);
     req->done();
     return;
   }
-  if (req->st->store)
+  if (cf.checkConverted && req->st->store)
     (c.check == tp::ConvertedBasket::kPassed ? req->st->store->stats().originChecksPassed
                                              : req->st->store->stats().originChecksNone)
         .fetch_add(1, std::memory_order_relaxed);
@@ -2089,6 +2102,26 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
 }
 
 } // namespace
+
+void coldHeldOriginal(const UrlKey& key, const std::string& cacheDir, uint64_t size,
+                      uint64_t originMtime, uint8_t cksumKind, uint32_t originCksum,
+                      std::vector<std::pair<uint64_t, uint64_t>>& out) noexcept try {
+  auto store = SlotStore::open(RealIO::instance(), key.objectDir(cacheDir), key.hashHex);
+  if (!store || store->header().declined ||
+      !adoptable(store->header(), size, originMtime, cksumKind, originCksum))
+    return;
+  tp::StoredLayout lay;
+  lay.slotFactor100 = store->header().slotFactor100;
+  if (!decodeLayout(store->layoutBlob(), lay))
+    return;
+  for (const SlotEntry& e : store->refresh(/*wait=*/true))
+    if ((e.kind == SlotEntry::kZstd || e.kind == SlotEntry::kRaw) && e.slot < lay.L.slots.size()) {
+      const tp::FillSlot& sl = lay.L.slots[e.slot];
+      out.emplace_back(sl.origSeek, sl.origSeek + sl.origLen);
+    }
+} catch (...) {
+}
+
 
 // --------------------------------------------------------------- committing
 

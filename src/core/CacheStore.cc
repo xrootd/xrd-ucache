@@ -1237,8 +1237,18 @@ void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const ch
 
 void CacheStore::enqueueRecord(std::string line, const std::string& capKey) {
   std::lock_guard<std::mutex> g(recMu_);
-  if (!capKey.empty() && ++recordCaps_[capKey] > kRecordsPerCapKey)
-    return;
+  if (!capKey.empty()) {
+    auto it = recordCaps_.find(capKey);
+    if (it == recordCaps_.end()) {
+      if (recordCaps_.size() >= kRecordCapKeys) {
+        stats_.recordsDropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      it = recordCaps_.emplace(capKey, 0).first;
+    }
+    if (++it->second > kRecordsPerCapKey)
+      return;
+  }
   if (records_.size() >= kRecordQueueMax) {
     stats_.recordsDropped.fetch_add(1, std::memory_order_relaxed);
     return;

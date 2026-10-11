@@ -938,9 +938,12 @@ std::string registrableDomain(const std::string& hostIn) {
     host.pop_back();
   if (host.empty())
     return "unknown";
+  // An address names a machine, not a domain: an IPv4 one, and any with a ':' or in brackets (an
+  // IPv6 one, the IPv4-mapped form "[::ffff:a.b.c.d]" among them, which would otherwise split into
+  // a piece of the address).
   const bool numeric = host.find_first_not_of("0123456789.") == std::string::npos;
-  const bool ipv6ish = host.find(':') != std::string::npos && host.find('.') == std::string::npos;
-  if (numeric || ipv6ish)
+  const bool v6 = host.find_first_of(":[]") != std::string::npos;
+  if (numeric || v6)
     return "unknown";
   std::vector<std::string> labels;
   size_t at = 0;
