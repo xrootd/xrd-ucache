@@ -901,8 +901,8 @@ echo "$RES" | grep -q '^read-failover end: clean$'; verdict "end: reads that rea
 # the fixture on a and b only, the copy the handle opened at cut after the open): the copy is marked as one the
 # handle never opens again, as for a data failure on the File it reads from. Two Reads issued 400 ms apart at X: the
 # first's miss fails (a connection error, 1 s late) and moves the handle to Y; the second, past the cut, is answered
-# short by X 2.5 s late, after that move. A third Read fails at Y: its move does not take X back (an X marked only as
-# a failure would be taken, as the oldest failure) and stays at Y.
+# short by X 2.5 s late, after that move. A third Read fails at Y: its move never opens X again (an X marked only as
+# a failure is opened again, as the oldest failure, and refused only for its size) and stays at Y.
 L=/store/ci/ct-leftdata.root
 placew $L a b
 RFC="$W/c-ct-leftdata"
@@ -912,14 +912,15 @@ echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-300
 LD=($(echo "$RES" | sed -n 's/^LEFTDATA //p' | pnorm))
 FL=($(recs "$RFC" origin_failure | field code)); FO=($(recs "$RFC" origin_failure | field off))
 MV=($(recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | field data_server | pnorm))
+RA=($(recs "$RFC" open | grep '"route":"read"' | field data_server | pnorm))  # every open attempt of a move
 recs "$RFC" origin_failure | sed 's/^/    fail: /' | cut -c1-240
 echo "$RES" | grep -q '^read-failover leftdata: clean$'
 verdict "leftdata: three Reads exact, once each; the third does not move the handle back to the copy that answered short (${LD[*]})" $?
 [ "${#LD[@]}" = 3 ] && [ "${LD[0]}" != "${LD[1]}" ] && [ "${#FL[@]}" = 3 ] && [ "${FL[0]} ${FO[0]}" = "108 8192" ] &&
   [ "${FL[1]} ${FO[1]}" = "14 36864" ] && [ "${FL[2]} ${FO[2]}" = "108 16384" ]
 verdict "leftdata: the faults struck as meant: a connection error at 8192, then the short answer past the cut (code 14, the page at 36864), then a connection error at 16384 (${FL[*]} at ${FO[*]})" $?
-[ "${#MV[@]}" -ge 1 ] && [ "${MV[0]}" = "${LD[1]:-}" ] && ! printf '%s\n' "${MV[@]}" | grep -qx "${LD[0]:-none}"
-verdict "leftdata: the moves landed at Y only, never back at X (${MV[*]}; X ${LD[0]:-}, Y ${LD[1]:-})" $?
+[ "${#MV[@]}" -ge 1 ] && [ "${MV[0]}" = "${LD[1]:-}" ] && ! printf '%s\n' "${RA[@]}" | grep -qx "${LD[0]:-none}"
+verdict "leftdata: the moves landed at Y, and no open attempt of a move went to X again (attempts at ${RA[*]}; X ${LD[0]:-}, Y ${LD[1]:-})" $?
 
 echo; echo "=== a handle that lost its trust, whose own open then fails at every copy"
 # The first run fills the cache with a freshness window, so that the second opens trusting the entry (no request

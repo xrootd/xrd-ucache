@@ -1635,8 +1635,9 @@ int runCut(const char* url, const char* local, const std::string& which) {
     // the first's miss fails (a connection error, 1 s late) and moves the handle to Y; the second's
     // (past the cut) is answered short by X, 2.5 s late, after that move, on the File the handle
     // left: X is then a copy the handle never opens again. Both are exact (the second is issued
-    // again at Y). A third Read fails at Y (a connection error): the move it makes does not take X,
-    // which an X marked only as a failure would be (the oldest failure), and stays at Y.
+    // again at Y). A third Read fails at Y (a connection error): the move it makes stays at Y and
+    // never opens X (an X marked only as a failure is opened again, as the oldest failure, and
+    // refused only for its size: the caller checks the records).
     std::thread t1([&] {
       readExact(8192, 4096, "a Read whose miss fails at X (a connection error) is exact");
     });
