@@ -390,7 +390,8 @@ std::string staleEntryAdvice(uint64_t ageS, uint64_t held, uint64_t size);
 //   kAllows   the copy could not be reached or served (a connection, socket, session, TLS or
 //             handshake error, an address that does not resolve, a timeout, a redirect loop, an
 //             answer the client could not read), the server failed (its I/O, file system or own
-//             error, overloaded, no server behind it), or the bytes were refused (a data error)
+//             error, out of memory, overloaded, no server behind it, its own timeout of the
+//             request), or the bytes were refused (a data error)
 //   kNeutral  "not found" after the first attempt: no other copy is left to send the open to (the
 //             redirector, with the servers that failed named, has none; a listed copy is gone)
 //   kBlocks   "not found" at the first attempt (the federation has no copy), a refusal to

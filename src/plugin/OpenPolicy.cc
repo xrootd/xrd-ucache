@@ -655,6 +655,8 @@ StaleAdvice staleAdviceAfter(int code, int errNo, bool firstAttempt) {
     case kXrServerError:
     case kXrOverloaded:
     case kXrNoServer:
+    case kXrReqTimedOut:
+    case kXrNoMemory:
       return StaleAdvice::kAllows;
     default:
       return StaleAdvice::kBlocks;

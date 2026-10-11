@@ -1431,12 +1431,12 @@ TEST(OpenPolicy, StaleAdviceAfter) {
           kErrConnectionError, kErrInvalidSession, kErrTlsError, kErrHandShakeFailed,
           kErrOperationExpired, kErrInvalidResponse, kErrRedirectLimit})
       EXPECT_EQ(staleAdviceAfter(code, 0, first), StaleAdvice::kAllows) << code << " " << first;
-    for (int errNo : {kXrIOError, kXrFSError, kXrServerError, kXrOverloaded, kXrNoServer})
+    for (int errNo : {kXrIOError, kXrFSError, kXrServerError, kXrOverloaded, kXrNoServer,
+                      kXrReqTimedOut, kXrNoMemory})
       EXPECT_EQ(staleAdviceAfter(kErrErrorResponse, errNo, first), StaleAdvice::kAllows) << errNo;
     // A refusal to authorize or authenticate, a request rejected for what it asks, anything else.
-    for (int errNo :
-         {kXrNotAuthorized, kXrFileLocked, kXrFileNotOpen, kXrNoMemory, kXrCancelled, kXrItExists,
-          kXrReqTimedOut, 3000, 3001, 3002, 3006, 3009, 3013, 3016, 3019, 0})
+    for (int errNo : {kXrNotAuthorized, kXrFileLocked, kXrFileNotOpen, kXrCancelled, kXrItExists,
+                      3000, 3001, 3002, 3006, 3009, 3013, 3016, 3019, 0})
       EXPECT_EQ(staleAdviceAfter(kErrErrorResponse, errNo, first), StaleAdvice::kBlocks) << errNo;
     for (int code : {kErrAuthFailed, 203, kErrInternal, kErrOperationInterrupted, kErrRedirect, 3,
                      9, 13, 1, 2, 201, 305, 999})
