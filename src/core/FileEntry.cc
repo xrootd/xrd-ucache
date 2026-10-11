@@ -199,6 +199,8 @@ FileEntry::~FileEntry() {
   closing_ = true;
   dropAllSpeculative(); // never-used at close: counted, never written
   flushAll();
+  if (dropped())
+    removeDroppedFiles(); // when no one has: a dropped entry's files never outlive it
   if (dataFd_ >= 0)
     io_.close(dataFd_);
   // Per-file record: one lifetime record per entry, at last release (or at
@@ -321,7 +323,7 @@ void FileEntry::ObsSink::append(const std::string& line) {
 bool FileEntry::hasRange(uint64_t off, uint64_t len) {
   // off + len can WRAP on a hostile or buggy caller; an unchecked wrap used to
   // pass the range test and then index the bitmap out of bounds.
-  if (len == 0 || off + len < off || off + len > meta_.fileSize)
+  if (len == 0 || off + len < off || off + len > meta_.fileSize || dropped())
     return false;
   uint64_t first = off / meta_.pageSize;
   uint64_t last = (off + len - 1) / meta_.pageSize;
@@ -410,7 +412,7 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf, bool account) 
     noteActivity();
   if (len == 0)
     return true;
-  if (off + len < off || off + len > meta_.fileSize) // wrap, then range
+  if (off + len < off || off + len > meta_.fileSize || dropped()) // wrap, then range
     return false;
   const uint32_t P = meta_.pageSize;
   uint64_t first = off / P, last = (off + len - 1) / P;
@@ -583,6 +585,8 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf, bool account) 
 
 void FileEntry::writePages(uint64_t off, uint64_t len, const void* buf) {
   noteActivity();
+  if (dropped())
+    return;
   if (cfg_.fillBufferMb <= 0) {
     writePagesDirect(off, len, buf);
     return;
@@ -646,7 +650,7 @@ void FileEntry::unmarkSpeculative(BufPage& p, uint32_t nbytes) {
 }
 
 uint64_t FileEntry::stageSpeculative(uint64_t off, uint64_t len, const void* buf) {
-  if (len == 0 || cfg_.fillBufferMb <= 0) // no stage to hold a speculative page
+  if (len == 0 || cfg_.fillBufferMb <= 0 || dropped()) // no stage to hold a speculative page
     return 0;
   const uint32_t P = meta_.pageSize;
   const auto* in = static_cast<const uint8_t*>(buf);
@@ -786,7 +790,7 @@ uint64_t FileEntry::speculativeDroppedTotal() {
 std::vector<std::pair<uint64_t, uint64_t>> FileEntry::absentRuns(uint64_t off, uint64_t len,
                                                                  bool skipInFlight) {
   std::vector<std::pair<uint64_t, uint64_t>> runs;
-  if (len == 0 || off + len < off)
+  if (len == 0 || off + len < off || dropped())
     return runs;
   const uint32_t P = meta_.pageSize;
   const uint64_t end = std::min(off + len, meta_.fileSize);
@@ -811,7 +815,7 @@ std::vector<std::pair<uint64_t, uint64_t>> FileEntry::absentRuns(uint64_t off, u
 
 void FileEntry::writePagesDirect(uint64_t off, uint64_t len, const void* buf) {
   noteActivity();
-  if (len == 0)
+  if (len == 0 || dropped())
     return;
   const uint32_t P = meta_.pageSize;
   const auto* in = static_cast<const uint8_t*>(buf);
@@ -925,8 +929,9 @@ void FileEntry::flushBuffer(bool force) {
   std::vector<std::pair<uint64_t, uint32_t>> published; // (page, crc)
   uint64_t written = 0;
   bool ioFailed = false;
+  const bool discard = dropped(); // a dropped entry's staged pages are let go of, never written
 
-  for (auto it = flushing_.begin(); it != flushing_.end() && !ioFailed;) {
+  for (auto it = flushing_.begin(); it != flushing_.end() && !ioFailed && !discard;) {
     const uint64_t firstPage = it->first;
     run.clear();
     std::vector<std::pair<uint64_t, uint32_t>> runPages;
@@ -1101,7 +1106,7 @@ void FileEntry::clearFetchInFlight(uint64_t off, uint64_t len) {
 bool FileEntry::waitForInFlight(const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
                                 std::function<void()> cb) {
   std::lock_guard<std::mutex> g(mu_);
-  if (flight_.empty())
+  if (flight_.empty() || dropped())
     return false;
   const uint32_t P = meta_.pageSize;
   bool sawAbsent = false;
@@ -1199,7 +1204,7 @@ bool FileEntry::flushMeta(bool force) {
   }
   bool ok = true;
   for (bool first = true;; first = false) {
-    if (!dirty_)
+    if (!dirty_ || dropped()) // a dropped entry's sidecar is never stored again
       break;
     const uint64_t now = nowS();
     if (!(first && force) && now < lastFlushS_ + static_cast<uint64_t>(cfg_.metaFlushSeconds))
@@ -1343,6 +1348,45 @@ bool FileEntry::commitSnapshot(MetaData snapshot, const PageBitmap& sets, const 
   return true;
 }
 
+bool FileEntry::drop() {
+  return !dropped_.exchange(true, std::memory_order_acq_rel);
+}
+
+void FileEntry::removeDroppedFiles() {
+  std::lock_guard<std::mutex> r(removeMu_);
+  if (removed_ || !dropped())
+    return;
+  removed_ = true;
+  {
+    // No commit starts once the entry is dropped (flushMeta); one under way is waited for, so
+    // that the flock below is not this process's own commit's (one descriptor: flock does not
+    // divide it).
+    std::unique_lock<std::mutex> g(mu_);
+    commitCv_.wait(g, [&] { return !committing_; });
+  }
+  struct ::stat mine, there;
+  if (dataFd_ < 0 || io_.fstat(dataFd_, &mine) != 0 || io_.stat(dataPath_, &there) != 0 ||
+      mine.st_dev != there.st_dev || mine.st_ino != there.st_ino)
+    return; // gone already, or another entry's by now
+  // Under the entry lock, so that another process's commit either lands before the sidecar goes,
+  // or finds the data file unlinked and stores nothing (commitSnapshot).
+  io_.flock(dataFd_, LOCK_EX);
+  removeFiles(io_, key_, cfg_.cacheDir);
+  io_.flock(dataFd_, LOCK_UN);
+}
+
+void FileEntry::removeFiles(IOBackend& io, const UrlKey& key, const std::string& cacheDir) {
+  io.unlink(key.dataPath(cacheDir));
+  io.unlink(key.metaPath(cacheDir));
+  // A replica derives from these bytes: it goes with them; and the freshness marker.
+  const std::string base = key.objectDir(cacheDir) + "/" + key.hashHex;
+  io.unlink(base + ".tdata");
+  io.unlink(base + ".tmeta");
+  io.unlink(base + ".tok");
+  io.unlink(base + ".val");
+  io.unlink(base + ".slots");
+}
+
 bool FileEntry::pinned() {
   std::lock_guard<std::mutex> g(mu_);
   return meta_.flags & MetaData::kFlagPinned;
@@ -1380,6 +1424,8 @@ uint64_t FileEntry::cachedBytes() {
 }
 
 uint64_t FileEntry::releaseRanges(const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+  if (dropped())
+    return 0;
   const uint32_t P = meta_.pageSize;
   // Aligned inner span of each range: only pages FULLY inside are released —
   // an edge page may still serve bytes outside the superseded range.

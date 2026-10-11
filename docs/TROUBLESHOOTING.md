@@ -531,6 +531,32 @@ read recovery turned off by uCache fails a forced `Stat`, `Fcntl` or `Visa` on
 such a lost session at once (the next read moves the file); a plain `Stat` is
 answered from what the open returned.
 
+## A cache entry was dropped (`bad_entries_dropped`)
+
+With `adaptive_federation = on`, uCache drops a file's cache entry when what it holds came
+from a bad copy, and the next open of the file fills a new one. The log says why, once per
+entry:
+
+- `<file>: the cache entry holds <M> bytes and the header it holds says the file is <N>
+  bytes: it was filled from a cut copy, and is dropped; the file is opened at an origin`:
+  an entry made before the checks at open existed (by uCache 1.4.0 or earlier, or with the
+  switch off) from a copy that holds only the first M bytes of the file. Such an entry
+  answered every read past M with nothing; the open now goes to an origin and takes a whole
+  copy (see "uCache opened the file at another site" above).
+- `<file>: the cache entry holds bytes from <host>:<port>, whose copy failed a check: the
+  entry is dropped, and the file is read from the origin until it is opened again`: a read
+  found that copy bad (a basket that failed the key-position check or its own checksum, or
+  a short answer inside the file's confirmed size; see "uCache read the file at another
+  site" above) after the entry had taken bytes from it. Those bytes may be damaged in ways
+  no check sees (inside a ZSTD or uncompressed block), so none of them are kept. Until the
+  job opens the file again, its reads of it go to the origin.
+
+`bad_entries_dropped` (STATS.md) counts both. Only the process that found the copy bad
+knows it: another job that has the file open at that moment goes on reading what its view
+of the entry holds until it closes the file, and an entry filled from the same copy by an
+earlier job is dropped only when a read finds the copy bad again. To be sure, remove the
+file's entry (`ucache rm <url>`) or clear the cache.
+
 ## The cache is filling my disk
 
 By default uCache uses the disk and evicts LRU to keep a free-space floor

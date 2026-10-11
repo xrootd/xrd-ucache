@@ -274,6 +274,142 @@ TEST(CacheStore, RemoveEntryHandlesReplicaOnlyOrphan) {
 }
 
 // Pinning a closed entry rewrites its sidecar flag directly: the size-confirmed bit stays.
+// A dropped entry (its bytes came in part from a copy found bad): it serves nothing and keeps
+// nothing, its sidecar is never stored again, and a handle holding it reads from the origin.
+TEST(CacheStore, DroppedEntryServesAndKeepsNothing) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const uint64_t P = cfg.pageSize;
+  auto e = store.open(keyN(11), 16 * P);
+  ASSERT_TRUE(e);
+  std::vector<char> buf(4 * P, 'x');
+  e->writePages(0, 2 * P, buf.data());
+  e->flushAll();
+  ASSERT_TRUE(e->hasRange(0, 2 * P));
+  e->writePages(2 * P, P, buf.data()); // staged, not yet written
+  ASSERT_TRUE(e->hasRange(2 * P, P));
+  auto before = MetaFile::load(io, keyN(11).metaPath(cfg.cacheDir));
+  ASSERT_TRUE(before);
+  EXPECT_TRUE(e->drop());
+  EXPECT_FALSE(e->drop()) << "true the first time only";
+  EXPECT_TRUE(e->dropped());
+  EXPECT_FALSE(e->hasRange(0, P)) << "written pages are not served";
+  EXPECT_FALSE(e->hasRange(2 * P, P)) << "nor staged ones";
+  std::vector<char> out(P);
+  EXPECT_FALSE(e->readCached(0, P, out.data()));
+  e->writePages(4 * P, 2 * P, buf.data());
+  EXPECT_FALSE(e->hasRange(4 * P, P)) << "nothing is kept";
+  EXPECT_EQ(e->stageSpeculative(6 * P, P, buf.data()), 0u);
+  EXPECT_TRUE(e->absentRuns(0, 16 * P).empty()) << "nothing for read-ahead to fetch";
+  EXPECT_EQ(e->releaseRanges({{0, 2 * P}}), 0u);
+  e->confirmSize();
+  e->flushAll();
+  auto after = MetaFile::load(io, keyN(11).metaPath(cfg.cacheDir));
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->bitmap.count(), before->bitmap.count()) << "the sidecar is never stored again";
+  EXPECT_FALSE(after->flags & MetaData::kFlagSizeConfirmed);
+}
+
+// The next open of a dropped entry's file starts a new entry: the dropped one's files go first;
+// the dropped one's last release later removes nothing of the new one's.
+TEST(CacheStore, OpenAfterADropStartsANewEntry) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const uint64_t P = cfg.pageSize;
+  std::vector<char> buf(2 * P, 'x');
+  auto e = store.open(keyN(12), 8 * P);
+  ASSERT_TRUE(e);
+  e->writePages(0, 2 * P, buf.data());
+  e->flushAll();
+  ASSERT_TRUE(e->drop()); // as on a client callback thread: no removal yet
+  struct ::stat st;
+  ASSERT_EQ(io.stat(keyN(12).metaPath(cfg.cacheDir), &st), 0) << "its files are still there";
+  auto f = store.open(keyN(12), 8 * P);
+  ASSERT_TRUE(f);
+  EXPECT_NE(f.get(), e.get()) << "a new entry, not the dropped one";
+  EXPECT_FALSE(f->dropped());
+  EXPECT_FALSE(f->hasRange(0, P)) << "the new entry holds nothing of the dropped one's";
+  f->writePages(4 * P, P, buf.data());
+  f->flushAll();
+  e.reset(); // the dropped entry's last release: its files went already, the new ones stay
+  auto m = MetaFile::load(io, keyN(12).metaPath(cfg.cacheDir));
+  ASSERT_TRUE(m);
+  EXPECT_FALSE(m->bitmap.get(0));
+  EXPECT_TRUE(m->bitmap.get(4));
+  EXPECT_TRUE(f->hasRange(4 * P, P));
+  store.removeDropped(f); // not dropped: nothing happens
+  EXPECT_EQ(io.stat(keyN(12).metaPath(cfg.cacheDir), &st), 0);
+}
+
+// The removal of a dropped entry: by the store (as posted off a callback thread), or at its last
+// release when no one removed it; dropEntry for a key, with an entry this process holds or not.
+TEST(CacheStore, DroppedEntryFilesAreRemoved) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const uint64_t P = cfg.pageSize;
+  std::vector<char> buf(P, 'x');
+  struct ::stat st;
+  const auto has = [&](int n) { return io.stat(keyN(n).metaPath(cfg.cacheDir), &st) == 0; };
+  const auto hasData = [&](int n) { return io.stat(keyN(n).dataPath(cfg.cacheDir), &st) == 0; };
+  // removeDropped
+  auto a = store.open(keyN(13), 4 * P);
+  ASSERT_TRUE(a);
+  a->writePages(0, P, buf.data());
+  a->flushAll();
+  const std::string val = keyN(13).objectDir(cfg.cacheDir) + "/" + keyN(13).hashHex + ".val";
+  std::ofstream(val) << "";
+  ASSERT_TRUE(a->drop());
+  store.removeDropped(a);
+  EXPECT_FALSE(has(13));
+  EXPECT_FALSE(hasData(13));
+  EXPECT_NE(io.stat(val, &st), 0) << "the freshness marker goes too";
+  // the last release of a dropped entry no one removed
+  auto b = store.open(keyN(14), 4 * P);
+  ASSERT_TRUE(b);
+  b->writePages(0, P, buf.data());
+  b->flushAll();
+  ASSERT_TRUE(b->drop());
+  EXPECT_TRUE(has(14));
+  b.reset();
+  EXPECT_FALSE(has(14));
+  EXPECT_FALSE(hasData(14));
+  // dropEntry with a live entry: it is dropped and its files go; a new open is a new entry
+  auto c = store.open(keyN(15), 4 * P);
+  ASSERT_TRUE(c);
+  c->writePages(0, P, buf.data());
+  c->flushAll();
+  store.dropEntry(keyN(15));
+  EXPECT_TRUE(c->dropped());
+  EXPECT_FALSE(has(15));
+  auto c2 = store.open(keyN(15), 4 * P);
+  ASSERT_TRUE(c2);
+  EXPECT_NE(c2.get(), c.get());
+  EXPECT_FALSE(c2->hasRange(0, P));
+  // dropEntry with no entry held here: the files go
+  {
+    auto d = store.open(keyN(16), 4 * P);
+    ASSERT_TRUE(d);
+    d->writePages(0, P, buf.data());
+    d->flushAll();
+  }
+  ASSERT_TRUE(has(16));
+  store.dropEntry(keyN(16));
+  EXPECT_FALSE(has(16));
+  EXPECT_FALSE(hasData(16));
+  auto d2 = store.open(keyN(16), 4 * P);
+  ASSERT_TRUE(d2);
+  EXPECT_FALSE(d2->hasRange(0, P)) << "the next open is cold";
+}
+
 TEST(CacheStore, PinningAClosedEntryKeepsItsConfirmedSize) {
   TempDir td;
   RealIO io;

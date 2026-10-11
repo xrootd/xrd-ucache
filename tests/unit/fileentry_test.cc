@@ -1664,3 +1664,30 @@ TEST(FileEntry, ServerTallyEdges) {
   EXPECT_EQ(t.failedHosts(), std::vector<std::string>{"[2001:db8::7]"});
   EXPECT_TRUE(ServerTally().failedHosts().empty());
 }
+
+// Which servers an account's own requests took bytes from: what says whether a file's entry was
+// given bytes a copy sent, when that copy is found bad later.
+TEST(FileEntry, ServerTallyTookFrom) {
+  ServerTally t;
+  EXPECT_FALSE(t.tookFrom("a.example.org:1094"));
+  t.fail("a.example.org:1094");
+  EXPECT_FALSE(t.tookFrom("a.example.org:1094")) << "a failure took nothing";
+  t.add("a.example.org:1094", 0, 1, 1);
+  EXPECT_FALSE(t.tookFrom("a.example.org:1094")) << "an answer of no bytes took nothing";
+  t.add("a.example.org:1094", 4096, 1, 1);
+  EXPECT_TRUE(t.tookFrom("a.example.org:1094"));
+  EXPECT_FALSE(t.tookFrom("a.example.org:1095")) << "another server (the port counts)";
+  EXPECT_FALSE(t.tookFrom(""));
+  ServerTally relayed;
+  relayed.add("b.example.org:1094", 4096, 1, 1);
+  t.addFrom(relayed);
+  EXPECT_FALSE(t.tookFrom("b.example.org:1094"))
+      << "bytes another account took (a relayed handle's) were not given to this one";
+  EXPECT_NE(t.text().find("b.example.org:1094=4096"), std::string::npos) << "but are counted";
+  const std::string before = t.text();
+  t.noteTook("c.example.org:1094");
+  EXPECT_TRUE(t.tookFrom("c.example.org:1094"));
+  EXPECT_EQ(t.text(), before) << "noteTook names no server in the account";
+  t.noteTook("");
+  EXPECT_FALSE(t.tookFrom(""));
+}

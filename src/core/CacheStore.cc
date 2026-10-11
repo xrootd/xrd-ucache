@@ -235,11 +235,16 @@ std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSi
     *declinedForSpace = false;
   if (declinedSizeDiffers)
     *declinedSizeDiffers = false;
+  std::shared_ptr<FileEntry> dropped; // a dropped entry found here: removed before a new one
   {
     std::lock_guard<std::mutex> g(regMu_);
     auto it = registry_.find(key.hashHex);
     if (it != registry_.end()) {
-      if (auto live = it->second.lock()) {
+      auto live = it->second.lock();
+      if (live && live->dropped()) {
+        dropped = std::move(live);
+        registry_.erase(it);
+      } else if (live) {
         // One entry per key per process — for one size. A source of another
         // size is another copy of the file (a damaged or truncated one, or the
         // file rewritten): its bytes never join an entry whose readers hold
@@ -256,10 +261,13 @@ std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSi
         }
         live->obs().opens.fetch_add(1, std::memory_order_relaxed);
         return live;
+      } else {
+        registry_.erase(it);
       }
-      registry_.erase(it);
     }
   }
+  if (dropped)
+    dropped->removeDroppedFiles(); // its files go before a new entry is made where they are
   // Decide on CURRENT state, not on what the last check happened to leave behind.
   // The latch lives in this process and starts clear, and open() otherwise runs
   // its eviction check only AFTER admitting — so without this a fresh process
@@ -691,16 +699,38 @@ void CacheStore::invalidate(const UrlKey& key) {
     std::lock_guard<std::mutex> g(regMu_);
     registry_.erase(key.hashHex);
   }
-  io_.unlink(key.dataPath(cfg_.cacheDir));
-  io_.unlink(key.metaPath(cfg_.cacheDir));
-  // A replica derives from the invalidated bytes — it goes with them.
-  const std::string base = key.objectDir(cfg_.cacheDir) + "/" + key.hashHex;
-  io_.unlink(base + ".tdata");
-  io_.unlink(base + ".tmeta");
-  io_.unlink(base + ".tok");
-  io_.unlink(base + ".val");
-  io_.unlink(base + ".slots");
+  FileEntry::removeFiles(io_, key, cfg_.cacheDir); // byte cache, sidecar, marker, replicas
   UCACHE_INFO("invalidated cache entry for %s", key.key.c_str());
+}
+
+void CacheStore::dropEntry(const UrlKey& key) {
+  std::shared_ptr<FileEntry> live;
+  {
+    std::lock_guard<std::mutex> g(regMu_);
+    auto it = registry_.find(key.hashHex);
+    if (it != registry_.end()) {
+      live = it->second.lock();
+      registry_.erase(it);
+    }
+  }
+  if (live) {
+    live->drop();
+    live->removeDroppedFiles();
+  } else {
+    FileEntry::removeFiles(io_, key, cfg_.cacheDir);
+  }
+}
+
+void CacheStore::removeDropped(const std::shared_ptr<FileEntry>& e) {
+  if (!e || !e->dropped())
+    return;
+  {
+    std::lock_guard<std::mutex> g(regMu_);
+    auto it = registry_.find(e->key().hashHex);
+    if (it != registry_.end() && it->second.lock() == e)
+      registry_.erase(it);
+  }
+  e->removeDroppedFiles();
 }
 
 bool CacheStore::removeEntry(const UrlKey& key) {

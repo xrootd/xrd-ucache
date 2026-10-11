@@ -248,6 +248,10 @@ size_t rootHeaderBytes(long long size);
 // The end of the data the first `n` bytes of `b` state, or -1 when they state none: they do
 // not begin with "root", or end before the end's own field (16 bytes, 20 for a 64-bit end).
 long long rootFileEnd(const unsigned char* b, size_t n);
+// Whether a cache entry of `storedSize` bytes, made before the checks at open existed (it carries
+// no confirmed size), was filled from a cut copy: the first `n` bytes it holds (`b`) state an end
+// of the data past `storedSize`. A header that states no end (rootFileEnd) makes no claim.
+bool storedEntryCut(const unsigned char* b, size_t n, uint64_t storedSize);
 // What the checks made at open say of a copy that reports `size` (> 0) bytes. They read what ROOT
 // reads when it opens a file (TFile::Init, TDirectoryFile::ReadKeys): the copy's first bytes, which
 // hold the file's header and, unless long names push it further, the top directory's record; and

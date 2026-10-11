@@ -313,6 +313,11 @@ bool rootNamed(const std::string& path) {
   return true;
 }
 
+bool storedEntryCut(const unsigned char* b, size_t n, uint64_t storedSize) {
+  const long long end = rootFileEnd(b, n);
+  return end >= 0 && static_cast<uint64_t>(end) > storedSize;
+}
+
 bool emptyRootCopy(const std::string& path, long long size) {
   return size == 0 && rootNamed(path);
 }

@@ -1267,8 +1267,10 @@ void failOriginCheck(const std::shared_ptr<ColdRequest>& req, uint64_t pos, uint
   if (req->st->store)
     req->st->store->stats().originChecksFailed.fetch_add(1, std::memory_order_relaxed);
   const XRootDStatus refused(XrdCl::stError, XrdCl::errDataError, 0, msg);
-  noteOriginFailure(*req->st, &req->entry->obs().servers, "first_pass", pos, len, refused,
-                    answeredBy(*req->st, nullptr), codec);
+  const std::string from = answeredBy(*req->st, nullptr);
+  noteOriginFailure(*req->st, &req->entry->obs().servers, "first_pass", pos, len, refused, from,
+                    codec);
+  dropEntryOfBadCopy(*req->st, req->entry, from);
   req->checkFailed.store(true);
   req->fail(refused);
 }

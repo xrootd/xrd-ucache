@@ -4,7 +4,8 @@
 // One FileEntry per key per process (refcounted via shared_ptr; concurrent
 // IMT streams share state). Eviction purges LRU-by-atime whole entries from
 // HIGH_WATER down to LOW_WATER under the cache-wide LOCK flock, skipping
-// pinned entries; entries unlinked while open keep serving via their fd.
+// pinned entries; entries unlinked while open keep serving via their fd, except
+// one dropped for holding bytes of a bad copy (dropEntry, FileEntry::drop).
 //
 // Budget: by DEFAULT the cache uses the disk and evicts to
 // keep a statvfs free-disk FLOOR (minFreeBytes, auto-set from the disk) — an
@@ -217,6 +218,16 @@ class CacheStore {
   // Handles still holding the entry keep serving via their fds; the
   // unlink-while-open guard prevents sidecar resurrection.
   void invalidate(const UrlKey& key);
+  // Drops the entry of `key` because what it holds is not to be trusted: the entry this process
+  // holds, if any, serves and keeps nothing more (FileEntry::drop), and the entry's files are
+  // removed, so the next open of the file, here or in another process, starts a new one. Another
+  // process that holds the entry open keeps its own view of it. I/O: not for a client callback
+  // thread.
+  void dropEntry(const UrlKey& key);
+  // The second half of a drop made where no I/O may happen (FileEntry::drop, on a client callback
+  // thread): `e` leaves the registry if it is still there, and its files are removed
+  // (FileEntry::removeDroppedFiles). open() does the same, first, when it finds a dropped entry.
+  void removeDropped(const std::shared_ptr<FileEntry>& e);
 
   // Appends one JSON line to stats/<host>-<pid>-<start_ts>.jsonl. finalDump:
   // this is the process's LAST dump (atexit/dtor) — also emit the Layer-2

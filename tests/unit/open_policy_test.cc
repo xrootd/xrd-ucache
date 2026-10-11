@@ -1025,6 +1025,27 @@ std::vector<unsigned char> header(const char* magic, uint32_t version, uint64_t 
 } // namespace
 
 // What a copy's first bytes say about where the file ends: the end, or none.
+// A warm entry made before the checks existed: the header it holds against the size it holds.
+TEST(OpenPolicy, StoredEntryCut) {
+  auto b = header("root", 62002, 1000000, false);
+  EXPECT_TRUE(storedEntryCut(b.data(), b.size(), 600000)) << "the end past the stored size: cut";
+  EXPECT_TRUE(storedEntryCut(b.data(), b.size(), 999999));
+  EXPECT_FALSE(storedEntryCut(b.data(), b.size(), 1000000)) << "the end at the stored size";
+  EXPECT_FALSE(storedEntryCut(b.data(), b.size(), 1004096))
+      << "the end before the stored size (bytes past it, a file updated in place): no claim";
+  EXPECT_TRUE(storedEntryCut(b.data(), 16, 600000)) << "a 32-bit end is whole at 16 bytes";
+  EXPECT_FALSE(storedEntryCut(b.data(), 15, 600000)) << "the end's field not held: no claim";
+  b = header("root", 1062002, 5000000000ull, true);
+  EXPECT_TRUE(storedEntryCut(b.data(), b.size(), 3000000000ull)) << "a 64-bit end";
+  EXPECT_FALSE(storedEntryCut(b.data(), b.size(), 5000000000ull));
+  EXPECT_FALSE(storedEntryCut(b.data(), 19, 3000000000ull)) << "a 64-bit end's field cut";
+  b = header("ROOT", 62002, 1000000, false);
+  EXPECT_FALSE(storedEntryCut(b.data(), b.size(), 600000)) << "not a ROOT file's header: no claim";
+  b = header("root", 1062002, ~0ull, true);
+  EXPECT_TRUE(storedEntryCut(b.data(), b.size(), 1000000)) << "an end no file has (LLONG_MAX)";
+  EXPECT_FALSE(storedEntryCut(nullptr, 0, 0));
+}
+
 TEST(OpenPolicy, RootFileEnd) {
   // The first bytes of a real file (6559 bytes): the end it states is its size.
   const unsigned char real[] = {0x72, 0x6f, 0x6f, 0x74, 0x00, 0x00, 0xf8, 0x72, 0x00, 0x00,

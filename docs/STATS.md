@@ -92,7 +92,7 @@ the consumers together.
  "records_dropped": 0, "hist_origin_open_us": [..],
  "open_failovers": 0, "opens_recovered": 0, "opens_failed_everywhere": 0,
  "open_deadline_expiries": 0, "failover_locates": 0, "offline_copies_skipped": 0,
- "open_check_bytes_kept": 0,
+ "open_check_bytes_kept": 0, "bad_entries_dropped": 0,
  "entries": [{"key": "root://host:1094/path", "file_size": 0,
               "cached_bytes": 0, "page_size": 4096}],
  "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ... adaptive_federation=off"}
@@ -263,6 +263,13 @@ ones included, so a run with caching disabled shows its origin failures too.
   They are also counted in `origin_bytes` and `origin_reads` (one read each),
   which is where a read the job makes of them would otherwise have been
   counted. Nothing a refused copy's checks read is kept.
+- `bad_entries_dropped` — with `adaptive_federation = on`, cache entries
+  dropped because what they hold came from a bad copy: an entry made before
+  the checks at open existed whose stored header states an end past its
+  stored size (filled from a cut copy), found at an open the entry would have
+  answered; and an entry holding bytes this process fetched from a copy that a
+  check then found bad (`check_origin_integrity`, which the switch forces on).
+  The next open of the file fills a new entry (TROUBLESHOOTING.md).
 
 `run_settings`, on the counter line, is the settings that decide how the
 origin is reached, as the plugin found them at load, one string:

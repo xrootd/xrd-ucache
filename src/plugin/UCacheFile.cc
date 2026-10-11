@@ -2268,6 +2268,32 @@ void noteOriginFailure(HandleState& st, ServerTally* tally, const char* op, uint
   // a completion handler of the client library: nothing may leave it
 }
 
+void dropEntryOfBadCopy(HandleState& st, const std::shared_ptr<FileEntry>& entry,
+                        const std::string& server) noexcept try {
+  if (!entry || !st.store || !globalConfig().checkOriginIntegrity ||
+      !entry->obs().servers.tookFrom(server) || !entry->drop())
+    return;
+  st.store->stats().badEntriesDropped.fetch_add(1, std::memory_order_relaxed);
+  UCACHE_WARN("%s: the cache entry holds bytes from %s, whose copy failed a check: the entry is "
+              "dropped, and the file is read from the origin until it is opened again",
+              recordFile(st.url).c_str(), server.c_str());
+  auto store = st.store;
+  Executor::instance().post([store, entry] { store->removeDropped(entry); });
+} catch (...) {
+  // a completion handler of the client library: nothing may leave it (the entry, dropped, serves
+  // nothing; its files go at its last release)
+}
+
+void dropEntryOfBadCopy(HandleState& st, const std::string& server) noexcept try {
+  std::shared_ptr<FileEntry> e;
+  {
+    std::lock_guard<std::mutex> g(st.mu);
+    e = st.entry;
+  }
+  dropEntryOfBadCopy(st, e, server);
+} catch (...) {
+}
+
 namespace {
 
 // Cache-freshness marker (UCACHE_REVALIDATE_S): objects/<aa>/<hash>.val, whose
@@ -2352,6 +2378,44 @@ bool cacheFresh(const UrlKey& key, const std::string& cacheDir, int revalidateSe
     return false; // stale — revalidate against the origin
   struct ::stat ms; // a sidecar must exist for the entry to be usable
   return RealIO::instance().stat(key.metaPath(cacheDir), &ms) == 0;
+}
+
+// A warm entry made before the checks at open existed, at an open that would trust it (cacheFresh),
+// with adaptive_federation on: an entry of a file named *.root whose sidecar carries no confirmed size
+// (made by an earlier release, or with the switch off) is judged by the header it holds, against the
+// size it holds (storedEntryCut). One whose header states an end past that size was filled from a cut
+// copy: it is dropped (CacheStore::dropEntry), and the open goes on as a cold one, with the checks at
+// open. Only what the cache holds is read, the sidecar's summary and the first bytes of the first
+// page; no origin is asked. A first page the entry does not hold, a header that makes no claim, or
+// anything that cannot be read leaves the entry as it is. True when the entry was dropped. On the
+// caller's thread (Open), where a trusted open already looks at the entry's files.
+bool dropCutWarmEntry(const UrlKey& key, const std::string& url, const Config& cfg,
+                      CacheStore& store) noexcept try {
+  if (!cfg.adaptiveFederation || !rootNamed(url))
+    return false;
+  IOBackend& io = RealIO::instance();
+  const auto m = MetaFile::loadSummary(io, key.metaPath(cfg.cacheDir));
+  if (!m || m->key != key.key || (m->flags & MetaData::kFlagSizeConfirmed) || m->npages() == 0 ||
+      m->bitmap.npages() == 0 || !m->bitmap.get(0))
+    return false;
+  unsigned char b[kRootHeaderBytes];
+  const uint64_t want = std::min<uint64_t>(sizeof b, m->pageBytes(0));
+  const int fd = io.open(key.dataPath(cfg.cacheDir), O_RDONLY, 0);
+  if (fd < 0)
+    return false;
+  const int64_t got = io.pread(fd, b, want, 0);
+  io.close(fd);
+  if (got <= 0 || !storedEntryCut(b, static_cast<size_t>(got), m->fileSize))
+    return false;
+  UCACHE_WARN("%s: the cache entry holds %llu bytes and the header it holds says the file is %lld "
+              "bytes: it was filled from a cut copy, and is dropped; the file is opened at an origin",
+              recordFile(url).c_str(), static_cast<unsigned long long>(m->fileSize),
+              rootFileEnd(b, static_cast<size_t>(got)));
+  store.dropEntry(key);
+  store.stats().badEntriesDropped.fetch_add(1, std::memory_order_relaxed);
+  return true;
+} catch (...) {
+  return false;
 }
 
 } // namespace
@@ -3382,6 +3446,7 @@ static XRootDStatus* shortAnswer(HandleState& st, ServerTally* tally, const char
               server.empty() ? "the origin" : server.c_str(), msg);
   auto* refused = new XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, msg);
   noteOriginFailure(st, tally, op, off, len, *refused, server);
+  dropEntryOfBadCopy(st, server);
   return refused;
 }
 
@@ -3402,6 +3467,7 @@ static XRootDStatus* emptyPageAnswer(HandleState& st, ServerTally* tally, uint64
               server.empty() ? "the origin" : server.c_str(), msg);
   auto* refused = new XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, msg);
   noteOriginFailure(st, tally, "relay", off, len, *refused, server);
+  dropEntryOfBadCopy(st, server);
   return refused;
 }
 
@@ -4040,6 +4106,7 @@ void persistPagesReserved(const std::shared_ptr<HandleState>& st,
     st.store->stats().originChecksFailed.fetch_add(n, std::memory_order_relaxed);
   auto* refused = new XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, msg);
   noteOriginFailure(st, tally, op, spanOff, spanLen, *refused, server);
+  dropEntryOfBadCopy(st, server);
   return refused;
 }
 
@@ -4792,7 +4859,8 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // every open) never enters here.
   if (!passthroughOnly_ && cfg.revalidateSeconds > 0) {
     auto key = UrlKey::parse(url, cfg.keepCgi);
-    if (key && cacheFresh(*key, cfg.cacheDir, cfg.revalidateSeconds)) {
+    if (key && cacheFresh(*key, cfg.cacheDir, cfg.revalidateSeconds) &&
+        !dropCutWarmEntry(*key, url, cfg, *st_->store)) {
       {
         std::lock_guard<std::mutex> g(st_->mu);
         st_->cacheOnly = true;

@@ -19,7 +19,22 @@ void ServerTally::add(const std::string& server, uint64_t bytes, uint64_t rtUs,
   a.rtSum += rtUs;
   a.rtMax = std::max(a.rtMax, rtUs);
   a.ncMax = std::max(a.ncMax, inFlight);
+  if (bytes)
+    took_.insert(server);
 } catch (...) {
+}
+
+void ServerTally::noteTook(const std::string& server) try {
+  if (server.empty())
+    return;
+  std::lock_guard<std::mutex> g(mu_);
+  took_.insert(server);
+} catch (...) {
+}
+
+bool ServerTally::tookFrom(const std::string& server) const {
+  std::lock_guard<std::mutex> g(mu_);
+  return took_.count(server) != 0;
 }
 
 void ServerTally::fail(const std::string& server) try {

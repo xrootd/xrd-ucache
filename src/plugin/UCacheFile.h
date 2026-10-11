@@ -515,6 +515,18 @@ std::string wireTraceFields(const std::string& ds, uint64_t t0, uint64_t nc) noe
 void noteOriginFailure(HandleState& st, ServerTally* tally, const char* op, uint64_t off,
                        uint64_t len, const XrdCl::XRootDStatus& s, const std::string& server,
                        const std::string& codec = std::string());
+// A check found the copy at `server` bad while a handle read the file (a basket that failed the
+// key-position check or its own checksum, a short answer inside the confirmed size, a page read
+// answered with no bytes inside it). When `entry` (the handle's) holds bytes this process fetched
+// from that copy (ServerTally::tookFrom on its account of its servers), the entry is dropped: no
+// handle of this process is served from it again, their reads go to the origin (and move as any
+// read does), and its files are removed off this thread (CacheStore::removeDropped), so that the
+// next open of the file starts a new entry. Only with check_origin_integrity on, which
+// adaptive_federation forces. No I/O: it may run on a client callback thread.
+void dropEntryOfBadCopy(HandleState& st, const std::shared_ptr<FileEntry>& entry,
+                        const std::string& server) noexcept;
+// The same, with the handle's own entry.
+void dropEntryOfBadCopy(HandleState& st, const std::string& server) noexcept;
 
 // Process-wide config/store accessors (UCacheFactory.cc).
 const Config& globalConfig();

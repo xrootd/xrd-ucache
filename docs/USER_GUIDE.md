@@ -895,7 +895,15 @@ the origin and finds only copies of another size fails with one error naming the
 next open checks the origin again). After the window the next open checks the origin
 and reads the header of the copy it lands on: a copy that fails the check is refused, and
 one that passes at another size (the file was rewritten) replaces the entry and becomes
-its confirmed size. With `revalidate_seconds = 0` every open does so. When no copy passes at
+its confirmed size. With `revalidate_seconds = 0` every open does so. An entry made before
+these checks existed (by an earlier release, or with the switch off) carries no confirmed
+size: within its window, a job's open that such an entry of a `*.root` file would answer
+first compares the end its header states, as the cache holds it, with the size the entry
+holds, reading nothing but the cache. An entry whose header states an end past its size was
+filled from a cut copy: it is dropped (`bad_entries_dropped`, STATS.md), and the open goes
+to the origin as one with no entry, with the checks above. An entry that does not hold the
+file's first page, or whose header makes no claim, answers the open as before; one that
+carries a confirmed size is not looked at again. When no copy passes at
 that open, the job's open fails with the one error that names the copies, and the entry is
 not served; when uCache holds one, the error says so and how to read it from the cache
 (TROUBLESHOOTING.md, "The open fails, and the error says uCache holds an earlier copy").
@@ -981,7 +989,18 @@ fails within a second after that gets the same error at once, without another at
 A copy that answered a read with bad bytes (a basket that failed the check, a short
 answer inside the confirmed size) is never taken again for that file handle: the
 regional redirector's list of copies no longer offers it, and an open the redirector
-sends back to it is refused. Because the client's own
+sends back to it is refused. Nor does anything it sent stay cached: when the file's cache
+entry holds bytes this process fetched from that copy, the whole entry is dropped
+(`bad_entries_dropped`, STATS.md). No handle of the process is served from it again (their
+reads go to the origin, and move as above), and its files are removed, so the next open of
+the file starts a new entry. The same holds when a block fails its own checksum where
+`recompress` converts it. This needs `check_origin_integrity`, which the switch forces on.
+Only this process's own fetches are known: an entry another process filled from that copy,
+or this process before it opened the file this time, is not dropped, and another process
+that holds the entry open at the same time goes on serving what it holds until it closes the
+file (what it adds is no longer kept). A handle shown uCache's own layout keeps the blocks
+that layout holds converted until it closes (each passed its own checksum when converted);
+the layout's file is removed with the entry. Because the client's own
 recovery of a read would otherwise run first, such a file has it turned off
 (`ReadRecovery` and `WriteRecovery` read `false`, and a program cannot turn them
 back on): a call that the client used to recover on a connection that was lost

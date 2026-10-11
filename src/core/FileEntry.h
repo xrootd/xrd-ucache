@@ -13,6 +13,9 @@
 //                  (tail page special-cased), data-before-bit ordering,
 //                  UCACHE_FSYNC honored; backend errors fail open (page
 //                  skipped, failopen_events counted) and never throw
+//   drop()       — what the entry holds is not to be trusted (bytes from a
+//                  copy found bad): from then on it serves and keeps nothing,
+//                  and its files are removed (removeDroppedFiles)
 //
 // Fill buffer: with fill_buffer_mb > 0 (default),
 // writePages STAGES pages in RAM instead of writing them; staged pages are
@@ -176,6 +179,26 @@ class FileEntry {
   bool sizeConfirmed();
   void confirmSize();
   uint64_t cachedBytes();
+
+  // ---- a dropped entry: what it holds is not to be trusted -----------------
+  // An entry that holds bytes from a copy of the file that a check then found
+  // bad. Once dropped it serves nothing and keeps nothing: hasRange and
+  // readCached find no byte present, absentRuns and waitForInFlight find
+  // nothing to wait for, writePages, stageSpeculative and releaseRanges do
+  // nothing, and its sidecar is never stored again, so every handle holding it
+  // reads from the origin. True the first time only. No I/O: callable from any
+  // thread, a client callback included.
+  bool drop();
+  bool dropped() const { return dropped_.load(std::memory_order_acquire); }
+  // Removes a dropped entry's files (removeFiles), once, and only while the
+  // data file at its path is still this entry's (another process may have made
+  // a new entry there since). Returns when they are gone, also to a caller that
+  // found another one removing them. I/O: not for a client callback thread; the
+  // destructor of a dropped entry calls it when no one has.
+  void removeDroppedFiles();
+  // The files of the entry of `key`: its data, sidecar and freshness marker,
+  // and the replicas made from them.
+  static void removeFiles(IOBackend& io, const UrlKey& key, const std::string& cacheDir);
 
   // CRC scrub over all present pages (CLI `verify`, crash suite).
   struct ScrubResult {
@@ -378,6 +401,9 @@ class FileEntry {
   int dataFd_ = -1;
   std::function<void(uint64_t, bool)> onPersist_; // usage/eviction hook
   bool closing_ = false; // set by the dtor: final flush counts, never evicts
+  std::atomic<bool> dropped_{false}; // drop()
+  std::mutex removeMu_;              // removeDroppedFiles, one at a time
+  bool removed_ = false;             // under removeMu_
 
   std::mutex mu_; // guards meta_, dirty_, lastFlush_, buf_/flushing_ state
   MetaData meta_;

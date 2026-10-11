@@ -724,8 +724,10 @@ struct Shard {
       // the plugin destructor waits for the former and must not find this
       // handler still holding the latter afterwards. The store outlives us.
       // The server that answered is named first, for the trace.
-      const std::string server =
-          stats_ && stats_->tracer ? answeredBy(*st_, hosts) : std::string();
+      // check_origin_integrity also needs it: a copy found bad later drops an entry given its bytes.
+      const std::string server = (stats_ && stats_->tracer) || globalConfig().checkOriginIntegrity
+                                     ? answeredBy(*st_, hosts)
+                                     : std::string();
       st_->releaseInner();
       st_.reset();
       inflight_.release();
@@ -742,7 +744,7 @@ struct Shard {
         delete this;
         return;
       }
-      uint64_t late = 0, dropped = 0;
+      uint64_t late = 0, dropped = 0, staged = 0;
       for (auto& e : elems_) {
         for (const auto& r : e.stage) {
           if (h_->closed.load(std::memory_order_acquire)) {
@@ -754,9 +756,12 @@ struct Shard {
           // is freed with the buffer and never touches the entry.
           const char* at = e.buf->data() + (r.first - e.off);
           const uint64_t got = entry_->stageSpeculative(r.first, r.second, at);
+          staged += got;
           late += r.second - got; // pages a demand read had already brought in
         }
       }
+      if (staged)
+        entry_->obs().servers.noteTook(server); // the entry holds bytes it sent
       if (stats) {
         stats->originBytes.fetch_add(wire, std::memory_order_relaxed);
         stats->originReadvs.fetch_add(1, std::memory_order_relaxed);

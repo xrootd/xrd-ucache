@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -30,8 +31,15 @@ class ServerTally {
   void add(const std::string& server, uint64_t bytes, uint64_t rtUs, uint64_t inFlight);
   // One failed request (every one: the failure lines are capped, this is not).
   void fail(const std::string& server);
-  // Adds another account to this one (a relayed handle's into its entry's).
+  // Adds another account to this one (a relayed handle's into its entry's). What
+  // the other account's own requests took (tookFrom) is not added.
   void addFrom(const ServerTally& o);
+  // A server that delivered bytes to a request made outside add (read-ahead, which
+  // keeps no account of its servers): counted by tookFrom only.
+  void noteTook(const std::string& server);
+  // Whether this account's own requests (add with bytes, noteTook) took bytes from
+  // `server`: for a file's entry, whether the entry was given bytes that server sent.
+  bool tookFrom(const std::string& server) const;
   bool empty() const;
   // The host:port that delivered the most bytes; "" when none did.
   std::string topServer() const noexcept;
@@ -50,6 +58,7 @@ class ServerTally {
   };
   mutable std::mutex mu_;
   std::map<std::string, Agg> m_;
+  std::set<std::string> took_; // tookFrom's servers
 };
 
 } // namespace ucache
