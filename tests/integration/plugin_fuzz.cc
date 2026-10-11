@@ -28,9 +28,11 @@
 //   open-property-race a ReadRecovery set just as the checks made at open
 //                      begin does not land on the File during their reads
 //                      (see runOpenPropertyRace)
-//   open-stat-during-checks a Stat made while the checks made at open run
-//                      sets the handle up first: what they read is stored
-//                      in its entry all the same (see runOpenStatDuringChecks)
+//   open-stat-during-checks [cut] a Stat made while the checks made at open
+//                      run waits for the open's answer: it is never given a
+//                      copy the checks refuse, and what they read of the copy
+//                      the open takes is stored in the entry (see
+//                      runOpenStatDuringChecks)
 //   open-failover [N]  N opens through a redirector where a server refuses
 //                      the file: exactly one completion each (see runOpenFailover)
 //   open-denied        one open of a file that every server refuses: Open()
@@ -1248,19 +1250,19 @@ int runOpenPropertyRace(const char* url) {
   return good ? 0 : 1;
 }
 
-// open-stat-during-checks: a Stat made by the reader while the checks made at open run (a file
-// named
-// *.root that the cache caches, adaptive_federation on; the checks' first read sent 5 s late,
-// UCACHE_TEST_HEADER_FAIL_N=1, _KIND=delay). The Stat sets the handle up (its entry) before the
-// open answers; what the checks read of the copy the open takes must still go into that entry, not
-// wait in memory for a set-up that has happened. 1.5 s after the open is issued, a Stat, which must
-// answer the file's size before the open does; after the open (and a second), a Read of the first
-// 300 bytes, which must be the file's. The gate checks the counter and the client's log.
-// With UCACHE_TEST_SETUP_DELAY_MS (longer than the checks' late read), the set-up the Stat makes
-// waits after it first collects what the checks kept, so the open answers in between, before the
-// handle is set up: the open must then answer before the Stat does, and what the checks read must
-// still go into the entry.
-int runOpenStatDuringChecks(const char* url, const char* local) {
+// open-stat-during-checks [cut]: a Stat made by the reader while the checks made at open run (a
+// file named *.root that the cache caches, adaptive_federation on; the checks' first read sent 5 s
+// late, UCACHE_TEST_HEADER_FAIL_N=1, _KIND=delay). Until the open answers, its File may be open at
+// a copy the checks have yet to judge: the Stat waits for the open's answer before the handle is
+// set up, so neither the entry nor the reader is given the size of a copy the checks then refuse.
+// 1.5 s after the open is issued, a Stat; it must answer no earlier than 4.5 s after the open was
+// issued (the checks' late read). Without `cut`, the copies are whole: the Stat answers the file's
+// size, the open succeeds, and after it (and a second) a Read of the first 300 bytes is the file's;
+// the gate checks that what the checks read went into the entry. With `cut`, <local-path> is the
+// cut copy every server holds (its header states a larger end): the open fails, once, and the Stat
+// never answers the cut copy's size. With UCACHE_TEST_SETUP_DELAY_MS, the set-up the Stat makes
+// waits after it first collects what the checks kept; what they read must still go into the entry.
+int runOpenStatDuringChecks(const char* url, const char* local, bool cut) {
   const char* mode = "open-stat-during-checks";
   if (envInt("UCACHE_TEST_HEADER_FAIL_N", 0) != 1) {
     std::printf("%s: SETUP: needs UCACHE_TEST_HEADER_FAIL_N=1 (_KIND=delay)\n", mode);
@@ -1282,30 +1284,43 @@ int runOpenStatDuringChecks(const char* url, const char* local) {
   const XrdCl::XRootDStatus st = f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h);
   std::this_thread::sleep_until(t0 + std::chrono::milliseconds(1500));
   XrdCl::StatInfo* si = nullptr;
-  const XrdCl::XRootDStatus ss = f->Stat(false, si, 30);
+  const XrdCl::XRootDStatus ss = f->Stat(false, si, 60);
+  const long long statMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
   const uint64_t statSize = si ? si->GetSize() : 0;
   delete si;
-  const bool doneEarly = h->count() > 0; // the open answered before the Stat did
-  if (!st.IsOK() || !h->succeededWithin(std::chrono::seconds(60))) {
-    std::printf("%s: FAIL: the open (Open() %s, %d completion(s))\n", mode, st.ToString().c_str(),
-                h->count());
+  const bool doneEarly = h->count() > 0; // the open had answered when the Stat returned
+  const bool openOk = h->succeededWithin(std::chrono::seconds(120));
+  if (!st.IsOK() || openOk == cut) {
+    std::printf("%s: FAIL: the open (Open() %s, %s, %d completion(s))\n", mode,
+                st.ToString().c_str(), openOk ? "succeeded" : "failed", h->count());
     return 1;
   }
-  std::this_thread::sleep_for(std::chrono::seconds(1));
-  uint32_t bytes = 0;
-  const XrdCl::XRootDStatus rs = f->Read(0, 300, got.data(), bytes);
-  const bool exact = rs.IsOK() && bytes == 300 && got == ref;
+  bool exact = true;
+  std::string readText = "not made";
+  if (!cut) {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    uint32_t bytes = 0;
+    const XrdCl::XRootDStatus rs = f->Read(0, 300, got.data(), bytes);
+    exact = rs.IsOK() && bytes == 300 && got == ref;
+    readText = exact ? "exact" : rs.ToString();
+  }
   std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a second completion
-  std::printf("%s: Stat during the checks: %s, size %llu%s; the open: %d completion(s); the read "
-              "of 300 bytes at 0: %s\n",
-              mode, ss.ToString().c_str(), static_cast<unsigned long long>(statSize),
+  std::printf("%s: Stat during the checks: %s, size %llu, answered %lld ms after the open was "
+              "issued%s; the open: %d completion(s), %s; the read of 300 bytes at 0: %s\n",
+              mode, ss.ToString().c_str(), static_cast<unsigned long long>(statSize), statMs,
               doneEarly ? " (the open had already answered)" : "", h->count(),
-              exact ? "exact" : rs.ToString().c_str());
-  const XrdCl::XRootDStatus cs = f->Close();
-  (void)cs;
-  const bool setupWaits = envInt("UCACHE_TEST_SETUP_DELAY_MS", 0) > 0;
-  const bool good = ss.IsOK() && statSize == static_cast<uint64_t>(sb.st_size) &&
-                    doneEarly == setupWaits && exact && h->exactlyOne();
+              openOk ? "succeeded" : "failed", readText.c_str());
+  if (!cut) {
+    const XrdCl::XRootDStatus cs = f->Close();
+    (void)cs;
+  }
+  const bool waited = statMs >= 4500;
+  const bool statRight = cut ? !(ss.IsOK() && statSize == static_cast<uint64_t>(sb.st_size))
+                             : ss.IsOK() && statSize == static_cast<uint64_t>(sb.st_size);
+  const bool good = waited && statRight && exact && h->exactlyOne();
+  std::printf("STATWAIT %s\n", waited ? "yes" : "no");
   std::printf(good ? "%s: clean\n" : "%s: FAIL\n", mode);
   return good ? 0 : 1;
 }
@@ -1594,6 +1609,16 @@ int runZero(const char* url, const char* local, const std::string& which) {
 //            opened. Then UCACHE_RESTORE_CMD, when set, makes
 //            the copies readable again, and after the open's cool-down (a second) a Read and a
 //            PgRead at the same place are exact: the handle's own open is made again and stands
+//   ownfcntl, ownvisa the handle opened trusting its cache entry, and UCACHE_CUT_CMD puts another
+//            version of the file, of another size, at every copy: an Fcntl (a Visa) before the
+//            first read is answered once, and a Read at 85000, which the entry does not hold,
+//            fails with the error naming the copies' other size; never the other version's bytes
+//   degradedcut the handle opened trusting its cache entry, and UCACHE_CUT_CMD removes the entry
+//            and cuts every copy short (its header intact): a Stat and then a Read at 80000 (past
+//            the cut) each fail, once, with the error naming the copies, each refused by its
+//            header's end: the handle's own open makes the checks made at open
+//   degradedwhole the same with every copy whole: a Stat answers the file's size and a Read at
+//            80000 is exact
 //   end      nothing is cut. A Read and a PgRead that reach past the end of the file are answered
 //            with the bytes that exist, short, as they always were, and the handle stays put; a
 //            PgRead wholly past the end is answered as without uCache (no bytes, or the client's
@@ -1760,6 +1785,110 @@ int runCut(const char* url, const char* local, const std::string& which) {
                     std::memcmp(buf.data(), src.bytes.data() + 40000, 65536) == 0,
                 "and a PgRead (" + ps.ToString() + ", " + std::to_string(got) + " bytes)");
       }
+  } else if (which == "ownfcntl" || which == "ownvisa") {
+    // Trusted at Open (no request at open); UCACHE_CUT_CMD put another version of the file, of
+    // another size and with other bytes at 85000 (where no basket begins), at every copy. An Fcntl
+    // (or a Visa) before the handle's first read needs the cache's own open of the origin, which
+    // must find the size the entry holds: every copy is refused for its size, and a Read at 85000,
+    // which the entry does not hold, then fails with that error; never the other version's bytes.
+    const bool fc = which == "ownfcntl";
+    const char* what = fc ? "an Fcntl" : "a Visa";
+    auto* w = new ReadWait(); // leaked: a late completion lands safely
+    const XrdCl::XRootDStatus s = fc ? file->Fcntl(XrdCl::Buffer(), w) : file->Visa(w);
+    XrdCl::XRootDStatus got = s;
+    bool once = true;
+    if (s.IsOK()) {
+      const bool answered = w->wait();
+      std::this_thread::sleep_for(std::chrono::milliseconds(300)); // room for a second completion
+      once = answered && w->contractKept();
+      std::lock_guard<std::mutex> g(w->mu);
+      got = answered ? w->status : XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errOperationExpired);
+    }
+    std::printf("MSG %s %s\n", fc ? "fcntl" : "visa", got.ToString().c_str());
+    verdict(once, std::string(what) + " before the first read is answered once");
+    auto* rw = new ReadWait();
+    auto* b = new std::vector<char>(4096, 0x5A);
+    const XrdCl::XRootDStatus rs = file->Read(85000, 4096, b->data(), rw);
+    XrdCl::XRootDStatus rgot = rs;
+    bool ronce = true;
+    if (rs.IsOK()) {
+      const bool answered = rw->wait();
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      ronce = answered && rw->contractKept();
+      std::lock_guard<std::mutex> g(rw->mu);
+      rgot = answered ? rw->status
+                      : XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errOperationExpired);
+    }
+    const bool same = rgot.IsOK() && std::memcmp(b->data(), src.bytes.data() + 85000, 4096) == 0;
+    const std::string m = rgot.GetErrorMessage();
+    std::printf("OWNREAD %s %s\n", !rgot.IsOK() ? "error" : same ? "exact" : "other",
+                rgot.ToString().c_str());
+    verdict(ronce && !rgot.IsOK() && rgot.code == XrdCl::errDataError &&
+                m.find("the cached file has " + std::to_string(size)) != std::string::npos,
+            "then a Read at 85000, which the entry does not hold, fails with the error that names "
+            "the copies' other size, never the other version's bytes (" +
+                rgot.ToString().substr(0, 200) + ")");
+  } else if (which == "degradedcut") {
+    // Trusted at Open; UCACHE_CUT_CMD removed the entry and cut every copy short (its header
+    // intact, so it states the whole file's end). The handle's own open at its first request
+    // makes the checks made at open, as the reader's open does, and refuses every copy: a Stat
+    // and a Read past the cut each fail with the error that names the copies and the end their
+    // header states; never the cut copy's size, nor an empty answer past it.
+    auto* w = new ReadWait();
+    XrdCl::XRootDStatus s = file->Stat(false, w);
+    XrdCl::XRootDStatus got = s;
+    bool once = true;
+    uint64_t shown = 0;
+    if (s.IsOK()) {
+      const bool answered = w->wait();
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      once = answered && w->contractKept();
+      std::lock_guard<std::mutex> g(w->mu);
+      got = answered ? w->status : XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errOperationExpired);
+    }
+    if (got.IsOK()) { // what size the Stat showed, from a synchronous Stat (answered the same way)
+      XrdCl::StatInfo* si = nullptr;
+      if (file->Stat(false, si, 30).IsOK() && si)
+        shown = si->GetSize();
+      delete si;
+    }
+    const std::string sm = got.GetErrorMessage();
+    std::printf("MSG stat %s%s\n", got.ToString().c_str(),
+                got.IsOK() ? (" size " + std::to_string(shown)).c_str() : "");
+    verdict(once && !got.IsOK() && sm.find("no copy could serve the read") != std::string::npos &&
+                sm.find("its header says the file is " + std::to_string(size)) != std::string::npos,
+            "a Stat fails with the error that names the copies, each refused by its header's "
+            "end (" +
+                got.ToString().substr(0, 200) + ")");
+    auto* rw = new ReadWait();
+    auto* b = new std::vector<char>(4096, 0x5A);
+    s = file->Read(80000, 4096, b->data(), rw);
+    got = s;
+    once = true;
+    if (s.IsOK()) {
+      const bool answered = rw->wait();
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      once = answered && rw->contractKept();
+      std::lock_guard<std::mutex> g(rw->mu);
+      got = answered ? rw->status : XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errOperationExpired);
+    }
+    std::printf("MSG read %s\n", got.ToString().c_str());
+    verdict(once && !got.IsOK() && got.GetErrorMessage().find("no copy could serve the read") !=
+                                       std::string::npos,
+            "a Read at 80000, past the cut, fails with that error (" +
+                got.ToString().substr(0, 200) + ")");
+  } else if (which == "degradedwhole") {
+    // Trusted at Open; UCACHE_CUT_CMD removed the entry, and every copy is whole: the handle's own
+    // open makes the checks made at open and takes the copy it lands on. A Stat answers the file's
+    // size and a Read at 80000 is exact.
+    XrdCl::StatInfo* si = nullptr;
+    const XrdCl::XRootDStatus ss = file->Stat(false, si, 60);
+    const uint64_t shown = si ? si->GetSize() : 0;
+    delete si;
+    verdict(ss.IsOK() && shown == size,
+            "a Stat answers the file's size (" + ss.ToString() + ", " + std::to_string(shown) +
+                ")");
+    readExact(80000, 4096, "a Read at 80000 is exact");
   } else if (which == "end") { // past the end: short, exact, no move
     uint32_t got = 0;
     XrdCl::XRootDStatus s = file->Read(size - 1000, 65536, buf.data(), got);
@@ -1837,7 +1966,9 @@ int runReadFailover(const char* url, const char* local, const std::string& which
   if (which.rfind("zero", 0) == 0)
     return runZero(url, local, which);
   if (which == "cut" || which == "cutpg" || which == "cutpgpast" || which == "cutonly" ||
-      which == "end" || which == "degraded" || which == "degradedoff" || which == "leftdata")
+      which == "end" || which == "degraded" || which == "degradedoff" || which == "leftdata" ||
+      which == "ownfcntl" || which == "ownvisa" || which == "degradedcut" ||
+      which == "degradedwhole")
     return runCut(url, local, which);
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   Source src(local);
@@ -1960,7 +2091,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: %s <root-url> <local-path> [ops] [threads] [seed] "
                  "[fuzz|inner-race|inner-race-relay|open-refused|open-property|open-property-race|"
-                 "open-stat-during-checks|"
+                 "open-stat-during-checks [cut]|"
                  "open-failover|open-denied|"
                  "key-check <off> <len>|read-failover <case>]\n",
                  argv[0]);
@@ -1982,7 +2113,7 @@ int main(int argc, char** argv) {
   if (mode == "open-property-race")
     return runOpenPropertyRace(url);
   if (mode == "open-stat-during-checks")
-    return runOpenStatDuringChecks(url, argv[2]);
+    return runOpenStatDuringChecks(url, argv[2], argc > 7 && std::string(argv[7]) == "cut");
   if (mode == "open-failover")
     return runOpenFailover(url, argv[2], argc > 3 ? ::atoi(argv[3]) : 12);
   if (mode == "open-denied")

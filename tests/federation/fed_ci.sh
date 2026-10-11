@@ -49,9 +49,10 @@
 #                          and uCache closes each copy it opened. A ReadRecovery the reader sets
 #                          just as the checks begin is on the File before they turn it off: it
 #                          reads false during their reads, and the reader's value after them. A Stat
-#                          the reader makes while the checks run sets the handle up before its open
-#                          answers; what the checks read is stored in that entry all the same, also
-#                          when the open answers while that set-up is under way
+#                          the reader makes while the checks run waits for the open's answer before
+#                          the handle is set up (with every copy cut, it is never answered the cut
+#                          size); what the checks read is stored in the entry, also when that set-up
+#                          is made to wait
 #   zeros at the size      one server holds as many zero bytes as the file has (a, b and c in
 #                          turn), the other two the file: the copy of zeros does not begin as a
 #                          ROOT file does and is refused; the open goes on to a whole copy
@@ -134,7 +135,12 @@
 #                          opened (neither gets the client's own answer there, "Invalid operation")
 #                          With the switch off (the default) each read gets that open's own error, the
 #                          server's refusal, naming no copies, and never "Invalid operation"; once the
-#                          copies are readable again, a later read (after the open's cool-down) is exact
+#                          copies are readable again, a later read (after the open's cool-down) is exact.
+#                          With the switch on, such a handle's own open makes the checks made at open
+#                          (every copy cut: a Stat and a Read fail naming the copies; every copy whole:
+#                          both are right), and an Fcntl or a Visa before the first read sets the handle
+#                          up first, so that its own open finds the entry's size (another version at
+#                          every copy: a Read the entry does not hold fails, never that version's bytes)
 #   left copy              a read's data failure (a short answer inside the confirmed size) that
 #                          arrives after the handle moved, on the File it left: that copy is one the
 #                          handle never opens again, as for a failure on the File it reads from
@@ -439,15 +445,16 @@ res=$(fuzz "$W/c24" "$W/f24.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-pr
 echo "$res" | sed 's/^/    /' | cut -c1-300
 echo "$res" | grep -q '^open-property-race: clean$'; verdict "a setting made as the checks at open begin: ReadRecovery false during their reads, the reader's true after, one completion" $?
 [ "$(nheader "$W/f24.log")" = 1 ] && records "$W/c24" | grep -q '"status":"ok"'; verdict "the checks' first read was sent once, late, and the open succeeded (the fault was in place)" $?
-# A Stat the reader makes while the checks run (their first read sent 5 s late) sets the handle up before its open
-# answers: what the checks read of the copy the open takes goes into that entry all the same (open_check_bytes_kept),
-# never left waiting in memory for a set-up that has happened.
+# A Stat the reader makes while the checks run (their first read sent 5 s late) waits for the open's answer before
+# the handle is set up: until then the File may be open at a copy the checks have yet to judge. It answers the
+# file's size no earlier than the checks' late read, and what the checks read of the copy the open takes goes into
+# the entry (open_check_bytes_kept), never left waiting in memory.
 L=/store/ci/stat-during.root
 placew $L a b c
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay)
 res=$(fuzz "$W/c25" "$W/f25.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-stat-during-checks)
 echo "$res" | sed 's/^/    /' | cut -c1-300
-echo "$res" | grep -q '^open-stat-during-checks: clean$'; verdict "a Stat made while the checks at open run: the file's size, answered before the open; one completion; the read of the header exact" $?
+echo "$res" | grep -q '^open-stat-during-checks: clean$'; verdict "a Stat made while the checks at open run waits for the open's answer: the file's size, no earlier than 4.5 s after the open was issued; one completion; the read of the header exact" $?
 # (The delayed read is a test's fault, made as asked, 300 bytes, and not kept; the list's pages are kept.)
 grep -qE 'MsgHandler created.*kXR_read \(handle: 0x[0-9a-f]*, offset: 0, size: 300\)' "$W/f25.log" &&
   [ "$(records "$W/c25" | wc -l)" = 1 ] && records "$W/c25" | grep -q '"status":"ok"'
@@ -455,20 +462,34 @@ verdict "the checks' first read was the late one (300 bytes at 0), and the open 
 K=$(counter "$W/c25" open_check_bytes_kept)
 [ "${K:-0}" -gt 0 ]; verdict "what the checks read went into the entry the Stat had set up (open_check_bytes_kept ${K:-none})" $?
 # The same with the Stat's set-up made to wait (UCACHE_TEST_SETUP_DELAY_MS, 8 s) after it first collects what the
-# checks kept and before the handle is marked set up: the open answers in between (it answers before the Stat
-# does), and what its checks read must still go into the entry, not wait in memory until Close.
+# checks kept and before the handle is marked set up: what the checks read must still go into the entry, not wait
+# in memory until Close.
 L=/store/ci/stat-during-wait.root
 placew $L a b c
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay UCACHE_TEST_SETUP_DELAY_MS=8000)
 res=$(fuzz "$W/c25w" "$W/f25w.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-stat-during-checks)
 echo "$res" | sed 's/^/    /' | cut -c1-300
-echo "$res" | grep -q '^open-stat-during-checks: clean$' && echo "$res" | grep -q '(the open had already answered)'
-verdict "an open answered while the Stat's set-up waited: one completion, before the Stat's answer; the read of the header exact" $?
+echo "$res" | grep -q '^open-stat-during-checks: clean$' && echo "$res" | grep -q '^STATWAIT yes$'
+verdict "a Stat whose set-up waits: it answered after the open's checks; one completion; the read of the header exact" $?
 grep -qE 'MsgHandler created.*kXR_read \(handle: 0x[0-9a-f]*, offset: 0, size: 300\)' "$W/f25w.log" &&
   [ "$(records "$W/c25w" | wc -l)" = 1 ] && records "$W/c25w" | grep -q '"status":"ok"'
 verdict "the checks' first read was the late one, and the open succeeded at its first attempt (the fault was in place)" $?
 K=$(counter "$W/c25w" open_check_bytes_kept)
-[ "${K:-0}" -gt 0 ]; verdict "what the checks read went into the entry though the open answered before the set-up ended (open_check_bytes_kept ${K:-none})" $?
+[ "${K:-0}" -gt 0 ]; verdict "what the checks read went into the entry though the set-up waited (open_check_bytes_kept ${K:-none})" $?
+# Every copy cut short (its header intact): a Stat made while the checks run (their first read sent 5 s late) is
+# never given a cut copy's size, for any copy the redirector picks: it waits for the open, which refuses every copy
+# and fails once; the Stat then fails too (the client's own answer for a File that is not open).
+L=/store/ci/stat-during-cut.root
+cutw $L a b c
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay)
+res=$(fuzz "$W/c25c" "$W/f25c.log" "root://127.0.0.1:$RX/$L" "$W/fixw-cut.bin" 1 1 1 open-stat-during-checks cut)
+echo "$res" | sed 's/^/    /' | cut -c1-300
+echo "$res" | grep -q '^open-stat-during-checks: clean$'
+verdict "every copy cut: a Stat made while the checks run waits for the open, is never answered the cut size ($CUT), and the open fails once" $?
+NC=$(records "$W/c25c" | grep -c '"size":'"$CUT")
+grep -qE 'MsgHandler created.*kXR_read \(handle: 0x[0-9a-f]*, offset: 0, size: 300\)' "$W/f25c.log" && [ "$NC" -ge 1 ] &&
+  records "$W/c25c" | tail -1 | grep -q '"outcome":"error"'
+verdict "every copy cut: the checks' first read was the late one, the open's copies reported the cut size ($NC records), and the open ended in error (the fault was in place)" $?
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on) # the cases below have no header fault
 
 echo; echo "=== a copy that is zeros at the file's size is refused"
@@ -832,6 +853,7 @@ zr() {
   n=$(echo "$l" | tr / _)
   RFC="$W/c-zr$n"
   FEDENV=(UCACHE_ADAPTIVE_FEDERATION=$sw UCACHE_CHECK_ORIGIN_INTEGRITY=on ${land:+UCACHE_ZERO_CMD=$W/zero.sh ZERO_LFN=$l})
+  [ "$land" = landref ] && FEDENV+=(UCACHE_TEST_LOCATE_REFRESH=1)
   RES=$(fuzz "$RFC" "$W/zr$n.log" "root://127.0.0.1:$RX/$l" "$FIX" 1 1 1 read-failover $c)
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-220
   SV=($(echo "$RES" | sed -n 's/^SERVERS //p' | pnorm))
@@ -849,17 +871,25 @@ for c in zero zerov; do
   [ "$F14" = 1 ] && [ "${FL[0]:-x}" = "${SV[0]}" ]; verdict "$c: one failed read with code 14, at the server the handle landed on (${FL[*]})" $?
   [ "${#MV[@]}" -ge 1 ] && [ "${MV[-1]}" = "${SV[1]}" ]; verdict "$c: a move of route read ended at the server the bytes came from (${MV[*]})" $?
 done
-# (b) the first move may land on a copy that is damaged too: that answer is refused as well. A new file
-# each time, until a first move landed on one (up to 30).
-hit=0 allok=1
-for i in $(seq 30); do
-  L=/store/ci/zr-b$i.root; placefix $L a b c; zero_at $L b
-  zr zero $L on land
-  clean_zr zero || { allok=0; break; }
-  [ "$F14" -ge 2 ] && { hit=$i; break; }
-done
-[ "$allok" = 1 ]; verdict "two damaged copies: every read was exact, once, from the one that is not" $?
-[ "$hit" != 0 ]; verdict "two damaged copies: a move landed on the damaged one and its answer was refused too (file $hit of at most 30; $F14 failed reads, ${#MV[@]} moves)" $?
+# (b) the first move may land on a copy that is damaged too: that answer is refused as well. Made certain (it
+# was a loop of up to 30 files, which missed now and then): the file is placed on a alone and the regional asked
+# where it is (it keeps that answer, a alone, and sends every open there); then on b, whole, and c, damaged. The
+# handle lands on a, whose copy the hook zeroes. The read fails its check at a; the move's open is sent back to a,
+# which a read found bad (refused as it is), so the regional is asked for its list, with refresh
+# (UCACHE_TEST_LOCATE_REFRESH: uCache asks with refresh only after a "not found", which a server that still has
+# the file open never answers): it lists c and b, in that order (as it lists its servers, c's port first). The move
+# lands on c, damaged, whose answer is refused too, and then on b, which is exact.
+L=/store/ci/zr-b.root; placefix $L a
+RL=$(xfs 127.0.0.1:$RX locate "$L" 2>&1 | tr '\n' ' ')
+placefix $L b c; zero_at $L c
+zr zero $L on landref
+echo "    the regional listed before the open: $RL"
+clean_zr zero; verdict "two damaged copies: every read was exact, once, from the one that is not" $?
+[ "$F14" = 2 ] && [ "${FL[0]:-}" = "$AX" ] && [ "${FL[1]:-}" = "$CX" ] && [ "${SV[1]:-}" = "$BX" ]
+verdict "two damaged copies: the read failed its check at a, the move landed on c, damaged, and its answer was refused too, and the bytes came from b ($F14 failed reads at ${FL[*]}; ended at ${SV[1]:-none})" $?
+case "$RL" in *":$AX "*) case "$RL" in *":$BX "*|*":$CX "*) r=1 ;; *) r=0 ;; esac ;; *) r=1 ;; esac
+[ "$r" = 0 ] && [ "${SV[0]:-}" = "$AX" ]
+verdict "two damaged copies: the regional listed a alone before the open, and the handle landed on a (the fault was in place: $RL; landed ${SV[0]:-none})" $?
 # (c) every copy is damaged: the reader gets the error, after at most four reads, never the zeros
 L=/store/ci/zr-all.root; placefix $L a b c; zero_at $L a b c
 zr zeroerr $L on
@@ -1068,6 +1098,78 @@ DREC=$(recs "$DO" open | tail -n +$((N0 + 1)))
 echo "$DREC" | head -1 | grep -q '"route":"degraded","status":"error","code":400,"errno":3010,' &&
   echo "$DREC" | tail -1 | grep -q '"route":"degraded","status":"ok"' && [ "$(echo "$DREC" | grep -c '"route":"failover"\|"route":"candidate"')" = 0 ]
 verdict "lost trust, switch off: the records show the handle's own open refused (route degraded, 400/3010), made again once the copies were readable (ok), and no failover" $?
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
+
+echo; echo "=== a trusted handle's own open: an Fcntl or a Visa first, another version at every copy"
+# A handle opened trusting its entry (a freshness window) is given an Fcntl (a Visa) before its first read: the
+# cache's own open of the origin, which that needs, must find the size the entry holds. The test puts another
+# version of the file at every copy after the open: 4 KiB longer, with other bytes at 85000 (inside a basket, whose
+# key stays as it is, so that the key-position check finds nothing wrong there). Every copy is refused for its
+# size, and a Read at 85000, which the entry does not hold, fails with the error naming that size, never the other
+# version's bytes. Certain for any copy the redirector picks.
+{ head -c 85000 "$FIXW"; head -c 4096 /dev/zero | tr '\0' 'Z'; tail -c +$((85000 + 4096 + 1)) "$FIXW"; head -c 4096 /dev/zero; } > "$W/fixw-other.bin"
+OTHER_SIZE=$(stat -c %s "$W/fixw-other.bin")
+[ "$OTHER_SIZE" = $((FIXW_SIZE + 4096)) ]; verdict "the other version is $OTHER_SIZE bytes, 4 KiB more than the file" $?
+for kind in fcntl visa; do
+  L=/store/ci/own-$kind.root
+  placew $L a b c
+  OC="$W/c-own-$kind"
+  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_REVALIDATE_S=3600)
+  res=$(fuzz "$OC" "$W/own-$kind-fill.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
+  echo "$res" | grep -q '^open-failover: clean$' && [ -n "$(find "$OC" -name '*.val' -print -quit)" ]
+  verdict "own $kind: the first run read the file and left its entry and its freshness marker" $?
+  N0=$(recs "$OC" open | wc -l)
+  printf '#!/bin/sh\nfor s in a b c; do cp "%s" "%s/data/$s%s"; chmod 666 "%s/data/$s%s"; done\n' "$W/fixw-other.bin" "$W" "$L" "$W" "$L" > "$W/own-$kind.sh"
+  chmod 755 "$W/own-$kind.sh"
+  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_REVALIDATE_S=3600 UCACHE_CUT_CMD=$W/own-$kind.sh)
+  RES=$(fuzz "$OC" "$W/own-$kind.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 read-failover own$kind)
+  echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-400
+  echo "$RES" | grep -q "^read-failover own$kind: clean$"
+  verdict "own $kind: answered once, and a Read the entry does not hold fails naming the copies' other size, never the other version's bytes" $?
+  NO=$(recs "$OC" open | tail -n +$((N0 + 1)) | grep -c '"size":'"$OTHER_SIZE")
+  grep -q 'trusted recent cache for ' "$W/own-$kind.log" && [ "$NO" -ge 1 ] && [ "$(stat -c %s "$W/data/a$L")" = "$OTHER_SIZE" ]
+  verdict "own $kind: the handle was trusted at its open, and its own open met the other version (records of size $OTHER_SIZE: $NO; the fault was in place)" $?
+done
+
+echo; echo "=== a trusted handle whose entry is gone: its own open makes the checks made at open"
+# The entry is removed after the trusted open, so the handle's first request opens the file itself, with no size
+# it must find. Every copy cut short (its header intact): that open makes the checks made at open and refuses each,
+# so a Stat and a Read past the cut fail with the error naming the copies; never the cut size, nor an empty answer
+# past it. Certain for any copy the redirector picks. Then every copy whole: the checks pass, the Stat answers the
+# file's size and a Read is exact.
+for kind in cut whole; do
+  L=/store/ci/degraded-$kind.root
+  placew $L a b c
+  DK="$W/c-degraded-$kind"
+  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_REVALIDATE_S=3600)
+  res=$(fuzz "$DK" "$W/degraded-$kind-fill.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
+  echo "$res" | grep -q '^open-failover: clean$' && [ -n "$(find "$DK" -name '*.val' -print -quit)" ]
+  verdict "degraded $kind: the first run read the file and left its entry and its freshness marker" $?
+  N0=$(recs "$DK" open | wc -l)
+  {
+    echo '#!/bin/sh'
+    echo "find \"$DK\" -name '*.meta' -delete"
+    [ "$kind" = cut ] && echo "for s in a b c; do cp \"$W/fixw-cut.bin\" \"$W/data/\$s$L\"; done"
+  } > "$W/degraded-$kind.sh"
+  chmod 755 "$W/degraded-$kind.sh"
+  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_REVALIDATE_S=3600 UCACHE_CUT_CMD=$W/degraded-$kind.sh)
+  RES=$(fuzz "$DK" "$W/degraded-$kind.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 read-failover degraded$kind)
+  echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-400
+  recs "$DK" open | tail -n +$((N0 + 1)) | sed 's/^/    rec: /' | cut -c1-230
+  echo "$RES" | grep -q "^read-failover degraded$kind: clean$"; r=$?
+  if [ "$kind" = cut ]; then
+    verdict "degraded, every copy cut: a Stat and a Read past the cut fail with the error naming the copies and their header's end; never the cut size" $r
+  else
+    verdict "degraded, every copy whole: the Stat answers the file's size and a Read is exact (the checks refuse no whole copy)" $r
+  fi
+  NDG=$(recs "$DK" open | tail -n +$((N0 + 1)) | grep -c '"route":"degraded"')
+  SZ=$(for x in a b c; do stat -c %s "$W/data/$x$L"; done | sort -u | tr '\n' ' ')
+  WANT=$([ "$kind" = cut ] && echo "$CUT " || echo "$FIXW_SIZE ")
+  grep -q 'trusted recent cache for ' "$W/degraded-$kind.log" && [ "$NDG" -ge 1 ] && [ "$SZ" = "$WANT" ]
+  verdict "degraded $kind: trusted at its open, its entry gone so that its own open was made (route degraded: $NDG), every copy $SZ bytes (the fault was in place)" $?
+  NH=$(grep -cE 'MsgHandler created.*kXR_read \(handle: 0x[0-9a-f]*, offset: 0, size: 300\)' "$W/degraded-$kind.log")
+  [ "$NH" -ge 1 ]; verdict "degraded $kind: the handle's own open read the copy's first 300 bytes, the checks made at open ($NH)" $?
+done
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
 
 echo; echo "fed_ci: $FAILS failure(s)"
