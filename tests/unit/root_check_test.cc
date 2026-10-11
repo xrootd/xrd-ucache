@@ -1385,7 +1385,7 @@ std::vector<RootHeaderVerdict::Label> labelsOf(const std::vector<unsigned char>&
 #endif
 } // namespace
 
-// The labels of the records the list names, and of the class descriptions (the reference's F7):
+// The labels of the records the list names, and of the class descriptions:
 // each must state the position it was read from and the top directory, read as ROOT reads a label;
 // one that does not is held against the copy only where ROOT cannot read the record from those
 // bytes either (its data at the label's length opens no block ROOT decompresses; the class
@@ -1409,6 +1409,20 @@ TEST(RootCheck, LabelsOfTheListedRecords) {
       EXPECT_EQ(v.why, "size " + std::to_string(s.end) + ": the label at " +
                            std::to_string(s.listed[1].seekKey) +
                            " (TH1F h1) states position 0, and no block follows it");
+      // The list's own bytes for its class and name, as the text shows them: every byte that is
+      // not a printable character, and '?', as '.'.
+      const std::vector<unsigned char> list =
+          img.read(s.seekKeys, static_cast<size_t>(s.nbytesKeys));
+      const std::string text(list.begin(), list.end());
+      const size_t at = text.find("h1");
+      ASSERT_NE(at, std::string::npos);
+      Image odd = img;
+      odd.put(s.seekKeys + static_cast<int64_t>(at), {'?', 0x01});
+      const RootHeaderVerdict u = check(odd);
+      EXPECT_EQ(u.kind, K::kBad);
+      EXPECT_EQ(u.why, "size " + std::to_string(s.end) + ": the label at " +
+                           std::to_string(s.listed[1].seekKey) +
+                           " (TH1F ..) states position 0, and no block follows it");
     }
     { // its label alone zeroed: ROOT reads the object by the list's account of it, and so it stands
       Image img = good;

@@ -458,7 +458,7 @@ void judgeKeysList(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
   if (count < 0)
     return refuse(v, list + " gives a count of " + num(count) + " objects");
   const int64_t to = listBound(v);
-  // The labels to read next (F7): the class descriptions', then the trees' and RNTuples', then the
+  // The labels to read next: the class descriptions', then the trees' and RNTuples', then the
   // other objects', at most kRootLabelsMax in all, each list kept within that while the list is
   // read so that a list of very many objects costs no more memory.
   std::vector<RootHeaderVerdict::Label> trees, others;
@@ -514,7 +514,8 @@ void judgeKeysList(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
     v.next = RootHeaderVerdict::kNone;
     return;
   }
-  if (h.seekInfo > h.begin && h.nbytesInfo > 0) { // where ROOT reads them (TFile::Init), F5 above
+  // Where ROOT reads them (TFile::Init), held within the header's bounds above.
+  if (h.seekInfo > h.begin && h.nbytesInfo > 0) {
     RootHeaderVerdict::Label l;
     l.at = h.seekInfo;
     l.len = static_cast<uint32_t>(std::min<int64_t>(h.nbytesInfo, kRootInfoLabelBytes));
@@ -680,8 +681,9 @@ void rootCheckLabels(RootHeaderVerdict& v, const std::vector<ByteView>& views) {
       const std::string cls(reinterpret_cast<const char*>(p + at0 + 1),
                             std::min<size_t>({clen, l.len - at0 - 1, 20}));
       if (clen != 5 || cls != "TList")
-        return refuse(v, "the label at " + num(l.at) + " (" + l.what + ") states position " +
-                             num(k.seekKey) + " and class \"" + printable(cls) + "\"");
+        return refuse(v, "the label at " + num(l.at) + " (" + printable(l.what) +
+                             ") states position " + num(k.seekKey) + " and class \"" +
+                             printable(cls) + "\"");
       keylen = k.keylen;
       compressed = int64_t(k.objlen) > int64_t(k.nbytes) - k.keylen;
     }
@@ -690,10 +692,10 @@ void rootCheckLabels(RootHeaderVerdict& v, const std::vector<ByteView>& views) {
     if (rootBlockHeader(p + keylen))
       continue; // ROOT decompresses its data from there, whatever the label says
     if (k.seekKey != l.at)
-      return refuse(v, "the label at " + num(l.at) + " (" + l.what + ") states position " +
-                           num(k.seekKey) + ", and no block follows it");
-    return refuse(v, "the label at " + num(l.at) + " (" + l.what + ") states directory " +
-                         num(k.seekPdir) + ", not " + num(v.header.begin) +
+      return refuse(v, "the label at " + num(l.at) + " (" + printable(l.what) +
+                           ") states position " + num(k.seekKey) + ", and no block follows it");
+    return refuse(v, "the label at " + num(l.at) + " (" + printable(l.what) +
+                         ") states directory " + num(k.seekPdir) + ", not " + num(v.header.begin) +
                          ", and no block follows");
   }
   v.next = RootHeaderVerdict::kNone;

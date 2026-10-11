@@ -202,7 +202,7 @@ TEST(Fault, OpenFailuresReturnNull) {
 }
 
 TEST(Fault, FdatasyncFailureNeverPublishesBits) {
-  // D1 data-before-bit ordering under fsync loss: payload lands but the sync
+  // The data-before-bit ordering under fsync loss: payload lands but the sync
   // fails, so the bits must never publish — pages are refetched, not trusted.
   Fx fx;
   fx.cfg.fsync = FsyncMode::kData;
@@ -225,7 +225,7 @@ TEST(Fault, FdatasyncFailureNeverPublishesBits) {
 
 TEST(Fault, PunchHoleHardFailureStillClearsBits) {
   // A punchHole error that is NOT EOPNOTSUPP/ENOSYS (e.g. EIO) takes the warn
-  // branch: reclaim is best-effort, but the released bits stay gone (D1: bits
+  // branch: reclaim is best-effort, but the released bits stay gone (bits
   // durable before the bytes vanish) and untouched pages still serve.
   Fx fx;
   auto e = fx.open();

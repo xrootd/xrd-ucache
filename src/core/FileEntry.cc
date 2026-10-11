@@ -1507,7 +1507,7 @@ uint64_t FileEntry::releaseRanges(const std::vector<std::pair<uint64_t, uint64_t
     noteSpeculativeDropped(specDropped);
   if (spans.empty())
     return 0;
-  // Bits durable BEFORE the bytes vanish (D1 ordering): a reader that loads
+  // Bits durable BEFORE the bytes vanish (the data-before-bit ordering): a reader that loads
   // the flushed sidecar refetches from origin; one already holding the old
   // in-memory bitmap is protected by per-page CRC (punched zeros fail it).
   if (!flushMeta(true))
