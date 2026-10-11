@@ -487,11 +487,21 @@ void judgeKeysList(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
                           std::min<size_t>(k.classLen, 64));
     const bool tree = firstRead(cls);
     std::vector<RootHeaderVerdict::Label>& into = tree ? trees : others;
-    if (into.size() < kRootLabelsMax)
-      into.push_back(RootHeaderVerdict::Label{
-          k.seekKey, static_cast<uint32_t>(std::min<int64_t>(k.nbytes, kRootKeyFieldsBytes)), tree,
-          cls.substr(0, 24) + " " +
-              std::string(reinterpret_cast<const char*>(b + k.nameAt), std::min<size_t>(k.nameLen, 16))});
+    if (into.size() < kRootLabelsMax) {
+      RootHeaderVerdict::Label l;
+      l.at = k.seekKey;
+      // Its fields and the first bytes of its data, as the list accounts for them.
+      const int64_t want = k.keylen > 0 && k.keylen < k.nbytes
+                               ? std::max<int64_t>(kRootKeyFieldsBytes, int64_t(k.keylen) + 3)
+                               : int64_t(kRootKeyFieldsBytes);
+      l.len = static_cast<uint32_t>(std::min<int64_t>(k.nbytes, want));
+      l.first = tree;
+      l.what = cls.substr(0, 20) + " " +
+               std::string(reinterpret_cast<const char*>(b + k.nameAt), std::min<size_t>(k.nameLen, 16));
+      l.keylen = k.keylen;
+      l.compressed = int64_t(k.objlen) > int64_t(k.nbytes) - k.keylen; // TKey::ReadObj's test
+      into.push_back(std::move(l));
+    }
   }
   v.labels.clear();
   if (own.nbytes < 0) { // a writer stopped inside a save (see above): no claim on the records
@@ -504,10 +514,15 @@ void judgeKeysList(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
     v.next = RootHeaderVerdict::kNone;
     return;
   }
-  if (h.seekInfo > h.begin && h.nbytesInfo > 0) // where ROOT reads them (TFile::Init), F5 above
-    v.labels.push_back(RootHeaderVerdict::Label{
-        h.seekInfo, static_cast<uint32_t>(std::min<int64_t>(h.nbytesInfo, kRootKeyFieldsBytes)),
-        true, "class descriptions"});
+  if (h.seekInfo > h.begin && h.nbytesInfo > 0) { // where ROOT reads them (TFile::Init), F5 above
+    RootHeaderVerdict::Label l;
+    l.at = h.seekInfo;
+    l.len = static_cast<uint32_t>(std::min<int64_t>(h.nbytesInfo, kRootInfoLabelBytes));
+    l.first = true;
+    l.what = "class descriptions";
+    l.own = true;
+    v.labels.push_back(std::move(l));
+  }
   for (auto* from : {&trees, &others})
     for (auto& l : *from)
       if (v.labels.size() < kRootLabelsMax)
@@ -610,6 +625,22 @@ void rootCheckRead(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
   judgeKeysList(v, b, v.nextLen);
 }
 
+namespace {
+// `t` with every byte that is not a printable character as '?'.
+std::string printable(std::string t) {
+  for (auto& c : t)
+    if (c < 0x20 || c > 0x7e)
+      c = '?';
+  return t;
+}
+// Whether `p` (3 bytes) opens a block ROOT decompresses (R__unzip_header's own test).
+bool rootBlockHeader(const unsigned char* p) {
+  return (p[0] == 'Z' && p[1] == 'L' && p[2] == 8) || (p[0] == 'C' && p[1] == 'S' && p[2] == 8) ||
+         (p[0] == 'X' && p[1] == 'Z' && p[2] == 0) || (p[0] == 'L' && p[1] == '4') ||
+         (p[0] == 'Z' && p[1] == 'S' && p[2] == 1);
+}
+} // namespace
+
 bool viewsHold(const std::vector<ByteView>& views, uint64_t off, uint64_t len) {
   for (const auto& w : views)
     if (w.b && off >= w.off && off - w.off <= w.n && len <= w.n - (off - w.off))
@@ -630,15 +661,39 @@ void rootCheckLabels(RootHeaderVerdict& v, const std::vector<ByteView>& views) {
       }
     if (!w)
       return refuse(v, "a read of " + num(l.len) + " bytes at " + num(l.at) + " answered short");
+    const unsigned char* p = w->b + (at - w->off);
     RootKeyLabel k;
-    if (!parseRootKeyFields(w->b + (at - w->off), l.len, k))
+    if (!parseRootKeyFields(p, l.len, k))
       continue; // its fields do not fit in the record: no claim
+    if (k.seekKey == l.at && topDirectory(v, k.seekPdir))
+      continue;
+    // The label does not state its place: held against the copy only where ROOT cannot read the
+    // record from these bytes either (see OpenPolicy.h).
+    int keylen = l.keylen;
+    bool compressed = l.compressed;
+    if (l.own) { // the class descriptions: ROOT reads this label itself, and needs a TList
+      const size_t at0 = k.version > 1000 ? 34 : 26; // its class name: a length byte, then it
+      if (at0 >= l.len)
+        continue; // past the bytes read: no claim
+      const size_t clen = p[at0] == 255 ? 255 : p[at0];
+      const std::string cls(reinterpret_cast<const char*>(p + at0 + 1),
+                            std::min<size_t>({clen, l.len - at0 - 1, 20}));
+      if (clen != 5 || cls != "TList")
+        return refuse(v, "the label at " + num(l.at) + " (" + l.what + ") states position " +
+                             num(k.seekKey) + " and class \"" + printable(cls) + "\"");
+      keylen = k.keylen;
+      compressed = int64_t(k.objlen) > int64_t(k.nbytes) - k.keylen;
+    }
+    if (!compressed || keylen <= 0 || static_cast<uint32_t>(keylen) + 3 > l.len)
+      continue; // stored as it is, or its data past the bytes read: no claim
+    if (rootBlockHeader(p + keylen))
+      continue; // ROOT decompresses its data from there, whatever the label says
     if (k.seekKey != l.at)
       return refuse(v, "the label at " + num(l.at) + " (" + l.what + ") states position " +
-                           num(k.seekKey));
-    if (!topDirectory(v, k.seekPdir))
-      return refuse(v, "the label at " + num(l.at) + " (" + l.what + ") states directory " +
-                           num(k.seekPdir) + ", not the top one at " + num(v.header.begin));
+                           num(k.seekKey) + ", and no block follows it");
+    return refuse(v, "the label at " + num(l.at) + " (" + l.what + ") states directory " +
+                         num(k.seekPdir) + ", not " + num(v.header.begin) +
+                         ", and no block follows");
   }
   v.next = RootHeaderVerdict::kNone;
 }

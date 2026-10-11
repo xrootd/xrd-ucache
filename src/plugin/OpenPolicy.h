@@ -284,11 +284,22 @@ bool storedEntryCut(const unsigned char* b, size_t n, uint64_t storedSize);
 //     - the label at the head of a record the list names, or of the class descriptions, does not
 //       state the position it was read from and the top directory (read as TKey::ReadKeyBuffer
 //       reads them: a signed version above 1000 marks 64-bit positions, 32-bit ones are unsigned,
-//       the top 16 bits of a 64-bit directory position are not part of it). Every record ROOT
-//       writes states both; a label zeroed or overwritten (a tree description or the class
-//       descriptions lost at the end of a copy whose list survived) does not. Only the label's
-//       fields are read (kRootKeyFieldsBytes, or the record's length when shorter: a label whose
-//       fields do not fit in it makes no claim). At most kRootLabelsMax labels are read: the class
+//       the top 16 bits of a 64-bit directory position are not part of it), and ROOT cannot read
+//       the record from those bytes either. Every record ROOT writes states both; a record zeroed
+//       or overwritten (a tree description or the class descriptions lost at the end of a copy
+//       whose list survived) does not. ROOT itself does not compare a record's position or
+//       directory with where it read it: it reads an object the list names by the list's account
+//       of it (its data from the label's length on, decompressed when compressed), and the class
+//       descriptions by their own label. So a label that does not state its place is held against
+//       the copy only where ROOT would fail on the same bytes: for a compressed object, the bytes
+//       at the label's length (the list's, or for the class descriptions their own) do not open a
+//       block ROOT decompresses (R__unzip_header: "ZL" or "CS" and 8, "XZ" and 0, "ZS" and 1,
+//       "L4"); for the class descriptions, their label's class is not TList, or its names do not
+//       fit in the bytes read. A label whose own fields alone are damaged, or an object stored
+//       uncompressed, makes no claim. The bytes read of each label: its fields and the block's
+//       first three bytes (kRootKeyFieldsBytes, or the list's label length and 3 when more), or
+//       kRootInfoLabelBytes for the class descriptions, never past the record's length; a label
+//       whose bytes do not fit in what is read makes no claim. At most kRootLabelsMax labels are read: the class
 //       descriptions', then the trees' and RNTuples' (TTree, TNtuple, TNtupleD, ROOT::RNTuple,
 //       ROOT::Experimental::RNTuple), then the other objects', each in the list's order; the labels
 //       of the objects past that are not read (labelsNotRead counts them). A list that carries
@@ -323,12 +334,19 @@ struct RootHeaderVerdict {
   uint32_t nextLen = 0;
   // A label to be read: its `len` bytes at `at`; `first`: a record the reader's ROOT reads right
   // after its open (the class descriptions, a tree, an RNTuple), whose bytes may be kept; `what`
-  // names it in a refusal.
+  // names it in a refusal. For an object the list names, the list's own account of its record,
+  // which is what ROOT reads it by (TKey::ReadObj): the length of its label (`keylen`) and whether
+  // its data is compressed (`compressed`: its object is longer than the record past its label).
+  // For the class descriptions (`own`), ROOT reads the record's label itself
+  // (TFile::GetStreamerInfoListImpl, TKey::ReadKeyBuffer).
   struct Label {
     long long at = 0;
     uint32_t len = 0;
     bool first = false;
     std::string what;
+    int16_t keylen = 0;
+    bool compressed = false;
+    bool own = false;
   };
   std::vector<Label> labels;
   uint32_t labelsNotRead = 0; // objects listed whose labels are past kRootLabelsMax
@@ -338,6 +356,7 @@ struct RootHeaderVerdict {
 };
 inline constexpr uint32_t kRootKeysListMaxBytes = 16u << 20;
 inline constexpr size_t kRootLabelsMax = 64;
+inline constexpr uint32_t kRootInfoLabelBytes = 160;
 RootHeaderVerdict rootHeaderVerdict(const unsigned char* b, size_t n, long long size);
 // Judges the answer to the read `v.next` asked for: the `n` bytes of `b`, which a read of
 // `v.nextLen` bytes at `v.nextAt` answered with (fewer than asked: the copy ends there, kBad).
