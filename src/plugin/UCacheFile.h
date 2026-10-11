@@ -59,6 +59,8 @@ struct ColdMap; // StoreMaps.h
 using ColdMap = transpose::ColdMap;
 class ReadRule; // ReadRule.h
 
+class UCacheFile;
+
 // The layout a handle a forked child inherited had been set up in: its next
 // setup in the child serves exactly that one (HandleState::syncFork).
 enum class ForkLayout : uint8_t { kNone, kOriginal, kCold };
@@ -221,10 +223,30 @@ struct HandleState {
   // Under mu: with adaptive_federation on, the reader's open of a handle the cache serves is in
   // flight (RetryingOpenHandler), from its first attempt to the completion the reader gets. Its
   // File may meanwhile be open at a copy the checks made at open have yet to judge, or have
-  // refused: a request made on the handle then waits for the answer (openCv) before the handle is
-  // set up, so that neither its entry nor its reader is given that copy's size (ensureEntry).
+  // refused: a request made on the handle then is parked until the answer (openWaiters), or, made
+  // without a handler, waits for it (openCv), before the handle is set up, so that neither its entry
+  // nor its reader is given that copy's size (ensureEntry).
   bool readerOpenPending = false;
   std::condition_variable openCv;
+  // Under mu, with adaptive_federation on: the requests made with a handler while the reader's open
+  // is in flight, parked here instead of waiting on the thread that made them (it may be a client
+  // callback thread that the open's own checks need: UCacheFile::parkForOpen). Taken whole by the
+  // first of: the open's answer, Close, the plugin object's end (under mu). Each is then given its
+  // turn on a pool thread, exactly once: made again through the plugin object (`redo`, with the
+  // handler to answer) once the open succeeded, or its `handler` answered with the open's error,
+  // or a closed handle's.
+  struct OpenWaiter {
+    XrdCl::ResponseHandler* handler = nullptr;
+    std::function<XrdCl::XRootDStatus(UCacheFile* owner, XrdCl::ResponseHandler* h)> redo;
+  };
+  std::vector<OpenWaiter> openWaiters;
+  // Under mu: the plugin object while it lives, through which a parked request is made again (the
+  // tasks hold this state, never the plugin object), and how many such requests are inside it now;
+  // the plugin's destructor clears `owner` and waits (openCv) until ownerUses is 0. A request made
+  // again is answered only after it has left the plugin object, so a handler that deletes its file
+  // never waits for itself.
+  UCacheFile* owner = nullptr;
+  int ownerUses = 0;
   // With adaptive_federation on, for a file the cache caches: what the checks made at the reader's
   // open read of the copy the open took, as whole pages of the file (OpenPolicy.h checkReadSpan),
   // kept here from the open's answer until the handle's entry is set up (ensureEntry), which stores
@@ -437,6 +459,11 @@ class UCacheFile : public XrdCl::FilePlugIn {
   // Sets up a handle trusted at Open before a request that would make the cache's own open of the
   // origin (adaptive_federation on only): that open must find the entry's size.
   void setUpBeforeOwnOpen();
+  // With adaptive_federation on, a request made with a handler while the reader's open is in flight
+  // is parked (HandleState::openWaiters) and true is returned: `redo` then makes it again, or
+  // `handler` is answered, exactly once, after the open's answer. False (nothing parked) otherwise.
+  bool parkForOpen(XrdCl::ResponseHandler* handler,
+                   std::function<XrdCl::XRootDStatus(UCacheFile*, XrdCl::ResponseHandler*)> redo);
   // Lazily create the cache entry on the caller's thread (first read), doing
   // a synchronous inner Stat. Returns the entry, or nullptr for
   // pass-through (write-open, disabled, denied host, Stat failure, closed).

@@ -34,6 +34,10 @@
 //                      copy the checks refuse, and what they read of the copy
 //                      the open takes is stored in the entry (see
 //                      runOpenStatDuringChecks)
+//   open-park-from-callback an asynchronous Stat and Read made from another
+//                      file's callback while the checks made at open run
+//                      return at once and are answered after the open (see
+//                      runOpenParkFromCallback)
 //   open-failover [N]  N opens through a redirector where a server refuses
 //                      the file: exactly one completion each (see runOpenFailover)
 //   open-denied        one open of a file that every server refuses: Open()
@@ -1359,6 +1363,175 @@ int runOpenStatDuringChecks(const char* url, const char* local, bool cut) {
   return good ? 0 : 1;
 }
 
+// One request's completions, timed: the first one's status, its size (a Stat) or length (a read),
+// the time it came, and how many came (the contract: exactly one, with a non-null HostList).
+struct TimedAnswer : XrdCl::ResponseHandler {
+  std::mutex mu;
+  std::condition_variable cv;
+  int completions = 0;
+  bool ok = false;
+  bool contract = true;
+  uint64_t size = 0;
+  std::chrono::steady_clock::time_point at;
+  void HandleResponse(XrdCl::XRootDStatus* status, XrdCl::AnyObject* response) override {
+    {
+      std::lock_guard<std::mutex> g(mu);
+      contract = false; // a completion through HandleResponse
+    }
+    HandleResponseWithHosts(status, response, nullptr);
+  }
+  void HandleResponseWithHosts(XrdCl::XRootDStatus* status, XrdCl::AnyObject* response,
+                               XrdCl::HostList* hostList) override {
+    const bool good = status && status->IsOK();
+    uint64_t n = 0;
+    if (good && response) {
+      XrdCl::StatInfo* si = nullptr;
+      XrdCl::ChunkInfo* ci = nullptr;
+      response->Get(si); // null unless the object is of that type
+      response->Get(ci);
+      n = si ? si->GetSize() : ci ? ci->length : 0;
+    }
+    std::lock_guard<std::mutex> g(mu);
+    if (!hostList)
+      contract = false;
+    if (++completions == 1) {
+      ok = good;
+      size = n;
+      at = std::chrono::steady_clock::now();
+    }
+    delete status;
+    delete response;
+    delete hostList;
+    cv.notify_all();
+  }
+  bool waitFor(std::chrono::seconds max) {
+    std::unique_lock<std::mutex> l(mu);
+    return cv.wait_for(l, max, [&] { return completions > 0; });
+  }
+};
+
+// open-park-from-callback: an asynchronous Stat and Read made on a file whose reader's open is in
+// flight (adaptive_federation on, a file named *.root the cache caches; the checks' first read sent
+// 5 s late, UCACHE_TEST_HEADER_FAIL_N=1, _KIND=delay), from inside the completion of another file's
+// request, on the client's own callback thread. Each call must return at once (within 1 s): the
+// thread is the client's, and the open's own checks may need it to deliver their reads. Each
+// request must then be answered once, after the open answered: the Stat with the file's size, the
+// Read with the file's first 300 bytes. The other file is opened without plug-ins, so its answer
+// comes on a client thread.
+int runOpenParkFromCallback(const char* url, const char* local) {
+  const char* mode = "open-park-from-callback";
+  if (envInt("UCACHE_TEST_HEADER_FAIL_N", 0) != 1) {
+    std::printf("%s: SETUP: needs UCACHE_TEST_HEADER_FAIL_N=1 (_KIND=delay)\n", mode);
+    return 2;
+  }
+  const int fd = ::open(local, O_RDONLY);
+  struct stat sb{};
+  std::vector<char> ref(300);
+  if (fd < 0 || ::fstat(fd, &sb) != 0 || ::pread(fd, ref.data(), ref.size(), 0) != 300) {
+    std::printf("%s: SETUP: cannot read 300 bytes of %s\n", mode, local);
+    if (fd >= 0)
+      ::close(fd);
+    return 2;
+  }
+  ::close(fd);
+  auto* other = new XrdCl::File(false); // no plug-ins: its answers come on the client's threads
+  if (!other->Open(url, XrdCl::OpenFlags::Read).IsOK()) {
+    std::printf("%s: SETUP: the other file did not open\n", mode);
+    return 2;
+  }
+  // Leaked with their handlers: a late completion lands safely.
+  auto* f = new XrdCl::File();
+  auto* h = new StrictOpenHandler();
+  auto* hs = new TimedAnswer();
+  auto* hr = new TimedAnswer();
+  auto* buf = new std::vector<char>(300);
+  struct FromCallback : XrdCl::ResponseHandler {
+    XrdCl::File* f;
+    TimedAnswer* hs;
+    TimedAnswer* hr;
+    std::vector<char>* buf;
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    bool mainThread = false;
+    std::thread::id main;
+    long long statCallMs = -1, readCallMs = -1;
+    std::string statRet, readRet;
+    void HandleResponseWithHosts(XrdCl::XRootDStatus* status, XrdCl::AnyObject* response,
+                                 XrdCl::HostList* hostList) override {
+      delete status;
+      delete response;
+      delete hostList;
+      const auto t1 = std::chrono::steady_clock::now();
+      const XrdCl::XRootDStatus ss = f->Stat(false, hs, 60);
+      const auto t2 = std::chrono::steady_clock::now();
+      const XrdCl::XRootDStatus rs = f->Read(0, 300, buf->data(), hr, 60);
+      const auto t3 = std::chrono::steady_clock::now();
+      std::lock_guard<std::mutex> g(mu);
+      mainThread = std::this_thread::get_id() == main;
+      statCallMs = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+      readCallMs = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+      statRet = ss.ToString();
+      readRet = rs.ToString();
+      if (!ss.IsOK())
+        hs->HandleResponseWithHosts(new XrdCl::XRootDStatus(ss), nullptr, new XrdCl::HostList());
+      if (!rs.IsOK())
+        hr->HandleResponseWithHosts(new XrdCl::XRootDStatus(rs), nullptr, new XrdCl::HostList());
+      done = true;
+      cv.notify_all();
+    }
+  };
+  auto* cb = new FromCallback();
+  cb->f = f;
+  cb->hs = hs;
+  cb->hr = hr;
+  cb->buf = buf;
+  cb->main = std::this_thread::get_id();
+  const auto t0 = std::chrono::steady_clock::now();
+  const XrdCl::XRootDStatus st = f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h);
+  std::this_thread::sleep_until(t0 + std::chrono::milliseconds(1500));
+  const XrdCl::XRootDStatus os = other->Stat(true, cb, 60);
+  bool cbDone = false;
+  {
+    std::unique_lock<std::mutex> l(cb->mu);
+    cbDone = os.IsOK() && cb->cv.wait_for(l, std::chrono::seconds(200), [&] { return cb->done; });
+  }
+  const bool openOk = h->succeededWithin(std::chrono::seconds(120));
+  const auto openAt = std::chrono::steady_clock::now(); // no earlier than the open's answer
+  hs->waitFor(std::chrono::seconds(120));
+  hr->waitFor(std::chrono::seconds(120));
+  std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a second completion
+  auto ms = [&](std::chrono::steady_clock::time_point t) {
+    return static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(t - t0).count());
+  };
+  std::lock_guard<std::mutex> gs(hs->mu);
+  std::lock_guard<std::mutex> gr(hr->mu);
+  std::lock_guard<std::mutex> gc(cb->mu);
+  const long long statAt = hs->completions ? ms(hs->at) : -1;
+  const long long readAt = hr->completions ? ms(hr->at) : -1;
+  const bool exact = hr->ok && hr->size == 300 && *buf == ref;
+  std::printf("%s: the open: Open() %s, %s, %d completion(s), waited for until %lld ms; from the "
+              "other file's callback (%s thread): Stat() returned %s in %lld ms, Read() returned "
+              "%s in %lld ms; the Stat answered %s at %lld ms (%d completion(s), size %llu); the "
+              "Read answered %s at %lld ms (%d completion(s), %s)\n",
+              mode, st.ToString().c_str(), openOk ? "succeeded" : "failed", h->count(),
+              ms(openAt), cb->mainThread ? "the main" : "a client", cb->statRet.c_str(),
+              cb->statCallMs, cb->readRet.c_str(), cb->readCallMs, hs->ok ? "ok" : "in error",
+              statAt, hs->completions, static_cast<unsigned long long>(hs->size),
+              hr->ok ? "ok" : "in error", readAt, hr->completions,
+              exact ? "the file's 300 bytes" : "not the file's bytes");
+  const bool returnedAtOnce =
+      cbDone && cb->statCallMs >= 0 && cb->statCallMs < 1000 && cb->readCallMs < 1000;
+  std::printf("CALLS %s\n", returnedAtOnce ? "at-once" : "held");
+  const bool good = st.IsOK() && openOk && h->exactlyOne() && cbDone && !cb->mainThread &&
+                    returnedAtOnce && hs->completions == 1 && hs->contract && hs->ok &&
+                    hs->size == static_cast<uint64_t>(sb.st_size) && statAt >= 4500 &&
+                    hr->completions == 1 && hr->contract && exact && readAt >= 4500;
+  std::printf(good ? "%s: clean\n" : "%s: FAIL\n", mode);
+  return good ? 0 : 1;
+}
+
 // open-failover N: N opens, one after another, each with its own handler,
 // through a redirector where a server refuses the file (the gate's fault):
 // every open must get exactly one completion, a success, with a host list,
@@ -2125,7 +2298,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: %s <root-url> <local-path> [ops] [threads] [seed] "
                  "[fuzz|inner-race|inner-race-relay|open-refused|open-property|open-property-race|"
-                 "open-stat-during-checks [cut]|"
+                 "open-stat-during-checks [cut]|open-park-from-callback|"
                  "open-failover|open-denied|"
                  "key-check <off> <len>|read-failover <case>]\n",
                  argv[0]);
@@ -2148,6 +2321,8 @@ int main(int argc, char** argv) {
     return runOpenPropertyRace(url);
   if (mode == "open-stat-during-checks")
     return runOpenStatDuringChecks(url, argv[2], argc > 7 && std::string(argv[7]) == "cut");
+  if (mode == "open-park-from-callback")
+    return runOpenParkFromCallback(url, argv[2]);
   if (mode == "open-failover")
     return runOpenFailover(url, argv[2], argc > 3 ? ::atoi(argv[3]) : 12);
   if (mode == "open-denied")

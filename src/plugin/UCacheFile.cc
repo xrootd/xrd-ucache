@@ -297,7 +297,66 @@ XRootDStatus waited(const std::shared_ptr<HandleState>& st, bool passthrough,
 }
 } // namespace
 
+namespace {
+// The handler a request parked for the reader's open (HandleState::openWaiters) is made again
+// with: an answer given while the request is still inside the plugin object is held and handed on
+// once it has left (settle), so that a reader's handler that deletes its file (and with it the
+// plugin object, whose destructor waits for the requests made again inside it) never waits for
+// itself; a later answer is handed on as it comes. Forwards exactly one completion, through
+// HandleResponseWithHosts with a non-null host list, then deletes itself.
+class DeferredAnswer : public ResponseHandler {
+ public:
+  explicit DeferredAnswer(ResponseHandler* real) : real_(real) {}
+  void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
+                               HostList* hostList) override {
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      if (inCall_) {
+        s_ = status;
+        r_ = response;
+        h_ = hostList;
+        got_ = true;
+        return;
+      }
+    }
+    real_->HandleResponseWithHosts(status, response, hostList ? hostList : new HostList());
+    delete this;
+  }
+  void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    HandleResponseWithHosts(status, response, nullptr);
+  }
+  // The request has left the plugin object, which returned `s`: an answer held meanwhile is handed
+  // on now; else an error returned means no answer will come, and the reader gets it; else the
+  // answer is handed on when it comes.
+  void settle(const XRootDStatus& s) {
+    std::unique_lock<std::mutex> g(mu_);
+    inCall_ = false;
+    if (got_) {
+      g.unlock();
+      real_->HandleResponseWithHosts(s_, r_, h_ ? h_ : new HostList());
+      delete this;
+    } else if (!s.IsOK()) {
+      g.unlock();
+      real_->HandleResponseWithHosts(new XRootDStatus(s), nullptr, new HostList());
+      delete this;
+    }
+  }
+  ResponseHandler* real() const { return real_; }
+
+ private:
+  ResponseHandler* real_;
+  std::mutex mu_;
+  bool inCall_ = true;
+  bool got_ = false;
+  XRootDStatus* s_ = nullptr;
+  AnyObject* r_ = nullptr;
+  HostList* h_ = nullptr;
+};
+} // namespace
+
 void noteWaitTier(ResponseHandler* h, uint8_t tier) {
+  if (auto* d = dynamic_cast<DeferredAnswer*>(h))
+    h = d->real();
   if (auto* w = dynamic_cast<WaitHandler*>(h))
     w->note(tier);
 }
@@ -397,6 +456,14 @@ Executor& moveExecutor() {
 // answer never waits behind a move that is stalled.
 Executor& deliverExecutor() {
   static Executor* exec = new Executor(2);
+  return *exec;
+}
+// The pool on which the requests parked while a reader's open was in flight (adaptive_federation
+// on) are made again, or answered, once it has answered (releaseOpenWaiters). Making one again may
+// set the handle up, which waits for the cache's disk and may read the file's own records from the
+// origin: not for a client callback thread, nor for the pools above. Built at first use.
+Executor& openWaitExecutor() {
+  static Executor* exec = new Executor(4);
   return *exec;
 }
 // UCACHE_TEST_OFFLINE_HOSTS=host:port,... (inert unless set): the stat an open
@@ -1440,6 +1507,57 @@ static void giveBackCheckProps(HandleState& st, XrdCl::File* f, const std::strin
   }
 }
 
+// The requests parked on `st` while its reader's open was in flight (HandleState::openWaiters),
+// each given its turn on the open-wait pool, never on the thread that answered the open: with
+// `failure` null (the open succeeded) made again through the plugin object while it lives -- the
+// task holds the handle's state, takes the plugin object from it under mu and counts itself in
+// ownerUses, which the plugin's destructor waits for, and the answer is handed on only once the
+// request has left the object (DeferredAnswer) -- else answered with `failure`, or with a closed
+// handle's error when the plugin object is gone. Each request gets exactly one completion, with a
+// non-null host list. Throws nothing: a task that cannot be posted runs here.
+void releaseOpenWaiters(const std::shared_ptr<HandleState>& st,
+                        std::vector<HandleState::OpenWaiter> waiters,
+                        const XRootDStatus* failure) noexcept {
+  for (auto& w : waiters) {
+    std::optional<XRootDStatus> fail;
+    if (failure)
+      fail = *failure;
+    std::function<void()> task = [st, w = std::move(w), fail]() {
+      if (fail) {
+        complete(w.handler, new XRootDStatus(*fail), nullptr);
+        return;
+      }
+      UCacheFile* o = nullptr;
+      {
+        std::lock_guard<std::mutex> g(st->mu);
+        o = st->owner;
+        if (o)
+          ++st->ownerUses;
+      }
+      if (!o) {
+        complete(w.handler,
+                 new XRootDStatus(XrdCl::stError, XrdCl::errInvalidOp, 0,
+                                  "uCache: the file was closed before its open was answered"),
+                 nullptr);
+        return;
+      }
+      auto* d = new DeferredAnswer(w.handler);
+      const XRootDStatus s = w.redo(o, d);
+      {
+        std::lock_guard<std::mutex> g(st->mu);
+        if (--st->ownerUses == 0)
+          st->openCv.notify_all();
+      }
+      d->settle(s);
+    };
+    try {
+      openWaitExecutor().post(task);
+    } catch (...) {
+      task();
+    }
+  }
+}
+
 // ---- The reader's open, retried --------------------------------------------
 // Wraps the reader's open handler to retry an open that failed, each time on a
 // FRESH inner file (a failed open is terminal on the object):
@@ -1565,14 +1683,19 @@ class RetryingOpenHandler : public ResponseHandler {
   // The reader is about to be answered: a request waiting for the open (ensureEntry) may set the
   // handle up now. Before the answer, so that a reader's handler that makes a request at once
   // never waits for itself.
-  void answered() noexcept {
+  // The requests parked meanwhile (HandleState::openWaiters) are made again once the open
+  // succeeded (`failure` null), or answered with the open's error.
+  void answered(const XRootDStatus* failure = nullptr) noexcept {
     if (!seq_)
       return;
+    std::vector<HandleState::OpenWaiter> waiters;
     {
       std::lock_guard<std::mutex> g(st_->mu);
       st_->readerOpenPending = false;
+      waiters.swap(st_->openWaiters);
     }
     st_->openCv.notify_all();
+    releaseOpenWaiters(st_, std::move(waiters), failure);
   }
 
   // The checks made at open: the open succeeded at a copy of a file named *.root, and before the
@@ -1989,7 +2112,7 @@ class RetryingOpenHandler : public ResponseHandler {
     // The hosts of the last attempt that went through any, else a non-null
     // empty HostList: the native completion contract (see complete()).
     HostList* hosts = lastHosts_ ? lastHosts_.release() : new HostList();
-    answered();
+    answered(&out);
     real_->HandleResponseWithHosts(new XRootDStatus(out), nullptr, hosts);
     delete this;
   }
@@ -3689,6 +3812,8 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   headerReading = false; // so is the header read of an open: its end never comes here
   readerOpenPending = false; // and the open itself: its answer never comes here
   new (&openCv) std::condition_variable;
+  new (&openWaiters) std::vector<OpenWaiter>; // the parent's requests: left behind, never answered here
+  ownerUses = 0; // made again on the parent's pool, which never runs here
   parkedReads = 0;
   new (&moveWaiters) std::vector<MoveWaiter>;
   new (&source) SiteFailure; // written under mu by callback threads: a fork may have caught them mid-write
@@ -4498,11 +4623,22 @@ UCacheFile::UCacheFile() : st_(std::make_shared<HandleState>()) {
     st_->innerOwned = std::make_unique<XrdCl::File>(false);
     st_->inner = st_->innerOwned.get();
     st_->innerValid = true;
+    st_->owner = this; // for the requests parked while the reader's open is in flight
   }
 }
 
 UCacheFile::~UCacheFile() {
   st_->syncFork(); // a handle a forked child inherited starts over first
+  // No parked request is made again through this object from now on: those still parked are
+  // answered with a closed handle's error, and one being made again now is waited for.
+  std::vector<HandleState::OpenWaiter> waiters;
+  {
+    std::unique_lock<std::mutex> g(st_->mu);
+    st_->owner = nullptr;
+    waiters.swap(st_->openWaiters);
+    st_->openCv.wait(g, [this] { return st_->ownerUses == 0; });
+  }
+  releaseOpenWaiters(st_, std::move(waiters), nullptr);
   // Drain outstanding page persists so a short-lived process still leaves a
   // fully populated cache (Close normally does this; the dtor covers the
   // no-explicit-Close path). Not on any read's latency path.
@@ -4943,8 +5079,10 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
       return (st_->closed || st_->tripped) ? nullptr : st_->entry;
     // With adaptive_federation on, a request made while the reader's open is in flight waits for
     // its answer: the File may be open at a copy the checks made at open have yet to judge, or have
-    // refused, and neither the entry nor the reader may be given its size. Bounded: the open's
-    // attempts end within its budget (a wait that ends at the bound sets the handle up as it is).
+    // refused, and neither the entry nor the reader may be given its size. A request made with a
+    // handler was parked instead (parkForOpen) and comes here only after the answer; this wait is
+    // left to a call made without one. Bounded: the open's attempts end within its budget (a wait
+    // that ends at the bound sets the handle up as it is).
     if (st_->readerOpenPending)
       st_->openCv.wait_for(g, std::chrono::seconds(kFailoverMaxS + 120),
                            [&] { return !st_->readerOpenPending || st_->closed; });
@@ -5207,14 +5345,21 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
   std::shared_ptr<FileEntry> e;
   std::shared_ptr<ColdFill> cold;
   std::unique_ptr<HandleState::OpenBytes> openBytes; // never stored now: let go without the lock
+  std::vector<HandleState::OpenWaiter> waiters;
   {
     std::lock_guard<std::mutex> g(st_->mu);
     st_->closed = true;
     e.swap(st_->entry);
     cold.swap(st_->cold);
     openBytes = std::move(st_->openBytes);
+    waiters.swap(st_->openWaiters);
   }
   st_->openCv.notify_all(); // a request waiting for the reader's open (ensureEntry) stops waiting
+  if (!waiters.empty()) { // and one parked for it is answered: the file was closed first
+    const XRootDStatus closedFirst(XrdCl::stError, XrdCl::errInvalidOp, 0,
+                                   "uCache: the file was closed before its open was answered");
+    releaseOpenWaiters(st_, std::move(waiters), &closedFirst);
+  }
 #ifdef UCACHE_HAVE_COLDRUN
   coldDetach(cold); // the process's last handle on the file commits what it converted
 #endif
@@ -5260,6 +5405,11 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
 XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
                                      ucache::XrdTimeout timeout) {
   st_->syncFork();
+  // Made while the reader's open is in flight (adaptive_federation on): parked until its answer.
+  if (parkForOpen(handler, [force, timeout](UCacheFile* o, ResponseHandler* h) {
+        return o->Stat(force, h, timeout);
+      }))
+    return XRootDStatus();
   st_->opsSeen.store(true, std::memory_order_relaxed); // a reader that stats first is no copy by read
   struct SizeShown { // every answer below gives a relocated handle's shown size
     UCacheFile* f;
@@ -5355,6 +5505,11 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
 XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* buffer,
                                           ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
+  // Made while the reader's open is in flight (adaptive_federation on): parked until its answer.
+  if (parkForOpen(handler, [offset, size, buffer, timeout](UCacheFile* o, ResponseHandler* h) {
+        return o->readServe(offset, size, buffer, h, timeout);
+      }))
+    return XRootDStatus();
   const std::pair<uint64_t, uint64_t> req{offset, size};
   auto entry = ensureEntry(st_->opsSeen.exchange(true) ? nullptr : &req);
   if (!entry && st_->layoutLost.load(std::memory_order_acquire))
@@ -5543,6 +5698,11 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
 XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void* buffer,
                                             ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
+  // Made while the reader's open is in flight (adaptive_federation on): parked until its answer.
+  if (parkForOpen(handler, [offset, size, buffer, timeout](UCacheFile* o, ResponseHandler* h) {
+        return o->pgReadServe(offset, size, buffer, h, timeout);
+      }))
+    return XRootDStatus();
   const std::pair<uint64_t, uint64_t> req{offset, size};
   auto entry = ensureEntry(st_->opsSeen.exchange(true) ? nullptr : &req);
   if (!entry && st_->layoutLost.load(std::memory_order_acquire))
@@ -5767,6 +5927,11 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
                                                 ResponseHandler* handler,
                                                 ucache::XrdTimeout timeout) {
   st_->syncFork();
+  // Made while the reader's open is in flight (adaptive_federation on): parked until its answer.
+  if (parkForOpen(handler, [chunks, buffer, timeout](UCacheFile* o, ResponseHandler* h) {
+        return o->vectorReadServe(chunks, buffer, h, timeout);
+      }))
+    return XRootDStatus();
   st_->opsSeen.store(true, std::memory_order_relaxed);
   auto entry = ensureEntry();
   if (!entry && st_->layoutLost.load(std::memory_order_acquire))
@@ -5900,6 +6065,18 @@ XrdCl::XRootDStatus UCacheFile::Truncate(uint64_t size, ResponseHandler* handler
   st_->syncFork();
   invalidateOnWrite();
   return st_->inner.load()->Truncate(size, handler, timeout);
+}
+
+bool UCacheFile::parkForOpen(
+    ResponseHandler* handler,
+    std::function<XRootDStatus(UCacheFile*, ResponseHandler*)> redo) {
+  if (!handler || passthroughOnly_ || !st_->store)
+    return false;
+  std::lock_guard<std::mutex> g(st_->mu);
+  if (!st_->readerOpenPending || st_->setupDone || st_->closed)
+    return false;
+  st_->openWaiters.push_back(HandleState::OpenWaiter{handler, std::move(redo)});
+  return true;
 }
 
 // With adaptive_federation on, a handle trusted at Open that has not been set up yet is set up

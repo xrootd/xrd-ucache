@@ -52,7 +52,8 @@
 #                          the reader makes while the checks run waits for the open's answer before
 #                          the handle is set up (with every copy cut, it is never answered the cut
 #                          size); what the checks read is stored in the entry, also when that set-up
-#                          is made to wait
+#                          is made to wait. A Stat and a Read made then from another file's callback
+#                          return at once and are answered after the open
 #   zeros at the size      one server holds as many zero bytes as the file has (a, b and c in
 #                          turn), the other two the file: the copy of zeros does not begin as a
 #                          ROOT file does and is refused; the open goes on to a whole copy
@@ -490,6 +491,22 @@ NC=$(records "$W/c25c" | grep -c '"size":'"$CUT")
 grep -qE 'MsgHandler created.*kXR_read \(handle: 0x[0-9a-f]*, offset: 0, size: 300\)' "$W/f25c.log" && [ "$NC" -ge 1 ] &&
   records "$W/c25c" | tail -1 | grep -q '"outcome":"error"'
 verdict "every copy cut: the checks' first read was the late one, the open's copies reported the cut size ($NC records), and the open ended in error (the fault was in place)" $?
+# A Stat and a Read made, asynchronously, from inside the callback of another file's request (on the client's own
+# thread) while the checks at open run (their first read sent 5 s late): each call returns at once, never holding the
+# client's thread, which the open's own checks may need, and each is answered once, after the open answered: the
+# file's size, and the file's first 300 bytes.
+L=/store/ci/park-from-callback.root
+placew $L a b c
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay)
+res=$(fuzz "$W/c25p" "$W/f25p.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-park-from-callback)
+echo "$res" | sed 's/^/    /' | cut -c1-600
+echo "$res" | grep -q '^CALLS at-once$'
+verdict "a Stat and a Read made from another file's callback while the checks at open run return at once (the client's thread is not held)" $?
+echo "$res" | grep -q '^open-park-from-callback: clean$'
+verdict "the Stat and the Read made from the callback are answered once each, after the open: the file's size and its first 300 bytes" $?
+grep -qE 'MsgHandler created.*kXR_read \(handle: 0x[0-9a-f]*, offset: 0, size: 300\)' "$W/f25p.log" &&
+  [ "$(records "$W/c25p" | wc -l)" = 1 ] && records "$W/c25p" | grep -q '"status":"ok"'
+verdict "the checks' first read was the late one, and the open succeeded at its first attempt (the fault was in place)" $?
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on) # the cases below have no header fault
 
 echo; echo "=== a copy that is zeros at the file's size is refused"
