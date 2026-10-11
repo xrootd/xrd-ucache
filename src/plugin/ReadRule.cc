@@ -7,9 +7,12 @@
 #include "TreeMeta.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <deque>
 #include <iterator>
 #include <new>
+#include <thread>
 #include <unordered_map>
 
 namespace ucache {
@@ -137,6 +140,14 @@ keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEn
   if (!fm) {
     t->parsing = true;
     g.unlock();
+    // Test hook: the parse held this long before its first read, so that another handle's miss
+    // is answered while it runs (that answer waits for the map, keySeeksBuilt).
+    static const long holdMs = [] {
+      const char* v = std::getenv("UCACHE_TEST_KEYMAP_DELAY_MS");
+      return v ? std::strtol(v, nullptr, 10) : 0L;
+    }();
+    if (holdMs > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
     src.st = st;
     src.entry = entry;
     src.timeout = timeout;
