@@ -138,7 +138,16 @@
 #                          data changed: ROOT finds no tree), damaged on the server the handle landed on after
 #                          the open: with the switch on the read is refused there and made again at another
 #                          site, exactly, once, for a Read and a VectorRead; with it off the read fails its
-#                          check and is not moved; each failure's text says which
+#                          check and is not moved; each failure's text says which. A tree's record that
+#                          fails its own check is held against the reads of that tree's own parts only: in a
+#                          file of two trees, a read of the other tree's baskets at that copy is exact and
+#                          stays there, a read of the damaged record moves
+#   block checksum         a basket whose compressed data fails its own checksum (one byte changed inside a
+#                          ZLIB basket's data, its key intact), on the server the handle landed on after the
+#                          open: with the switch on the read is refused there and made again at another site,
+#                          exactly, once, for a Read, a VectorRead and a PgRead (which the cache relays to the
+#                          origin), and the entry holding the copy's bytes is dropped; with it off the read
+#                          fails its check and is not moved
 #   lost trust, open fails a handle opened trusting its cache entry (a freshness window) whose entry is
 #                          gone by its first read, and whose own open then fails at every copy (each
 #                          refuses the file): a Read and a PgRead each fail with that open's error,
@@ -968,7 +977,10 @@ verdict "len, switch off: one failed read whose warning says \"$why\", no open o
 # whole copies on b and c; the handle lands on a. The map made from a's record shows a bad: the read fails its check
 # there, the move's open (sent back to a, which a read found bad) asks the regional for its list with refresh, and the
 # read is exact at b or c.
-ZREXTRA=(UCACHE_FAULT_AT=11296 UCACHE_FAULT_LEN=1)
+# The read is of the record itself (11210, 717 bytes): a map that shows its copy bad refuses only the reads of
+# the damaged tree's own parts (a read of a basket of the tree, which ROOT reaches only through the record, or
+# of another tree, makes no claim; below).
+ZREXTRA=(UCACHE_FAULT_AT=11296 UCACHE_FAULT_LEN=1 UCACHE_READ_AT=11210 UCACHE_READ_LEN=717)
 why="the tree's record fails its own check"
 for c in rec recv; do
   L=/store/ci/zr-$c.root; placefix $L a
@@ -987,6 +999,67 @@ zr recerr $L off
 clean_zr recerr; verdict "rec, switch off: the read fails its check, once, and is never served" $?
 [ "$F14" = 1 ] && [ "$NRA" = 0 ] && [ "$(failtext "$why")" = 1 ]
 verdict "rec, switch off: one failed read whose warning says \"$why\", no open of route read ($F14, $NRA)" $?
+ZREXTRA=()
+
+echo; echo "=== a basket whose compressed data fails its own checksum: the read moves"
+# The block checksum (the check on): the fixture's Jet_pt basket at 4915 (2481 bytes, ZLIB, its key 75 bytes) with
+# one byte of its compressed data changed, at 5999 (157 made 141), its key intact, on the server the handle
+# landed on, after the open (ROOT fails to decompress it: its adler32 does not hold).
+cat > "$W/blk.sh" <<BLKSH
+#!/bin/sh
+case \$1 in $AX) s=a ;; $BX) s=b ;; $CX) s=c ;; *) exit 1 ;; esac
+printf '\215' | dd of="$W/data/\$s\$ZERO_LFN" bs=1 seek=5999 conv=notrunc status=none
+BLKSH
+chmod 755 "$W/blk.sh"
+ZREXTRA=(UCACHE_FAULT_AT=5999 UCACHE_FAULT_LEN=1)
+why="its data fails its own check: zlib block failed its check or did not decode"
+for c in blk blkv blkpg; do
+  L=/store/ci/zr-$c.root; placefix $L a b c
+  zr $c $L on land "$W/blk.sh"
+  clean_zr $c; verdict "$c: the basket whose data fails its checksum is refused and read exactly at another server, once (${SV[*]})" $?
+  [ "$F14" = 1 ] && [ "${FL[0]:-x}" = "${SV[0]}" ] && [ "$(failtext "$why")" = 1 ]
+  verdict "$c: one failed read with code 14, at the server the handle landed on, its warning saying \"$why\" (${FL[*]})" $?
+  [ "${#MV[@]}" -ge 1 ] && [ "${MV[-1]}" = "${SV[1]}" ]; verdict "$c: a move of route read ended at the server the bytes came from (${MV[*]})" $?
+  ND=$(counter "$RFC" bad_entries_dropped); [ "$ND" = 1 ] && [ -z "$(find "$RFC/objects" -name '*.meta' 2>/dev/null)" ]
+  verdict "$c: the entry, which holds bytes of the damaged copy (the checks' at open), is dropped (bad_entries_dropped $ND, no sidecar left)" $?
+  NP=$(counter "$RFC" origin_checks_passed); [ "${NP:-0}" -ge 1 ]
+  verdict "$c: baskets whose checksum held are counted (origin_checks_passed ${NP:-0})" $?
+done
+L=/store/ci/zr-blk-off.root; placefix $L a b c
+zr blkerr $L off land "$W/blk.sh"
+clean_zr blkerr; verdict "blk, switch off: the read fails its check, once, and is never served" $?
+[ "$F14" = 1 ] && [ "$NRA" = 0 ] && [ "$(failtext "$why")" = 1 ]
+verdict "blk, switch off: one failed read whose warning says \"$why\", no open of route read ($F14, $NRA)" $?
+ZREXTRA=()
+
+echo; echo "=== a tree's record that fails its own check concerns that tree only: a read of another tree stays"
+# tests/data/two_trees_fixture.root: Events (its record at 9094, 694 bytes, ZLIB, its label 46 bytes) and Runs (its
+# baskets at 4627, 82 and 104 bytes, on a page the checks at open do not keep). Events' record with one byte of its
+# compressed data changed, at 9449 (156 made 140), on a, before the open; whole copies on b and c; the handle lands
+# on a (as the rec cases above). A read of Runs' baskets is exact at a, with no failed read and no move (ROOT reads
+# Runs from that copy); a read of Events' record is refused there and read exactly at another server.
+FIXONE=$FIX
+FIX="$HERE/../data/two_trees_fixture.root"
+for c in stay rec2; do
+  L=/store/ci/zr-two-$c.root; placefix $L a
+  RL=$(xfs 127.0.0.1:$RX locate "$L" 2>&1 | tr '\n' ' ')
+  printf '\214' | dd of="$W/data/a$L" bs=1 seek=9449 conv=notrunc status=none
+  placefix $L b c
+  if [ $c = stay ]; then
+    ZREXTRA=(UCACHE_FAULT_AT=9449 UCACHE_FAULT_LEN=1 UCACHE_READ_AT=4627 UCACHE_READ_LEN=186)
+    zr stay $L on landref /bin/true
+    clean_zr stay; verdict "two trees: a read of Runs' baskets at a, whose Events record fails its check, is exact and stays at a (${SV[*]})" $?
+    [ "$F14" = 0 ] && [ "${SV[0]:-}" = "$AX" ] && [ "${#MV[@]}" = 0 ]
+    verdict "two trees: the handle landed on a (the regional listed $RL), no failed read, no move ($F14 failed, ${#MV[@]} moves)" $?
+  else
+    ZREXTRA=(UCACHE_FAULT_AT=9449 UCACHE_FAULT_LEN=1 UCACHE_READ_AT=9094 UCACHE_READ_LEN=694)
+    zr rec $L on landref /bin/true
+    clean_zr rec; verdict "two trees: a read of Events' record at a is refused and read exactly at another server (${SV[*]})" $?
+    [ "$F14" = 1 ] && [ "${FL[0]:-x}" = "$AX" ] && [ "$(failtext "the tree's record fails its own check")" = 1 ]
+    verdict "two trees: one failed read with code 14 at a, the record's failure (${FL[*]})" $?
+  fi
+done
+FIX=$FIXONE
 ZREXTRA=()
 
 echo; echo "=== a copy cut short after the open: a read inside the file's size is answered short"

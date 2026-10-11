@@ -6,6 +6,7 @@
 #include "Log.h"
 #include "OriginInFlight.h"
 #include "ReadRounding.h"
+#include "ReadRule.h"
 #include "Trace.h"
 #include "TreeMeta.h"
 #include "UCacheFile.h"
@@ -728,6 +729,17 @@ struct Shard {
       const std::string server = (stats_ && stats_->tracer) || globalConfig().checkOriginIntegrity
                                      ? answeredBy(*st_, hosts)
                                      : std::string();
+      // check_origin_integrity: the file's map, taken before the handle is let go of.
+      std::shared_ptr<const KeyMap> map;
+      const bool check = globalConfig().checkOriginIntegrity;
+      if (check) {
+        {
+          std::lock_guard<std::mutex> g(st_->mu);
+          map = st_->keySeeks;
+        }
+        if (!map)
+          map = keySeeksBuilt(entry_, nullptr).map;
+      }
       st_->releaseInner();
       st_.reset();
       inflight_.release();
@@ -744,6 +756,55 @@ struct Shard {
         delete this;
         return;
       }
+      // check_origin_integrity: what read-ahead fetched is checked as a miss's fetch is (each
+      // basket's key, its data's own checksum) before anything of it is staged; decoding runs on
+      // the executor, not on this (the client's) thread. Nothing of a read in which a basket fails,
+      // or of one made while the file's map is not known, is staged: the reader's own read of
+      // those bytes then misses and is checked (and moves) as any miss.
+      if (check) {
+        if (!map) {
+          delete this;
+          return;
+        }
+        std::vector<FetchPiece> pieces;
+        for (const auto& e : elems_)
+          pieces.push_back(FetchPiece{e.off, e.buf->data(), e.len});
+        if (fetchNeedsWork(*map, server, pieces)) {
+          try {
+            Executor::instance().post(
+                [this, map, server, wire] { checkThenStage(*map, server, wire); });
+            return;
+          } catch (...) {
+            // could not be posted: checked here
+          }
+        }
+        checkThenStage(*map, server, wire);
+        return;
+      }
+      stage(server, wire);
+    }
+
+   private:
+    void checkThenStage(const KeyMap& map, const std::string& server, uint64_t wire) {
+      std::vector<FetchPiece> pieces;
+      for (const auto& e : elems_)
+        pieces.push_back(FetchPiece{e.off, e.buf->data(), e.len});
+      const transpose::FetchVerdict v = fetchVerdict(map, server, std::move(pieces));
+      if (stats_) {
+        stats_->originChecksPassed.fetch_add(v.passed, std::memory_order_relaxed);
+        stats_->originChecksNone.fetch_add(v.none, std::memory_order_relaxed);
+        stats_->originChecksFailed.fetch_add(v.faults.size(), std::memory_order_relaxed);
+      }
+      if (!v.faults.empty()) {
+        UCACHE_DEBUG("read-ahead of %s from %s: %zu basket(s) failed their check; nothing staged",
+                     entry_->key().key.c_str(), server.c_str(), v.faults.size());
+        delete this;
+        return;
+      }
+      stage(server, wire);
+    }
+    void stage(const std::string& server, uint64_t wire) {
+      Stats* stats = stats_;
       uint64_t late = 0, dropped = 0, staged = 0;
       for (auto& e : elems_) {
         for (const auto& r : e.stage) {
@@ -788,7 +849,6 @@ struct Shard {
       delete this;
     }
 
-   private:
     std::shared_ptr<HandleState> st_;
     std::shared_ptr<FileEntry> entry_;
     std::shared_ptr<PrefetchHandle> h_;

@@ -310,6 +310,55 @@ MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks, uint64_t spa
   return firstMisplacedKey(seeks, std::vector<int32_t>(), spanOff, bytes, n, lo, hi);
 }
 
+namespace {
+// One basket's key header at `at` of the fetched bytes `p` (`n` of them), for the basket the map
+// places at `seek` with length `want` (0: none known; `withLength`: the map gives lengths).
+enum class KeyVerdict : uint8_t { kCut, kOk, kPosition, kLength };
+KeyVerdict judgeKey(const uint8_t* p, uint64_t n, uint64_t at, uint64_t seek, int32_t want,
+                    bool withLength) {
+  // The key's version (bytes 4-5) says how wide fSeekKey (from byte 18) is,
+  // read as TKey reads it: a signed version above 1000 is 64-bit, and a
+  // 32-bit fSeekKey is unsigned. A version whose top bit is set is negative,
+  // so ROOT reads that key as 32-bit, and so does this check.
+  if (n - at < 6)
+    return KeyVerdict::kCut;
+  const bool wide = beGet<int16_t>(p + at + 4) > 1000;
+  if (n - at < (wide ? 26u : 22u))
+    return KeyVerdict::kCut;
+  const int64_t key = wide ? beGet<int64_t>(p + at + 18) : int64_t{beGet<uint32_t>(p + at + 18)};
+  if (key != static_cast<int64_t>(seek))
+    return KeyVerdict::kPosition;
+  if (!withLength)
+    return KeyVerdict::kOk;
+  // The key's own fields, read as TKey::ReadKeyBuffer reads them (fNbytes and fObjlen signed
+  // 32-bit, fKeylen signed 16-bit), against the map's length of the basket.
+  const int32_t nbytes = beGet<int32_t>(p + at);
+  const int32_t objlen = beGet<int32_t>(p + at + 6);
+  const int16_t keylen = beGet<int16_t>(p + at + 14);
+  // ROOT reads the basket by the map's length and decides from the key's own fields whether
+  // it is compressed (TBasket::ReadBasketBuffers: fObjlen > fNbytes - fKeylen). A key length
+  // that differs from the map's is held against the copy only where that decision differs
+  // from the one the map's length gives: there ROOT takes compressed bytes for the entries
+  // (wrong values, no error) or fails to decompress stored ones. Elsewhere ROOT reads the
+  // basket correctly, and no claim is made.
+  // The key's own fields: ROOT makes a zombie of a key whose length, key length or object
+  // length is negative, and fails to read the basket. A key length of 0 makes it take the
+  // key's own bytes for the data, and one past the map's length makes it read past the bytes
+  // it fetched. A length below the key length, with that length alone damaged, is read
+  // correctly (ROOT reads by the map's length) and makes no claim of its own.
+  const bool byKey = int64_t{objlen} > int64_t{nbytes} - keylen;
+  const bool byMap = int64_t{objlen} > int64_t{want} - keylen;
+  if ((want > 0 && nbytes != want && byKey != byMap) || keylen <= 0 ||
+      (want > 0 && keylen > want) || nbytes < 0 || objlen < 0)
+    return KeyVerdict::kLength;
+  return KeyVerdict::kOk;
+}
+
+bool overlaps(uint64_t a, uint64_t b, uint64_t lo, uint64_t hi) {
+  return a < hi && lo < b;
+}
+} // namespace
+
 MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks,
                                 const std::vector<int32_t>& lengths, uint64_t spanOff,
                                 const void* bytes, uint64_t n, uint64_t lo, uint64_t hi) {
@@ -318,51 +367,273 @@ MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks,
   MisplacedKeys m;
   for (auto it = std::lower_bound(seeks.begin(), seeks.end(), spanOff);
        it != seeks.end() && *it - spanOff < n; ++it) {
-    // The key's version (bytes 4-5) says how wide fSeekKey (from byte 18) is,
-    // read as TKey reads it: a signed version above 1000 is 64-bit, and a
-    // 32-bit fSeekKey is unsigned. A version whose top bit is set is negative,
-    // so ROOT reads that key as 32-bit, and so does this check.
     // Seeks only grow from here, so once a header no longer fits none will.
-    const uint64_t at = *it - spanOff;
-    if (n - at < 6)
+    const size_t i = static_cast<size_t>(it - seeks.begin());
+    const KeyVerdict v =
+        judgeKey(p, n, *it - spanOff, *it, withLengths ? lengths[i] : 0, withLengths);
+    if (v == KeyVerdict::kCut)
       break;
-    const bool wide = beGet<int16_t>(p + at + 4) > 1000;
-    if (n - at < (wide ? 26u : 22u))
-      break;
-    const int64_t key = wide ? beGet<int64_t>(p + at + 18) : int64_t{beGet<uint32_t>(p + at + 18)};
-    bool fails = key != static_cast<int64_t>(*it);
-    bool byLength = false;
-    if (!fails && withLengths) {
-      // The key's own fields, read as TKey::ReadKeyBuffer reads them (fNbytes and fObjlen signed
-      // 32-bit, fKeylen signed 16-bit), against the map's length of the basket.
-      const int32_t want = lengths[static_cast<size_t>(it - seeks.begin())];
-      const int32_t nbytes = beGet<int32_t>(p + at);
-      const int32_t objlen = beGet<int32_t>(p + at + 6);
-      const int16_t keylen = beGet<int16_t>(p + at + 14);
-      // ROOT reads the basket by the map's length and decides from the key's own fields whether
-      // it is compressed (TBasket::ReadBasketBuffers: fObjlen > fNbytes - fKeylen). A key length
-      // that differs from the map's is held against the copy only where that decision differs
-      // from the one the map's length gives: there ROOT takes compressed bytes for the entries
-      // (wrong values, no error) or fails to decompress stored ones. Elsewhere ROOT reads the
-      // basket correctly, and no claim is made.
-      const bool byKey = int64_t{objlen} > int64_t{nbytes} - keylen;
-      const bool byMap = int64_t{objlen} > int64_t{want} - keylen;
-      byLength = (want > 0 && nbytes != want && byKey != byMap) || keylen <= 0 || keylen > nbytes ||
-                 objlen < 0;
-      fails = byLength;
-    }
-    if (!fails)
+    if (v == KeyVerdict::kOk)
       continue;
     if (*it >= lo && *it < hi) {
       if (m.count++ == 0) {
         m.first = *it;
-        m.length = byLength;
+        m.length = v == KeyVerdict::kLength;
       }
     } else {
       m.outside = true;
     }
   }
   return m;
+}
+
+namespace {
+// Whether a basket's data, `pay` (`n` bytes, its first block's header first), opens a block whose
+// own checksum can be verified: zlib (adler32), LZMA (the xz stream's check), LZ4 (when this build
+// has lz4; its XXH64), ZSTD only with a content checksum. A tag ROOT does not know is judged too
+// (ROOT fails on it, and the decoder says so without decoding). Stored data, ZSTD without a
+// checksum and ROOT's old algorithm carry none.
+enum class DataCheck : uint8_t { kNone, kDecode };
+DataCheck dataCheckOf(const uint8_t* pay, uint64_t n) {
+  if (n < 9)
+    return DataCheck::kDecode; // no block header: the decoder fails it at once
+  const uint8_t a = pay[0], b = pay[1];
+  if ((a == 'Z' && b == 'L') || (a == 'X' && b == 'Z'))
+    return DataCheck::kDecode;
+  if (a == 'L' && b == '4') {
+#ifdef UCACHE_HAVE_LZ4
+    return DataCheck::kDecode;
+#else
+    return DataCheck::kNone;
+#endif
+  }
+  if (a == 'Z' && b == 'S')
+    return n >= 14 && (pay[13] & 0x04) ? DataCheck::kDecode : DataCheck::kNone;
+  if (a == 'C' && b == 'S')
+    return DataCheck::kNone;
+  return DataCheck::kDecode;
+}
+
+// The basket at `at` (map length `want`, its key passed) wholly in the fetched bytes: whether ROOT
+// decompresses it (fObjlen > fNbytes - fKeylen, from the key, as TBasket::ReadBasketBuffers
+// decides), and where its data starts. False when it is stored as it is.
+bool compressedData(const uint8_t* p, uint64_t at, int32_t want, const uint8_t*& pay,
+                    uint64_t& payLen, uint64_t& objlen) {
+  const int32_t nbytes = beGet<int32_t>(p + at);
+  const int32_t obj = beGet<int32_t>(p + at + 6);
+  const int16_t keylen = beGet<int16_t>(p + at + 14);
+  if (int64_t{obj} <= int64_t{nbytes} - keylen)
+    return false;
+  pay = p + at + static_cast<uint64_t>(keylen);
+  payLen = static_cast<uint64_t>(want) - static_cast<uint64_t>(keylen);
+  objlen = static_cast<uint64_t>(obj);
+  return true;
+}
+} // namespace
+
+FetchVerdict checkFetched(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
+                          uint64_t spanOff, const void* bytes, uint64_t n, bool data) {
+  const auto* p = static_cast<const uint8_t*>(bytes);
+  const bool withLengths = lengths.size() == seeks.size();
+  FetchVerdict v;
+  for (auto it = std::lower_bound(seeks.begin(), seeks.end(), spanOff);
+       it != seeks.end() && *it - spanOff < n; ++it) {
+    const size_t i = static_cast<size_t>(it - seeks.begin());
+    const uint64_t at = *it - spanOff;
+    const int32_t want = withLengths ? lengths[i] : 0;
+    const KeyVerdict k = judgeKey(p, n, at, *it, want, withLengths);
+    if (k == KeyVerdict::kCut)
+      break;
+    if (k != KeyVerdict::kOk) {
+      FetchFault f;
+      f.at = *it;
+      f.end = *it + 1;
+      f.kind = k == KeyVerdict::kLength ? FetchFault::kLength : FetchFault::kPosition;
+      v.faults.push_back(std::move(f));
+      continue;
+    }
+    // The basket's data: only one whose length the map gives and that lies wholly in the bytes.
+    if (!data || want <= 0 || static_cast<uint64_t>(want) > n - at)
+      continue;
+    const uint8_t* pay = nullptr;
+    uint64_t payLen = 0, objlen = 0;
+    if (!compressedData(p, at, want, pay, payLen, objlen) ||
+        dataCheckOf(pay, payLen) == DataCheck::kNone) {
+      ++v.none;
+      continue;
+    }
+    const DecodedFrames d = decodeFrames(pay, payLen, objlen);
+    if (d.check == FrameCheck::kPassed) {
+      ++v.passed;
+    } else if (d.check == FrameCheck::kFailed) {
+      FetchFault f;
+      f.at = *it;
+      f.end = *it + static_cast<uint64_t>(want);
+      f.kind = FetchFault::kData;
+      f.why = d.why;
+      v.faults.push_back(std::move(f));
+    } else {
+      ++v.none;
+    }
+  }
+  return v;
+}
+
+bool fetchedDataToCheck(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
+                        uint64_t spanOff, const void* bytes, uint64_t n) {
+  if (lengths.size() != seeks.size())
+    return false;
+  const auto* p = static_cast<const uint8_t*>(bytes);
+  for (auto it = std::lower_bound(seeks.begin(), seeks.end(), spanOff);
+       it != seeks.end() && *it - spanOff < n; ++it) {
+    const size_t i = static_cast<size_t>(it - seeks.begin());
+    const uint64_t at = *it - spanOff;
+    const int32_t want = lengths[i];
+    const KeyVerdict k = judgeKey(p, n, at, *it, want, true);
+    if (k == KeyVerdict::kCut)
+      break;
+    if (k != KeyVerdict::kOk || want <= 0 || static_cast<uint64_t>(want) > n - at)
+      continue;
+    const uint8_t* pay = nullptr;
+    uint64_t payLen = 0, objlen = 0;
+    if (compressedData(p, at, want, pay, payLen, objlen) &&
+        dataCheckOf(pay, payLen) == DataCheck::kDecode)
+      return true;
+  }
+  return false;
+}
+
+namespace {
+// `pieces` in offset order, cut into runs of pieces that follow each other without a gap.
+std::vector<std::vector<BytePiece>> pieceRuns(std::vector<BytePiece> pieces) {
+  std::sort(pieces.begin(), pieces.end(),
+            [](const BytePiece& a, const BytePiece& b) { return a.off < b.off; });
+  std::vector<std::vector<BytePiece>> runs;
+  for (const auto& x : pieces) {
+    if (!x.p || !x.n)
+      continue;
+    if (!runs.empty() && runs.back().back().off + runs.back().back().n == x.off)
+      runs.back().push_back(x);
+    else
+      runs.push_back({x});
+  }
+  return runs;
+}
+} // namespace
+
+FetchVerdict checkPieces(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
+                         std::vector<BytePiece> pieces, bool data,
+                         const std::vector<std::pair<uint64_t, uint64_t>>* damaged,
+                         const std::string& why) {
+  FetchVerdict v;
+  std::vector<char> joined;
+  for (const auto& run : pieceRuns(std::move(pieces))) {
+    const char* p = run.front().p;
+    uint64_t n = run.front().n;
+    if (run.size() > 1) {
+      joined.clear();
+      for (const auto& x : run)
+        joined.insert(joined.end(), x.p, x.p + x.n);
+      p = joined.data();
+      n = joined.size();
+    }
+    const uint64_t off = run.front().off;
+    if (damaged)
+      v.damaged(*damaged, off, n, why);
+    v.merge(checkFetched(seeks, lengths, off, p, n, data));
+  }
+  return v;
+}
+
+bool piecesNeedWork(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
+                    std::vector<BytePiece> pieces) {
+  for (const auto& run : pieceRuns(std::move(pieces)))
+    if (run.size() > 1 ||
+        fetchedDataToCheck(seeks, lengths, run.front().off, run.front().p, run.front().n))
+      return true;
+  return false;
+}
+
+void FetchVerdict::damaged(const std::vector<std::pair<uint64_t, uint64_t>>& spans,
+                           uint64_t spanOff, uint64_t n, const std::string& why) {
+  auto it = std::upper_bound(spans.begin(), spans.end(),
+                             std::pair<uint64_t, uint64_t>(spanOff, ~uint64_t{0}));
+  if (it != spans.begin() && std::prev(it)->second > spanOff)
+    --it;
+  for (; it != spans.end() && it->first < spanOff + n; ++it) {
+    FetchFault f;
+    f.at = std::max(it->first, spanOff);
+    f.end = std::min(it->second, spanOff + n);
+    f.kind = FetchFault::kDamaged;
+    f.why = why;
+    faults.push_back(std::move(f));
+  }
+}
+
+void FetchVerdict::merge(FetchVerdict&& o) {
+  for (auto& f : o.faults)
+    faults.push_back(std::move(f));
+  passed += o.passed;
+  none += o.none;
+}
+
+MisplacedKeys FetchVerdict::against(const std::vector<std::pair<uint64_t, uint64_t>>& reader,
+                                    std::string* why) const {
+  MisplacedKeys m;
+  for (const auto& f : faults) {
+    bool mine = false;
+    uint64_t first = f.at;
+    for (const auto& [lo, hi] : reader) {
+      if (f.kind == FetchFault::kPosition || f.kind == FetchFault::kLength) {
+        mine = f.at >= lo && f.at < hi; // a key that starts in the reader's bytes
+      } else if (overlaps(f.at, f.end, lo, hi)) {
+        mine = true; // a basket's data, or a damaged part, the reader's bytes reach into
+        first = f.kind == FetchFault::kDamaged ? std::max(f.at, lo) : f.at;
+      }
+      if (mine)
+        break;
+    }
+    if (!mine) {
+      m.outside = true;
+      continue;
+    }
+    if (m.count++ == 0) {
+      m.first = first;
+      m.length = f.kind == FetchFault::kLength;
+      if (why)
+        *why = f.kind == FetchFault::kLength    ? "key length differs from the tree's record"
+               : f.kind == FetchFault::kData    ? "its data fails its own check: " + f.why
+               : f.kind == FetchFault::kDamaged ? f.why
+                                                : std::string();
+    }
+  }
+  return m;
+}
+
+MisplacedKeys FetchVerdict::against(uint64_t lo, uint64_t hi, std::string* why) const {
+  return against(std::vector<std::pair<uint64_t, uint64_t>>{{lo, hi}}, why);
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> treeSpans(const FileMeta& fm,
+                                                     const std::vector<uint64_t>& seeks,
+                                                     const std::vector<int32_t>& bytes) {
+  std::vector<std::pair<uint64_t, uint64_t>> all;
+  if (fm.treeKey.nbytes > 0 && fm.treeKey.seekkey > 0)
+    all.emplace_back(static_cast<uint64_t>(fm.treeKey.seekkey),
+                     static_cast<uint64_t>(fm.treeKey.seekkey) +
+                         static_cast<uint64_t>(fm.treeKey.nbytes));
+  for (size_t i = 0; i < seeks.size(); ++i)
+    all.emplace_back(seeks[i],
+                     seeks[i] + (i < bytes.size() && bytes[i] > 0 ? static_cast<uint64_t>(bytes[i])
+                                                                  : uint64_t{1}));
+  std::sort(all.begin(), all.end());
+  std::vector<std::pair<uint64_t, uint64_t>> out;
+  for (const auto& r : all)
+    if (!out.empty() && r.first <= out.back().second)
+      out.back().second = std::max(out.back().second, r.second);
+    else
+      out.push_back(r);
+  return out;
 }
 
 std::string blockCodec(const uint8_t* p, size_t n) {

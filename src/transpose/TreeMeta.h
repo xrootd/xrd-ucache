@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ucache::transpose {
@@ -272,5 +273,75 @@ MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks, uint64_t spa
 MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks,
                                 const std::vector<int32_t>& bytes, uint64_t spanOff,
                                 const void* p, uint64_t n, uint64_t lo, uint64_t hi);
+
+// What fetched bytes show of the baskets in them, judged once (checkFetched) and then held against
+// the bytes a reader asked for (FetchVerdict::against).
+struct FetchFault {
+  // kPosition, kLength: a basket's key fails, as firstMisplacedKey judges it ([at, at + 1)).
+  // kData: a basket's compressed data fails its own check ([at, end): the whole basket).
+  // kDamaged: a part of the copy a map that shows its copy bad concerns ([at, end): the part of it
+  // in the fetched bytes).
+  enum Kind : uint8_t { kPosition, kLength, kData, kDamaged };
+  uint64_t at = 0, end = 0;
+  Kind kind = kPosition;
+  std::string why; // kData: the decoder's reason; kDamaged: the map's
+};
+struct FetchVerdict {
+  std::vector<FetchFault> faults;
+  uint32_t passed = 0; // baskets whose compressed data was decoded and its own checksum held
+  uint32_t none = 0;   // baskets wholly in the bytes whose data carries no checksum (stored as
+                       // they are, ZSTD without one, ROOT's old algorithm) or could not be judged
+  // The parts of `spans` (sorted, merged) inside the fetched bytes [spanOff, spanOff + n), as
+  // kDamaged faults that say `why`.
+  void damaged(const std::vector<std::pair<uint64_t, uint64_t>>& spans, uint64_t spanOff,
+               uint64_t n, const std::string& why);
+  void merge(FetchVerdict&& o);
+  // The faults the reader's bytes `reader` (ranges [lo, hi)) concern: a key that starts in them, a
+  // basket's data or a damaged part they reach into (counted, the first one's position and
+  // reason given, `why`: "" for a key's position); the others are `outside`. With lo == hi every
+  // fault is outside.
+  MisplacedKeys against(const std::vector<std::pair<uint64_t, uint64_t>>& reader,
+                        std::string* why = nullptr) const;
+  MisplacedKeys against(uint64_t lo, uint64_t hi, std::string* why = nullptr) const;
+};
+// The key check of firstMisplacedKey (with the map's lengths) of fetched bytes [spanOff, spanOff +
+// n) held in `p`, every failing key listed; and, with `data`, the block checksum of every basket
+// whose key passes, whose length the map gives, and that lies wholly in the bytes: where ROOT
+// decompresses it (fObjlen > fNbytes - fKeylen, from the key), its data, from the key's length to
+// the map's, is decoded as ROOT decodes it (decodeFrames), and a block that fails its own checksum
+// or does not decode is a kData fault. ZSTD blocks without a content checksum, ROOT's old
+// algorithm, LZ4 in a build without lz4 and stored data are not decoded (counted `none`). Reads
+// nothing outside [p, p + n). CPU: one decompression of each basket judged.
+FetchVerdict checkFetched(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
+                          uint64_t spanOff, const void* p, uint64_t n, bool data);
+// Whether checkFetched(..., data = true) would decode any basket of these bytes: a few bytes read
+// per basket, for a caller that decodes off its own thread only when there is something to decode.
+bool fetchedDataToCheck(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
+                        uint64_t spanOff, const void* p, uint64_t n);
+// A piece of fetched bytes (an answer's buffer, an element of a vector read), at `off` in the file.
+struct BytePiece {
+  uint64_t off = 0;
+  const char* p = nullptr;
+  uint64_t n = 0;
+};
+// checkFetched over `pieces`: pieces that follow each other without a gap (in offset order) are
+// judged as one run, so a key header or a basket a cut between two pieces divides is judged whole
+// (such a run is copied into one buffer first); pieces that overlap are judged apart. `damaged`
+// (sorted, merged; with `why`): parts of the copy whose bytes fail as kDamaged where the pieces
+// hold them.
+FetchVerdict checkPieces(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
+                         std::vector<BytePiece> pieces, bool data,
+                         const std::vector<std::pair<uint64_t, uint64_t>>* damaged = nullptr,
+                         const std::string& why = std::string());
+// Whether checkPieces(..., data = true) would decode anything, or join pieces.
+bool piecesNeedWork(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
+                    std::vector<BytePiece> pieces);
+// The parts of the copy the parse `fm` concerns: its tree's record and every basket its map places
+// (`seeks`, `bytes`; one of no known length as its first byte), sorted and merged. A map that shows
+// its copy bad is held only against reads of these (a job reading another tree of the copy is not
+// refused).
+std::vector<std::pair<uint64_t, uint64_t>> treeSpans(const FileMeta& fm,
+                                                     const std::vector<uint64_t>& seeks,
+                                                     const std::vector<int32_t>& bytes);
 
 } // namespace ucache::transpose

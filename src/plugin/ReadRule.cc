@@ -1,5 +1,6 @@
 #include "ReadRule.h"
 
+#include "Executor.h"
 #include "Log.h"
 #include "OriginSource.h"
 #include "RNTupleMeta.h"
@@ -61,7 +62,22 @@ struct KeySeekTable {
   uint64_t failedUs = 0; // when a failed origin read last stopped a parse
   uint64_t badUs = 0;    // when a parse last made a map that shows its copy bad
   std::shared_ptr<const KeyMap> seeks; // null until built
+  // Requests of other handles answered while a parse runs (keySeeksBuilt): posted to the
+  // executor when it ends, whatever it found.
+  std::vector<std::function<void()>> waiters;
 };
+// The waiters of a parse that ended, each posted to the executor (none runs on the parsing
+// thread, which may be a client callback thread). A waiter that cannot be posted runs here.
+void postWaiters(std::vector<std::function<void()>>& w) {
+  for (auto& f : w) {
+    try {
+      Executor::instance().post(f);
+    } catch (...) {
+      f();
+    }
+  }
+  w.clear();
+}
 std::mutex& tablesMu() {
   static auto* m = new std::mutex;
   return *m;
@@ -84,10 +100,11 @@ KeyMap keyMapOf(const tp::FileMeta& fm, uint64_t fileSize, const std::string& se
   if (fm.error.empty())
     tp::basketMap(fm, m.seeks, m.bytes);
   m.bad = tp::basketMapBad(fm, m.seeks, m.bytes, fileSize);
-  if (!m.bad.empty()) { // no basket is checked against a map that shows its copy bad
+  if (!m.bad.empty()) {
     m.server = server;
-    m.seeks.clear();
-    m.bytes.clear();
+    m.badSpans = tp::treeSpans(fm, m.seeks, m.bytes);
+    if (m.badSpans.empty()) // nothing to hold against: no claim
+      m.bad.clear();
   }
   return m;
 }
@@ -128,7 +145,12 @@ keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEn
     t->parsing = false;
     if (src.readFailed) {
       t->failedUs = nowUs();
-      return t->seeks;
+      auto seeks = t->seeks;
+      std::vector<std::function<void()>> w;
+      w.swap(t->waiters);
+      g.unlock();
+      postWaiters(w);
+      return seeks;
     }
     fm = &own;
   }
@@ -140,8 +162,44 @@ keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEn
     from = *current;
   auto m = std::make_shared<const KeyMap>(keyMapOf(*fm, entry->fileSize(), from));
   t->badUs = m->bad.empty() ? 0 : nowUs();
-  t->seeks = std::move(m);
-  return t->seeks;
+  t->seeks = m;
+  std::vector<std::function<void()>> w;
+  w.swap(t->waiters);
+  g.unlock();
+  postWaiters(w);
+  return m;
+}
+
+tp::FetchVerdict fetchVerdict(const KeyMap& m, const std::string& server,
+                              std::vector<FetchPiece> pieces) {
+  if (!m.bad.empty() && (m.server.empty() || server != m.server))
+    return tp::FetchVerdict();
+  return tp::checkPieces(m.seeks, m.bytes, std::move(pieces), /*data=*/true,
+                         m.bad.empty() ? nullptr : &m.badSpans, m.bad);
+}
+
+bool fetchNeedsWork(const KeyMap& m, const std::string& server, std::vector<FetchPiece> pieces) {
+  if (!m.bad.empty() && (m.server.empty() || server != m.server))
+    return false;
+  return tp::piecesNeedWork(m.seeks, m.bytes, std::move(pieces));
+}
+
+KeySeeksBuilt keySeeksBuilt(const std::shared_ptr<FileEntry>& entry, std::function<void()>* then) {
+  KeySeeksBuilt b;
+  if (!entry)
+    return b;
+  std::lock_guard<std::mutex> g(tablesMu());
+  for (const auto& x : tables())
+    if (!x->entry.owner_before(entry) && !entry.owner_before(x->entry)) {
+      b.map = x->seeks;
+      if (!b.map && x->parsing && then && *then) {
+        x->waiters.push_back(std::move(*then));
+        *then = nullptr;
+        b.parked = true;
+      }
+      break;
+    }
+  return b;
 }
 
 void readRuleBeforeFork() {

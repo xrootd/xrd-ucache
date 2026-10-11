@@ -3121,35 +3121,58 @@ static void armKeyCheck(const std::shared_ptr<HandleState>& st,
   if (had && (had->bad.empty() || had->server == current))
     return;
   auto seeks = keySeeksFor(st, entry, timeout, nullptr, std::string(), &current);
+  // A map that shows a copy bad: what the entry took from that copy is dropped now (its records,
+  // read by the parse, among them), not only at the first read the map refuses.
+  if (seeks && !seeks->bad.empty() && seeks != had)
+    dropEntryOfBadCopy(*st, entry, seeks->server);
   std::lock_guard<std::mutex> g(st->mu);
   st->keySeeks = std::move(seeks);
 }
-// The key check of fetched bytes [spanOff, spanOff + n) that `server` answered, with the handle's
-// map `m` (check_origin_integrity): each basket that starts in them, its key header wholly in
-// them, must state its position and the length the map gives it (transpose::firstMisplacedKey). A
-// map that showed its copy bad fails the bytes that copy answered as one failure at `lo` (with
-// lo == hi, as outside), and makes no claim on another copy's. `why`: the failure's reason.
-static transpose::MisplacedKeys keyCheck(const KeyMap& m, const std::string& server,
-                                         uint64_t spanOff, const void* p, uint64_t n, uint64_t lo,
-                                         uint64_t hi, std::string* why = nullptr) {
-  transpose::MisplacedKeys r;
-  if (!m.bad.empty()) {
-    if (m.server.empty() || server != m.server)
-      return r;
-    if (hi > lo) {
-      r.count = 1;
-      r.first = lo;
-    } else {
-      r.outside = true;
-    }
-    if (why)
-      *why = m.bad;
-    return r;
+// The counts of a verdict, to the store's counters (origin_checks_passed, origin_checks_none; the
+// failures are counted where they are refused).
+static void countChecks(HandleState& st, const transpose::FetchVerdict& v) {
+  if (st.store) {
+    st.store->stats().originChecksPassed.fetch_add(v.passed, std::memory_order_relaxed);
+    st.store->stats().originChecksNone.fetch_add(v.none, std::memory_order_relaxed);
   }
-  r = transpose::firstMisplacedKey(m.seeks, m.bytes, spanOff, p, n, lo, hi);
-  if (why && r.count && r.length)
-    *why = "key length differs from the tree's record";
-  return r;
+}
+// check_origin_integrity, for the answer of a fetch from the origin: `go` is called with the map
+// the answer is checked against (null: none, not checked). At once, on this thread, when nothing
+// needs decoding; on the executor when something does (a basket's data to decode, pieces to join:
+// fetchNeedsWork), so that no client callback thread decodes; and, when the handle holds no map
+// while another handle's parse of the file is building it (`entry`; `wait`), once that parse ends,
+// on the executor: such an answer is checked rather than let through. `pieces` must stay valid
+// until `go` runs.
+using KeyMapGo = std::function<void(std::shared_ptr<const KeyMap>)>;
+static void withKeyMap(const std::shared_ptr<HandleState>& st,
+                       const std::shared_ptr<FileEntry>& entry, const std::string& server,
+                       const std::vector<FetchPiece>& pieces, const KeyMapGo& go, bool wait = true,
+                       bool offThread = false) {
+  if (!globalConfig().checkOriginIntegrity) {
+    go(nullptr);
+    return;
+  }
+  std::shared_ptr<const KeyMap> m = keySeeksOf(*st);
+  if (!m && entry) {
+    std::function<void()> then;
+    if (wait)
+      then = [st, entry, server, pieces, go] {
+        withKeyMap(st, entry, server, pieces, go, false, true);
+      };
+    const KeySeeksBuilt b = keySeeksBuilt(entry, wait ? &then : nullptr);
+    if (b.parked)
+      return;
+    m = b.map;
+  }
+  if (m && !offThread && fetchNeedsWork(*m, server, pieces)) {
+    try {
+      Executor::instance().post([go, m] { go(m); });
+      return;
+    } catch (...) {
+      // could not be posted: checked here
+    }
+  }
+  go(m);
 }
 #else
 static std::shared_ptr<ReadRule> directRule(const std::shared_ptr<HandleState>&,
@@ -3667,6 +3690,8 @@ struct RelayHandler : XrdCl::ResponseHandler {
   XrdCl::ResponseHandler* user = nullptr;
   OriginInFlight inflight;
   uint64_t t0 = 0;      // when the read was issued
+  // When its answer arrived (its check may run later, off the client's thread).
+  uint64_t arrivedUs = 0;
   uint64_t readLen = 0; // a plain read's length (Read, PgRead), else 0
   uint64_t off = 0, len = 0; // what was asked, for a failure's record
   bool pageRead = false;     // a PgRead (OpenPolicy.h emptyPageReadInsideConfirmed)
@@ -3818,35 +3843,51 @@ struct RelayHandler : XrdCl::ResponseHandler {
     }
   }
 #ifdef UCACHE_HAVE_COLDRUN
-  // The answer of a request that was moved, when its bytes fail the key-position
-  // check (check_origin_integrity), as a miss's do: the status the reader would
-  // get, null when they pass. Only moved requests are checked here, with the
-  // handle's table of basket positions when it holds one: a second damaged copy
-  // must not reach the reader in the case where damage is known.
-  XRootDStatus* misplaced(XrdCl::AnyObject* r, const HostList* h) {
-    const auto seeks = keySeeksOf(*st);
-    if (!seeks || !r)
-      return nullptr;
-    transpose::MisplacedKeys bad;
-    std::string why;
-    const std::string server = answeredBy(*st, h);
-    const auto look = [&](uint64_t o, const void* p, uint64_t n) {
-      std::string w;
-      const auto m = keyCheck(*seeks, server, o, p, n, o, o + n, &w);
-      if (m.count && !bad.count)
-        why = w;
-      bad.first = bad.count ? bad.first : m.first;
-      bad.count += m.count;
-    };
+  // The bytes an answer carries, as pieces: a plain read's, a page read's, a vector read's.
+  static std::vector<FetchPiece> answerPieces(XrdCl::AnyObject* r) {
+    std::vector<FetchPiece> out;
+    if (!r)
+      return out;
     XrdCl::ChunkInfo* ci = nullptr;
     r->Get(ci);
-    if (ci)
-      look(ci->offset, ci->buffer, ci->length);
+    if (ci && ci->buffer) {
+      out.push_back(FetchPiece{ci->offset, static_cast<const char*>(ci->buffer), ci->length});
+      return out;
+    }
+    XrdCl::PageInfo* pi = nullptr;
+    r->Get(pi);
+    if (pi && pi->GetBuffer()) {
+      out.push_back(
+          FetchPiece{pi->GetOffset(), static_cast<const char*>(pi->GetBuffer()), pi->GetLength()});
+      return out;
+    }
     XrdCl::VectorReadInfo* vi = nullptr;
     r->Get(vi);
     if (vi)
       for (const auto& c : vi->GetChunks())
-        look(c.offset, c.buffer, c.length);
+        if (c.buffer)
+          out.push_back(FetchPiece{c.offset, static_cast<const char*>(c.buffer), c.length});
+    return out;
+  }
+  // The answer's bytes, when they fail the check (check_origin_integrity) with the handle's own
+  // map `m`, as a miss's do: the status the reader would get, null when they pass. Every relayed
+  // answer of a handle that holds the file's map is checked (a handle that made a miss, or reads
+  // a file read directly), the first attempt's as a moved one's; a handle that never missed holds
+  // none (a copy's: pure pass-through), and its answers are not checked.
+  XRootDStatus* misplaced(XrdCl::AnyObject* r, const HostList* h, const KeyMap& m) {
+    std::vector<FetchPiece> pieces = answerPieces(r);
+    if (pieces.empty())
+      return nullptr;
+    std::vector<std::pair<uint64_t, uint64_t>> asked;
+    for (const auto& x : pieces)
+      asked.emplace_back(x.off, x.off + x.n);
+    const std::string server = answeredBy(*st, h);
+    const transpose::FetchVerdict v = fetchVerdict(m, server, std::move(pieces));
+    countChecks(*st, v);
+    std::string why;
+    const auto bad = v.against(asked, &why);
+    XrdCl::VectorReadInfo* vi = nullptr;
+    r->Get(vi);
     return bad.count ? originCheckFailed(*st, &st->relayServers, vi ? "readv" : "read", bad.first,
                                          bad.count, off, len, server, why)
                      : nullptr;
@@ -3854,16 +3895,36 @@ struct RelayHandler : XrdCl::ResponseHandler {
 #endif
   void HandleResponseWithHosts(XrdCl::XRootDStatus* s, XrdCl::AnyObject* r,
                                XrdCl::HostList* h) override {
+    arrivedUs = nowUs();
+#ifdef UCACHE_HAVE_COLDRUN
+    // check_origin_integrity: decoding (a basket's data) runs on the executor (withKeyMap).
+    if (s && s->IsOK() && r && globalConfig().checkOriginIntegrity && keySeeksOf(*st)) {
+      const std::vector<FetchPiece> pieces = answerPieces(r);
+      if (!pieces.empty()) {
+        withKeyMap(
+            st, nullptr, answeredBy(*st, h), pieces,
+            [this, s, r, h](std::shared_ptr<const KeyMap> m) { respond(s, r, h, m.get()); },
+            /*wait=*/false);
+        return;
+      }
+    }
+#endif
+    respond(s, r, h, nullptr);
+  }
+  // The answer, with the map it is checked against (null: not checked).
+  void respond(XrdCl::XRootDStatus* s, XrdCl::AnyObject* r, XrdCl::HostList* h, const KeyMap* m) {
     bool checkFailed = false;
 #ifdef UCACHE_HAVE_COLDRUN
-    if (attempt > 1 && s && s->IsOK())
-      if (XRootDStatus* refused = misplaced(r, h)) {
+    if (m && s && s->IsOK())
+      if (XRootDStatus* refused = misplaced(r, h, *m)) {
         delete s;
         delete r;
         s = refused;
         r = nullptr;
         checkFailed = true;
       }
+#else
+    (void)m;
 #endif
     // A plain or page read answered short inside the file's confirmed size: the copy ends
     // there, and the read is a data failure of it (moved on an armed handle).
@@ -3902,7 +3963,7 @@ struct RelayHandler : XrdCl::ResponseHandler {
     // Timed before the inner file is given back, so a Close that waits for
     // this read finds its time already on the handle.
     if (st->store && t0 && s && s->IsOK()) {
-      const uint64_t rt = nowUs() - t0;
+      const uint64_t rt = arrivedUs - t0;
       st->store->stats().relayRtUs.add(rt);
       st->relayRtUs.add(rt);
       st->relayServers.add(answeredBy(*st, h), answerBytes(r), rt, inflight.nc);
@@ -4267,12 +4328,12 @@ void persistPagesReserved(const std::shared_ptr<HandleState>& st,
                                                  const std::string& server,
                                                  const std::string& why) {
   char msg[600];
-  std::snprintf(msg, sizeof msg, "%s: a %s at %llu from %s failed its check (%s); not served",
-                recordFile(st.url).c_str(),
-                why.empty() || why.rfind("key ", 0) == 0 ? "basket" : "read",
-                static_cast<unsigned long long>(pos),
-                server.empty() ? "the origin" : server.c_str(),
-                why.empty() ? "key position differs from the tree's record" : why.c_str());
+  std::snprintf(
+      msg, sizeof msg, "%s: a %s at %llu from %s failed its check (%s); not served",
+      recordFile(st.url).c_str(),
+      why.empty() || why.rfind("key ", 0) == 0 || why.rfind("its data", 0) == 0 ? "basket" : "read",
+      static_cast<unsigned long long>(pos), server.empty() ? "the origin" : server.c_str(),
+      why.empty() ? "key position differs from the tree's record" : why.c_str());
   UCACHE_WARN("%s", msg);
   if (st.store)
     st.store->stats().originChecksFailed.fetch_add(n, std::memory_order_relaxed);
@@ -4375,32 +4436,60 @@ class MissReadHandler : public ResponseHandler {
       return;
     }
 
-    // check_origin_integrity: a basket the reader asked for that fails the key
-    // check fails the read. One only in the rounded rest of the fetch (a
-    // neighbour sharing an edge page) does not concern this reader: it is
-    // served, and nothing of the fetch is kept, so the neighbour's own read
-    // misses and is checked. Readers parked on this fetch then fetch, one after
-    // another, for themselves.
+    // check_origin_integrity: a basket the reader asked for that fails the check (its key, or
+    // its data's own checksum) fails the read. One only in the rounded rest of the fetch (a
+    // neighbour sharing an edge page) does not concern this reader: it is served, and nothing of
+    // the fetch is kept, so the neighbour's own read misses and is checked. Readers parked on this
+    // fetch then fetch, one after another, for themselves. Decoding runs on the executor, not on
+    // this (the client's) thread (withKeyMap).
+    arrivedUs_ = nowUs();
+    auto a = std::make_shared<Answer>(std::move(s), std::move(r), std::move(h));
+    const std::string server = answeredBy(*st_, a->h.get());
+#ifdef UCACHE_HAVE_COLDRUN
+    const std::vector<FetchPiece> pieces{FetchPiece{wireOff_, wireBuf_->data(), got}};
+    withKeyMap(st_, entry_, server, pieces,
+               [this, a, got, server](std::shared_ptr<const KeyMap> m) {
+                 finish(*a, got, server, m.get());
+               });
+#else
+    finish(*a, got, server, nullptr);
+#endif
+  }
+
+ private:
+  // A fetch's answer, kept while its check runs.
+  struct Answer {
+    Answer(std::unique_ptr<XRootDStatus> s0, std::unique_ptr<AnyObject> r0,
+           std::unique_ptr<HostList> h0)
+        : s(std::move(s0)), r(std::move(r0)), h(std::move(h0)) {}
+    std::unique_ptr<XRootDStatus> s;
+    std::unique_ptr<AnyObject> r;
+    std::unique_ptr<HostList> h;
+  };
+  // The rest, with the map the fetch is checked against (null: not checked).
+  void finish(Answer& a, uint64_t got, const std::string& server, const KeyMap* m) {
     bool keepNone = false;
 #ifdef UCACHE_HAVE_COLDRUN
-    if (auto seeks = keySeeksOf(*st_)) {
+    if (m) {
       std::string why;
-      const std::string server = answeredBy(*st_, h.get());
-      const auto m = keyCheck(*seeks, server, wireOff_, wireBuf_->data(), got, userOff_,
-                              userOff_ + userLen_, &why);
-      if (m.count) {
+      std::vector<FetchPiece> pieces{FetchPiece{wireOff_, wireBuf_->data(), got}};
+      const transpose::FetchVerdict v = fetchVerdict(*m, server, std::move(pieces));
+      countChecks(*st_, v);
+      const auto mk = v.against(userOff_, userOff_ + userLen_, &why);
+      if (mk.count) {
         if (gateLen_)
           entry_->endFetch(wireOff_, gateLen_); // waiters fetch, and are checked, on their own
-        std::unique_ptr<XRootDStatus> refused(originCheckFailed(*st_, &entry_->obs().servers,
-                                                                "read", m.first, m.count, wireOff_,
-                                                                got, server, why));
-        if (!handOff(*refused, h, true))
+        std::unique_ptr<XRootDStatus> refused(originCheckFailed(
+            *st_, &entry_->obs().servers, "read", mk.first, mk.count, wireOff_, got, server, why));
+        if (!handOff(*refused, a.h, true))
           complete(user_, refused.release(), nullptr);
         delete this;
         return;
       }
-      keepNone = m.outside;
+      keepNone = mk.outside;
     }
+#else
+    (void)m;
 #endif
     // Serve the user first (memcpy only — no disk on this thread)...
     std::memcpy(userBuf_, wireBuf_->data() + (userOff_ - wireOff_), userLen_);
@@ -4410,13 +4499,12 @@ class MissReadHandler : public ResponseHandler {
       stats.servedBytes.fetch_add(userLen_, std::memory_order_relaxed);
       stats.originBytes.fetch_add(got, std::memory_order_relaxed);
       stats.originReads.fetch_add(1, std::memory_order_relaxed);
-      const uint64_t rt = nowUs() - t0_;
+      const uint64_t rt = arrivedUs_ - t0_;
       stats.originRtUs.add(rt);
       entry_->obs().originRtUs.add(rt);
-      const std::string server = answeredBy(*st_, h.get());
       entry_->obs().servers.add(server, got, rt, inflight_.nc);
       if (stats.tracer)
-        stats.tracer->rec("wire", entry_->key().key, wireOff_, got, nowUs() - t0_, true,
+        stats.tracer->rec("wire", entry_->key().key, wireOff_, got, rt, true,
                           wireTraceFields(server, inflight_.t0, inflight_.nc));
     }
     st_->noteCacheOk();
@@ -4427,14 +4515,13 @@ class MissReadHandler : public ResponseHandler {
     // ...then persist full pages asynchronously (§5.2 step 4). Ownership of
     // the wire buffer MOVES to the task: single owner, no cross-thread
     // refcount teardown (keeps TSan exact and the lifetime obvious). Nothing
-    // of it is kept when its edge failed the key check (parked readers then
+    // of it is kept when its edge failed the check (parked readers then
     // fetch for themselves).
     persistPagesReserved(st_, entry_, wireOff_, std::move(wireBuf_), keepNone ? 0 : got,
                          gateLen_);
     delete this;
   }
 
- private:
    // The request moves to another site, as a relay, when the handle is armed and
    // `s` says so (moveRead); `checkFailed`: its bytes failed the integrity check.
    bool handOff(const XRootDStatus& s, std::unique_ptr<HostList>& h, bool checkFailed) {
@@ -4459,6 +4546,7 @@ class MissReadHandler : public ResponseHandler {
   XrdCl::File* on_; // the File the read was issued on
   int readerT_;
   OriginInFlight inflight_; // the origin read this handler waits for
+  uint64_t arrivedUs_ = 0;  // when its answer arrived (the check may run later)
 };
 
 // Issue the rounded wire read for a single-Read miss, honoring the test-only
@@ -4601,45 +4689,67 @@ class MissVReadHandler : public ResponseHandler {
     // check_origin_integrity, as for a single read: a failing basket inside a
     // miss chunk fails the whole request (one damaged basket fails the
     // reader's whole fill); one only in an element's rounded rest is served
-    // and nothing of this answer is kept. Each element is checked on its own,
-    // so a key header that an element cut divides is not judged.
+    // and nothing of this answer is kept. Elements that follow each other (the
+    // protocol-legal pieces of one oversized run) are judged as one, so a key
+    // header or a basket a cut between two of them divides is judged whole.
+    // Decoding runs on the executor (withKeyMap).
+    arrivedUs_ = nowUs();
+    auto a = std::make_shared<Answer>(std::move(s), std::move(r), std::move(h));
+    const std::string server = answeredBy(*st_, a->h.get());
+#ifdef UCACHE_HAVE_COLDRUN
+    std::vector<FetchPiece> pieces;
+    pieces.reserve(wire_.size());
+    for (const auto& w : wire_)
+      pieces.push_back(FetchPiece{w.off, w.buf->data(), w.len});
+    withKeyMap(st_, entry_, server, pieces,
+               [this, a, wireBytes, server](std::shared_ptr<const KeyMap> m) {
+                 finish(*a, wireBytes, server, m.get());
+               });
+#else
+    finish(*a, wireBytes, server, nullptr);
+#endif
+  }
+
+ private:
+  struct Answer {
+    Answer(std::unique_ptr<XRootDStatus> s0, std::unique_ptr<AnyObject> r0,
+           std::unique_ptr<HostList> h0)
+        : s(std::move(s0)), r(std::move(r0)), h(std::move(h0)) {}
+    std::unique_ptr<XRootDStatus> s;
+    std::unique_ptr<AnyObject> r;
+    std::unique_ptr<HostList> h;
+  };
+  // The rest, with the map the answer is checked against (null: not checked).
+  void finish(Answer& a, uint64_t wireBytes, const std::string& server, const KeyMap* m) {
     bool keepNone = false;
 #ifdef UCACHE_HAVE_COLDRUN
-    if (auto seeks = keySeeksOf(*st_)) {
-      // One walk of each element finds whether any key in it fails; only an
-      // element that holds one is walked again for each miss chunk it covers.
-      // Every element overlaps a miss chunk (it is one's rounded run), so a
-      // failing key in no chunk is "outside" for each chunk of its element.
-      transpose::MisplacedKeys bad;
+    if (m) {
+      std::vector<FetchPiece> pieces;
+      pieces.reserve(wire_.size());
+      for (const auto& w : wire_)
+        pieces.push_back(FetchPiece{w.off, w.buf->data(), w.len});
+      const transpose::FetchVerdict v = fetchVerdict(*m, server, std::move(pieces));
+      countChecks(*st_, v);
+      std::vector<std::pair<uint64_t, uint64_t>> asked;
+      asked.reserve(missIdx_.size());
+      for (size_t idx : missIdx_)
+        asked.emplace_back(userChunks_[idx].offset,
+                           userChunks_[idx].offset + userChunks_[idx].length);
       std::string why;
-      const std::string server = answeredBy(*st_, h.get());
-      for (const auto& w : wire_) {
-        if (!keyCheck(*seeks, server, w.off, w.buf->data(), w.len, w.off, w.off).outside)
-          continue;
-        for (size_t idx : missIdx_) {
-          const auto& c = userChunks_[idx];
-          if (c.offset >= w.off + w.len || c.offset + c.length <= w.off)
-            continue;
-          std::string cw;
-          const auto m = keyCheck(*seeks, server, w.off, w.buf->data(), w.len, c.offset,
-                                  c.offset + c.length, &cw);
-          if (m.count && !bad.count)
-            why = cw;
-          bad.first = bad.count ? bad.first : m.first;
-          bad.count += m.count;
-          keepNone = keepNone || m.outside;
-        }
-      }
+      const auto bad = v.against(asked, &why);
       if (bad.count) {
         std::unique_ptr<XRootDStatus> refused(
             originCheckFailed(*st_, &entry_->obs().servers, "readv", bad.first, bad.count,
                               wire_.front().off, wireBytes, server, why));
-        if (!handOff(*refused, h, true))
+        if (!handOff(*refused, a.h, true))
           complete(user_, refused.release(), nullptr);
         delete this;
         return;
       }
+      keepNone = bad.outside;
     }
+#else
+    (void)m;
 #endif
 
     // Scatter wire bytes into the user's miss chunks (memcpy only). A chunk can
@@ -4683,14 +4793,13 @@ class MissVReadHandler : public ResponseHandler {
       for (const auto& c : userChunks_)
         total += c.length;
       stats.servedBytes.fetch_add(total - directBytes, std::memory_order_relaxed);
-      const uint64_t rt = nowUs() - t0_;
+      const uint64_t rt = arrivedUs_ - t0_;
       stats.originRtUs.add(rt);
       entry_->obs().originRtUs.add(rt);
-      const std::string server = answeredBy(*st_, h.get());
       entry_->obs().servers.add(server, wireBytes, rt, inflight_.nc);
       if (stats.tracer)
-        stats.tracer->rec("wire", entry_->key().key, wire_.front().off, wireBytes, nowUs() - t0_,
-                          true, wireTraceFields(server, inflight_.t0, inflight_.nc));
+        stats.tracer->rec("wire", entry_->key().key, wire_.front().off, wireBytes, rt, true,
+                          wireTraceFields(server, inflight_.t0, inflight_.nc));
     }
     st_->noteCacheOk();
     if (keepNone)
@@ -4782,6 +4891,7 @@ class MissVReadHandler : public ResponseHandler {
   std::shared_ptr<ReadRule> direct_;
   XrdCl::File* on_;         // the File the read was issued on
   OriginInFlight inflight_; // the origin read this handler waits for
+  uint64_t arrivedUs_ = 0;  // when its answer arrived (the check may run later)
 };
 
 // Rounded [start,end) for a chunk; the rule and why it is not optional are in
@@ -5238,17 +5348,83 @@ bool guardAllowsChunks(const std::shared_ptr<HandleState>& st, uint64_t originSi
 
 namespace {
 
+#ifdef UCACHE_HAVE_COLDRUN
+// The bytes the checks at open kept, as a parser's source: nothing else is read (a range they do
+// not hold is `missing`, and the parse that asked for it says nothing).
+struct OpenBytesSource : transpose::Source {
+  const HandleState::OpenBytes& ob;
+  bool missing = false;
+  explicit OpenBytesSource(const HandleState::OpenBytes& o) : ob(o) {}
+  // Copies [off, off + n) from the spans that hold it, in any order; false when one byte is not
+  // held.
+  bool copy(void* dst, uint64_t n, uint64_t off) {
+    uint64_t at = off;
+    const uint64_t end = off + n;
+    while (at < end) {
+      const HandleState::OpenBytes::Span* hold = nullptr;
+      for (const auto& sp : ob.spans)
+        if (at >= sp.off && at - sp.off < sp.bytes.size()) {
+          hold = &sp;
+          break;
+        }
+      if (!hold)
+        return false;
+      const uint64_t k = std::min<uint64_t>(end - at, hold->bytes.size() - (at - hold->off));
+      if (dst)
+        std::memcpy(static_cast<char*>(dst) + (at - off), hold->bytes.data() + (at - hold->off), k);
+      at += k;
+    }
+    return true;
+  }
+  bool has(uint64_t off, uint64_t n) override {
+    const bool ok = off + n >= off && off + n <= ob.size && copy(nullptr, n, off);
+    missing = missing || !ok;
+    return ok;
+  }
+  bool read(void* dst, uint64_t n, uint64_t off) override {
+    const bool ok = off + n >= off && off + n <= ob.size && copy(dst, n, off);
+    missing = missing || !ok;
+    return ok;
+  }
+};
+
+// The handle's map, when it holds none at its setup: the file's map another handle built, or one
+// made from the bytes the checks at open kept, when they hold every record the map needs (the
+// header, the list of top-level objects and the tree's record: a small file's often do). A parse
+// that needs more says nothing, and the map is made at the handle's first miss, as before.
+std::shared_ptr<const KeyMap> openBytesMap(HandleState& st, const std::shared_ptr<FileEntry>& entry,
+                                           const HandleState::OpenBytes& ob) {
+  if (auto m = keySeeksOf(st))
+    return m;
+  std::shared_ptr<const KeyMap> m = keySeeksBuilt(entry, nullptr).map;
+  if (!m) {
+    OpenBytesSource src(ob);
+    const transpose::FileMeta fm =
+        transpose::parseReaderTree(src, static_cast<int64_t>(entry->fileSize()));
+    if (src.missing)
+      return nullptr;
+    m = keySeeksFor(nullptr, entry, 0, &fm, ob.server);
+  }
+  if (m) {
+    std::lock_guard<std::mutex> g(st.mu);
+    if (!st.keySeeks)
+      st.keySeeks = m;
+  }
+  return m;
+}
+#endif
+
 // What the checks made at the reader's open read of the copy the open took (`ob`, whole pages),
 // stored in the handle's entry as any bytes fetched from the origin are, so that the reader's
 // reads of the same records are served from the cache: only when the entry is of the size the copy
 // reported and the handle's File is still the one they were read on; counted as reads from the
 // origin for the entry, as the metadata parsers' reads are (OriginSource). check_origin_integrity's
-// key-position check is applied only when the handle already holds the file's table of basket
-// positions (a span with a misplaced basket in it is then not kept). It does not when the entry is
-// first set up: the table is built at the handle's first miss, after that. So, like the pages of
-// the file's own records that the metadata parsers read, the kept pages are stored unchecked at
-// setup. Pages the entry holds already are left as they are. The bytes go in any case; a failure
-// to store them fails nothing.
+// check is applied with the handle's map (openBytesMap: the file's, or one made from these bytes
+// when they hold the tree's record): a span with a basket that fails it, or with a part of the
+// copy a map that shows it bad concerns, is not kept. When no map can be had yet, the kept pages
+// are stored unchecked, like the pages of the file's own records that the metadata parsers read.
+// Pages the entry holds already are left as they are. The bytes go in any case; a failure to store
+// them fails nothing.
 void storeOpenBytesIn(HandleState& st, const std::shared_ptr<FileEntry>& entry,
                       const HandleState::OpenBytes& ob) noexcept try {
   {
@@ -5260,19 +5436,25 @@ void storeOpenBytesIn(HandleState& st, const std::shared_ptr<FileEntry>& entry,
       st.innerStale.load(std::memory_order_acquire))
     return;
 #ifdef UCACHE_HAVE_COLDRUN
-  const auto seeks = keySeeksOf(st);
+  transpose::FetchVerdict verdict;
+  if (globalConfig().checkOriginIntegrity)
+    if (const auto seeks = openBytesMap(st, entry, ob)) {
+      if (!seeks->bad.empty())
+        dropEntryOfBadCopy(st, entry, seeks->server); // what the entry took from it earlier
+      std::vector<FetchPiece> pieces;
+      for (const auto& sp : ob.spans)
+        pieces.push_back(FetchPiece{sp.off, sp.bytes.data(), sp.bytes.size()});
+      verdict = fetchVerdict(*seeks, ob.server, std::move(pieces));
+      countChecks(st, verdict);
+    }
 #endif
   uint64_t stored = 0;
   for (const auto& sp : ob.spans) {
     if (sp.bytes.empty())
       continue;
 #ifdef UCACHE_HAVE_COLDRUN
-    if (seeks) {
-      const auto m =
-          keyCheck(*seeks, ob.server, sp.off, sp.bytes.data(), sp.bytes.size(), sp.off, sp.off);
-      if (m.count || m.outside)
-        continue;
-    }
+    if (verdict.against(sp.off, sp.off + sp.bytes.size()).count)
+      continue;
 #endif
     if (st.store) {
       auto& stats = st.store->stats();
@@ -5867,6 +6049,7 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
     ChunkList one;
     one.emplace_back(offset, size, buffer);
     if (auto rule = directRule(st_, entry, one); ruleReadsData(rule, offset, size)) {
+      armKeyCheck(st_, entry, timeout); // its answer is checked, as a miss's is
       noteDirectBytes(st_, entry, size);
       return relayToInner(
           st_, handler, timeout,
@@ -5920,7 +6103,7 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
 }
 
 // §4.7: PgRead is pure pass-through, never cached, never served from cache —
-// ROOT's remote-read path is Read/VectorRead (F5); xrdcp's pgread traffic is
+// ROOT's remote-read path is Read/VectorRead; xrdcp's pgread traffic is
 // deliberately uncached in v1, and a copy's handle is pass-through anyway
 // (CopyDetect.h). On a trusted-cache handle (UCACHE_REVALIDATE_S,
 // default-on) the relay lazy-opens the origin first

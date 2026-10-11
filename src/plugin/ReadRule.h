@@ -22,10 +22,12 @@
 #pragma once
 
 #include "ReadMap.h"
+#include "TreeMeta.h"
 #include "XrdClTimeout.h"
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -43,10 +45,14 @@ class FileEntry;
 struct KeyMap {
   std::vector<uint64_t> seeks; // where each basket starts, sorted
   std::vector<int32_t> bytes;  // beside seeks: its length, 0 for none known
-  // Non-empty: the map shows the copy it was read from bad (why), and holds no basket; `server`
-  // is that copy's server ("" when not known).
+  // Non-empty: the map shows the copy it was read from bad (why); `server` is that copy's server
+  // ("" when not known), and `badSpans` the parts of the copy the damaged tree concerns (its
+  // record, and its baskets when the record could be read; transpose::treeSpans): only reads
+  // of those, answered by that copy, are refused. A map whose tree's record failed its own check
+  // holds no basket; one that places a basket past the copy's end keeps its baskets.
   std::string bad;
   std::string server;
+  std::vector<std::pair<uint64_t, uint64_t>> badSpans;
 };
 
 class ReadRule : public std::enable_shared_from_this<ReadRule> {
@@ -113,9 +119,10 @@ bool readRuleDirect(const std::string& key);
 //
 // The table is the file map (KeyMap): each basket's position and
 // the length the tree's record gives it. A parse that shows the copy it read
-// from bad makes a map that holds no basket and says why (KeyMap::bad), with
-// that copy's server: the tree's record failed its own check (ROOT fails to
-// read the tree too), or it places a basket past the copy's end. A parse this
+// from bad makes a map that says why (KeyMap::bad), with that copy's server
+// and the parts of the copy the damaged tree concerns: the tree's record
+// failed its own check (ROOT fails to read the tree too), or it places a
+// basket past the copy's end. A parse this
 // walk does not support makes no claim (an empty map), as before. A bad map
 // is parsed again when `current` (the server the handle reads from now) is
 // another (the handle moved), at most once a second. `fmServer`: with `fm`,
@@ -124,6 +131,31 @@ std::shared_ptr<const KeyMap>
 keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEntry>& entry,
             XrdTimeout timeout, const transpose::FileMeta* fm = nullptr,
             const std::string& fmServer = std::string(), const std::string* current = nullptr);
+// check_origin_integrity: a piece of bytes fetched from the origin (an answer's buffer, an element
+// of a vector read), at `off` in the file.
+using FetchPiece = transpose::BytePiece;
+// The verdict on fetched `pieces` that `server` answered, with the map `m`: each basket's key
+// (position, length) and the block checksum of each basket's data (transpose::checkFetched: one
+// decompression of each basket wholly in the bytes, CPU), and, where `m` shows that copy bad, the
+// parts of the bytes its damaged tree concerns. A map that shows another copy bad makes no claim
+// on them. Pieces that follow each other without a gap (in offset order) are judged as one run, so
+// a key header or a basket a cut between two pieces divides is judged whole (such a run is copied
+// into one buffer first). Pieces that overlap are judged apart. Thread-safe; reads only the pieces.
+transpose::FetchVerdict fetchVerdict(const KeyMap& m, const std::string& server,
+                                     std::vector<FetchPiece> pieces);
+// Whether fetchVerdict would decode anything, or join pieces: work kept off the client's callback
+// threads. A few bytes read per basket.
+bool fetchNeedsWork(const KeyMap& m, const std::string& server, std::vector<FetchPiece> pieces);
+// The map of `entry` when a parse has built it, without parsing (null: none yet). While a parse
+// of the file runs and has built none yet, `then` (when given and set) is kept and posted to the
+// executor once that parse ends, whatever it found (`parked`; *then is taken). For the answer of a
+// request a handle made while another handle's parse ran: it is checked once the map is known
+// rather than not at all.
+struct KeySeeksBuilt {
+  std::shared_ptr<const KeyMap> map;
+  bool parked = false;
+};
+KeySeeksBuilt keySeeksBuilt(const std::shared_ptr<FileEntry>& entry, std::function<void()>* then);
 // The file map of the parse `fm` of a copy of `fileSize` bytes read from `server`.
 KeyMap keyMapOf(const transpose::FileMeta& fm, uint64_t fileSize, const std::string& server);
 

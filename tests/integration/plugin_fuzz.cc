@@ -55,9 +55,10 @@
 // redirector (see runReadFailover). The caller checks the records. The cases
 // zero, zerov and zeroerr do the same for a read of a basket that a server serves
 // as zeros (see runZero), len, lenv and lenerr for one whose key states another length, rec,
-// recv and recerr for one whose tree's record fails its own check, and cut, cutpg, cutpgpast, cutonly and end for a copy that is cut
-// short after the open (see runCut), and degraded and degradedoff for a handle whose own open of
-// the origin fails.
+// recv and recerr for one whose tree's record fails its own check, blk, blkv and blkerr for one
+// whose compressed data fails its own checksum, stay for a read no check refuses, and cut, cutpg,
+// cutpgpast, cutonly and end for a copy that is cut short after the open (see runCut), and degraded
+// and degradedoff for a handle whose own open of the origin fails.
 #include <XrdCl/XrdClFile.hh>
 #include <XrdCl/XrdClURL.hh>
 #ifdef UCACHE_FUZZ_HAVE_TRANSPOSE
@@ -1704,14 +1705,21 @@ struct ReadCase {
 //   zeroerr  the read fails with errDataError and "failed its check" in the message, once:
 //            no copy serves it (or the handle is not armed to move); never the zeros
 // len, lenv, lenerr: the same, with the copy damaged elsewhere by UCACHE_ZERO_CMD: the basket's
-// key states another length; rec, recv, recerr: the tree's record fails its own check. The fault
-// is then checked as the bytes the copy serves at UCACHE_FAULT_AT (UCACHE_FAULT_LEN of them,
-// default 4) differing from the fixture's, read with no plugin.
+// key states another length; rec, recv, recerr: the tree's record fails its own check; blk, blkv,
+// blkpg, blkerr: a byte inside the basket's compressed data changed (its key intact), so that its
+// data fails its own checksum (blkpg: read by a PgRead, which the cache relays to the origin);
+// stay: the read is exact and made where the handle landed (the copy's damage concerns other
+// bytes). The fault is then checked as the bytes the copy serves at
+// UCACHE_FAULT_AT (UCACHE_FAULT_LEN of them, default 4) differing from the fixture's, read with no
+// plugin. UCACHE_READ_AT and UCACHE_READ_LEN, when set, give the bytes read in place of the basket
+// at 4915 (another basket, a tree's record).
 // "SERVERS landed final" is printed for the caller to check against the records.
 int runZero(const char* url, const char* local, const std::string& which) {
   const char* mode = "read-failover";
-  constexpr uint64_t kOff = 4915;
-  constexpr uint32_t kLen = 2481;
+  const char* ra = ::getenv("UCACHE_READ_AT");
+  const char* rl = ::getenv("UCACHE_READ_LEN");
+  const uint64_t kOff = ra ? std::strtoull(ra, nullptr, 10) : 4915;
+  const uint32_t kLen = rl ? static_cast<uint32_t>(std::strtoul(rl, nullptr, 10)) : 2481;
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   Source src(local);
   if (src.bytes.size() < kOff + kLen ||
@@ -1767,9 +1775,10 @@ int runZero(const char* url, const char* local, const std::string& which) {
   auto* w = new ReadWait(); // leaked with its buffer: a late completion lands safely
   auto* buf = new std::vector<char>(kLen, 0x5A);
   XrdCl::ChunkList chunks{XrdCl::ChunkInfo(kOff, kLen, buf->data())};
-  const bool vec = which == "zerov" || which == "lenv" || which == "recv";
-  const XrdCl::XRootDStatus s = vec ? file->VectorRead(chunks, nullptr, w)
-                                    : file->Read(kOff, kLen, buf->data(), w);
+  const bool vec = which == "zerov" || which == "lenv" || which == "recv" || which == "blkv";
+  const XrdCl::XRootDStatus s = vec                ? file->VectorRead(chunks, nullptr, w)
+                                : which == "blkpg" ? file->PgRead(kOff, kLen, buf->data(), w)
+                                                   : file->Read(kOff, kLen, buf->data(), w);
   const bool answered = s.IsOK() && w->wait();
   std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a second completion
   std::string now;
@@ -1777,10 +1786,16 @@ int runZero(const char* url, const char* local, const std::string& which) {
   {
     std::lock_guard<std::mutex> g(w->mu);
     const std::string said = w->status.ToStr();
-    if (which == "zeroerr" || which == "lenerr" || which == "recerr") {
+    if (which == "zeroerr" || which == "lenerr" || which == "recerr" || which == "blkerr") {
       verdict(answered && w->status.code == XrdCl::errDataError &&
                   said.find("failed its check") != std::string::npos,
               "the read of the zeroed basket fails its check: " + said);
+    } else if (which == "stay") {
+      verdict(answered && w->status.IsOK() &&
+                  std::memcmp(buf->data(), src.bytes.data() + kOff, kLen) == 0,
+              "the bytes are read exactly (" + (answered ? said : "no answer") + ")");
+      verdict(now == landed,
+              "they were read where the handle landed, " + landed + " (now " + now + ")");
     } else {
       verdict(answered && w->status.IsOK() &&
                   std::memcmp(buf->data(), src.bytes.data() + kOff, kLen) == 0,
@@ -2187,7 +2202,8 @@ int runCut(const char* url, const char* local, const std::string& which) {
 
 int runReadFailover(const char* url, const char* local, const std::string& which) {
   const char* mode = "read-failover";
-  if (which.rfind("zero", 0) == 0 || which.rfind("len", 0) == 0 || which.rfind("rec", 0) == 0)
+  if (which.rfind("zero", 0) == 0 || which.rfind("len", 0) == 0 || which.rfind("rec", 0) == 0 ||
+      which.rfind("blk", 0) == 0 || which == "stay")
     return runZero(url, local, which);
   if (which == "cut" || which == "cutpg" || which == "cutpgpast" || which == "cutonly" ||
       which == "end" || which == "degraded" || which == "degradedoff" || which == "leftdata" ||

@@ -10,6 +10,7 @@
 #include <zstd.h>
 
 #include <cstring>
+#include <set>
 #include <tuple>
 #include <vector>
 
@@ -698,6 +699,25 @@ TEST(FileMap, KeyLengthAndFieldsAgainstTheMap) {
   r = rec;
   putBe32(r, 6, -1);
   EXPECT_EQ(checkLen({S}, {nb}, spanWith(r, 0, S, 4096), S, hi).count, 1u) << "object length < 0";
+  // The key's length alone damaged to a value below its key length (0 included): ROOT reads the
+  // basket by the map's length and still takes it as compressed, so it reads it correctly: no
+  // claim. A negative one makes the key a zombie: refused.
+  for (int32_t v : {0, 1, kl - 1}) {
+    r = rec;
+    putBe32(r, 0, v);
+    EXPECT_EQ(checkLen({S}, {nb}, spanWith(r, 0, S, 4096), S, hi).count, 0u) << "fNbytes " << v;
+  }
+  r = rec;
+  putBe32(r, 0, -1);
+  m = checkLen({S}, {nb}, spanWith(r, 0, S, 4096), S, hi);
+  EXPECT_EQ(m.count, 1u) << "fNbytes < 0";
+  EXPECT_TRUE(m.length);
+  // A key length past the map's length: refused; with no length known, no claim on it.
+  r = rec;
+  r[14] = 0;
+  r[15] = static_cast<uint8_t>(nb + 1);
+  EXPECT_EQ(checkLen({S}, {nb}, spanWith(r, 0, S, 4096), S, hi).count, 1u) << "key past the map";
+  EXPECT_EQ(checkLen({S}, {0}, spanWith(r, 0, S, 4096), S, hi).count, 0u) << "no length known";
   // A 32-bit key (8 bytes shorter): with the map's own length, or one 8 bytes longer (a key
   // rewritten shorter in place, the tree's record left as it was), ROOT reads it: no claim.
   const std::vector<uint8_t> n = narrowAt(S);
@@ -788,5 +808,276 @@ TEST(FileMap, ATreeRecordThatFailsItsOwnCheck) {
     ++checked;
   }
   EXPECT_GT(checked, 0) << "a fixture with a checked tree record";
+}
+#endif
+
+// The block checksum on the byte path (checkFetched with data): every basket whose key passes,
+// whose length the map gives and that lies wholly in the fetched bytes has its data decoded as ROOT
+// decodes it; a block that fails its own checksum is a fault of that basket. ROOT's ZSTD carries
+// none, and stored data none: no claim.
+namespace {
+// A basket record of `payload` at `seek`: the LZMA record's 64-bit key header (70 bytes, object
+// length 8000) with its length set to the payload's.
+std::vector<uint8_t> basketOf(const uint8_t* payload, size_t n, uint64_t seek) {
+  std::vector<uint8_t> r = wideAt(seek);
+  r.resize(70);
+  putBe32(r, 0, static_cast<int32_t>(70 + n));
+  r.insert(r.end(), payload, payload + n);
+  return r;
+}
+FetchVerdict verdictOf(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
+                       const Span& s, bool data = true) {
+  return checkFetched(seeks, lengths, s.off, s.b.data(), s.b.size(), data);
+}
+struct Codec {
+  const char* name;
+  const uint8_t* p;
+  size_t n;
+  bool checked; // carries a checksum this build verifies
+};
+std::vector<Codec> codecs() {
+  return {{"lzma", kLzmaPayload, sizeof(kLzmaPayload), true},
+          {"zlib", kZlibPayload, sizeof(kZlibPayload), true},
+          {"lz4", kLz4Payload, sizeof(kLz4Payload), haveLz4()},
+          {"zstd", kZstdPayload, sizeof(kZstdPayload), false}};
+}
+} // namespace
+
+TEST(BlockChecksum, RootWrittenBasketsOfEachCodec) {
+  const uint64_t S = 300;
+  for (const Codec& c : codecs()) {
+    const std::vector<uint8_t> rec = basketOf(c.p, c.n, S);
+    const int32_t nb = static_cast<int32_t>(rec.size());
+    const Span sp = spanWith(rec, 0, S, 4096);
+    // As ROOT wrote it: passes; checked where the codec carries a checksum.
+    FetchVerdict v = verdictOf({S}, {nb}, sp);
+    EXPECT_TRUE(v.faults.empty()) << c.name;
+    EXPECT_EQ(v.passed, c.checked ? 1u : 0u) << c.name;
+    EXPECT_EQ(v.none, c.checked ? 0u : 1u) << c.name;
+    EXPECT_EQ(fetchedDataToCheck({S}, {nb}, sp.off, sp.b.data(), sp.b.size()), c.checked) << c.name;
+    // One byte changed inside the compressed data, the key intact (its position and length
+    // pass): refused where the codec carries a checksum, as the basket's own fault.
+    std::vector<uint8_t> bad = rec;
+    bad[70 + 9 + (c.n - 9) / 2] ^= 0x10;
+    const Span bsp = spanWith(bad, 0, S, 4096);
+    EXPECT_EQ(firstMisplacedKey({S}, {nb}, bsp.off, bsp.b.data(), bsp.b.size(), S, S + nb).count,
+              0u)
+        << c.name << ": the key passes";
+    v = verdictOf({S}, {nb}, bsp);
+    if (!c.checked) {
+      EXPECT_TRUE(v.faults.empty()) << c.name << ": nothing to check it against";
+      continue;
+    }
+    ASSERT_EQ(v.faults.size(), 1u) << c.name;
+    EXPECT_EQ(v.faults[0].kind, FetchFault::kData);
+    EXPECT_EQ(v.faults[0].at, S);
+    EXPECT_EQ(v.faults[0].end, S + nb);
+    std::string why;
+    MisplacedKeys m = v.against(S, S + nb, &why);
+    EXPECT_EQ(m.count, 1u);
+    EXPECT_EQ(m.first, S);
+    EXPECT_FALSE(m.length);
+    EXPECT_EQ(why.rfind("its data fails its own check: ", 0), 0u) << why;
+    // A reader whose bytes reach into the basket's data, not its key: still its fault.
+    EXPECT_EQ(v.against(S + nb - 1, S + nb + 10).count, 1u) << c.name;
+    // Bytes the reader did not ask for: outside (nothing of the fetch kept), not counted.
+    m = v.against(S + nb, S + nb + 100);
+    EXPECT_EQ(m.count, 0u);
+    EXPECT_TRUE(m.outside);
+    m = v.against(S, S);
+    EXPECT_EQ(m.count, 0u);
+    EXPECT_TRUE(m.outside);
+    // Without the data check (as before), only the key: no fault.
+    EXPECT_TRUE(verdictOf({S}, {nb}, bsp, false).faults.empty());
+  }
+}
+
+TEST(BlockChecksum, WhatIsNotJudged) {
+  const uint64_t S = 300;
+  const std::vector<uint8_t> rec = basketOf(kZlibPayload, sizeof(kZlibPayload), S);
+  const int32_t nb = static_cast<int32_t>(rec.size());
+  std::vector<uint8_t> bad = rec;
+  bad[70 + 40] ^= 0x10;
+  // No length known (two records of one position disagree): ROOT's read length is not known.
+  FetchVerdict v = verdictOf({S}, {0}, spanWith(bad, 0, S, 4096));
+  EXPECT_TRUE(v.faults.empty());
+  EXPECT_EQ(v.passed + v.none, 0u);
+  // No map lengths at all.
+  EXPECT_TRUE(verdictOf({S}, {}, spanWith(bad, 0, S, 4096)).faults.empty());
+  // The basket not wholly in the fetched bytes (its key is): not judged.
+  Span cut = spanWith(bad, 0, S, 4096);
+  cut.b.resize(S + nb - 1);
+  v = verdictOf({S}, {nb}, cut);
+  EXPECT_TRUE(v.faults.empty());
+  EXPECT_EQ(v.passed + v.none, 0u);
+  EXPECT_FALSE(fetchedDataToCheck({S}, {nb}, cut.off, cut.b.data(), cut.b.size()));
+  // Stored as it is (fObjlen == fNbytes - fKeylen): no checksum, counted none, never decoded.
+  std::vector<uint8_t> stored = wideAt(S);
+  stored.resize(70);
+  std::vector<uint8_t> data(200, 0x11);
+  putBe32(stored, 0, 270);
+  putBe32(stored, 6, 200);
+  stored.insert(stored.end(), data.begin(), data.end());
+  const Span ssp = spanWith(stored, 0, S, 4096);
+  v = verdictOf({S}, {270}, ssp);
+  EXPECT_TRUE(v.faults.empty());
+  EXPECT_EQ(v.none, 1u);
+  EXPECT_FALSE(fetchedDataToCheck({S}, {270}, ssp.off, ssp.b.data(), ssp.b.size()));
+  // ROOT's old algorithm (CS): no claim. A tag ROOT does not know: ROOT fails, and so does this.
+  std::vector<uint8_t> cs = rec;
+  cs[70] = 'C';
+  cs[71] = 'S';
+  v = verdictOf({S}, {nb}, spanWith(cs, 0, S, 4096));
+  EXPECT_TRUE(v.faults.empty());
+  EXPECT_EQ(v.none, 1u);
+  std::vector<uint8_t> unk = rec;
+  unk[70] = 'Q';
+  v = verdictOf({S}, {nb}, spanWith(unk, 0, S, 4096));
+  ASSERT_EQ(v.faults.size(), 1u);
+  EXPECT_EQ(v.faults[0].why, "unknown compression block");
+  // A key that fails is reported as the key's fault, and its data is not decoded.
+  v = verdictOf({S}, {nb},
+                spanWith(basketOf(kZlibPayload, sizeof(kZlibPayload), S + 1), 0, S, 4096));
+  ASSERT_EQ(v.faults.size(), 1u);
+  EXPECT_EQ(v.faults[0].kind, FetchFault::kPosition);
+  EXPECT_EQ(v.passed + v.none, 0u);
+}
+
+TEST(BlockChecksum, MapLengthDecidesTheBytesDecoded) {
+  // ROOT reads a basket by the map's length: a key whose own length alone differs (ROOT's
+  // compressed decision unchanged) is decoded from the key's length to the map's.
+  const uint64_t S = 300;
+  std::vector<uint8_t> rec = basketOf(kLzmaPayload, sizeof(kLzmaPayload), S);
+  const int32_t nb = static_cast<int32_t>(rec.size());
+  putBe32(rec, 0, nb + 7); // the key says 7 bytes more: still compressed by both
+  Span sp = spanWith(rec, 0, S, 4096);
+  FetchVerdict v = verdictOf({S}, {nb}, sp);
+  EXPECT_TRUE(v.faults.empty());
+  EXPECT_EQ(v.passed, 1u);
+}
+
+TEST(BlockChecksum, PiecesThatFollowEachOtherAreJudgedWhole) {
+  // A basket (its key header, or its data) that a cut between two pieces of one fetch divides is
+  // judged as if fetched in one piece; apart, neither piece holds it whole.
+  const uint64_t S = 300;
+  const std::vector<uint8_t> rec = basketOf(kZlibPayload, sizeof(kZlibPayload), S);
+  const int32_t nb = static_cast<int32_t>(rec.size());
+  std::vector<uint8_t> bad = rec;
+  bad[70 + 9 + 30] ^= 0x10;
+  std::vector<uint8_t> zero = rec;
+  std::fill(zero.begin(), zero.begin() + 26, 0); // the key header zeroed
+  for (const std::vector<uint8_t>* r :
+       std::vector<const std::vector<uint8_t>*>{&rec, &bad, &zero}) {
+    const Span sp = spanWith(*r, 0, S, 4096);
+    for (uint64_t cut : {S + 10, S + 20, S + 25, S + 70, S + 100, S + nb - 1}) {
+      const std::vector<BytePiece> two{
+          {0, reinterpret_cast<const char*>(sp.b.data()), cut},
+          {cut, reinterpret_cast<const char*>(sp.b.data()) + cut, sp.b.size() - cut}};
+      const FetchVerdict whole = verdictOf({S}, {nb}, sp);
+      const FetchVerdict joined = checkPieces({S}, {nb}, two, true);
+      EXPECT_EQ(joined.faults.size(), whole.faults.size()) << "cut " << cut;
+      EXPECT_EQ(joined.passed, whole.passed) << "cut " << cut;
+      EXPECT_TRUE(piecesNeedWork({S}, {nb}, two)) << "pieces to join";
+      // Judged apart, the divided basket is not judged at all.
+      FetchVerdict apart = checkFetched({S}, {nb}, 0, sp.b.data(), cut, true);
+      apart.merge(checkFetched({S}, {nb}, cut, sp.b.data() + cut, sp.b.size() - cut, true));
+      // A header the first piece holds whole is judged there (a zeroed one is read 32-bit: 22
+      // bytes).
+      if (r != &zero || cut < S + 22) {
+        EXPECT_TRUE(apart.faults.empty()) << "cut " << cut;
+      }
+    }
+    // In reverse order: joined all the same. With a gap: not joined.
+    const std::vector<BytePiece> rev{
+        {S + 50, reinterpret_cast<const char*>(sp.b.data()) + S + 50, sp.b.size() - S - 50},
+        {0, reinterpret_cast<const char*>(sp.b.data()), S + 50}};
+    EXPECT_EQ(checkPieces({S}, {nb}, rev, true).faults.size(),
+              verdictOf({S}, {nb}, sp).faults.size());
+    const std::vector<BytePiece> gap{
+        {0, reinterpret_cast<const char*>(sp.b.data()), S + 50},
+        {S + 51, reinterpret_cast<const char*>(sp.b.data()) + S + 51, sp.b.size() - S - 51}};
+    EXPECT_EQ(checkPieces({S}, {nb}, gap, true).faults.size(), r == &zero ? 1u : 0u)
+        << "only a header the first piece holds whole";
+  }
+  // One piece whose basket needs no decoding: no work to hand off.
+  const Span plain = spanWith(rec, 0, S, 4096);
+  const std::vector<BytePiece> one{{0, reinterpret_cast<const char*>(plain.b.data()), 200}};
+  EXPECT_FALSE(piecesNeedWork({S}, {nb}, one));
+}
+
+// A map that shows its copy bad concerns only the damaged tree: its record and, where the record
+// could be read, its baskets. Reads of another tree of the copy make no claim.
+TEST(FileMap, ADamagedTreeConcernsOnlyItsOwnParts) {
+  FileMeta fm;
+  fm.treeKey.seekkey = 1000;
+  fm.treeKey.nbytes = 200;
+  EXPECT_EQ(treeSpans(fm, {}, {}), (std::vector<std::pair<uint64_t, uint64_t>>{{1000, 1200}}));
+  EXPECT_EQ(treeSpans(fm, {100, 150, 300}, {50, 20, 0}),
+            (std::vector<std::pair<uint64_t, uint64_t>>{{100, 170}, {300, 301}, {1000, 1200}}));
+  fm.treeKey.nbytes = 0;
+  EXPECT_TRUE(treeSpans(fm, {}, {}).empty()) << "no record found: nothing to hold against";
+  const std::vector<std::pair<uint64_t, uint64_t>> spans{{1000, 1200}};
+  std::vector<char> b(4096, 0);
+  const std::string why = "the tree's record fails its own check";
+  const auto at = [&](uint64_t off, uint64_t n) {
+    return checkPieces({}, {}, {BytePiece{off, b.data(), n}}, true, &spans, why);
+  };
+  // Another tree's bytes, before and after the record: no claim.
+  EXPECT_TRUE(at(0, 1000).faults.empty());
+  EXPECT_TRUE(at(1200, 2000).faults.empty());
+  // The record: refused, at the first byte the reader asked for inside it.
+  std::string w;
+  MisplacedKeys m = at(900, 400).against(1100, 1150, &w);
+  EXPECT_EQ(m.count, 1u);
+  EXPECT_EQ(m.first, 1100u);
+  EXPECT_EQ(w, why);
+  m = at(900, 400).against(950, 1010);
+  EXPECT_EQ(m.count, 1u);
+  EXPECT_EQ(m.first, 1000u);
+  // The fetch holds part of the record, the reader's bytes do not: outside (nothing kept).
+  m = at(900, 400).against(900, 950);
+  EXPECT_EQ(m.count, 0u);
+  EXPECT_TRUE(m.outside);
+}
+
+#ifdef UCACHE_TEST_DATA_DIR
+// The fixture's baskets as ROOT wrote them (zlib and LZMA, ROOT reads every one): every basket the
+// map places passes its data's own check; one byte changed inside any basket's compressed data,
+// its key intact, is that basket's fault and no other's.
+TEST(BlockChecksum, EveryBasketOfARootFile) {
+  BytesSource src;
+  FILE* fp =
+      std::fopen((std::string(UCACHE_TEST_DATA_DIR) + "/unnamed_codec_fixture.root").c_str(), "rb");
+  ASSERT_NE(fp, nullptr);
+  uint8_t buf[65536];
+  size_t r;
+  while ((r = std::fread(buf, 1, sizeof buf, fp)) > 0)
+    src.b.insert(src.b.end(), buf, buf + r);
+  std::fclose(fp);
+  const FileMeta fm = parseFile(src, static_cast<int64_t>(src.b.size()), "Events");
+  ASSERT_TRUE(fm.error.empty()) << fm.error;
+  std::vector<uint64_t> seeks;
+  std::vector<int32_t> lengths;
+  basketMap(fm, seeks, lengths);
+  ASSERT_EQ(seeks.size(), 12u);
+  FetchVerdict v = checkFetched(seeks, lengths, 0, src.b.data(), src.b.size(), true);
+  EXPECT_TRUE(v.faults.empty());
+  EXPECT_EQ(v.passed, 12u) << "every basket compressed, by zlib or LZMA";
+  std::set<std::string> seen;
+  for (size_t i = 0; i < seeks.size(); ++i) {
+    const uint8_t* k = src.b.data() + seeks[i];
+    const int keylen = k[14] << 8 | k[15];
+    seen.insert(blockCodec(k + keylen, 9));
+    std::vector<uint8_t> bad = src.b;
+    bad[seeks[i] + keylen + 9 + (lengths[i] - keylen - 9) / 2] ^= 0x04;
+    v = checkFetched(seeks, lengths, 0, bad.data(), bad.size(), true);
+    ASSERT_EQ(v.faults.size(), 1u) << "basket at " << seeks[i];
+    EXPECT_EQ(v.faults[0].at, seeks[i]);
+    EXPECT_EQ(v.faults[0].kind, FetchFault::kData);
+    EXPECT_EQ(v.passed, 11u);
+    EXPECT_EQ(firstMisplacedKey(seeks, lengths, 0, bad.data(), bad.size(), 0, bad.size()).count, 0u)
+        << "its key passes";
+  }
+  EXPECT_EQ(seen, (std::set<std::string>{"lzma", "zlib"}));
 }
 #endif
