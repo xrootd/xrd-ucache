@@ -30,6 +30,7 @@ namespace xrdwire {
 // Client status codes (XrdClStatus.hh).
 constexpr int kErrInternal = 7;
 constexpr int kErrDataError = 14;
+constexpr int kErrInvalidAddr = 101;
 constexpr int kErrSocketError = 102;
 constexpr int kErrSocketTimeout = 103;
 constexpr int kErrSocketDisconnected = 104;
@@ -39,6 +40,7 @@ constexpr int kErrStreamDisconnect = 107;
 constexpr int kErrConnectionError = 108;
 constexpr int kErrInvalidSession = 109;
 constexpr int kErrTlsError = 110;
+constexpr int kErrHandShakeFailed = 202;
 constexpr int kErrAuthFailed = 204;
 constexpr int kErrOperationExpired = 206;
 constexpr int kErrOperationInterrupted = 207;
@@ -217,6 +219,15 @@ bool clientRecoversRead(int code);
 // failure the client would have recovered (clientRecoversRead) by opening the file again, had its
 // recovery been on for the read. A file the reader opens without uCache stays readable with it.
 bool openOnceMoreAfterCheckRead(bool headerFailed, int sourceAttempt, int code);
+// Whether the open's budget has time for that once-more open: what is left of it
+// (`remainingMs`, FailoverSeq::remainingMs), less the wait before the open (`waitMs`, the
+// backoff's ceiling), holds at least kOnceMoreMinMs, the shortest limit an attempt is given. The
+// open is then given no more than what is left, and its checks' first read no more than that and
+// the margin of kHeaderReadFloorS (headerReadTimeoutS's `openLeftMs`), as the later reads are
+// (checkReadTimeoutS): the job's open never runs past its budget by more than that margin. Without
+// that time the open ends with the failure of the read, as it would at the end of its budget.
+inline constexpr int64_t kOnceMoreMinMs = 1000;
+bool openOnceMoreInTime(int64_t remainingMs, uint64_t waitMs);
 
 // Whether a copy of `path` that reports `size` bytes is a bad copy for that file: no
 // bytes in a file named *.root (a ROOT file is never empty). For any other name a size of
@@ -306,10 +317,13 @@ void rootCheckRead(RootHeaderVerdict& v, const unsigned char* b, size_t n);
 // the read (one round trip to a server that has just answered). It is the margin that budgetS
 // keeps between an open's budget and the client's stream error window, so a read that starts
 // at the end of the budget still ends inside that window.
+// `openLeftMs`, when given (the once-more open, openOnceMoreInTime): the limit is never more than
+// that, what is left of the open's own time (its budget and that margin), rounded up; 0 when none
+// is left (the copy has run out of time, as for a read that expired).
 inline constexpr int kHeaderReadFloorS = 5;
 static_assert(kHeaderReadFloorS >= 1 && kHeaderReadFloorS < kOpenDeadlineS,
               "the header read's floor is a moment, never a fresh open deadline");
-int headerReadTimeoutS(int attemptLimitS, int64_t elapsedMs);
+int headerReadTimeoutS(int attemptLimitS, int64_t elapsedMs, int64_t openLeftMs = INT64_MAX);
 // The time limit, in seconds, of a further read of the checks made at open (the top directory's
 // record, the list of top-level objects), of `len` bytes: what is left of the time the checks were
 // given when their first read was sent (headerReadTimeoutS), `leftMs`, or the read's own floor when
@@ -370,6 +384,20 @@ uint64_t suggestedWindowS(uint64_t ageS);
 // of its <size> (<percent>)", "reads the parts it holds from the cache without asking an origin;
 // reads of the parts it does not hold will still fail". "" for an entry that holds nothing.
 std::string staleEntryAdvice(uint64_t ageS, uint64_t held, uint64_t size);
+// What an attempt of the open that failed with `code`/`errNo` says of that advice. It is given only
+// when every copy was refused by a check or could not be reached; never for a file that is not
+// there, a refusal to authorize, or a request a server rejects for what it asks:
+//   kAllows   the copy could not be reached or served (a connection, socket, session, TLS or
+//             handshake error, an address that does not resolve, a timeout, a redirect loop, an
+//             answer the client could not read), the server failed (its I/O, file system or own
+//             error, overloaded, no server behind it), or the bytes were refused (a data error)
+//   kNeutral  "not found" after the first attempt: no other copy is left to send the open to (the
+//             redirector, with the servers that failed named, has none; a listed copy is gone)
+//   kBlocks   "not found" at the first attempt (the federation has no copy), a refusal to
+//             authorize or authenticate, and any other error (a request rejected for what it asks)
+// `firstAttempt`: the sequence's first attempt. A success (code 0) allows it.
+enum class StaleAdvice : uint8_t { kAllows, kNeutral, kBlocks };
+StaleAdvice staleAdviceAfter(int code, int errNo, bool firstAttempt);
 // The bound on the text of the error that names every copy (allSitesFailedText, noCopyServedText).
 inline constexpr size_t kErrorTextMax = 1024;
 // `text` and then `advice`, the whole at most `max` bytes: `text` is cut first, so the advice is

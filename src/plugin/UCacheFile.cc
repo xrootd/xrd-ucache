@@ -64,6 +64,8 @@ static_assert(kXR_ItExists == 3018 && kXR_Overloaded == 3024,
 // The same for OpenPolicy.h's failure classes.
 static_assert(XrdCl::errInternal == xrdwire::kErrInternal &&
                   XrdCl::errDataError == xrdwire::kErrDataError &&
+                  XrdCl::errInvalidAddr == xrdwire::kErrInvalidAddr &&
+                  XrdCl::errHandShakeFailed == xrdwire::kErrHandShakeFailed &&
                   XrdCl::errSocketError == xrdwire::kErrSocketError &&
                   XrdCl::errSocketTimeout == xrdwire::kErrSocketTimeout &&
                   XrdCl::errSocketDisconnected == xrdwire::kErrSocketDisconnected &&
@@ -807,8 +809,8 @@ enum class Next : uint8_t {
 // whose checks' read failed in a way the client would have recovered, had its recovery been
 // on for that read (OpenPolicy.h openOnceMoreAfterCheckRead), is made once more at the same
 // source wherever it would otherwise end there: at a direct URL, at the last open of the
-// reader's own URL, and when the sequence's bounds are spent or no other copy is left. Counts
-// the retries.
+// reader's own URL, and when the sequence's bounds are spent or no other copy is left, while its
+// budget has time for it (openOnceMoreInTime). Counts the retries.
 // Throws nothing: for want of memory the open ends with this answer.
 Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XRootDStatus& s,
                   const AttemptView& w, const std::string& sentUrl, int sourceAttempt,
@@ -820,8 +822,12 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
   // once, the open of a direct URL whose header read failed in a way the client would have
   // recovered by opening the file again, had its recovery been on for that read.
   const bool elsewhere = w.v.viaRedirector && w.v.hops > 1;
+  // ... and only while the sequence's budget has time for it (openOnceMoreInTime): the job's open
+  // never runs past its budget by more than the checks' margin.
   const bool onceMore =
-      !ok && openOnceMoreAfterCheckRead(w.headerFailed, sourceAttempt, s.code) && !processExiting();
+      !ok && openOnceMoreAfterCheckRead(w.headerFailed, sourceAttempt, s.code) &&
+      !processExiting() &&
+      (!seq || openOnceMoreInTime(seq->remainingMs(), backoffBoundMs(sourceAttempt, cfg)));
   const auto sameSource = [&st] {
     if (st.store)
       st.store->stats().openRetries.fetch_add(1, std::memory_order_relaxed);
@@ -1342,6 +1348,10 @@ void noteAnswer(const OpenAttempt& a, const OpenAnswer& ans, const std::string& 
 // The advice the error of a failed open carries when the cache holds an earlier copy of the file
 // (defined below, beside the freshness marker).
 std::string staleEntryAdviceFor(const std::string& url) noexcept;
+// Stores what the checks at the reader's open read in the handle's entry (defined below, beside
+// ensureEntry).
+void storeOpenBytesIn(HandleState& st, const std::shared_ptr<FileEntry>& entry,
+                      const HandleState::OpenBytes& ob) noexcept;
 
 // Whether the cache caches the file `st` reads: it has a store, and the host of the reader's URL
 // passes the allow and deny lists, as ensureEntry asks. (A handle the cache passes straight to the
@@ -1689,7 +1699,11 @@ class RetryingOpenHandler : public ResponseHandler {
     hr->sentUs = now;
     int limitS = 0;
     if (hr->stage == RootHeaderVerdict::kNone) {
-      limitS = headerReadTimeoutS(a_.timeoutS, static_cast<int64_t>((now - a_.t0) / 1000));
+      // The once-more open after a failed read of the checks: within the open's own time too.
+      const int64_t openLeftMs =
+          seq_ && onceMore_ ? seq_->remainingMs() + int64_t(kHeaderReadFloorS) * 1000 : INT64_MAX;
+      limitS =
+          headerReadTimeoutS(a_.timeoutS, static_cast<int64_t>((now - a_.t0) / 1000), openLeftMs);
       hr->deadlineUs = now + static_cast<uint64_t>(limitS) * 1000000;
     } else {
       const int64_t openLeftMs = (seq_ ? seq_->remainingMs() : int64_t(kOpenDeadlineS) * 1000) +
@@ -1714,18 +1728,42 @@ class RetryingOpenHandler : public ResponseHandler {
 
   // The open takes the copy `w` is of: what its checks read (`kept_`) is given to the handle, with
   // the copy's size, its server and the File it was read on, to be stored when the handle's entry
-  // is set up (storeOpenBytes). Throws nothing: for want of memory nothing is kept.
+  // is set up (storeOpenBytes). A handle whose entry was set up before this answer (a request made
+  // on the handle while the checks ran sets it up) has them stored now, off this thread, as a
+  // miss's pages are (reserved before the reader is answered, so that its Close waits for them);
+  // a handle with no entry lets them go at once. Throws nothing: for want of memory nothing is
+  // kept.
   void keepOpenBytes(const AttemptView& w) noexcept try {
     if (kept_.empty() || w.size <= 0)
       return;
-    auto ob = std::make_unique<HandleState::OpenBytes>();
+    auto ob = std::make_shared<HandleState::OpenBytes>();
     ob->file = keptOn_;
     ob->size = static_cast<uint64_t>(w.size);
     ob->server = lastServer(w);
     ob->spans = std::move(kept_);
-    std::lock_guard<std::mutex> g(st_->mu);
-    if (!st_->closed)
-      st_->openBytes = std::move(ob);
+    std::shared_ptr<FileEntry> entry;
+    {
+      std::lock_guard<std::mutex> g(st_->mu);
+      if (st_->closed)
+        return;
+      if (!st_->setupDone) {
+        st_->openBytes = std::make_unique<HandleState::OpenBytes>(std::move(*ob));
+        return;
+      }
+      if (st_->tripped || !st_->entry)
+        return; // no entry to store them in: they go now
+      entry = st_->entry;
+    }
+    std::shared_ptr<HandleState> st = st_;
+    st->beginPersist();
+    try {
+      Executor::instance().post([st, entry, ob] {
+        storeOpenBytesIn(*st, entry, *ob);
+        st->endPersist();
+      });
+    } catch (...) {
+      st->endPersist();
+    }
   } catch (...) {
   }
 
@@ -1745,6 +1783,12 @@ class RetryingOpenHandler : public ResponseHandler {
              bool fresh, bool opened = false) {
     const Next n = afterAttempt(*st_, cfg_, seq_.get(), s, w, sentUrl_, sourceAttempt_, 0);
     const bool ok = s.IsOK();
+    // What this attempt says of the advice of an earlier copy in the cache (staleAdviceAfter).
+    if (!ok &&
+        staleAdviceAfter(s.code, static_cast<int>(s.errNo), attempt_ <= 1) == StaleAdvice::kBlocks)
+      adviceBlocked_ = true;
+    // The next attempt is the open made once more after a failed read of the checks.
+    onceMore_ = n == Next::kSameSource && w.headerFailed;
     a_.endUs = nowUs();
     if (seq_ && (n == Next::kDone || n == Next::kRefuse)) {
       a_.outcome = ok && n == Next::kDone ? "ok" : "error";
@@ -1861,9 +1905,11 @@ class RetryingOpenHandler : public ResponseHandler {
   void forwardFailure() {
     // Once it has failed over, an error naming every site that failed.
     XRootDStatus out = seq_ ? seq_->finalError(*st_, recordFile(st_->url), lastStatus_) : lastStatus_;
-    // With adaptive_federation on, no copy passed: when the cache holds an earlier copy of the file,
+    // With adaptive_federation on, no copy passed: when the cache holds an earlier copy of the
+    // file, and every copy was refused by a check or could not be reached (never for a file that is
+    // not there, a refusal to authorize, or a request rejected for what it asks: staleAdviceAfter),
     // the error says so, and how to read it without asking an origin. The entry is left as it is.
-    if (seq_ && record_) {
+    if (seq_ && record_ && !adviceBlocked_) {
       const std::string advice = staleEntryAdviceFor(st_->url);
       if (!advice.empty()) {
         out = XRootDStatus(out.status, out.code, out.errNo,
@@ -1888,6 +1934,11 @@ class RetryingOpenHandler : public ResponseHandler {
   const bool record_; // a handle the cache serves: its attempts are recorded
   int attempt_ = 0;
   int sourceAttempt_ = 0; // attempts at the current source
+  // The attempt in flight is the open made once more at its source after a read of the checks
+  // failed (afterAttempt, openOnceMoreInTime): its checks' first read is held to the open's time.
+  bool onceMore_ = false;
+  // An attempt failed in a way that rules out the advice of an earlier copy (staleAdviceAfter).
+  bool adviceBlocked_ = false;
   XRootDStatus lastStatus_;
   std::unique_ptr<HostList> lastHosts_; // of the last failed attempt that had any
   OpenAttempt a_; // the attempt in flight, as recorded
@@ -4574,29 +4625,34 @@ bool guardAllowsChunks(const std::shared_ptr<HandleState>& st, uint64_t originSi
 #endif
 } // namespace
 
-// What the checks made at the reader's open read of the copy the open took (HandleState::
-// openBytes, whole pages), stored in the handle's new entry as any bytes fetched from the origin
-// are, before the reader's first read is looked up, so that its reads of the same records are
-// served from the cache: only when the entry is of the size the copy reported and the handle's
-// File is still the one they were read on; with check_origin_integrity's key-position check where
-// the handle has the file's table of baskets (a span with a misplaced basket in it is not kept);
-// counted as reads from the origin for the entry, as the metadata parsers' reads are (OriginSource).
-// Pages the entry holds already are left as they are. The bytes go in any case; a failure to store
-// them fails nothing.
-static void storeOpenBytes(HandleState& st, const std::shared_ptr<FileEntry>& entry) noexcept try {
-  std::unique_ptr<HandleState::OpenBytes> ob;
+namespace {
+
+// What the checks made at the reader's open read of the copy the open took (`ob`, whole pages),
+// stored in the handle's entry as any bytes fetched from the origin are, so that the reader's
+// reads of the same records are served from the cache: only when the entry is of the size the copy
+// reported and the handle's File is still the one they were read on; counted as reads from the
+// origin for the entry, as the metadata parsers' reads are (OriginSource). check_origin_integrity's
+// key-position check is applied only when the handle already holds the file's table of basket
+// positions (a span with a misplaced basket in it is then not kept). It does not when the entry is
+// first set up: the table is built at the handle's first miss, after that. So, like the pages of
+// the file's own records that the metadata parsers read, the kept pages are stored unchecked at
+// setup. Pages the entry holds already are left as they are. The bytes go in any case; a failure
+// to store them fails nothing.
+void storeOpenBytesIn(HandleState& st, const std::shared_ptr<FileEntry>& entry,
+                      const HandleState::OpenBytes& ob) noexcept try {
   {
     std::lock_guard<std::mutex> g(st.mu);
-    ob = std::move(st.openBytes);
+    if (st.closed)
+      return;
   }
-  if (!ob || !entry || ob->size != entry->fileSize() || st.inner.load() != ob->file ||
+  if (!entry || ob.size != entry->fileSize() || st.inner.load() != ob.file ||
       st.innerStale.load(std::memory_order_acquire))
     return;
 #ifdef UCACHE_HAVE_COLDRUN
   const auto seeks = keySeeksOf(st);
 #endif
   uint64_t stored = 0;
-  for (const auto& sp : ob->spans) {
+  for (const auto& sp : ob.spans) {
     if (sp.bytes.empty())
       continue;
 #ifdef UCACHE_HAVE_COLDRUN
@@ -4613,10 +4669,10 @@ static void storeOpenBytes(HandleState& st, const std::shared_ptr<FileEntry>& en
       stats.originReads.fetch_add(1, std::memory_order_relaxed);
       stats.originRtUs.add(sp.rtUs);
       entry->obs().originRtUs.add(sp.rtUs);
-      entry->obs().servers.add(ob->server, sp.bytes.size(), sp.rtUs, 0);
+      entry->obs().servers.add(ob.server, sp.bytes.size(), sp.rtUs, 0);
       if (stats.tracer)
         stats.tracer->rec("wire", entry->key().key, sp.off, sp.bytes.size(), sp.rtUs, true,
-                          wireTraceFields(ob->server, sp.t0Us, 1));
+                          wireTraceFields(ob.server, sp.t0Us, 1));
       stats.openCheckBytesKept.fetch_add(sp.bytes.size(), std::memory_order_relaxed);
     }
     entry->writePages(sp.off, sp.bytes.size(), sp.bytes.data());
@@ -4626,6 +4682,20 @@ static void storeOpenBytes(HandleState& st, const std::shared_ptr<FileEntry>& en
     entry->flushMeta(false);
 } catch (...) {
 }
+
+// The same, for the bytes the handle holds (HandleState::openBytes), when its entry is set up
+// (ensureEntry): before the reader's first read is looked up; let go when there is no entry.
+static void storeOpenBytes(HandleState& st, const std::shared_ptr<FileEntry>& entry) noexcept {
+  std::unique_ptr<HandleState::OpenBytes> ob;
+  {
+    std::lock_guard<std::mutex> g(st.mu);
+    ob = std::move(st.openBytes);
+  }
+  if (ob)
+    storeOpenBytesIn(st, entry, *ob);
+}
+
+} // namespace
 
 std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uint64_t>* firstRead) {
   // Pass-through handles -- write opens, UCACHE_DISABLE, no store, and copies

@@ -48,7 +48,9 @@
 #                          another; either way the reader's open gets exactly one completion,
 #                          and uCache closes each copy it opened. A ReadRecovery the reader sets
 #                          just as the checks begin is on the File before they turn it off: it
-#                          reads false during their reads, and the reader's value after them
+#                          reads false during their reads, and the reader's value after them. A Stat
+#                          the reader makes while the checks run sets the handle up before its open
+#                          answers; what the checks read is stored in that entry all the same
 #   zeros at the size      one server holds as many zero bytes as the file has (a, b and c in
 #                          turn), the other two the file: the copy of zeros does not begin as a
 #                          ROOT file does and is refused; the open goes on to a whole copy
@@ -425,6 +427,21 @@ res=$(fuzz "$W/c24" "$W/f24.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-pr
 echo "$res" | sed 's/^/    /' | cut -c1-300
 echo "$res" | grep -q '^open-property-race: clean$'; verdict "a setting made as the checks at open begin: ReadRecovery false during their reads, the reader's true after, one completion" $?
 [ "$(nheader "$W/f24.log")" = 1 ] && records "$W/c24" | grep -q '"status":"ok"'; verdict "the checks' first read was sent once, late, and the open succeeded (the fault was in place)" $?
+# A Stat the reader makes while the checks run (their first read sent 5 s late) sets the handle up before its open
+# answers: what the checks read of the copy the open takes goes into that entry all the same (open_check_bytes_kept),
+# never left waiting in memory for a set-up that has happened.
+L=/store/ci/stat-during.root
+placew $L a b c
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay)
+res=$(fuzz "$W/c25" "$W/f25.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-stat-during-checks)
+echo "$res" | sed 's/^/    /' | cut -c1-300
+echo "$res" | grep -q '^open-stat-during-checks: clean$'; verdict "a Stat made while the checks at open run: the file's size, answered before the open; one completion; the read of the header exact" $?
+# (The delayed read is a test's fault, made as asked, 300 bytes, and not kept; the list's pages are kept.)
+grep -qE 'MsgHandler created.*kXR_read \(handle: 0x[0-9a-f]*, offset: 0, size: 300\)' "$W/f25.log" &&
+  [ "$(records "$W/c25" | wc -l)" = 1 ] && records "$W/c25" | grep -q '"status":"ok"'
+verdict "the checks' first read was the late one (300 bytes at 0), and the open succeeded at its first attempt (the fault was in place)" $?
+K=$(counter "$W/c25" open_check_bytes_kept)
+[ "${K:-0}" -gt 0 ]; verdict "what the checks read went into the entry the Stat had set up (open_check_bytes_kept ${K:-none})" $?
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on) # the cases below have no header fault
 
 echo; echo "=== a copy that is zeros at the file's size is refused"

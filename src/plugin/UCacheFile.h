@@ -217,7 +217,9 @@ struct HandleState {
   // kept here from the open's answer until the handle's entry is set up (ensureEntry), which stores
   // them as it stores any bytes fetched from the origin, when the entry is of the size the copy
   // reported and the handle's File is still the one they were read on; then, or at Close, they go.
-  // Under mu.
+  // A handle set up before its open answered (a request made on it while the checks ran) never
+  // holds them here: they are stored in its entry at the answer (RetryingOpenHandler::
+  // keepOpenBytes). Under mu.
   struct OpenBytes {
     XrdCl::File* file = nullptr; // the File the checks read on
     uint64_t size = 0;           // the size the copy reported at its open

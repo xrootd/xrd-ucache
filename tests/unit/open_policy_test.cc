@@ -1221,6 +1221,48 @@ TEST(OpenPolicy, OpenOnceMoreAfterCheckRead) {
     EXPECT_FALSE(openOnceMoreAfterCheckRead(true, 1, code)) << code;
 }
 
+// The once-more open is made only while the open's budget has time for it, and its checks' first
+// read is held to what is left and the margin: the job's open never runs past its budget by more
+// than kHeaderReadFloorS.
+TEST(OpenPolicy, OnceMoreOpenWithinTheBudget) {
+  EXPECT_EQ(kOnceMoreMinMs, 1000);
+  EXPECT_TRUE(openOnceMoreInTime(1000, 0)) << "a second left, no wait";
+  EXPECT_FALSE(openOnceMoreInTime(999, 0)) << "less than a second";
+  EXPECT_TRUE(openOnceMoreInTime(1500, 500)) << "the wait and a second";
+  EXPECT_FALSE(openOnceMoreInTime(1499, 500));
+  EXPECT_FALSE(openOnceMoreInTime(0, 0)) << "the budget spent";
+  EXPECT_FALSE(openOnceMoreInTime(-20000, 0)) << "the budget overrun";
+  EXPECT_TRUE(openOnceMoreInTime(170000, 0)) << "most of it left";
+  EXPECT_FALSE(openOnceMoreInTime(170000, 169001));
+  EXPECT_FALSE(openOnceMoreInTime(INT64_MAX, UINT64_MAX)) << "no wraps";
+  EXPECT_TRUE(openOnceMoreInTime(INT64_MAX, 0));
+  // Its first read: no more than what is left of the open's time, rounded up; 0 for none.
+  const int64_t m = int64_t(kHeaderReadFloorS) * 1000; // the margin
+  EXPECT_EQ(headerReadTimeoutS(60, 0, 100000 + m), 60) << "time enough: as before";
+  EXPECT_EQ(headerReadTimeoutS(60, 0, 20000 + m), 25) << "the budget's rest and the margin";
+  EXPECT_EQ(headerReadTimeoutS(60, 0, 20001 + m), 26) << "rounded up";
+  EXPECT_EQ(headerReadTimeoutS(1, 0, 1000 + m), kHeaderReadFloorS) << "the floor, inside the cap";
+  EXPECT_EQ(headerReadTimeoutS(1, 0, 300 + m), kHeaderReadFloorS);
+  EXPECT_EQ(headerReadTimeoutS(1, 900, 100 + m), kHeaderReadFloorS);
+  EXPECT_EQ(headerReadTimeoutS(1, 0, 4200), kHeaderReadFloorS) << "the budget overrun by 0.8 s";
+  EXPECT_EQ(headerReadTimeoutS(1, 0, 1), 1) << "a moment left: a second";
+  EXPECT_EQ(headerReadTimeoutS(1, 0, -3000 + m), 2) << "overrun by 3 s: 2 s of the margin";
+  EXPECT_EQ(headerReadTimeoutS(1, 0, 0), 0) << "none left";
+  EXPECT_EQ(headerReadTimeoutS(1, 0, -1), 0);
+  EXPECT_EQ(headerReadTimeoutS(60, 0, INT64_MIN), 0);
+  // Without the cap (the default), as before.
+  EXPECT_EQ(headerReadTimeoutS(60, 20000), headerReadTimeoutS(60, 20000, INT64_MAX));
+  EXPECT_EQ(headerReadTimeoutS(3, 0), kHeaderReadFloorS);
+  // The bound: an attempt that starts with `rem` of the budget left, given at most that for its
+  // open, ends its first read no later than the budget's end plus the margin.
+  for (int64_t rem = kOnceMoreMinMs; rem <= 60000; rem += 333)
+    for (int64_t openMs = 0; openMs <= rem; openMs += 997) {
+      const int t =
+          headerReadTimeoutS(static_cast<int>((rem + 999) / 1000), openMs, rem - openMs + m);
+      ASSERT_LE(openMs + int64_t(t) * 1000, rem + m + 999) << rem << " " << openMs;
+    }
+}
+
 // A page read the client failed with an invalid response (its answer to a copy's empty answer) is
 // a failure of the copy only on an armed handle, inside the confirmed size; anything else is as it
 // was.
@@ -1377,6 +1419,36 @@ TEST(OpenPolicy, StaleEntryAdvice) {
 }
 
 // The advice goes after the error's text, whole: the text is cut first, within the bound.
+// The advice of an earlier copy is given only when every copy was refused by a check or could not
+// be reached: never for a file that is not there, a refusal to authorize, or a request a server
+// rejects.
+TEST(OpenPolicy, StaleAdviceAfter) {
+  using namespace xrdwire;
+  for (bool first : {true, false}) {
+    for (int code :
+         {0, kErrDataError, kErrInvalidAddr, kErrSocketError, kErrSocketTimeout,
+          kErrSocketDisconnected, kErrPollerError, kErrSocketOptError, kErrStreamDisconnect,
+          kErrConnectionError, kErrInvalidSession, kErrTlsError, kErrHandShakeFailed,
+          kErrOperationExpired, kErrInvalidResponse, kErrRedirectLimit})
+      EXPECT_EQ(staleAdviceAfter(code, 0, first), StaleAdvice::kAllows) << code << " " << first;
+    for (int errNo : {kXrIOError, kXrFSError, kXrServerError, kXrOverloaded, kXrNoServer})
+      EXPECT_EQ(staleAdviceAfter(kErrErrorResponse, errNo, first), StaleAdvice::kAllows) << errNo;
+    // A refusal to authorize or authenticate, a request rejected for what it asks, anything else.
+    for (int errNo :
+         {kXrNotAuthorized, kXrFileLocked, kXrFileNotOpen, kXrNoMemory, kXrCancelled, kXrItExists,
+          kXrReqTimedOut, 3000, 3001, 3002, 3006, 3009, 3013, 3016, 3019, 0})
+      EXPECT_EQ(staleAdviceAfter(kErrErrorResponse, errNo, first), StaleAdvice::kBlocks) << errNo;
+    for (int code : {kErrAuthFailed, 203, kErrInternal, kErrOperationInterrupted, kErrRedirect, 3,
+                     9, 13, 1, 2, 201, 305, 999})
+      EXPECT_EQ(staleAdviceAfter(code, 0, first), StaleAdvice::kBlocks) << code;
+  }
+  // Not found: at the first attempt the federation has no copy; later, no other copy is left.
+  EXPECT_EQ(staleAdviceAfter(kErrErrorResponse, kXrNotFound, true), StaleAdvice::kBlocks);
+  EXPECT_EQ(staleAdviceAfter(kErrNotFound, 0, true), StaleAdvice::kBlocks);
+  EXPECT_EQ(staleAdviceAfter(kErrErrorResponse, kXrNotFound, false), StaleAdvice::kNeutral);
+  EXPECT_EQ(staleAdviceAfter(kErrNotFound, 0, false), StaleAdvice::kNeutral);
+}
+
 TEST(OpenPolicy, WithAdvice) {
   const std::string advice = staleEntryAdvice(5, 131072, 1756917);
   EXPECT_EQ(withAdvice("uCache: /f.root: no site could open it: a (a:1): refused", advice),

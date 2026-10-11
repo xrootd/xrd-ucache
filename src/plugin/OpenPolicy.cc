@@ -295,6 +295,12 @@ bool openOnceMoreAfterCheckRead(bool headerFailed, int sourceAttempt, int code) 
   return headerFailed && sourceAttempt == 1 && clientRecoversRead(code);
 }
 
+bool openOnceMoreInTime(int64_t remainingMs, uint64_t waitMs) {
+  if (waitMs > static_cast<uint64_t>(INT64_MAX) || remainingMs < kOnceMoreMinMs)
+    return false;
+  return remainingMs - kOnceMoreMinMs >= static_cast<int64_t>(waitMs);
+}
+
 bool rootNamed(const std::string& path) {
   const size_t end = path.find('?');
   const size_t n = end == std::string::npos ? path.size() : end;
@@ -551,10 +557,14 @@ void rootCheckRead(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
   judgeKeysList(v, b, v.nextLen);
 }
 
-int headerReadTimeoutS(int attemptLimitS, int64_t elapsedMs) {
+int headerReadTimeoutS(int attemptLimitS, int64_t elapsedMs, int64_t openLeftMs) {
+  if (openLeftMs <= 0)
+    return 0;
   const int64_t limitMs = int64_t(attemptLimitS > 0 ? attemptLimitS : kOpenDeadlineS) * 1000;
   const int64_t leftS = (limitMs - std::max<int64_t>(elapsedMs, 0) + 999) / 1000;
-  return static_cast<int>(std::max<int64_t>(kHeaderReadFloorS, std::min<int64_t>(leftS, limitMs / 1000)));
+  const int64_t t = std::max<int64_t>(kHeaderReadFloorS, std::min<int64_t>(leftS, limitMs / 1000));
+  const int64_t capS = openLeftMs / 1000 + (openLeftMs % 1000 ? 1 : 0);
+  return static_cast<int>(std::min(t, capS));
 }
 
 int checkReadTimeoutS(uint32_t len, int64_t leftMs, int64_t openLeftMs) {
@@ -613,6 +623,45 @@ uint64_t suggestedWindowS(uint64_t ageS) {
   if (ageS >= kMax)
     return kMax;
   return std::min(kMax, (ageS + kDay + kDay - 1) / kDay * kDay);
+}
+
+StaleAdvice staleAdviceAfter(int code, int errNo, bool firstAttempt) {
+  using namespace xrdwire;
+  const bool notFound = code == kErrNotFound || (code == kErrErrorResponse && errNo == kXrNotFound);
+  if (notFound)
+    return firstAttempt ? StaleAdvice::kBlocks : StaleAdvice::kNeutral;
+  switch (code) {
+  case 0:
+  case kErrDataError:
+  case kErrInvalidAddr:
+  case kErrSocketError:
+  case kErrSocketTimeout:
+  case kErrSocketDisconnected:
+  case kErrPollerError:
+  case kErrSocketOptError:
+  case kErrStreamDisconnect:
+  case kErrConnectionError:
+  case kErrInvalidSession:
+  case kErrTlsError:
+  case kErrHandShakeFailed:
+  case kErrOperationExpired:
+  case kErrInvalidResponse:
+  case kErrRedirectLimit:
+    return StaleAdvice::kAllows;
+  case kErrErrorResponse:
+    switch (errNo) {
+    case kXrIOError:
+    case kXrFSError:
+    case kXrServerError:
+    case kXrOverloaded:
+    case kXrNoServer:
+      return StaleAdvice::kAllows;
+    default:
+      return StaleAdvice::kBlocks;
+    }
+  default:
+    return StaleAdvice::kBlocks;
+  }
 }
 
 std::string staleEntryAdvice(uint64_t ageS, uint64_t held, uint64_t size) {

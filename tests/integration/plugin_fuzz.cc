@@ -28,6 +28,9 @@
 //   open-property-race a ReadRecovery set just as the checks made at open
 //                      begin does not land on the File during their reads
 //                      (see runOpenPropertyRace)
+//   open-stat-during-checks a Stat made while the checks made at open run
+//                      sets the handle up first: what they read is stored
+//                      in its entry all the same (see runOpenStatDuringChecks)
 //   open-failover [N]  N opens through a redirector where a server refuses
 //                      the file: exactly one completion each (see runOpenFailover)
 //   open-denied        one open of a file that every server refuses: Open()
@@ -53,8 +56,8 @@
 #endif
 
 #include <algorithm>
-#include <chrono>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -65,6 +68,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <tuple>
 #include <unistd.h>
@@ -1243,6 +1247,63 @@ int runOpenPropertyRace(const char* url) {
   return good ? 0 : 1;
 }
 
+// open-stat-during-checks: a Stat made by the reader while the checks made at open run (a file
+// named
+// *.root that the cache caches, adaptive_federation on; the checks' first read sent 5 s late,
+// UCACHE_TEST_HEADER_FAIL_N=1, _KIND=delay). The Stat sets the handle up (its entry) before the
+// open answers; what the checks read of the copy the open takes must still go into that entry, not
+// wait in memory for a set-up that has happened. 1.5 s after the open is issued, a Stat, which must
+// answer the file's size before the open does; after the open (and a second), a Read of the first
+// 300 bytes, which must be the file's. The gate checks the counter and the client's log.
+int runOpenStatDuringChecks(const char* url, const char* local) {
+  const char* mode = "open-stat-during-checks";
+  if (envInt("UCACHE_TEST_HEADER_FAIL_N", 0) != 1) {
+    std::printf("%s: SETUP: needs UCACHE_TEST_HEADER_FAIL_N=1 (_KIND=delay)\n", mode);
+    return 2;
+  }
+  const int fd = ::open(local, O_RDONLY);
+  struct stat sb{};
+  std::vector<char> ref(300), got(300);
+  if (fd < 0 || ::fstat(fd, &sb) != 0 || ::pread(fd, ref.data(), ref.size(), 0) != 300) {
+    std::printf("%s: SETUP: cannot read 300 bytes of %s\n", mode, local);
+    if (fd >= 0)
+      ::close(fd);
+    return 2;
+  }
+  ::close(fd);
+  auto* f = new XrdCl::File(); // leaked with its handler: a late completion lands safely
+  auto* h = new StrictOpenHandler();
+  const auto t0 = std::chrono::steady_clock::now();
+  const XrdCl::XRootDStatus st = f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h);
+  std::this_thread::sleep_until(t0 + std::chrono::milliseconds(1500));
+  XrdCl::StatInfo* si = nullptr;
+  const XrdCl::XRootDStatus ss = f->Stat(false, si, 30);
+  const uint64_t statSize = si ? si->GetSize() : 0;
+  delete si;
+  const bool doneEarly = h->count() > 0; // the open answered before the Stat did
+  if (!st.IsOK() || !h->succeededWithin(std::chrono::seconds(60))) {
+    std::printf("%s: FAIL: the open (Open() %s, %d completion(s))\n", mode, st.ToString().c_str(),
+                h->count());
+    return 1;
+  }
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  uint32_t bytes = 0;
+  const XrdCl::XRootDStatus rs = f->Read(0, 300, got.data(), bytes);
+  const bool exact = rs.IsOK() && bytes == 300 && got == ref;
+  std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a second completion
+  std::printf("%s: Stat during the checks: %s, size %llu%s; the open: %d completion(s); the read "
+              "of 300 bytes at 0: %s\n",
+              mode, ss.ToString().c_str(), static_cast<unsigned long long>(statSize),
+              doneEarly ? " (the open had already answered)" : "", h->count(),
+              exact ? "exact" : rs.ToString().c_str());
+  const XrdCl::XRootDStatus cs = f->Close();
+  (void)cs;
+  const bool good = ss.IsOK() && statSize == static_cast<uint64_t>(sb.st_size) && !doneEarly &&
+                    exact && h->exactlyOne();
+  std::printf(good ? "%s: clean\n" : "%s: FAIL\n", mode);
+  return good ? 0 : 1;
+}
+
 // open-failover N: N opens, one after another, each with its own handler,
 // through a redirector where a server refuses the file (the gate's fault):
 // every open must get exactly one completion, a success, with a host list,
@@ -1778,6 +1839,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: %s <root-url> <local-path> [ops] [threads] [seed] "
                  "[fuzz|inner-race|inner-race-relay|open-refused|open-property|open-property-race|"
+                 "open-stat-during-checks|"
                  "open-failover|open-denied|"
                  "key-check <off> <len>|read-failover <case>]\n",
                  argv[0]);
@@ -1798,6 +1860,8 @@ int main(int argc, char** argv) {
     return runOpenProperty(url);
   if (mode == "open-property-race")
     return runOpenPropertyRace(url);
+  if (mode == "open-stat-during-checks")
+    return runOpenStatDuringChecks(url, argv[2]);
   if (mode == "open-failover")
     return runOpenFailover(url, argv[2], argc > 3 ? ::atoi(argv[3]) : 12);
   if (mode == "open-denied")
