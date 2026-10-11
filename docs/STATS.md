@@ -329,8 +329,8 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   checked by checksum; other bytes are not counted here except as follows.
   With `check_origin_integrity` on, `origin_checks_failed` also counts the baskets of a byte-cache fetch from the
   origin that the reader asked for and whose key does not say they sit where
-  the tree's record puts them, or does not give the length that record gives
-  them (the file map), and, as one each, the reads a copy answered whose tree's
+  the tree's record puts them, or whose length differs from the one that record
+  gives them where it changes ROOT's reading (the file map), and, as one each, the reads a copy answered whose tree's
   record showed it bad (its record failing its own checksum, or placing a basket
   past the copy's end): the read fails with "failed its check (the reason) ...
   not served", naming the position and the server, and nothing of that fetch is

@@ -339,7 +339,16 @@ MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks,
       const int32_t nbytes = beGet<int32_t>(p + at);
       const int32_t objlen = beGet<int32_t>(p + at + 6);
       const int16_t keylen = beGet<int16_t>(p + at + 14);
-      byLength = (want > 0 && nbytes != want) || keylen <= 0 || keylen > nbytes || objlen < 0;
+      // ROOT reads the basket by the map's length and decides from the key's own fields whether
+      // it is compressed (TBasket::ReadBasketBuffers: fObjlen > fNbytes - fKeylen). A key length
+      // that differs from the map's is held against the copy only where that decision differs
+      // from the one the map's length gives: there ROOT takes compressed bytes for the entries
+      // (wrong values, no error) or fails to decompress stored ones. Elsewhere ROOT reads the
+      // basket correctly, and no claim is made.
+      const bool byKey = int64_t{objlen} > int64_t{nbytes} - keylen;
+      const bool byMap = int64_t{objlen} > int64_t{want} - keylen;
+      byLength = (want > 0 && nbytes != want && byKey != byMap) || keylen <= 0 || keylen > nbytes ||
+                 objlen < 0;
       fails = byLength;
     }
     if (!fails)

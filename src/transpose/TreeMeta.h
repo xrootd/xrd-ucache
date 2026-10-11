@@ -261,10 +261,14 @@ struct MisplacedKeys {
 MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks, uint64_t spanOff,
                                 const void* p, uint64_t n, uint64_t lo, uint64_t hi);
 // The same with the file map's lengths (basketMap; `bytes` empty, or beside `seeks`): a key whose
-// header lies wholly in the span must also state the length the map gives its basket (its first
-// four bytes, signed, as TKey reads them), a key length above 0 and at most that length, and an
-// object length of 0 or more. ROOT writes every basket so; a key that says otherwise is not the
-// basket the tree's record names (a basket shifted, cut, or of another version of the file).
+// header lies wholly in the span must also state a key length above 0 and at most its own length,
+// and an object length of 0 or more; and a length (its first four bytes, signed, as TKey reads
+// them) that, where it differs from the one the map gives its basket, leaves ROOT's decision of
+// whether the basket is compressed (fObjlen > fNbytes - fKeylen) as the map's length makes it.
+// ROOT reads a basket by the map's length, so a key whose length alone differs is read correctly
+// unless that decision flips: then ROOT takes compressed bytes for the entries (wrong values, no
+// error) or fails to decompress stored ones, and the key is not the basket the tree's record names
+// (a basket shifted, cut, or of another version of the file).
 MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks,
                                 const std::vector<int32_t>& bytes, uint64_t spanOff,
                                 const void* p, uint64_t n, uint64_t lo, uint64_t hi);

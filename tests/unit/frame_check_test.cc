@@ -654,26 +654,40 @@ TEST(FileMap, LengthsAreTheTreesOwn) {
 TEST(FileMap, KeyLengthAndFieldsAgainstTheMap) {
   const uint64_t S = kLzmaRecordSeek;
   const std::vector<uint8_t> rec = wideAt(S);
-  const int32_t nb = 195; // the record's fNbytes, ROOT's basket length
+  const int32_t nb = 195, kl = 70, ol = 8000; // the record's fNbytes, fKeylen, fObjlen: compressed
   const uint64_t hi = S + rec.size();
   // As ROOT wrote it: passes with its length, with no length known, with no lengths at all.
   EXPECT_EQ(checkLen({S}, {nb}, spanWith(rec, 0, S, 4096), S, hi).count, 0u);
   EXPECT_EQ(checkLen({S}, {0}, spanWith(rec, 0, S, 4096), S, hi).count, 0u);
   EXPECT_EQ(checkLen({S}, {}, spanWith(rec, 0, S, 4096), S, hi).count, 0u);
-  // The map gives another length: not the basket the tree's record names.
-  MisplacedKeys m = checkLen({S}, {nb + 1}, spanWith(rec, 0, S, 4096), S, hi);
+  // Lengths that differ where ROOT still reads the basket correctly (it reads the map's length and
+  // decompresses by the blocks' own headers; compressed by either length): no claim.
+  EXPECT_EQ(checkLen({S}, {nb + 1}, spanWith(rec, 0, S, 4096), S, hi).count, 0u) << "map longer";
+  EXPECT_EQ(checkLen({S}, {nb - 8}, spanWith(rec, 0, S, 4096), S, hi).count, 0u) << "map shorter";
+  std::vector<uint8_t> r = rec;
+  putBe32(r, 0, nb - 8);
+  EXPECT_EQ(checkLen({S}, {nb}, spanWith(r, 0, S, 4096), S, hi).count, 0u) << "key shorter";
+  putBe32(r, 0, kl + ol - 1);
+  EXPECT_EQ(checkLen({S}, {nb}, spanWith(r, 0, S, 4096), S, hi).count, 0u)
+      << "key longer, still compressed by it";
+  // The key's length makes ROOT read the basket as stored uncompressed (its compressed bytes taken
+  // for the entries: wrong values, no error): refused, by length.
+  putBe32(r, 0, kl + ol);
+  MisplacedKeys m = checkLen({S}, {nb}, spanWith(r, 0, S, 4096), S, hi);
   EXPECT_EQ(m.count, 1u);
   EXPECT_EQ(m.first, S);
   EXPECT_TRUE(m.length);
-  // The key states another length (its fNbytes changed), its position intact.
-  std::vector<uint8_t> r = rec;
-  putBe32(r, 0, nb - 8);
-  m = checkLen({S}, {nb}, spanWith(r, 0, S, 4096), S, hi);
+  putBe32(r, 0, kl + ol + 500);
+  EXPECT_EQ(checkLen({S}, {nb}, spanWith(r, 0, S, 4096), S, hi).count, 1u);
+  EXPECT_EQ(checkLen({S}, {}, spanWith(r, 0, S, 4096), S, hi).count, 0u)
+      << "without the map's lengths, only the position and the key's own fields";
+  // The map's length says stored uncompressed, the key's says compressed (ROOT would try to
+  // decompress stored bytes and fail): refused.
+  m = checkLen({S}, {kl + ol}, spanWith(rec, 0, S, 4096), S, hi);
   EXPECT_EQ(m.count, 1u);
   EXPECT_TRUE(m.length);
-  EXPECT_EQ(checkLen({S}, {}, spanWith(r, 0, S, 4096), S, hi).count, 0u)
-      << "without the map's lengths, only the position is held to";
-  // The key's own fields: a key length of 0, one past its record, an object length below 0.
+  // The key's own fields, where ROOT fails too: a key length of 0, one past its record, an object
+  // length below 0.
   r = rec;
   r[14] = 0; // fKeylen, after fNbytes, fVersion, fObjlen and fDatime
   r[15] = 0;
@@ -684,10 +698,14 @@ TEST(FileMap, KeyLengthAndFieldsAgainstTheMap) {
   r = rec;
   putBe32(r, 6, -1);
   EXPECT_EQ(checkLen({S}, {nb}, spanWith(r, 0, S, 4096), S, hi).count, 1u) << "object length < 0";
-  // A 32-bit key is held to its length the same way.
+  // A 32-bit key (8 bytes shorter): with the map's own length, or one 8 bytes longer (a key
+  // rewritten shorter in place, the tree's record left as it was), ROOT reads it: no claim.
   const std::vector<uint8_t> n = narrowAt(S);
   EXPECT_EQ(checkLen({S}, {nb - 8}, spanWith(n, 0, S, 4096), S, S + n.size()).count, 0u);
-  m = checkLen({S}, {nb}, spanWith(n, 0, S, 4096), S, S + n.size());
+  EXPECT_EQ(checkLen({S}, {nb}, spanWith(n, 0, S, 4096), S, S + n.size()).count, 0u);
+  std::vector<uint8_t> nf = n;
+  putBe32(nf, 0, (kl - 8) + ol); // its length makes it a stored basket: refused
+  m = checkLen({S}, {nb - 8}, spanWith(nf, 0, S, 4096), S, S + n.size());
   EXPECT_EQ(m.count, 1u);
   EXPECT_TRUE(m.length);
   // A position that fails is reported as one, not as a length.
@@ -695,14 +713,14 @@ TEST(FileMap, KeyLengthAndFieldsAgainstTheMap) {
   EXPECT_EQ(m.count, 1u);
   EXPECT_FALSE(m.length);
   // Outside the reader's bytes: noted, not counted.
-  m = checkLen({S}, {nb + 1}, spanWith(rec, 0, S, 4096), S + 1, S + 2);
+  m = checkLen({S}, {kl + ol}, spanWith(rec, 0, S, 4096), S + 1, S + 2);
   EXPECT_EQ(m.count, 0u);
   EXPECT_TRUE(m.outside);
   // A header the span cuts is not judged (the length lies in its first 18 bytes, the position
   // past them: judged only once the position fits).
   Span cut = spanWith(rec, 0, S, 4096);
   cut.b.resize(S + 25);
-  EXPECT_EQ(checkLen({S}, {nb + 1}, cut, S, S + 25).count, 0u);
+  EXPECT_EQ(checkLen({S}, {kl + ol}, cut, S, S + 25).count, 0u);
 }
 
 TEST(FileMap, AMapThatShowsTheCopyBad) {
