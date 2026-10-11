@@ -570,6 +570,36 @@ TEST(CacheStore, OpenDuringADropByKey) {
   EXPECT_FALSE(f->hasRange(0, P)) << "the dropped files' pages are not served";
 }
 
+// A fork while a drop by key unlinks the key's files (in another thread of the parent): the child,
+// which has only the forking thread, opens the key and is not held by the parent's drop, which no
+// thread of the child will finish.
+TEST(CacheStore, ForkDuringADropByKeyLeavesTheChildFree) {
+  TempDir td;
+  GateIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const uint64_t P = cfg.pageSize;
+  ASSERT_TRUE(badEntry(store, keyN(26), P));
+  io.arm(0, /*unlinkToo=*/true);
+  std::thread t([&] { store.dropEntry(keyN(26)); });
+  io.waitEntered(); // t holds the key marked, inside its unlink
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    ::alarm(10); // a child held for good is ended by the alarm, and the test fails
+    store.afterForkChild(); // as the plug-in's fork child handler does
+    auto f = store.open(keyN(26), 8 * P);
+    ::_exit(f ? 0 : 3);
+  }
+  int status = 0;
+  ::waitpid(pid, &status, 0);
+  io.release();
+  t.join();
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "the child's open of the key returned (status " << status << ")";
+}
+
 // An open that made its entry from the files while a drop of the key began and ended (the entry it
 // made holds the dropped pages): it makes its entry again, and serves nothing of them.
 TEST(CacheStore, OpenThatMadeItsEntryDuringADrop) {

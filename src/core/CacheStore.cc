@@ -130,6 +130,7 @@ void CacheStore::afterForkChild() {
     std::unique_ptr<Tracer> tracer;
     std::deque<std::string> records;
     std::map<std::string, uint32_t> recordCaps;
+    std::set<std::string> removing;
   };
   auto* left = new LeftBehind; // leaked on purpose
   new (&relayFpMu_) std::mutex;
@@ -144,6 +145,11 @@ void CacheStore::afterForkChild() {
   left->recordCaps.swap(recordCaps_);
   left->relayFp.swap(relayFp_);
   left->registry.swap(registry_);
+  // A drop by key under way in a parent thread marks its key until its files are gone; that thread
+  // is not in this process, so the mark would hold the child's opens of the key for good, and the
+  // condition they wait on may have the parent's waiters in it: both are made anew.
+  left->removing.swap(removing_);
+  new (&dropCv_) std::condition_variable;
   left->summaries.swap(entrySummaries_);
   left->seen.swap(seenKeys_);
   left->sink = std::move(obsSink_);
@@ -245,13 +251,17 @@ std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSi
       return nullptr; // drops kept coming: read uncached (fail-open)
     uint64_t drops0 = 0;
     std::shared_ptr<FileEntry> dropped;
+    // Declared before the lock, so released after it: the last reference to an entry may be this
+    // one, and its release can run the entry's destructor (a dropped entry's removes its files:
+    // a commit's wait, a flock, unlinks), which never runs under regMu_.
+    std::shared_ptr<FileEntry> live;
     {
       std::unique_lock<std::mutex> g(regMu_);
       dropCv_.wait(g, [&] { return removing_.count(key.hashHex) == 0; });
       drops0 = drops_.load(std::memory_order_acquire);
       auto it = registry_.find(key.hashHex);
       if (it != registry_.end()) {
-        auto live = it->second.lock();
+        live = it->second.lock();
         if (live && live->dropped()) {
           dropped = std::move(live);
         } else if (live) {
@@ -322,6 +332,7 @@ std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSi
     // file would then start from nothing. Stable for the life of the process --
     // the table holds owning pointers and never erases.
     entry->useSharedFootprint(footprintFor(key.key));
+    live.reset();
     {
       std::lock_guard<std::mutex> g(regMu_);
       if (drops_.load(std::memory_order_acquire) != drops0 || removing_.count(key.hashHex)) {
@@ -331,7 +342,7 @@ std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSi
       // Racing opens of the same key: keep the first registered one.
       auto it = registry_.find(key.hashHex);
       if (it != registry_.end()) {
-        if (auto live = it->second.lock()) {
+        if ((live = it->second.lock())) {
           if (live->dropped()) { // dropped since (drops_ moved, above): cannot be
             entry->abandon();
             continue;
