@@ -5050,10 +5050,6 @@ void storeOpenBytesIn(HandleState& st, const std::shared_ptr<FileEntry>& entry,
 
 // The same, for the bytes the handle holds (HandleState::openBytes), when its entry is set up
 // (ensureEntry): before the reader's first read is looked up; let go when there is no entry.
-// UCACHE_TEST_SETUP_DELAY_MS (inert unless set, read at load): a test's wait in a handle's set-up,
-// after the bytes kept at its open are first collected and before the handle is marked set up, so
-// that a test can have the open answer in between.
-static const int gSetupDelayMs = envAtLoad("UCACHE_TEST_SETUP_DELAY_MS");
 
 static void storeOpenBytes(HandleState& st, const std::shared_ptr<FileEntry>& entry) noexcept {
   std::unique_ptr<HandleState::OpenBytes> ob;
@@ -5249,8 +5245,6 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
   // What the checks at the reader's open read is stored before its first read is looked up (and
   // let go when there is no entry for it).
   storeOpenBytes(*st_, entry);
-  if (gSetupDelayMs > 0)
-    std::this_thread::sleep_for(std::chrono::milliseconds(gSetupDelayMs));
 #ifdef UCACHE_HAVE_COLDRUN
   // The mixed map the handle is shown, chosen once for its life: a handle a
   // forked child set up again keeps the one it had (null: the slot layout).

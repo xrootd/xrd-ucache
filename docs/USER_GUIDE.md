@@ -821,7 +821,9 @@ query, `.root` in upper or lower case), a copy of such a file whose first bytes 
 it is not a whole ROOT file, and a copy on tape (the server's answer to the open says
 `Offline`) are passed over for another site's. Inside the job's open uCache checks the
 copy as ROOT itself does when it opens a file, before the job is shown it; a request the
-job makes on the file while its open is being checked waits for the open's answer. uCache's
+job makes on the file while its open is being checked waits for the open's answer (one made
+with a completion handler is held and made once the open has answered, so the call returns
+at once and never holds the thread that made it). uCache's
 own open of such a file makes the same checks when it knows no size the copy must have (an
 entry trusted at the job's open that is gone by its first request). It reads the
 first 300 bytes of the copy (what ROOT reads at open; the whole copy when it is smaller),

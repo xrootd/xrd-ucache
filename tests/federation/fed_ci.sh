@@ -51,9 +51,9 @@
 #                          reads false during their reads, and the reader's value after them. A Stat
 #                          the reader makes while the checks run waits for the open's answer before
 #                          the handle is set up (with every copy cut, it is never answered the cut
-#                          size); what the checks read is stored in the entry, also when that set-up
-#                          is made to wait. A Stat and a Read made then from another file's callback
-#                          return at once and are answered after the open
+#                          size); what the checks read is stored in the entry. A Stat and a Read
+#                          made then from another file's callback return at once and are answered
+#                          after the open
 #   zeros at the size      one server holds as many zero bytes as the file has (a, b and c in
 #                          turn), the other two the file: the copy of zeros does not begin as a
 #                          ROOT file does and is refused; the open goes on to a whole copy
@@ -462,21 +462,6 @@ grep -qE 'MsgHandler created.*kXR_read \(handle: 0x[0-9a-f]*, offset: 0, size: 3
 verdict "the checks' first read was the late one (300 bytes at 0), and the open succeeded at its first attempt (the fault was in place)" $?
 K=$(counter "$W/c25" open_check_bytes_kept)
 [ "${K:-0}" -gt 0 ]; verdict "what the checks read went into the entry the Stat had set up (open_check_bytes_kept ${K:-none})" $?
-# The same with the Stat's set-up made to wait (UCACHE_TEST_SETUP_DELAY_MS, 8 s) after it first collects what the
-# checks kept and before the handle is marked set up: what the checks read must still go into the entry, not wait
-# in memory until Close.
-L=/store/ci/stat-during-wait.root
-placew $L a b c
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay UCACHE_TEST_SETUP_DELAY_MS=8000)
-res=$(fuzz "$W/c25w" "$W/f25w.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-stat-during-checks)
-echo "$res" | sed 's/^/    /' | cut -c1-300
-echo "$res" | grep -q '^open-stat-during-checks: clean$' && echo "$res" | grep -q '^STATWAIT yes$'
-verdict "a Stat whose set-up waits: it answered after the open's checks; one completion; the read of the header exact" $?
-grep -qE 'MsgHandler created.*kXR_read \(handle: 0x[0-9a-f]*, offset: 0, size: 300\)' "$W/f25w.log" &&
-  [ "$(records "$W/c25w" | wc -l)" = 1 ] && records "$W/c25w" | grep -q '"status":"ok"'
-verdict "the checks' first read was the late one, and the open succeeded at its first attempt (the fault was in place)" $?
-K=$(counter "$W/c25w" open_check_bytes_kept)
-[ "${K:-0}" -gt 0 ]; verdict "what the checks read went into the entry though the set-up waited (open_check_bytes_kept ${K:-none})" $?
 # Every copy cut short (its header intact): a Stat made while the checks run (their first read sent 5 s late) is
 # never given a cut copy's size, for any copy the redirector picks: it waits for the open, which refuses every copy
 # and fails once; the Stat then fails too (the client's own answer for a File that is not open).

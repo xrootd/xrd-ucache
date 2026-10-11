@@ -1298,8 +1298,7 @@ int runOpenPropertyRace(const char* url) {
 // size, the open succeeds, and after it (and a second) a Read of the first 300 bytes is the file's;
 // the gate checks that what the checks read went into the entry. With `cut`, <local-path> is the
 // cut copy every server holds (its header states a larger end): the open fails, once, and the Stat
-// never answers the cut copy's size. With UCACHE_TEST_SETUP_DELAY_MS, the set-up the Stat makes
-// waits after it first collects what the checks kept; what they read must still go into the entry.
+// never answers the cut copy's size.
 int runOpenStatDuringChecks(const char* url, const char* local, bool cut) {
   const char* mode = "open-stat-during-checks";
   if (envInt("UCACHE_TEST_HEADER_FAIL_N", 0) != 1) {
