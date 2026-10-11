@@ -37,9 +37,9 @@ template <typename T> T beGet(const uint8_t* p) {
 }
 
 // fSeekKey of a key header at `rec`, written at the key's own width: 64-bit
-// for a version above 1000, 32-bit otherwise. False when a 32-bit key cannot
-// hold `seek`.
-bool putKeySeek(uint8_t* rec, uint16_t ver, int64_t seek) {
+// for a version above 1000, 32-bit otherwise (the version signed, as TKey
+// reads it). False when a 32-bit key cannot hold `seek`.
+bool putKeySeek(uint8_t* rec, int16_t ver, int64_t seek) {
   if (ver > 1000) {
     bePut<int64_t>(rec + 18, seek);
     return true;
@@ -95,6 +95,11 @@ bool parseHeader(const std::vector<uint8_t>& h, Header& out) {
     return false;
   out.version = beGet<int32_t>(&h[4]);
   out.begin = beGet<int32_t>(&h[8]);
+  // Signed, as TFile::Init reads it. A negative version marks 32-bit fields,
+  // and no 64-bit header can keep it as ROOT reads it (largeHeader adds
+  // 1000000 to a 32-bit file's version): such a file is not rewritten.
+  if (out.version < 0)
+    return false;
   out.large = out.version >= 1000000;
   if (out.large) {
     out.end = beGet<int64_t>(&h[12]);
@@ -149,7 +154,7 @@ bool headerWindowForEnd(const std::vector<uint8_t>& header, uint64_t newEnd, uin
                         std::vector<uint8_t>& window, std::string& err) {
   Header H;
   if (!parseHeader(header, H)) {
-    err = "file header unreadable or fBEGIN below 75";
+    err = "file header unreadable, its version negative as ROOT reads it, or fBEGIN below 75";
     return false;
   }
   if (H.large) {
@@ -252,7 +257,8 @@ FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vecto
     return decline("slot factor must be at least 1");
   Header H;
   if (!parseHeader(header, H))
-    return decline("file header unreadable or fBEGIN below 75");
+    return decline(
+        "file header unreadable, its version negative as ROOT reads it, or fBEGIN below 75");
   if (H.end != fm.fend)
     return decline("file header disagrees with the parse on fEND");
   if (treeKeyHeader.size() != fm.treeKey.keylen || fm.treeKey.keylen < 26)
@@ -474,7 +480,7 @@ ConvertedBasket convertBasket(const uint8_t* rec, size_t n, uint32_t slotLen,
 bool patchKeySeek(uint8_t* record, size_t n, uint64_t seek) {
   if (n < 26 || seek > static_cast<uint64_t>(INT64_MAX))
     return false;
-  const uint16_t ver = beGet<uint16_t>(record + 4);
+  const int16_t ver = beGet<int16_t>(record + 4);
   if (ver > 1000 && n < 34)
     return false;
   return putKeySeek(record, ver, static_cast<int64_t>(seek));
@@ -490,7 +496,7 @@ bool placeInSlot(const ConvertedBasket& c, const FillSlot& slot, uint8_t* out, s
     return false;
   }
   std::memcpy(out, c.record.data(), c.record.size());
-  const uint16_t ver = beGet<uint16_t>(out + 4);
+  const int16_t ver = beGet<int16_t>(out + 4);
   if (!putKeySeek(out, ver, static_cast<int64_t>(slot.vSeek))) {
     err = "32-bit basket key cannot address a slot past 2 GiB";
     return false;
@@ -570,7 +576,7 @@ MapTables mapTables(const FillLayout& L) {
 
 uint64_t mapSeekLimit(const FillLayout& L) {
   constexpr uint64_t kNarrow = INT32_MAX;
-  if (L.metaRecord.size() < 6 || beGet<uint16_t>(L.metaRecord.data() + 4) <= 1000)
+  if (L.metaRecord.size() < 6 || beGet<int16_t>(L.metaRecord.data() + 4) <= 1000)
     return kNarrow;
   for (const auto& w : L.windows) {
     auto kl = parseKey(w.bytes.data(), w.bytes.size(), 0);

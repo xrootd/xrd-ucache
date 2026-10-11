@@ -171,7 +171,9 @@ std::optional<KeyInfo> parseKey(const uint8_t* p, size_t n, uint64_t off) {
   const uint8_t* k = p + off;
   KeyInfo o;
   o.nbytes = beGet<int32_t>(k);
-  o.ver = beGet<uint16_t>(k + 4);
+  // TKey::ReadKeyBuffer: the version is a signed Version_t, and above 1000
+  // marks 64-bit positions; a 32-bit fSeekKey is read unsigned (UInt_t).
+  o.ver = beGet<int16_t>(k + 4);
   o.objlen = beGet<int32_t>(k + 6);
   o.keylen = beGet<uint16_t>(k + 14);
   o.cycle = beGet<uint16_t>(k + 16);
@@ -180,7 +182,7 @@ std::optional<KeyInfo> parseKey(const uint8_t* p, size_t n, uint64_t off) {
     o.seekkey = beGet<int64_t>(k + 18);
     q = 34;
   } else {
-    o.seekkey = beGet<int32_t>(k + 18);
+    o.seekkey = beGet<uint32_t>(k + 18);
     q = 26;
   }
   auto str = [&](std::string& s) {
@@ -209,7 +211,7 @@ std::optional<BasketHeader> parseBasketHeader(const uint8_t* p, size_t n, uint64
     return std::nullopt;
   const uint8_t* b = p + at;
   BasketHeader h;
-  h.version = beGet<uint16_t>(b);
+  h.version = beGet<int16_t>(b);
   h.bufferSize = beGet<int32_t>(b + 2);
   h.nevBufSize = beGet<int32_t>(b + 6);
   h.nevBuf = beGet<int32_t>(b + 10);
@@ -275,15 +277,18 @@ MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks, uint64_t spa
   MisplacedKeys m;
   for (auto it = std::lower_bound(seeks.begin(), seeks.end(), spanOff);
        it != seeks.end() && *it - spanOff < n; ++it) {
-    // The key's version (bytes 4-5) says how wide fSeekKey (from byte 18) is.
+    // The key's version (bytes 4-5) says how wide fSeekKey (from byte 18) is,
+    // read as TKey reads it: a signed version above 1000 is 64-bit, and a
+    // 32-bit fSeekKey is unsigned. A version whose top bit is set is negative,
+    // so ROOT reads that key as 32-bit, and so does this check.
     // Seeks only grow from here, so once a header no longer fits none will.
     const uint64_t at = *it - spanOff;
     if (n - at < 6)
       break;
-    const bool wide = beGet<uint16_t>(p + at + 4) > 1000;
+    const bool wide = beGet<int16_t>(p + at + 4) > 1000;
     if (n - at < (wide ? 26u : 22u))
       break;
-    const int64_t key = wide ? beGet<int64_t>(p + at + 18) : beGet<int32_t>(p + at + 18);
+    const int64_t key = wide ? beGet<int64_t>(p + at + 18) : int64_t{beGet<uint32_t>(p + at + 18)};
     if (key == static_cast<int64_t>(*it))
       continue;
     if (*it >= lo && *it < hi) {
@@ -655,7 +660,8 @@ ContainerMeta parseContainerFrom(Reader& r) {
   if (head.size() < 20 || !r.read(head.data(), head.size(), 0) ||
       std::memcmp(head.data(), "root", 4) != 0)
     return fail("not a ROOT file");
-  fm.large = beGet<int32_t>(head.data() + 4) > 1000000;
+  // TFile::Init: a signed version below 1000000 has 32-bit fields.
+  fm.large = beGet<int32_t>(head.data() + 4) >= 1000000;
   fm.headerSeekWidth = fm.large ? 8 : 4;
   fm.fend = fm.large ? beGet<int64_t>(head.data() + 12) : beGet<int32_t>(head.data() + 12);
 
@@ -695,7 +701,8 @@ ContainerMeta parseContainerFrom(Reader& r) {
     pstr(q);
     if (oob || q + 2 > head.size())
       return fail("directory record out of bounds");
-    uint16_t dver = beGet<uint16_t>(head.data() + q);
+    // A signed Version_t, as TFile::Init and TDirectoryFile::ReadKeys read it.
+    const int16_t dver = beGet<int16_t>(head.data() + q);
     q += 2 + 4 + 4 + 4 + 4; // version, datimeC, datimeM, fNbytesKeys, fNbytesName
     bool wide = dver > 1000;
     q += (wide ? 8 : 4) * 2; // fSeekDir, fSeekParent

@@ -543,6 +543,42 @@ TEST(FillLayout, Declines) {
   }
 }
 
+TEST(FillLayout, VersionsReadAsRootReadsThem) {
+  // A 32-bit key whose version has its top bit set is negative to ROOT, which
+  // reads its 32-bit positions: its fSeekKey is patched at 32 bits, and the
+  // 4 bytes after it (fSeekPdir) are left as they are.
+  {
+    auto k = keyHeader(false, "TBasket", "Muon_pt", 0, 100, 1000);
+    k[4] |= 0x80;
+    bePut32(k.data() + 22, 0x11223344u);
+    ASSERT_TRUE(patchKeySeek(k.data(), k.size(), 5000));
+    EXPECT_EQ(beGet32(&k[18]), 5000u);
+    EXPECT_EQ(beGet32(&k[22]), 0x11223344u);
+    // ... and cannot address a slot past 2 GiB.
+    EXPECT_FALSE(patchKeySeek(k.data(), k.size(), uint64_t{1} << 31));
+  }
+  {
+    // The tree's key, the same: the metadata record keeps its 32-bit fSeekKey.
+    Fx fx = fixture();
+    fx.treeKeyHeader = keyHeader(false, "TTree", "Events", 2000, 400, kTreeKeySeek);
+    fx.treeKeyHeader[4] |= 0x80;
+    fx.fm.treeKey.keylen = static_cast<uint16_t>(fx.treeKeyHeader.size());
+    fx.fm.treeKey.ver = static_cast<decltype(fx.fm.treeKey.ver)>(0x8004);
+    FillLayout L = layout(fx);
+    ASSERT_TRUE(L.error.empty()) << L.error;
+    EXPECT_EQ(beGet32(&L.metaRecord[18]), L.metaSeek);
+    EXPECT_EQ(beGet32(&L.metaRecord[22]), 0u);
+    EXPECT_EQ(mapSeekLimit(L), uint64_t{INT32_MAX});
+  }
+  {
+    // A header version with its top bit set marks 32-bit fields to ROOT, and
+    // no 64-bit header can keep it as ROOT reads it: the file is not rewritten.
+    Fx fx = fixture();
+    fx.header[4] |= 0x80;
+    EXPECT_NE(layout(fx).error.find("version negative"), std::string::npos) << layout(fx).error;
+  }
+}
+
 TEST(FillLayout, ConvertsToZstdWhenItFits) {
   auto raw = compressible(20000);
   auto zs = encodeZstdFrames(raw.data(), raw.size(), 19);

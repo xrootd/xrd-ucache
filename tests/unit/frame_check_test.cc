@@ -446,6 +446,69 @@ TEST(KeyPosition, RootWrittenKeysPass) {
   }
 }
 
+TEST(KeyPosition, VersionsReadAsRootReadsThem) {
+  // TKey reads a key's version as a signed 16-bit Version_t and takes 64-bit
+  // positions only above 1000, and reads a 32-bit fSeekKey unsigned. A 32-bit
+  // basket key whose version has its top bit set (4 as 0x8004) is negative to
+  // ROOT, which reads it as 32-bit and reads the basket: it must pass.
+  const uint64_t S = kLzmaRecordSeek;
+  std::vector<uint8_t> n = narrowAt(S);
+  n[4] |= 0x80;
+  auto k = parseKey(n.data(), n.size(), 0);
+  ASSERT_TRUE(k);
+  EXPECT_EQ(k->ver, -32764);
+  EXPECT_EQ(k->seekkey, static_cast<int64_t>(S));
+  EXPECT_EQ(k->cls, "TBasket");
+  EXPECT_EQ(k->name, "x");
+  EXPECT_EQ(k->title, "Events");
+  EXPECT_EQ(check({S}, spanWith(n, 0, S, 4096), S, S + n.size()).count, 0u);
+  // And through the conversion's own check of the basket (fLast moves with the
+  // 8 bytes the narrow key header is shorter by).
+  {
+    std::vector<uint8_t> r = n;
+    const size_t lastAt = k->keyPartLen + 14u;
+    const uint32_t last = (uint32_t{r[lastAt]} << 24) | (uint32_t{r[lastAt + 1]} << 16) |
+                          (uint32_t{r[lastAt + 2]} << 8) | r[lastAt + 3];
+    const uint32_t moved = last - 8;
+    for (int i = 0; i < 4; ++i)
+      r[lastAt + i] = static_cast<uint8_t>(moved >> (24 - 8 * i));
+    const auto rk = parseKey(r.data(), r.size(), 0);
+    ASSERT_TRUE(rk);
+    const auto b = parseBasketHeader(r.data(), r.size(), 0, *rk);
+    ASSERT_TRUE(b);
+    BranchInfo br;
+    br.name = "x";
+    br.basketSeek = {static_cast<int64_t>(S)};
+    br.basketBytes = {static_cast<int32_t>(r.size())};
+    br.basketEntry = {0, 2000};
+    const BasketKeyCheck c = checkBasketKey(*rk, *b, br, 0, "Events");
+    EXPECT_FALSE(c.fail) << (c.problems.empty() ? "" : c.problems.front());
+  }
+  // The same bit on a 64-bit key's 1004: ROOT reads it as 32-bit, finds the
+  // high half of the position (0 here) at byte 18, and refuses the basket; so
+  // does the check.
+  std::vector<uint8_t> w = wideAt(S);
+  w[4] |= 0x80;
+  EXPECT_EQ(check({S}, spanWith(w, 0, S, 4096), S, S + w.size()).count, 1u);
+  // A version of 1001 is 64-bit, 1000 is 32-bit (ROOT's "> 1000").
+  std::vector<uint8_t> v1000 = narrowAt(S);
+  v1000[4] = 0x03;
+  v1000[5] = 0xE8;
+  EXPECT_EQ(check({S}, spanWith(v1000, 0, S, 4096), S, S + v1000.size()).count, 0u);
+  std::vector<uint8_t> v1001 = wideAt(S);
+  v1001[4] = 0x03;
+  v1001[5] = 0xE9;
+  EXPECT_EQ(check({S}, spanWith(v1001, 0, S, 4096), S, S + v1001.size()).count, 0u);
+  // A 32-bit fSeekKey is unsigned: a position with its top bit set, as ROOT
+  // reads it.
+  const uint64_t T = (uint64_t{1} << 31) + 4096;
+  const std::vector<uint8_t> high = narrowAt(static_cast<uint32_t>(T));
+  k = parseKey(high.data(), high.size(), 0);
+  ASSERT_TRUE(k);
+  EXPECT_EQ(k->seekkey, static_cast<int64_t>(T));
+  EXPECT_EQ(check({T}, spanWith(high, T - 100, T, 4096), T, T + high.size()).count, 0u);
+}
+
 TEST(KeyPosition, ZerosWhereTheTreeSaysABasketIsFail) {
   // A basket of 1,647 bytes at 27,130,216, 2408 bytes into its page, read
   // back as zeros: the shape seen at a site.

@@ -479,7 +479,10 @@ const char* StoreMaps::compactPlan(const std::vector<std::pair<uint32_t, uint32_
     e.len = m.recs[0].len;
     e.crc = m.recs[0].crc;
     uint8_t h[6];
-    if (!store->readHead(e, h, sizeof h) || ((h[4] << 8) | h[5]) <= 1000)
+    // The key's version, signed as TKey reads it: one whose top bit is set
+    // is a 32-bit key.
+    if (!store->readHead(e, h, sizeof h) ||
+        static_cast<int16_t>(static_cast<uint16_t>((h[4] << 8) | h[5])) <= 1000)
       return "32-bit basket keys";
   }
   const uint64_t lo = (base + kCompactGuard + 4095) / 4096 * 4096;

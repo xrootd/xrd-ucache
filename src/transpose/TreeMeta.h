@@ -33,7 +33,9 @@ struct Source {
 
 struct KeyInfo {
   int32_t nbytes = 0;
-  uint16_t ver = 0;
+  // Signed, as TKey reads it (a Version_t): above 1000 marks 64-bit positions,
+  // so a version whose top bit is set is a 32-bit key.
+  int16_t ver = 0;
   int32_t objlen = 0;
   uint16_t keylen = 0;
   uint16_t cycle = 0;
@@ -77,7 +79,7 @@ std::vector<uint8_t> decompressFrames(const uint8_t* payload, size_t n, uint64_t
 
 // The TBasket fields that follow the TKey part of a basket's key header.
 struct BasketHeader {
-  uint16_t version = 0;
+  int16_t version = 0; // a Version_t, as TBasket::Streamer reads it
   int32_t bufferSize = 0;
   int32_t nevBufSize = 0; // the entry size for fixed-size entries
   int32_t nevBuf = 0;     // entries in the basket
@@ -103,7 +105,7 @@ std::string blockCodec(const uint8_t* p, size_t n);
 // bytes first, and a second copy of these bounds checks would be a second
 // copy to keep fuzzed.
 struct ContainerMeta {
-  bool large = false; // 64-bit header layout (file version > 1000000)
+  bool large = false; // 64-bit header layout (file version >= 1000000, read signed)
   int64_t fend = 0;
   int64_t keyslistSeek = 0;
   uint64_t dirSeekKeysOff = 0; // file offset of the directory's fSeekKeys
@@ -164,7 +166,7 @@ struct BranchInfo {
 };
 
 struct FileMeta {
-  bool large = false; // 64-bit header layout (file version > 1000000)
+  bool large = false; // 64-bit header layout (file version >= 1000000, read signed)
   int64_t fend = 0;
   int64_t keyslistSeek = 0;
   uint64_t dirSeekKeysOff = 0; // file offset of the directory's fSeekKeys
