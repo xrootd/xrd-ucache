@@ -54,7 +54,8 @@
 // right bytes, once, with adaptive_federation on and the file's copies behind a
 // redirector (see runReadFailover). The caller checks the records. The cases
 // zero, zerov and zeroerr do the same for a read of a basket that a server serves
-// as zeros (see runZero), and cut, cutpg, cutpgpast, cutonly and end for a copy that is cut
+// as zeros (see runZero), len, lenv and lenerr for one whose key states another length, rec,
+// recv and recerr for one whose tree's record fails its own check, and cut, cutpg, cutpgpast, cutonly and end for a copy that is cut
 // short after the open (see runCut), and degraded and degradedoff for a handle whose own open of
 // the origin fails.
 #include <XrdCl/XrdClFile.hh>
@@ -1702,6 +1703,10 @@ struct ReadCase {
 //   zerov    the same with a VectorRead
 //   zeroerr  the read fails with errDataError and "failed its check" in the message, once:
 //            no copy serves it (or the handle is not armed to move); never the zeros
+// len, lenv, lenerr: the same, with the copy damaged elsewhere by UCACHE_ZERO_CMD: the basket's
+// key states another length; rec, recv, recerr: the tree's record fails its own check. The fault
+// is then checked as the bytes the copy serves at UCACHE_FAULT_AT (UCACHE_FAULT_LEN of them,
+// default 4) differing from the fixture's, read with no plugin.
 // "SERVERS landed final" is printed for the caller to check against the records.
 int runZero(const char* url, const char* local, const std::string& which) {
   const char* mode = "read-failover";
@@ -1732,16 +1737,28 @@ int runZero(const char* url, const char* local, const std::string& which) {
       std::printf("%s: SETUP: %s failed\n", mode, cmd);
       return 2;
     }
-  { // the fault: the server the handle landed on serves zeros there (read with no plugin)
+  const bool zeros = which.rfind("zero", 0) == 0;
+  const char* fa = ::getenv("UCACHE_FAULT_AT");
+  const char* fl = ::getenv("UCACHE_FAULT_LEN");
+  const uint64_t faultAt = zeros || !fa ? kOff : std::strtoull(fa, nullptr, 10);
+  const uint32_t faultLen = zeros ? kLen : fl ? static_cast<uint32_t>(std::atoi(fl)) : 4;
+  { // the fault: the server the handle landed on serves zeros there, or other bytes than the
+    // fixture's (read with no plugin)
     XrdCl::File plain(false);
-    std::vector<char> z(kLen, 1);
+    std::vector<char> z(faultLen, 1);
     uint32_t got = 0;
     const std::string at = "root://" + landed + "/" + XrdCl::URL(url).GetPath();
-    if (!plain.Open(at, XrdCl::OpenFlags::Read).IsOK() ||
-        !plain.Read(kOff, kLen, z.data(), got).IsOK() || got != kLen ||
-        std::count(z.begin(), z.end(), 0) != static_cast<std::ptrdiff_t>(kLen)) {
-      std::printf("%s: SETUP: %s does not serve zeros at %llu+%u\n", mode, landed.c_str(),
-                  static_cast<unsigned long long>(kOff), kLen);
+    const bool read = faultAt + faultLen <= src.bytes.size() &&
+                      plain.Open(at, XrdCl::OpenFlags::Read).IsOK() &&
+                      plain.Read(faultAt, faultLen, z.data(), got).IsOK() && got == faultLen;
+    const bool fault = read && (zeros ? std::count(z.begin(), z.end(), 0) ==
+                                            static_cast<std::ptrdiff_t>(faultLen)
+                                      : std::memcmp(z.data(), src.bytes.data() + faultAt,
+                                                    faultLen) != 0);
+    if (!fault) {
+      std::printf("%s: SETUP: %s does not serve %s at %llu+%u\n", mode, landed.c_str(),
+                  zeros ? "zeros" : "other bytes than the fixture's",
+                  static_cast<unsigned long long>(faultAt), faultLen);
       return 2;
     }
     const XrdCl::XRootDStatus closed = plain.Close();
@@ -1750,8 +1767,9 @@ int runZero(const char* url, const char* local, const std::string& which) {
   auto* w = new ReadWait(); // leaked with its buffer: a late completion lands safely
   auto* buf = new std::vector<char>(kLen, 0x5A);
   XrdCl::ChunkList chunks{XrdCl::ChunkInfo(kOff, kLen, buf->data())};
-  const XrdCl::XRootDStatus s = which == "zerov" ? file->VectorRead(chunks, nullptr, w)
-                                                 : file->Read(kOff, kLen, buf->data(), w);
+  const bool vec = which == "zerov" || which == "lenv" || which == "recv";
+  const XrdCl::XRootDStatus s = vec ? file->VectorRead(chunks, nullptr, w)
+                                    : file->Read(kOff, kLen, buf->data(), w);
   const bool answered = s.IsOK() && w->wait();
   std::this_thread::sleep_for(std::chrono::seconds(1)); // room for a second completion
   std::string now;
@@ -1759,7 +1777,7 @@ int runZero(const char* url, const char* local, const std::string& which) {
   {
     std::lock_guard<std::mutex> g(w->mu);
     const std::string said = w->status.ToStr();
-    if (which == "zeroerr") {
+    if (which == "zeroerr" || which == "lenerr" || which == "recerr") {
       verdict(answered && w->status.code == XrdCl::errDataError &&
                   said.find("failed its check") != std::string::npos,
               "the read of the zeroed basket fails its check: " + said);
@@ -2169,7 +2187,7 @@ int runCut(const char* url, const char* local, const std::string& which) {
 
 int runReadFailover(const char* url, const char* local, const std::string& which) {
   const char* mode = "read-failover";
-  if (which.rfind("zero", 0) == 0)
+  if (which.rfind("zero", 0) == 0 || which.rfind("len", 0) == 0 || which.rfind("rec", 0) == 0)
     return runZero(url, local, which);
   if (which == "cut" || which == "cutpg" || which == "cutpgpast" || which == "cutonly" ||
       which == "end" || which == "degraded" || which == "degradedoff" || which == "leftdata" ||

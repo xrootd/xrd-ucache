@@ -132,6 +132,13 @@
 #                          for the handle (one failed read, no move takes it), and the error names
 #                          it; with the switch off (the check on) it gets the error and no read is
 #                          moved
+#   another length         the file map (the check on): a copy whose basket's key states another length than
+#                          the tree's record gives it (one ROOT would read as stored uncompressed: wrong values,
+#                          no error), or whose tree's record fails its own check (one byte of its compressed
+#                          data changed: ROOT finds no tree), damaged on the server the handle landed on after
+#                          the open: with the switch on the read is refused there and made again at another
+#                          site, exactly, once, for a Read and a VectorRead; with it off the read fails its
+#                          check and is not moved; each failure's text says which
 #   lost trust, open fails a handle opened trusting its cache entry (a freshness window) whose entry is
 #                          gone by its first read, and whose own open then fails at every copy (each
 #                          refuses the file): a Read and a PgRead each fail with that open's error,
@@ -850,14 +857,17 @@ case \$1 in $AX) s=a ;; $BX) s=b ;; $CX) s=c ;; *) exit 1 ;; esac
 dd if=/dev/zero of="$W/data/\$s\$ZERO_LFN" bs=64K seek=4915 count=2481 oflag=seek_bytes iflag=count_bytes conv=notrunc status=none
 ZERO
 chmod 755 "$W/zero.sh"
-# zr CASE LFN SWITCH [land]: plugin_fuzz's read-failover CASE on LFN (the check on); `land`: the basket is
-# zeroed on the server the handle lands on. Sets RES, RFC (its cache), SV (landed, final), F14 (failed
+# zr CASE LFN SWITCH [land] [CMD]: plugin_fuzz's read-failover CASE on LFN (the check on); `land`: the basket is
+# zeroed on the server the handle lands on (by CMD instead of zero.sh when given: the copy damaged otherwise, with
+# ZREXTRA's settings for the case's check of the fault). Sets RES, RFC (its cache), SV (landed, final), F14 (failed
 # reads with code 14), FL (their servers), MV (where each move landed) and NRA (attempts of route read).
+ZREXTRA=()
 zr() {
-  local c=$1 l=$2 sw=$3 land=${4:-} n
+  local c=$1 l=$2 sw=$3 land=${4:-} cmd=${5:-$W/zero.sh} n
   n=$(echo "$l" | tr / _)
   RFC="$W/c-zr$n"
-  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=$sw UCACHE_CHECK_ORIGIN_INTEGRITY=on ${land:+UCACHE_ZERO_CMD=$W/zero.sh ZERO_LFN=$l})
+  ZRLOG="$W/zr$n.log"
+  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=$sw UCACHE_CHECK_ORIGIN_INTEGRITY=on ${land:+UCACHE_ZERO_CMD=$cmd ZERO_LFN=$l} "${ZREXTRA[@]}")
   [ "$land" = landref ] && FEDENV+=(UCACHE_TEST_LOCATE_REFRESH=1)
   RES=$(fuzz "$RFC" "$W/zr$n.log" "root://127.0.0.1:$RX/$l" "$FIX" 1 1 1 read-failover $c)
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-220
@@ -914,6 +924,66 @@ L=/store/ci/zr-off.root; placefix $L a b c; zero_at $L a b c
 zr zeroerr $L off
 clean_zr zeroerr; verdict "switch off: the read fails its check, once, and never serves the zeros" $?
 [ "$F14" = 1 ] && [ "$NRA" = 0 ]; verdict "switch off: one failed read, no open of route read ($F14, $NRA)" $?
+
+echo; echo "=== a basket whose key states another length, a tree's record that fails its own check: the read moves"
+# The file map (check_origin_integrity): a basket fetched must state the length the tree's record gives it, and a
+# tree's record that fails its own check shows its copy bad. The fixture's Jet_pt basket at 4915 (2481 bytes, its key
+# 75 bytes, its object 12008) made to state 12083 bytes, the length of a basket stored as it is (ROOT then takes its
+# compressed bytes for its entries: wrong values, no error); the fixture's tree record at 11210 (717 bytes, zlib, its
+# label 46 bytes) with one byte of its compressed data changed, at 11296 (ROOT finds no tree). Each by a script the
+# test client runs with the port of the server its handle landed on, after the open.
+cat > "$W/len.sh" <<LENSH
+#!/bin/sh
+case \$1 in $AX) s=a ;; $BX) s=b ;; $CX) s=c ;; *) exit 1 ;; esac
+printf '\000\000\057\063' | dd of="$W/data/\$s\$ZERO_LFN" bs=1 seek=4915 conv=notrunc status=none
+LENSH
+rec_at() { # LFN server... : one byte of the tree's record's compressed data changed in the copies on those servers
+  local lfn=$1 s; shift
+  for s in "$@"; do printf '\060' | dd of="$W/data/$s$lfn" bs=1 seek=11296 conv=notrunc status=none; done
+}
+chmod 755 "$W/len.sh"
+# failtext WHY: the failed reads whose warning, in the test client's log, gives WHY as the reason
+failtext() { grep -c "failed its check ($1); not served" "$ZRLOG"; }
+# (a) a basket whose key states another length, on the server the handle landed on, made after the open
+ZREXTRA=(UCACHE_FAULT_AT=4915)
+why="key length differs from the tree's record"
+for c in len lenv; do
+  L=/store/ci/zr-$c.root; placefix $L a b c
+  zr $c $L on land "$W/len.sh"
+  clean_zr $c; verdict "$c: the basket of another length is refused and read exactly at another server, once (${SV[*]})" $?
+  [ "$F14" = 1 ] && [ "${FL[0]:-x}" = "${SV[0]}" ] && [ "$(failtext "$why")" = 1 ]
+  verdict "$c: one failed read with code 14, at the server the handle landed on, its warning saying \"$why\" (${FL[*]})" $?
+  [ "${#MV[@]}" -ge 1 ] && [ "${MV[-1]}" = "${SV[1]}" ]; verdict "$c: a move of route read ended at the server the bytes came from (${MV[*]})" $?
+done
+L=/store/ci/zr-len-off.root; placefix $L a b c
+zr lenerr $L off land "$W/len.sh"
+clean_zr lenerr; verdict "len, switch off: the read fails its check, once, and is never served" $?
+[ "$F14" = 1 ] && [ "$NRA" = 0 ] && [ "$(failtext "$why")" = 1 ]
+verdict "len, switch off: one failed read whose warning says \"$why\", no open of route read ($F14, $NRA)" $?
+# (b) a tree's record that fails its own check. It must be damaged before the open: the checks made at open keep the
+# record's pages (the reader reads it first), and the map is made from them. Made certain as (b) of the zeros above:
+# the file placed on a alone and the regional asked where it is (it keeps that answer, a alone), a's copy damaged, then
+# whole copies on b and c; the handle lands on a. The map made from a's record shows a bad: the read fails its check
+# there, the move's open (sent back to a, which a read found bad) asks the regional for its list with refresh, and the
+# read is exact at b or c.
+ZREXTRA=(UCACHE_FAULT_AT=11296 UCACHE_FAULT_LEN=1)
+why="the tree's record fails its own check"
+for c in rec recv; do
+  L=/store/ci/zr-$c.root; placefix $L a
+  RL=$(xfs 127.0.0.1:$RX locate "$L" 2>&1 | tr '\n' ' ')
+  rec_at $L a; placefix $L b c
+  zr $c $L on landref /bin/true
+  clean_zr $c; verdict "$c: a's tree's record fails its own check: the read is refused there and read exactly at another server, once (${SV[*]})" $?
+  [ "$F14" = 1 ] && [ "${FL[0]:-x}" = "$AX" ] && [ "${SV[0]:-}" = "$AX" ] && [ "$(failtext "$why")" = 1 ]
+  verdict "$c: the handle landed on a (the regional listed $RL), one failed read with code 14 at a, its warning saying \"$why\" (${FL[*]})" $?
+  [ "${#MV[@]}" -ge 1 ] && [ "${MV[-1]}" = "${SV[1]}" ] && [ "${SV[1]}" != "$AX" ]; verdict "$c: a move of route read ended at the server the bytes came from, not a (${MV[*]})" $?
+done
+L=/store/ci/zr-rec-off.root; placefix $L a b c; rec_at $L a b c
+zr recerr $L off
+clean_zr recerr; verdict "rec, switch off: the read fails its check, once, and is never served" $?
+[ "$F14" = 1 ] && [ "$NRA" = 0 ] && [ "$(failtext "$why")" = 1 ]
+verdict "rec, switch off: one failed read whose warning says \"$why\", no open of route read ($F14, $NRA)" $?
+ZREXTRA=()
 
 echo; echo "=== a copy cut short after the open: a read inside the file's size is answered short"
 CUTAT=30000

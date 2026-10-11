@@ -132,8 +132,13 @@ keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEn
     }
     fm = &own;
   }
-  auto m = std::make_shared<const KeyMap>(
-      keyMapOf(*fm, entry->fileSize(), fm == &own ? src.fetchedFrom : fmServer));
+  // The copy the records came from: the server of the parse's reads from the origin, or, when the
+  // cache held them all (the checks at open keep the records the reader reads first, from the copy
+  // the handle reads from), the handle's own server.
+  std::string from = fm == &own ? src.fetchedFrom : fmServer;
+  if (from.empty() && current)
+    from = *current;
+  auto m = std::make_shared<const KeyMap>(keyMapOf(*fm, entry->fileSize(), from));
   t->badUs = m->bad.empty() ? 0 : nowUs();
   t->seeks = std::move(m);
   return t->seeks;
@@ -217,12 +222,13 @@ ReadRule::State ReadRule::observe(const std::vector<std::pair<uint64_t, uint64_t
   if (!parsed_) {
     parsed_ = true;
     tp::FileMeta fm = tp::parseReaderTree(src, static_cast<int64_t>(size_));
+    const std::string from = src.fetchedFrom.empty() ? issueServer(*src.st, nullptr) : src.fetchedFrom;
     if (fm.recordFailed && globalConfig().checkOriginIntegrity) // the copy shown bad, for the check
-      keySeeksFor(src.st, src.entry, 0, &fm, src.fetchedFrom);
+      keySeeksFor(src.st, src.entry, 0, &fm, from);
     if (fm.error.empty()) {
       map_ = std::make_unique<tp::ReadMap>(tp::ReadMap::fromTree(fm));
       if (globalConfig().checkOriginIntegrity) // the key-position check's table, from this parse
-        keySeeksFor(src.st, src.entry, 0, &fm, src.fetchedFrom);
+        keySeeksFor(src.st, src.entry, 0, &fm, from);
     } else if (fm.error.find("not found") != std::string::npos && src.fetchHead()) {
       tp::RNTupleMeta rm = tp::parseRNTuple(src, static_cast<int64_t>(size_), "");
       if (rm.error.empty())

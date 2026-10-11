@@ -4268,7 +4268,8 @@ void persistPagesReserved(const std::shared_ptr<HandleState>& st,
                                                  const std::string& why) {
   char msg[600];
   std::snprintf(msg, sizeof msg, "%s: a %s at %llu from %s failed its check (%s); not served",
-                recordFile(st.url).c_str(), why.empty() ? "basket" : "read",
+                recordFile(st.url).c_str(),
+                why.empty() || why.rfind("key ", 0) == 0 ? "basket" : "read",
                 static_cast<unsigned long long>(pos),
                 server.empty() ? "the origin" : server.c_str(),
                 why.empty() ? "key position differs from the tree's record" : why.c_str());
