@@ -157,24 +157,51 @@ bool headerFaultFires() {
 // other site would answer differently. late: the misses, the error posted 500 ms
 // late (after the open of a move, on the loopback). again: relayed reads, as relay,
 // and also each issue of a read made again after a move (RelayHandler::goOn), so that
-// a read can fail at every copy a move takes.
-enum class FaultKind : uint8_t { kMiss, kRelay, kRefuse, kFinal, kLate, kAgain };
+// a read can fail at every copy a move takes. leftdata: the misses of plain reads; the second
+// fault is no error: the read is sent as it is and its answer delivered 2500 ms late (after a move
+// the first one started, so that a copy cut short answers it short on the File the handle left);
+// every other one a connection error posted 1000 ms late (two reads issued together both meet the
+// copy before either answer comes).
+enum class FaultKind : uint8_t { kMiss, kRelay, kRefuse, kFinal, kLate, kAgain, kLeftData };
 static const FaultKind gFaultKind = [] {
   const char* v = ::getenv("UCACHE_TEST_READ_FAIL_KIND");
   const std::string k = v ? v : "";
-  return k == "relay"    ? FaultKind::kRelay
-         : k == "refuse" ? FaultKind::kRefuse
-         : k == "final"  ? FaultKind::kFinal
-         : k == "late"   ? FaultKind::kLate
-         : k == "again"  ? FaultKind::kAgain
-                         : FaultKind::kMiss;
+  return k == "relay"      ? FaultKind::kRelay
+         : k == "refuse"   ? FaultKind::kRefuse
+         : k == "final"    ? FaultKind::kFinal
+         : k == "late"     ? FaultKind::kLate
+         : k == "again"    ? FaultKind::kAgain
+         : k == "leftdata" ? FaultKind::kLeftData
+                           : FaultKind::kMiss;
 }();
+static std::atomic<int> gReadFaultsFired{0}; // of kLeftData: which fault this is
+// A handler that delivers the answer it gets 2500 ms late (leftdata's second fault).
+class LateAnswer : public ResponseHandler {
+public:
+  explicit LateAnswer(ResponseHandler* h) : h_(h) {}
+  void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
+                               HostList* hostList) override {
+    ResponseHandler* h = h_;
+    delete this;
+    Executor::instance().postAfter(2500, [h, status, response, hostList] {
+      h->HandleResponseWithHosts(status, response, hostList ? hostList : new HostList());
+    });
+  }
+  void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    HandleResponseWithHosts(status, response, nullptr);
+  }
+
+private:
+  ResponseHandler* h_;
+};
+
 // True when the fault fires at this issue site: `s` is then what the issue call
 // returns (OK when the failure is posted to `h`, which gets exactly that).
 // `relaySite`: a relayed read's first issue; `againSite`: an issue made again
-// after a move.
+// after a move. `late`, at a site that can delay an answer: set (and false returned) when the
+// read is to be sent as it is and its answer delivered late (leftdata's second fault).
 static bool injectReadFault(bool relaySite, ResponseHandler* h, XRootDStatus& s,
-                            bool againSite = false) {
+                            bool againSite = false, bool* late = nullptr) {
   const FaultKind k = gFaultKind;
   const bool here =
       againSite   ? k == FaultKind::kAgain
@@ -187,9 +214,15 @@ static bool injectReadFault(bool relaySite, ResponseHandler* h, XRootDStatus& s,
     s = XRootDStatus(XrdCl::stError, XrdCl::errInvalidSession);
     return true;
   }
+  if (k == FaultKind::kLeftData && gReadFaultsFired.fetch_add(1, std::memory_order_relaxed) == 1) {
+    if (late)
+      *late = true;
+    return false;
+  }
   const XRootDStatus err(XrdCl::stError, k == FaultKind::kFinal ? XrdCl::errInvalidResponse
                                                                 : XrdCl::errConnectionError);
-  Executor::instance().postAfter(k == FaultKind::kLate ? 500 : 0, [h, err] {
+  const uint64_t lateMs = k == FaultKind::kLate ? 500 : k == FaultKind::kLeftData ? 1000 : 0;
+  Executor::instance().postAfter(lateMs, [h, err] {
     h->HandleResponseWithHosts(new XRootDStatus(err), nullptr, new HostList());
   });
   return true;
@@ -1105,7 +1138,8 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     // The cache's allow and deny lists say which files it caches: they are matched against the
     // host of the job's URL (ensureEntry). For a file it caches they also narrow the copies the
     // regional lists; for a file it passes straight to the origin they do not, and its open's
-    // failover and its reads' moves may take every copy listed.
+    // failover and its reads' moves may take every copy listed. Where a redirector itself sends an
+    // open is not filtered, for a cached file too.
     const auto key = UrlKey::parse(st.url, cfg.keepCgi);
     const bool cached = key && hostPassesLists(cfg.allowHosts, cfg.denyHosts, key->host);
     std::vector<Location> listed;
@@ -3875,8 +3909,13 @@ class MissReadHandler : public ResponseHandler {
 XRootDStatus issueWireRead(const std::shared_ptr<HandleState>& st, XrdCl::File* f, uint64_t off,
                            uint64_t len, void* buf, MissReadHandler* mh, int readerT) {
   XRootDStatus s;
-  if (!injectReadFault(false, mh, s))
-    s = f->Read(off, len, buf, mh, st->originTimeout(readerT));
+  bool late = false;
+  if (!injectReadFault(false, mh, s, false, &late)) {
+    ResponseHandler* rh = late ? new LateAnswer(mh) : static_cast<ResponseHandler*>(mh);
+    s = f->Read(off, len, buf, rh, st->originTimeout(readerT));
+    if (!s.IsOK() && rh != mh)
+      delete rh;
+  }
   return refusedLater(st, s, mh);
 }
 

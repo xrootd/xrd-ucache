@@ -1612,7 +1612,48 @@ int runCut(const char* url, const char* local, const std::string& which) {
     }
   std::string now = landed;
   std::vector<char> buf(65536, 0x5A);
-  if (which == "degraded") { // the handle's own open fails: each read gets that open's error
+  // A read of `n` bytes at `off`, exact, once; `what` says which.
+  const auto readExact = [&](uint64_t off, uint32_t n, const std::string& what) {
+    auto* w = new ReadWait(); // leaked with its buffer: a late completion lands safely
+    auto* b = new std::vector<char>(n, 0x5A);
+    const XrdCl::XRootDStatus s = file->Read(off, n, b->data(), w);
+    const bool answered = s.IsOK() && w->wait();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // room for a second completion
+    const bool once = w->contractKept();
+    std::lock_guard<std::mutex> g(w->mu);
+    const bool ok = answered && once && w->status.IsOK() &&
+                    std::memcmp(b->data(), src.bytes.data() + off, n) == 0;
+    verdict(ok, what + (ok ? "" : " (" + (s.IsOK() ? w->status.ToStr() : s.ToString()) + ")"));
+  };
+  const auto server = [&] {
+    std::string v;
+    return file->GetProperty("DataServer", v) ? v : std::string("(none)");
+  };
+  if (which == "leftdata") {
+    // UCACHE_TEST_READ_FAIL_N=3, _KIND=leftdata; the file on two servers; the copy X the handle
+    // opened at cut after the open (UCACHE_CUT_CMD). Two Reads, issued 400 ms apart, both meet X:
+    // the first's miss fails (a connection error, 1 s late) and moves the handle to Y; the second's
+    // (past the cut) is answered short by X, 2.5 s late, after that move, on the File the handle
+    // left: X is then a copy the handle never opens again. Both are exact (the second is issued
+    // again at Y). A third Read fails at Y (a connection error): the move it makes does not take X,
+    // which an X marked only as a failure would be (the oldest failure), and stays at Y.
+    std::thread t1([&] {
+      readExact(8192, 4096, "a Read whose miss fails at X (a connection error) is exact");
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    std::thread t2([&] {
+      readExact(40000, 4096, "a Read past the cut, answered short by X after the move, is exact");
+    });
+    t1.join();
+    t2.join();
+    const std::string y = server();
+    verdict(y != landed, "after the two Reads the handle reads from " + y + ", was " + landed);
+    readExact(20000, 4096, "a third Read, whose miss fails at Y, is exact");
+    now = server();
+    verdict(now == y, "after the third Read the handle still reads from " + now +
+                          " (X, whose read answered short, is not taken again)");
+    std::printf("LEFTDATA %s %s %s\n", landed.c_str(), y.c_str(), now.c_str());
+  } else if (which == "degraded") { // the handle's own open fails: each read gets that open's error
     for (const bool pg : {false, true}) {
       auto* w = new ReadWait(); // leaked with its buffer: a late completion lands safely
       auto* b = new std::vector<char>(65536, 0x5A);
@@ -1716,7 +1757,7 @@ int runReadFailover(const char* url, const char* local, const std::string& which
   if (which.rfind("zero", 0) == 0)
     return runZero(url, local, which);
   if (which == "cut" || which == "cutpg" || which == "cutpgpast" || which == "cutonly" ||
-      which == "end" || which == "degraded")
+      which == "end" || which == "degraded" || which == "leftdata")
     return runCut(url, local, which);
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   Source src(local);

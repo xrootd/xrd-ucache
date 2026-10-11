@@ -110,7 +110,10 @@
 #                          invalid response; inside the file's size uCache holds that against the copy
 #                          too). When every copy is cut the read fails with the
 #                          data error, whose text says no copy could serve the read and names each
-#                          copy tried with its size. A read that reaches past the end of an intact
+#                          copy tried with its size; a second read made right after it, within a
+#                          second, is not moved again: it gets that move's error at once, which says
+#                          that a move made for an earlier read of the handle found no copy and that
+#                          the offsets it names are that read's. A read that reaches past the end of an intact
 #                          file is answered short as it always was, and the handle does not move
 #   zeros                  a copy that serves a basket as zeros (the fixture of the key-position
 #                          check, tests/data/unnamed_codec_fixture.root): with the switch on the
@@ -125,7 +128,11 @@
 #   lost trust, open fails a handle opened trusting its cache entry (a freshness window) whose entry is
 #                          gone by its first read, and whose own open then fails at every copy (each
 #                          refuses the file): a Read and a PgRead each fail with that open's error,
-#                          which names the copies, and nothing is sent on the File that never opened
+#                          which names the copies, and neither is given to the File that never
+#                          opened (neither gets the client's own answer there, "Invalid operation")
+#   left copy              a read's data failure (a short answer inside the confirmed size) that
+#                          arrives after the handle moved, on the File it left: that copy is one the
+#                          handle never opens again, as for a failure on the File it reads from
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD=$(cd "${1:?usage: fed_ci.sh BUILD_DIR}" && pwd)
@@ -890,6 +897,30 @@ ct end "" /store/ci/ct-end.root
 echo "$RES" | grep -q '^read-failover end: clean$'; verdict "end: reads that reach past the end of an intact file are answered short, exactly (a PgRead wholly past it as without uCache), and the handle stays (${SV[*]})" $?
 [ "$F14" = 0 ] && [ "$NRA" = 0 ]; verdict "end: no failed read, no move ($F14, $NRA)" $?
 
+# A read's data failure that arrives after the handle moved, on the File it left (UCACHE_TEST_READ_FAIL_KIND=leftdata;
+# the fixture on a and b only, the copy the handle opened at cut after the open): the copy is marked as one the
+# handle never opens again, as for a data failure on the File it reads from. Two Reads issued 400 ms apart at X: the
+# first's miss fails (a connection error, 1 s late) and moves the handle to Y; the second, past the cut, is answered
+# short by X 2.5 s late, after that move. A third Read fails at Y: its move does not take X back (an X marked only as
+# a failure would be taken, as the oldest failure) and stays at Y.
+L=/store/ci/ct-leftdata.root
+placew $L a b
+RFC="$W/c-ct-leftdata"
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_READ_FAIL_N=3 UCACHE_TEST_READ_FAIL_KIND=leftdata UCACHE_CUT_CMD=$W/cut.sh CUT_LFN=$L)
+RES=$(fuzz "$RFC" "$W/ct-leftdata.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 read-failover leftdata)
+echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-300
+LD=($(echo "$RES" | sed -n 's/^LEFTDATA //p' | pnorm))
+FL=($(recs "$RFC" origin_failure | field code)); FO=($(recs "$RFC" origin_failure | field off))
+MV=($(recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | field data_server | pnorm))
+recs "$RFC" origin_failure | sed 's/^/    fail: /' | cut -c1-240
+echo "$RES" | grep -q '^read-failover leftdata: clean$'
+verdict "leftdata: three Reads exact, once each; the third does not move the handle back to the copy that answered short (${LD[*]})" $?
+[ "${#LD[@]}" = 3 ] && [ "${LD[0]}" != "${LD[1]}" ] && [ "${#FL[@]}" = 3 ] && [ "${FL[0]} ${FO[0]}" = "108 8192" ] &&
+  [ "${FL[1]} ${FO[1]}" = "14 36864" ] && [ "${FL[2]} ${FO[2]}" = "108 16384" ]
+verdict "leftdata: the faults struck as meant: a connection error at 8192, then the short answer past the cut (code 14, the page at 36864), then a connection error at 16384 (${FL[*]} at ${FO[*]})" $?
+[ "${#MV[@]}" -ge 1 ] && [ "${MV[0]}" = "${LD[1]:-}" ] && ! printf '%s\n' "${MV[@]}" | grep -qx "${LD[0]:-none}"
+verdict "leftdata: the moves landed at Y only, never back at X (${MV[*]}; X ${LD[0]:-}, Y ${LD[1]:-})" $?
+
 echo; echo "=== a handle that lost its trust, whose own open then fails at every copy"
 # The first run fills the cache with a freshness window, so that the second opens trusting the entry (no request
 # at open). After that open the test removes the entry and has every copy refuse the file: the first read finds
@@ -926,8 +957,11 @@ NDG=$(recs "$DC" open | tail -n +$((N0 + 1)) | grep -c '"route":"degraded"'); NO
 verdict "lost trust: the records show the handle's own open (route degraded, then its failovers), none ok ($NDG degraded, $NOK ok)" $?
 n=0; for p in $AX $BX $CX; do echo "$RES" | grep '^MSG read' | grep -q "(127.0.0.1:$p)" && n=$((n + 1)); done
 [ "$n" = 3 ]; verdict "lost trust: the Read's error names each of the three copies ($n of 3)" $?
-[ "$(grep 'MsgHandler created' "$W/degraded.log" | grep -c 'kXR_pgread\|kXR_read ')" = 0 ]
-verdict "lost trust: no read was sent on the File that never opened (the client's log)" $?
+# No read is given to the File that never opened: the client answers such a read itself with "Invalid operation"
+# and sends nothing (so its log cannot show it), and a PgRead there brought the test client down. That answer is
+# what a read given to it would get.
+! echo "$RES" | grep -q 'Invalid operation'
+verdict "lost trust: no read got the client's answer for a File that never opened (Invalid operation): none was given to it" $?
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
 
 echo; echo "fed_ci: $FAILS failure(s)"

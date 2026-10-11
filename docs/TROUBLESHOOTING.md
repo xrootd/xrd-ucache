@@ -450,9 +450,11 @@ another site, and the job gets the bytes. The log says so, once for every move:
 A read moves only to a copy of the size the job was shown at its open, also on a
 file whose reads uCache passes straight to the origin (its host is left out by the
 cache's allow and deny lists). For a file uCache caches, the lists also narrow the copies a
-read moves to, as they do an open's: when the redirector sends the read's open back to a
-server that failed and the lists refuse every other copy the regional redirector lists,
-that server is taken again. For a file whose reads uCache passes straight to the origin
+read moves to, as they do an open's: the copies taken from the regional redirector's list.
+Where a redirector itself sends the read's open is not filtered: the server it names is
+taken whatever the lists say of its host, and when it sends the open back to a server that
+failed and the lists refuse every other copy the regional redirector lists, that server is
+taken again. For a file whose reads uCache passes straight to the origin
 (its host left out by the lists) they do not: its open's failover and its reads' moves may
 take any copy the regional redirector lists.
 A file whose size uCache does not know is not moved: the client's own recovery of its
