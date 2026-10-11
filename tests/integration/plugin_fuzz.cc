@@ -1635,9 +1635,9 @@ int runCut(const char* url, const char* local, const std::string& which) {
     // the first's miss fails (a connection error, 1 s late) and moves the handle to Y; the second's
     // (past the cut) is answered short by X, 2.5 s late, after that move, on the File the handle
     // left: X is then a copy the handle never opens again. Both are exact (the second is issued
-    // again at Y). A third Read fails at Y (a connection error): the move it makes stays at Y and
-    // never opens X (an X marked only as a failure is opened again, as the oldest failure, and
-    // refused only for its size: the caller checks the records).
+    // again at Y). Then UCACHE_RESTORE_CMD (with X's port) makes X whole again, so that only its
+    // mark can keep a move from it. A third Read fails at Y (a connection error): the move it makes
+    // stays at Y (an X marked only as a failure is taken again, as the oldest failure).
     std::thread t1([&] {
       readExact(8192, 4096, "a Read whose miss fails at X (a connection error) is exact");
     });
@@ -1649,10 +1649,16 @@ int runCut(const char* url, const char* local, const std::string& which) {
     t2.join();
     const std::string y = server();
     verdict(y != landed, "after the two Reads the handle reads from " + y + ", was " + landed);
+    if (const char* cmd = ::getenv("UCACHE_RESTORE_CMD"))
+      if (std::system((std::string(cmd) + " " + landed.substr(landed.rfind(':') + 1)).c_str()) !=
+          0) {
+        std::printf("%s: SETUP: %s failed\n", mode, cmd);
+        return 2;
+      }
     readExact(20000, 4096, "a third Read, whose miss fails at Y, is exact");
     now = server();
     verdict(now == y, "after the third Read the handle still reads from " + now +
-                          " (X, whose read answered short, is not taken again)");
+                          " (X, whose read answered short, is not taken again though whole)");
     std::printf("LEFTDATA %s %s %s\n", landed.c_str(), y.c_str(), now.c_str());
   } else if (which == "degraded") { // the handle's own open fails: each read gets that open's error
     for (const bool pg : {false, true}) {
