@@ -626,11 +626,12 @@ void rootCheckRead(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
 }
 
 namespace {
-// `t` with every byte that is not a printable character as '?'.
+// `t` with every byte that is not a printable character, and '?' (the error text that names the
+// copies drops a query from there on), as '.'.
 std::string printable(std::string t) {
   for (auto& c : t)
-    if (c < 0x20 || c > 0x7e)
-      c = '?';
+    if (c < 0x20 || c > 0x7e || c == '?')
+      c = '.';
   return t;
 }
 // Whether `p` (3 bytes) opens a block ROOT decompresses (R__unzip_header's own test).
