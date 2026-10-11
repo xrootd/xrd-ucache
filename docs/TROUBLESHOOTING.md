@@ -417,8 +417,9 @@ of files whose entries were confirmed within that window are answered from the c
 no request to any origin. That window applies to every file the job opens, not only this
 one, so a file rewritten at its origin within it is read as cached: set it for that job
 only. What the entry holds counts the bytes of the file the cache keeps as they are and, for
-a file with a replica (`recompress`), the parts of the file the replica holds converted.
-When the entry holds only part of the file, the error says how much (`holding 131.1 kB
+a file with a replica (`recompress`), the parts of the file the replica holds converted
+(read without waiting: while another job is writing to the replica at that moment, its parts
+are left out of the count). When the entry holds only part of the file, the error says how much (`holding 131.1 kB
 of its 1.8 MB (7%)`) and that reads of the parts it does not hold will still fail: they need
 an origin, and no copy passes. When the copies such a read then finds are of another size
 than the entry's, the read fails with the error that names them and the entry's freshness

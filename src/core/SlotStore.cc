@@ -184,9 +184,9 @@ bool isDebris(IOBackend& io, int fd) {
 } // namespace
 
 std::shared_ptr<SlotStore> SlotStore::open(IOBackend& io, const std::string& objectDir,
-                                           const std::string& hashHex) {
+                                           const std::string& hashHex, bool readOnly) {
   const std::string p = path(objectDir, hashHex);
-  int fd = io.open(p, O_RDWR | O_CLOEXEC, 0);
+  int fd = io.open(p, (readOnly ? O_RDONLY : O_RDWR) | O_CLOEXEC, 0);
   if (fd < 0)
     return nullptr;
   SlotStoreHeader h;

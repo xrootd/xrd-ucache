@@ -92,9 +92,11 @@ class SlotStore {
   // The entry's store, or null if there is none, or it is not usable: a header
   // being written right now, a layout blob failing its CRC, a format this
   // build does not know (newer() tells that one apart). Nothing is compared
-  // against the file here.
+  // against the file here. `readOnly`: opened for reading only, for a caller
+  // that only looks (refresh, header, layout): it works on a cache the
+  // process may not write, and such a store must never be given a commit.
   static std::shared_ptr<SlotStore> open(IOBackend& io, const std::string& objectDir,
-                                         const std::string& hashHex);
+                                         const std::string& hashHex, bool readOnly = false);
 
   // The store, created from `want` and `blob` if there is none. When one
   // exists (made by someone else, perhaps a moment ago) it is returned as it

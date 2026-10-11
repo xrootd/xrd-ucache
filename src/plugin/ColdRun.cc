@@ -2106,7 +2106,11 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
 void coldHeldOriginal(const UrlKey& key, const std::string& cacheDir, uint64_t size,
                       uint64_t originMtime, uint8_t cksumKind, uint32_t originCksum,
                       std::vector<std::pair<uint64_t, uint64_t>>& out) noexcept try {
-  auto store = SlotStore::open(RealIO::instance(), key.objectDir(cacheDir), key.hashHex);
+  // Read only, and never waiting: a commit in progress (its exclusive lock held, in this process
+  // or another) leaves the store's records out of this count rather than delay the caller, which
+  // gives an open its answer.
+  auto store = SlotStore::open(RealIO::instance(), key.objectDir(cacheDir), key.hashHex,
+                               /*readOnly=*/true);
   if (!store || store->header().declined ||
       !adoptable(store->header(), size, originMtime, cksumKind, originCksum))
     return;
@@ -2114,7 +2118,7 @@ void coldHeldOriginal(const UrlKey& key, const std::string& cacheDir, uint64_t s
   lay.slotFactor100 = store->header().slotFactor100;
   if (!decodeLayout(store->layoutBlob(), lay))
     return;
-  for (const SlotEntry& e : store->refresh(/*wait=*/true))
+  for (const SlotEntry& e : store->refresh(/*wait=*/false))
     if ((e.kind == SlotEntry::kZstd || e.kind == SlotEntry::kRaw) && e.slot < lay.L.slots.size()) {
       const tp::FillSlot& sl = lay.L.slots[e.slot];
       out.emplace_back(sl.origSeek, sl.origSeek + sl.origLen);
