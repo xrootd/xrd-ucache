@@ -2411,20 +2411,20 @@ XrdCl::XRootDStatus HandleState::missError() {
   return XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errInvalidOp);
 }
 
-// With adaptive_federation on, whether the handle's File is still to be opened by the cache's own
-// open: a handle trusted at Open whose open has not succeeded, whether or not it still trusts its
-// entry. A request on that File would meet a File that never opened.
+// Whether the handle's File is still to be opened by the cache's own open (OpenPolicy.h): with
+// adaptive_federation off, once a handle trusted at Open has lost its trust; with it on, also
+// before.
 static bool ownOpenPending(const HandleState& st) {
-  return st.trustedAtOpen.load(std::memory_order_acquire) && !st.innerOpened &&
-         globalConfig().adaptiveFederation;
+  return ucache::ownOpenPending(st.trustedAtOpen.load(std::memory_order_acquire), st.innerOpened,
+                                globalConfig().adaptiveFederation, st.cacheOnly);
 }
 
 XrdCl::File* HandleState::acquireInner() {
   // Trusted-cache handle: open the origin on first real need (fail-open —
-  // nullptr here makes the miss path return an error, never bad data). With
-  // adaptive_federation on, so is one that lost its trust at its first read
-  // and whose open then failed: each request gets the open's error (missError),
-  // and the next one after the cool-down opens it again.
+  // nullptr here makes the miss path return an error, never bad data). So is
+  // one that lost its trust at its first read and whose open then failed: each
+  // request gets the open's error (missError), and the next one after the
+  // cool-down opens it again.
   if ((cacheOnly || ownOpenPending(*this)) && !innerOpened && !ensureInnerOpen())
     return nullptr;
   if (sizeRefused.load(std::memory_order_acquire))
@@ -4724,6 +4724,11 @@ void storeOpenBytesIn(HandleState& st, const std::shared_ptr<FileEntry>& entry,
 
 // The same, for the bytes the handle holds (HandleState::openBytes), when its entry is set up
 // (ensureEntry): before the reader's first read is looked up; let go when there is no entry.
+// UCACHE_TEST_SETUP_DELAY_MS (inert unless set, read at load): a test's wait in a handle's set-up,
+// after the bytes kept at its open are first collected and before the handle is marked set up, so
+// that a test can have the open answer in between.
+static const int gSetupDelayMs = envAtLoad("UCACHE_TEST_SETUP_DELAY_MS");
+
 static void storeOpenBytes(HandleState& st, const std::shared_ptr<FileEntry>& entry) noexcept {
   std::unique_ptr<HandleState::OpenBytes> ob;
   {
@@ -4835,9 +4840,9 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
   // snapshot, and gating on it alone left the handle entry-less on an
   // unopened inner file — every read failed errInvalidOp (found by the
   // revalidate degrade-race gate).
-  if (!entry && !copy && (!cacheOnly || degraded)) {
-    if (degraded)
-      st_->ensureInnerOpen();
+  // A degraded handle whose open failed asks nothing of its File, which never opened: the handle
+  // is set up without an entry, and each request then gets that open's error (ownOpenPending).
+  if (!entry && !copy && (!cacheOnly || degraded) && (!degraded || st_->ensureInnerOpen())) {
     XrdCl::StatInfo* si = nullptr;
     XRootDStatus s = st_->inner.load()->Stat(false, si); // synchronous — caller thread
     std::unique_ptr<XrdCl::StatInfo> sip(si);
@@ -4906,6 +4911,8 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
   // What the checks at the reader's open read is stored before its first read is looked up (and
   // let go when there is no entry for it).
   storeOpenBytes(*st_, entry);
+  if (gSetupDelayMs > 0)
+    std::this_thread::sleep_for(std::chrono::milliseconds(gSetupDelayMs));
 #ifdef UCACHE_HAVE_COLDRUN
   // The mixed map the handle is shown, chosen once for its life: a handle a
   // forked child set up again keeps the one it had (null: the slot layout).
@@ -4956,6 +4963,10 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
       attached = true;
     }
   }
+  // The open's answer may have come between the bytes' collection above and setupDone, and found
+  // the handle not set up: they wait in the handle again, and are collected once more now (an
+  // answer after setupDone stores them itself, keepOpenBytes).
+  storeOpenBytes(*st_, attached ? entry : nullptr);
 #ifdef UCACHE_HAVE_COLDRUN
   if (cold && !attached)
     coldDetach(cold); // closed while setting up

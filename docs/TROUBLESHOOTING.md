@@ -465,7 +465,12 @@ origin only when a read needs it. When the entry is gone by the job's first read
 meanwhile), that read opens the file at an origin, with the failover of an open. If that open
 fails at every copy, each read and `Stat` of the file gets that open's error, which names the
 copies (`no copy could serve the read: ...`), and nothing is sent to an origin on the file
-until an open succeeds: the first read after a second opens it again.
+until an open succeeds: the first read after a second opens it again. With
+`adaptive_federation` off (the default) the same holds, with no other copy tried: each read
+and `Stat` gets the error the origin gave that open (for example `permission denied`), the
+one a job without uCache would have got at its open. (In uCache 1.4.0 and earlier, such
+reads got the XRootD client's `[ERROR] Invalid operation`, and a page read there could
+crash the client.)
 
 A read that a copy answers short, wholly inside the file's confirmed size (confirmed by
 the header at this open, or kept by the cache entry within its freshness window for an

@@ -583,6 +583,18 @@ bool shortInsideConfirmed(uint64_t confirmed, uint64_t off, uint64_t len, uint64
 bool emptyPageReadInsideConfirmed(bool armed, bool pageRead, int code, uint64_t confirmed,
                                   uint64_t off, uint64_t len);
 
+// Whether a handle's File is still to be opened by the cache's own open, so that no request may
+// be given to it before that open succeeds: the handle was trusted at Open (no request at open,
+// `trustedAtOpen`) and that open has not succeeded (`opened`). A request on a File that never
+// opened fails in the client ("invalid operation"), and a page read there crashes the client; the
+// request waits for the open, or gets its error. With adaptive_federation off (`federation`) this
+// holds only once the handle has lost its trust (its entry gone by its first read:
+// `stillTrusted` false): a handle that still trusts its entry is served as it always was. With it
+// on, it holds whether or not the handle still trusts its entry.
+inline bool ownOpenPending(bool trustedAtOpen, bool opened, bool federation, bool stillTrusted) {
+  return trustedAtOpen && !opened && (federation || !stillTrusted);
+}
+
 // What follows a failed origin read of an armed handle. This is every status the
 // client's own recovery of a read handles, which is off on such a handle, and
 // more: the stream and connection errors, an expired request, and a server's

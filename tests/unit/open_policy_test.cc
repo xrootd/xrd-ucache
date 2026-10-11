@@ -1418,7 +1418,6 @@ TEST(OpenPolicy, StaleEntryAdvice) {
   EXPECT_LE(staleEntryAdvice(UINT64_MAX, UINT64_MAX - 1, UINT64_MAX).size(), 400u);
 }
 
-// The advice goes after the error's text, whole: the text is cut first, within the bound.
 // The advice of an earlier copy is given only when every copy was refused by a check or could not
 // be reached: never for a file that is not there, a refusal to authorize, or a request a server
 // rejects.
@@ -1449,6 +1448,7 @@ TEST(OpenPolicy, StaleAdviceAfter) {
   EXPECT_EQ(staleAdviceAfter(kErrNotFound, 0, false), StaleAdvice::kNeutral);
 }
 
+// The advice goes after the error's text, whole: the text is cut first, within the bound.
 TEST(OpenPolicy, WithAdvice) {
   const std::string advice = staleEntryAdvice(5, 131072, 1756917);
   EXPECT_EQ(withAdvice("uCache: /f.root: no site could open it: a (a:1): refused", advice),
@@ -1470,4 +1470,23 @@ TEST(OpenPolicy, WithAdvice) {
   EXPECT_EQ(withAdvice("text", std::string(1023, 'a')), "text");
   EXPECT_EQ(withAdvice("text", std::string(1022, 'a')).size(), 1024u);
   EXPECT_EQ(withAdvice("", std::string(1025, 'a')), "");
+}
+
+// A handle trusted at Open whose own open has not succeeded gives no request to its File, which
+// never opened: with adaptive_federation off once it has lost its trust (its entry gone by its
+// first read), with it on also before. A handle not trusted at Open, or whose open succeeded, is
+// never held.
+TEST(OpenPolicy, OwnOpenPending) {
+  for (bool federation : {false, true}) {
+    EXPECT_TRUE(ownOpenPending(true, false, federation, false)) << "lost its trust: " << federation;
+    for (bool trusted : {false, true}) {
+      EXPECT_FALSE(ownOpenPending(true, true, federation, trusted)) << "its open succeeded";
+      EXPECT_FALSE(ownOpenPending(false, false, federation, trusted)) << "not trusted at Open";
+      EXPECT_FALSE(ownOpenPending(false, true, federation, trusted));
+    }
+  }
+  // A handle that still trusts its entry: held with the switch on only (the switch off serves it
+  // as it always was).
+  EXPECT_TRUE(ownOpenPending(true, false, true, true));
+  EXPECT_FALSE(ownOpenPending(true, false, false, true));
 }

@@ -274,10 +274,9 @@ struct HandleState {
   // unchanged. innerOpenMu serializes the one-shot lazy open off the fast path.
   bool cacheOnly = false;
   // Set at Open when the handle is trusted (cacheOnly): its File is opened only by the cache's own
-  // open (ensureInnerOpen), never by the reader's. With adaptive_federation on, no request goes to
-  // that File until that open has succeeded, also once the handle has lost its trust (its entry
-  // gone by its first read): a request on a File that never opened fails in the client, or crashes
-  // it.
+  // open (ensureInnerOpen), never by the reader's. No request goes to that File until that open has
+  // succeeded, also once the handle has lost its trust (its entry gone by its first read): a request
+  // on a File that never opened fails in the client, or crashes it.
   std::atomic<bool> trustedAtOpen{false};
   // Read without innerOpenMu on the fast path (acquireInner): set under it, and
   // atomic so a reader that sees it set also sees the open that preceded it.

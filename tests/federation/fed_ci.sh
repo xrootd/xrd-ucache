@@ -50,7 +50,8 @@
 #                          just as the checks begin is on the File before they turn it off: it
 #                          reads false during their reads, and the reader's value after them. A Stat
 #                          the reader makes while the checks run sets the handle up before its open
-#                          answers; what the checks read is stored in that entry all the same
+#                          answers; what the checks read is stored in that entry all the same, also
+#                          when the open answers while that set-up is under way
 #   zeros at the size      one server holds as many zero bytes as the file has (a, b and c in
 #                          turn), the other two the file: the copy of zeros does not begin as a
 #                          ROOT file does and is refused; the open goes on to a whole copy
@@ -74,10 +75,11 @@
 #                          uCache closes each copy it opened (the test client never closes its File)
 #   all refused            a, b and c refuse the file: Open() returns OK, one
 #                          completion, a failure that names all three servers
-#   switch off             the default: a refused at a: some opens fail, the client
-#                          sends no locate and the regional logs none for the file; the
-#                          positive controls are the first leg's client log and an
-#                          xrdfs locate of the leg's own
+#   switch off             the default: a refuses the file. On a alone, every open lands
+#                          on a and fails; on a, b and c, the opens that landed on a fail
+#                          there and none is moved. The client sends no locate and the
+#                          regional logs none for the file; the positive controls are the
+#                          first leg's client log and an xrdfs locate of the leg's own
 #   reads                  a read whose origin read is made to fail (UCACHE_TEST_READ_FAIL_N,
 #                          and _KIND for where and how) is read again at another site,
 #                          with adaptive_federation on, and answered with the file's own
@@ -130,6 +132,9 @@
 #                          refuses the file): a Read and a PgRead each fail with that open's error,
 #                          which names the copies, and neither is given to the File that never
 #                          opened (neither gets the client's own answer there, "Invalid operation")
+#                          With the switch off (the default) each read gets that open's own error, the
+#                          server's refusal, naming no copies, and never "Invalid operation"; once the
+#                          copies are readable again, a later read (after the open's cool-down) is exact
 #   left copy              a read's data failure (a short answer inside the confirmed size) that
 #                          arrives after the handle moved, on the File it left: that copy is one the
 #                          handle never opens again, as for a failure on the File it reads from
@@ -449,6 +454,21 @@ grep -qE 'MsgHandler created.*kXR_read \(handle: 0x[0-9a-f]*, offset: 0, size: 3
 verdict "the checks' first read was the late one (300 bytes at 0), and the open succeeded at its first attempt (the fault was in place)" $?
 K=$(counter "$W/c25" open_check_bytes_kept)
 [ "${K:-0}" -gt 0 ]; verdict "what the checks read went into the entry the Stat had set up (open_check_bytes_kept ${K:-none})" $?
+# The same with the Stat's set-up made to wait (UCACHE_TEST_SETUP_DELAY_MS, 8 s) after it first collects what the
+# checks kept and before the handle is marked set up: the open answers in between (it answers before the Stat
+# does), and what its checks read must still go into the entry, not wait in memory until Close.
+L=/store/ci/stat-during-wait.root
+placew $L a b c
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay UCACHE_TEST_SETUP_DELAY_MS=8000)
+res=$(fuzz "$W/c25w" "$W/f25w.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-stat-during-checks)
+echo "$res" | sed 's/^/    /' | cut -c1-300
+echo "$res" | grep -q '^open-stat-during-checks: clean$' && echo "$res" | grep -q '(the open had already answered)'
+verdict "an open answered while the Stat's set-up waited: one completion, before the Stat's answer; the read of the header exact" $?
+grep -qE 'MsgHandler created.*kXR_read \(handle: 0x[0-9a-f]*, offset: 0, size: 300\)' "$W/f25w.log" &&
+  [ "$(records "$W/c25w" | wc -l)" = 1 ] && records "$W/c25w" | grep -q '"status":"ok"'
+verdict "the checks' first read was the late one, and the open succeeded at its first attempt (the fault was in place)" $?
+K=$(counter "$W/c25w" open_check_bytes_kept)
+[ "${K:-0}" -gt 0 ]; verdict "what the checks read went into the entry though the open answered before the set-up ended (open_check_bytes_kept ${K:-none})" $?
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on) # the cases below have no header fault
 
 echo; echo "=== a copy that is zeros at the file's size is refused"
@@ -589,9 +609,14 @@ while read -r line; do
 done < <(records "$W/c12")
 [ "$dup" = 0 ]; verdict "an attempt at a listed copy was never at a copy that was refused already" $?
 records "$W/c12" | tail -1 | grep -q '"outcome":"error"'; verdict "the last record line says outcome error" $?
-[ "$(cat "$W/c12"/stats/*.files.jsonl | grep '"kind":"origin_failure"' | grep -c '"op":"open".*"class":"data"')" -ge 3 ]
-verdict "failures of op open, class data are recorded, one for each attempt" $?
-[ "$(counter "$W/c12" origin_failures_data)" = "$NATT" ]; verdict "origin_failures_data counts them ($NATT)" $?
+# A copy the regional sends back after it was refused at this open is refused again as it is, with no new record
+# and no new count (no read is made of it, and its refusal is not a new failure): one record and one count a copy,
+# whatever the number of attempts.
+NCOPY=$(records "$W/c12" | sed -n 's/.*"data_server":"[^"]*:\([0-9]*\)".*/\1/p' | sort -u | wc -l)
+FSRV=$(cat "$W/c12"/stats/*.files.jsonl | grep '"kind":"origin_failure"' | grep '"op":"open".*"class":"data"' | sed -n 's/.*"data_server":"[^"]*:\([0-9]*\)".*/\1/p')
+[ "$NCOPY" = 3 ] && [ "$(echo "$FSRV" | grep -c .)" = 3 ] && [ "$(echo "$FSRV" | sort -u | grep -c .)" = 3 ]; r=$?
+verdict "failures of op open, class data are recorded, one for each copy ($(echo $FSRV); $NCOPY copies in $NATT attempts)" $r
+[ "$(counter "$W/c12" origin_failures_data)" = "$NCOPY" ]; verdict "origin_failures_data counts them, once a copy ($NCOPY)" $?
 CC=$(copies_closed "$W/f12.log")
 [ "${CC% *}" = "$NATT" ] && [ "${CC#* }" = "$NATT" ]; verdict "each copy that was opened was closed by uCache (opened, closed: $CC; $NATT attempts)" $?
 [ -z "$(find "$W/c12" \( -name '*.meta' -o -name '*.data' \) -print -quit)" ]; verdict "nothing of the file is cached" $?
@@ -615,15 +640,34 @@ DEF=on
 [ -x "$BUILD/src/cli/ucache" ] && DEF=$(env -u UCACHE_ADAPTIVE_FEDERATION UCACHE_DIR="$W/c10s" "$BUILD/src/cli/ucache" settings 2>&1 | grep -i 'adaptive_federation' | head -1 | awk '{print $2}')
 echo "    the switch's default: $DEF"
 if [ "$DEF" = off ]; then
+  # First the file on a alone, which refuses it: every open lands on a (whatever the regional would choose among
+  # copies), is refused and fails. Then the file on a, b and c, a refusing: the regional chooses among them as it
+  # will (it went 30 opens without a in some runs), and each open that landed on a fails there, as it would without
+  # the cache, and no other is moved anywhere: the opens that failed are the refusals at a, one landing each.
+  FEDENV=()
+  L10A=/store/ci/f10a.bin
+  place $L10A a
+  chmod 000 "$W/data/a$L10A"
+  RL0A=$(regional_locates $L10A)
+  res=$(fuzz "$W/c10a" "$W/f10a.log" "root://127.0.0.1:$RX/$L10A" "$W/f.bin" 5 1 1 open-failover)
+  echo "$res" | tail -2 | sed 's/^/    /'
+  NRA=$(grep -c "\[127.0.0.1:$AX\] Handling error while processing kXR_open (file: $L10A,.*permission denied" "$W/f10a.log")
+  echo "$res" | grep -q '^open-failover: 5 open(s), 5 failed, 0 without exactly one completion$' && [ "$NRA" = 5 ]
+  verdict "the copy on a alone: each of 5 opens was refused at a and failed, one completion each: the refusal was felt and nothing failed over ($NRA refusals)" $?
+  [ "$(grep 'MsgHandler created' "$W/f10a.log" | grep -c 'kXR_locate ')" = 0 ] && [ "$(regional_locates $L10A)" = "$RL0A" ]
+  verdict "the copy on a alone: no kXR_locate in the client's log, none of the file in the regional's" $?
   L10=/store/ci/f10.bin
   place $L10 a b c
   chmod 000 "$W/data/a$L10"
   direct_read a $L10; r=$?; [ "$r" != 0 ]; verdict "a refuses the file" $?
   RL0=$(regional_locates $L10)
-  FEDENV=()
   res=$(fuzz "$W/c10" "$W/f10.log" "root://127.0.0.1:$RX/$L10" "$W/f.bin" 30 1 1 open-failover)
   echo "$res" | tail -2 | sed 's/^/    /'
-  echo "$res" | grep -q '^open-failover: FAIL$'; verdict "some opens failed: the refusal was felt and nothing failed over" $?
+  NF=$(echo "$res" | sed -n 's/^open-failover: 30 open(s), \([0-9]*\) failed, 0 without exactly one completion$/\1/p')
+  NR=$(grep -c "\[127.0.0.1:$AX\] Handling error while processing kXR_open (file: $L10,.*permission denied" "$W/f10.log")
+  NL=$(grep -c "Redirected from: root://127.0.0.1:$RX/*$L10 to: " "$W/f10.log")
+  [ -n "$NF" ] && [ "$NF" = "$NR" ] && [ "$NL" = 30 ]
+  verdict "the file on a, b and c: each open that landed on a failed there and none was moved ($NF failed, $NR refused at a, $NL landings for 30 opens)" $?
   [ "$(grep 'MsgHandler created' "$W/f10.log" | grep -c 'kXR_locate ')" = 0 ]; verdict "no kXR_locate in the client's log" $?
   [ "$(regional_locates $L10)" = "$RL0" ]; verdict "no locate of the file in the regional's log" $?
   xfs 127.0.0.1:$RX locate $L10 >/dev/null 2>&1
@@ -971,6 +1015,58 @@ n=0; for p in $AX $BX $CX; do echo "$RES" | grep '^MSG read' | grep -q "(127.0.0
 # what a read given to it would get.
 ! echo "$RES" | grep -q 'Invalid operation'
 verdict "lost trust: no read got the client's answer for a File that never opened (Invalid operation): none was given to it" $?
+
+echo; echo "=== the same with the switch off (the default)"
+# The same fault with adaptive_federation off: each read gets the handle's own open's error, the server's refusal,
+# which is what the reader's open would have got without the cache; no copy is named and no other is tried. Then
+# the test makes the copies readable again (UCACHE_RESTORE_CMD), and after the open's cool-down (a second) a Read
+# and a PgRead are exact: the open is made again and stands.
+L=/store/ci/degraded-off.root
+placew $L a b c
+DO="$W/c-degraded-off"
+FEDENV=(UCACHE_REVALIDATE_S=3600)
+res=$(fuzz "$DO" "$W/degraded-off-fill.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
+echo "$res" | grep -q '^open-failover: clean$' && [ -n "$(find "$DO" -name '*.meta' -print -quit)" ] && [ -n "$(find "$DO" -name '*.val' -print -quit)" ]
+verdict "lost trust, switch off: the first run read the file and left its entry and its freshness marker" $?
+N0=$(recs "$DO" open | wc -l)
+cat > "$W/degraded-off.sh" <<DEGSH
+#!/bin/sh
+find "$DO" -name '*.meta' -delete
+for s in a b c; do chmod 000 "$W/data/\$s$L"; done
+DEGSH
+cat > "$W/degraded-off-restore.sh" <<DEGSH
+#!/bin/sh
+for s in a b c; do chmod 666 "$W/data/\$s$L"; done
+DEGSH
+chmod 755 "$W/degraded-off.sh" "$W/degraded-off-restore.sh"
+FEDENV=(UCACHE_REVALIDATE_S=3600 UCACHE_CUT_CMD=$W/degraded-off.sh UCACHE_RESTORE_CMD=$W/degraded-off-restore.sh)
+RES=$(fuzz "$DO" "$W/degraded-off.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 read-failover degradedoff)
+echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-600
+recs "$DO" open | tail -n +$((N0 + 1)) | sed 's/^/    rec: /' | cut -c1-230
+echo "$RES" | grep -q '^read-failover degradedoff: clean$'
+verdict "lost trust, switch off: a Read and a PgRead each fail once with the open's own error (the server's refusal), and once the copies are readable again a Read and a PgRead are exact" $?
+NPD=$(echo "$RES" | grep '^MSG ' | grep -c 'permission denied')
+[ "$NPD" = 2 ] && ! echo "$RES" | grep '^MSG ' | grep -q 'no copy could serve'
+verdict "lost trust, switch off: both errors are the server's refusal, permission denied ($NPD of 2), naming no copies" $?
+# A read given to the File that never opened gets the client's own answer, "Invalid operation" (it sends nothing,
+# so the client's log cannot show it), and a PgRead there brings the test client down: the line it prints after
+# the PgRead, and its last line, are the client still running.
+! echo "$RES" | grep -q 'Invalid operation' && echo "$RES" | grep -q '^MSG pgread ' && echo "$RES" | grep -q '^read-failover degradedoff: '
+verdict "lost trust, switch off: no request got the client's answer for a File that never opened (Invalid operation), and the client ran on after the PgRead" $?
+# No read in the client's log until the open made again stood (the reads after it are the exact ones).
+FIRSTOK=$(grep -n 'successfully opened at' "$W/degraded-off.log" | head -1 | cut -d: -f1)
+FIRSTRD=$(grep -nE 'MsgHandler created.*kXR_(pg)?read ' "$W/degraded-off.log" | head -1 | cut -d: -f1)
+[ -n "$FIRSTOK" ] && [ -n "$FIRSTRD" ] && [ "$FIRSTRD" -gt "$FIRSTOK" ]
+verdict "lost trust, switch off: no read in the client's log before the open made again stood (first read at line ${FIRSTRD:-none}, the open at ${FIRSTOK:-none})" $?
+# the fault: trusted at its open, the entry gone, the origin refusing; with the switch off no locate is sent
+NREF=$(grep -c "Handling error while processing kXR_open (file: $L,.*permission denied" "$W/degraded-off.log")
+grep -q 'trusted recent cache for ' "$W/degraded-off.log" && [ "$NREF" -ge 1 ] && [ -z "$(find "$DO" -name '*.meta' -print -quit)" ] &&
+  [ "$(regional_locates $L)" = 0 ]
+verdict "lost trust, switch off: the handle was trusted at its open, its entry was gone, its own open was refused ($NREF), and no locate was sent (the fault was in place)" $?
+DREC=$(recs "$DO" open | tail -n +$((N0 + 1)))
+echo "$DREC" | head -1 | grep -q '"route":"degraded","status":"error","code":400,"errno":3010,' &&
+  echo "$DREC" | tail -1 | grep -q '"route":"degraded","status":"ok"' && [ "$(echo "$DREC" | grep -c '"route":"failover"\|"route":"candidate"')" = 0 ]
+verdict "lost trust, switch off: the records show the handle's own open refused (route degraded, 400/3010), made again once the copies were readable (ok), and no failover" $?
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
 
 echo; echo "fed_ci: $FAILS failure(s)"

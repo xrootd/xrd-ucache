@@ -48,7 +48,8 @@
 // redirector (see runReadFailover). The caller checks the records. The cases
 // zero, zerov and zeroerr do the same for a read of a basket that a server serves
 // as zeros (see runZero), and cut, cutpg, cutpgpast, cutonly and end for a copy that is cut
-// short after the open (see runCut).
+// short after the open (see runCut), and degraded and degradedoff for a handle whose own open of
+// the origin fails.
 #include <XrdCl/XrdClFile.hh>
 #include <XrdCl/XrdClURL.hh>
 #ifdef UCACHE_FUZZ_HAVE_TRANSPOSE
@@ -1255,6 +1256,10 @@ int runOpenPropertyRace(const char* url) {
 // wait in memory for a set-up that has happened. 1.5 s after the open is issued, a Stat, which must
 // answer the file's size before the open does; after the open (and a second), a Read of the first
 // 300 bytes, which must be the file's. The gate checks the counter and the client's log.
+// With UCACHE_TEST_SETUP_DELAY_MS (longer than the checks' late read), the set-up the Stat makes
+// waits after it first collects what the checks kept, so the open answers in between, before the
+// handle is set up: the open must then answer before the Stat does, and what the checks read must
+// still go into the entry.
 int runOpenStatDuringChecks(const char* url, const char* local) {
   const char* mode = "open-stat-during-checks";
   if (envInt("UCACHE_TEST_HEADER_FAIL_N", 0) != 1) {
@@ -1298,8 +1303,9 @@ int runOpenStatDuringChecks(const char* url, const char* local) {
               exact ? "exact" : rs.ToString().c_str());
   const XrdCl::XRootDStatus cs = f->Close();
   (void)cs;
-  const bool good = ss.IsOK() && statSize == static_cast<uint64_t>(sb.st_size) && !doneEarly &&
-                    exact && h->exactlyOne();
+  const bool setupWaits = envInt("UCACHE_TEST_SETUP_DELAY_MS", 0) > 0;
+  const bool good = ss.IsOK() && statSize == static_cast<uint64_t>(sb.st_size) &&
+                    doneEarly == setupWaits && exact && h->exactlyOne();
   std::printf(good ? "%s: clean\n" : "%s: FAIL\n", mode);
   return good ? 0 : 1;
 }
@@ -1581,6 +1587,12 @@ int runZero(const char* url, const char* local, const std::string& which) {
 //            once (at the call or through the handler), with the open's error, which names the
 //            copies ("no copy could serve the read"); never the client's error for a File that
 //            never opened, and the PgRead is never sent on that File (the client crashes there)
+//   degradedoff the same with adaptive_federation off: the Read and the PgRead each fail, once,
+//            with the open's own error, the one the reader's open would have got without the
+//            cache (here a refusal to authorize, kXR_NotAuthorized), naming no copies; never the
+//            client's error for a File that never opened. Then UCACHE_RESTORE_CMD, when set, makes
+//            the copies readable again, and after the open's cool-down (a second) a Read and a
+//            PgRead at the same place are exact: the handle's own open is made again and stands
 //   end      nothing is cut. A Read and a PgRead that reach past the end of the file are answered
 //            with the bytes that exist, short, as they always were, and the handle stays put; a
 //            PgRead wholly past the end is answered as without uCache (no bytes, or the client's
@@ -1660,7 +1672,8 @@ int runCut(const char* url, const char* local, const std::string& which) {
     verdict(now == y, "after the third Read the handle still reads from " + now +
                           " (X, whose read answered short, is not taken again though whole)");
     std::printf("LEFTDATA %s %s %s\n", landed.c_str(), y.c_str(), now.c_str());
-  } else if (which == "degraded") { // the handle's own open fails: each read gets that open's error
+  } else if (which == "degraded" || which == "degradedoff") { // each read gets the open's error
+    const bool on = which == "degraded";
     for (const bool pg : {false, true}) {
       auto* w = new ReadWait(); // leaked with its buffer: a late completion lands safely
       auto* b = new std::vector<char>(65536, 0x5A);
@@ -1678,15 +1691,38 @@ int runCut(const char* url, const char* local, const std::string& which) {
       }
       const std::string msg = got.GetErrorMessage();
       std::printf("MSG %s %s\n", pg ? "pgread" : "read", msg.c_str());
-      verdict(!got.IsOK() && got.code != XrdCl::errInvalidOp &&
-                  msg.find("no copy could serve the read") != std::string::npos,
-              std::string(pg ? "a PgRead" : "a Read") +
-                  " fails with the open's error, which names "
-                  "the copies (" +
-                  got.ToStr() + (s.IsOK() ? ", through the handler" : ", at the call") + ")");
+      if (on)
+        verdict(!got.IsOK() && got.code != XrdCl::errInvalidOp &&
+                    msg.find("no copy could serve the read") != std::string::npos,
+                std::string(pg ? "a PgRead" : "a Read") +
+                    " fails with the open's error, which names "
+                    "the copies (" +
+                    got.ToStr() + (s.IsOK() ? ", through the handler" : ", at the call") + ")");
+      else
+        verdict(!got.IsOK() && got.code == XrdCl::errErrorResponse &&
+                    got.errNo == 3010 && // kXR_NotAuthorized
+                    msg.find("no copy could serve the read") == std::string::npos,
+                std::string(pg ? "a PgRead" : "a Read") +
+                    " fails with the open's own error, the server's refusal (" + got.ToStr() +
+                    (s.IsOK() ? ", through the handler" : ", at the call") + ")");
       verdict(once && (!s.IsOK() || w->contractKept()),
               std::string(pg ? "the PgRead" : "the Read") + " is answered once");
     }
+    if (!on)
+      if (const char* cmd = ::getenv("UCACHE_RESTORE_CMD")) {
+        if (std::system(cmd) != 0) {
+          std::printf("%s: SETUP: %s failed\n", mode, cmd);
+          return 2;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500)); // past the open's cool-down
+        readExact(40000, 65536, "after the copies are readable again, a Read is exact");
+        uint32_t got = 0;
+        std::vector<uint32_t> cksums;
+        const XrdCl::XRootDStatus ps = file->PgRead(40000, 65536, buf.data(), cksums, got);
+        verdict(ps.IsOK() && got == 65536 &&
+                    std::memcmp(buf.data(), src.bytes.data() + 40000, 65536) == 0,
+                "and a PgRead (" + ps.ToString() + ", " + std::to_string(got) + " bytes)");
+      }
   } else if (which == "end") { // past the end: short, exact, no move
     uint32_t got = 0;
     XrdCl::XRootDStatus s = file->Read(size - 1000, 65536, buf.data(), got);
@@ -1764,7 +1800,7 @@ int runReadFailover(const char* url, const char* local, const std::string& which
   if (which.rfind("zero", 0) == 0)
     return runZero(url, local, which);
   if (which == "cut" || which == "cutpg" || which == "cutpgpast" || which == "cutonly" ||
-      which == "end" || which == "degraded" || which == "leftdata")
+      which == "end" || which == "degraded" || which == "degradedoff" || which == "leftdata")
     return runCut(url, local, which);
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   Source src(local);
