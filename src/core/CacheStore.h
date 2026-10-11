@@ -32,6 +32,7 @@
 #include "UrlKey.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <map>
 #include <memory>
@@ -228,6 +229,12 @@ class CacheStore {
   // thread): `e` leaves the registry if it is still there, and its files are removed
   // (FileEntry::removeDroppedFiles). open() does the same, first, when it finds a dropped entry.
   void removeDropped(const std::shared_ptr<FileEntry>& e);
+  // Drops `e` (FileEntry::drop) and tells the store a drop began, so that an open of the key that
+  // made its entry meanwhile makes it again. No I/O: callable on a client callback thread. True
+  // the first time only.
+  bool markDropped(const std::shared_ptr<FileEntry>& e);
+  // The entry this process holds for `key`, or null. No I/O.
+  std::shared_ptr<FileEntry> liveEntry(const UrlKey& key);
 
   // Appends one JSON line to stats/<host>-<pid>-<start_ts>.jsonl. finalDump:
   // this is the process's LAST dump (atexit/dtor) — also emit the Layer-2
@@ -416,6 +423,16 @@ class CacheStore {
   static constexpr size_t kMaxFootprints = 200000;
   std::mutex regMu_;
   std::map<std::string, std::weak_ptr<FileEntry>> registry_; // hash -> entry
+  // Drops (open, dropEntry, markDropped, removeDropped): drops begun, read by an open before and
+  // after it makes its entry; the keys whose files dropEntry is removing with no entry here (under
+  // regMu_), and the condition an open waits on for them.
+  std::atomic<uint64_t> drops_{0};
+  std::set<std::string> removing_;
+  std::condition_variable dropCv_;
+  static constexpr int kOpenDropRetries = 16;
+  // At the final stats dump: the files of every dropped entry still registered (its removal not
+  // run yet) are removed.
+  void removePendingDrops();
   // Session summaries of closed entries for the per-entry coverage dump.
   std::mutex sumMu_;
   std::vector<std::string> entrySummaries_;

@@ -263,12 +263,13 @@ ones included, so a run with caching disabled shows its origin failures too.
   They are also counted in `origin_bytes` and `origin_reads` (one read each),
   which is where a read the job makes of them would otherwise have been
   counted. Nothing a refused copy's checks read is kept.
-- `bad_entries_dropped` — with `adaptive_federation = on`, cache entries
-  dropped because what they hold came from a bad copy: an entry made before
-  the checks at open existed whose stored header states an end past its
-  stored size (filled from a cut copy), found at an open the entry would have
-  answered; and an entry holding bytes this process fetched from a copy that a
-  check then found bad (`check_origin_integrity`, which the switch forces on).
+- `bad_entries_dropped` — cache entries dropped because what they hold came
+  from a bad copy: with `adaptive_federation = on`, an entry made before the
+  checks at open existed whose stored header states an end past its stored
+  size (filled from a cut copy), found at an open the entry would have
+  answered; and, with `check_origin_integrity = on` (which the switch forces
+  on), an entry holding bytes this process fetched from a copy that a check
+  then found bad, at a read or at an open that refused the copy.
   The next open of the file fills a new entry (TROUBLESHOOTING.md).
 
 `run_settings`, on the counter line, is the settings that decide how the

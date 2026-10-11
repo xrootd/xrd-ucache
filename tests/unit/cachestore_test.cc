@@ -14,6 +14,8 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <vector>
 #include <csignal>
 #include <algorithm>
@@ -408,6 +410,211 @@ TEST(CacheStore, DroppedEntryFilesAreRemoved) {
   auto d2 = store.open(keyN(16), 4 * P);
   ASSERT_TRUE(d2);
   EXPECT_FALSE(d2->hasRange(0, P)) << "the next open is cold";
+}
+
+namespace {
+// An IOBackend that stops the first call of one kind after it is armed (a flock of op `op`, or an
+// unlink), until the test opens the gate: a step of a drop's removal, or of an open, held open
+// while another thread acts.
+struct GateIO : RealIO {
+  std::mutex m;
+  std::condition_variable cv;
+  int op = 0;            // the flock op to stop at; 0: none
+  bool atUnlink = false; // stop at the first unlink instead
+  bool entered = false, gateOpen = false;
+  void arm(int flockOp, bool unlinkToo = false) {
+    std::lock_guard<std::mutex> g(m);
+    op = flockOp;
+    atUnlink = unlinkToo;
+  }
+  void stopHere(std::unique_lock<std::mutex>& g) {
+    op = 0;
+    atUnlink = false;
+    entered = true;
+    cv.notify_all();
+    cv.wait(g, [&] { return gateOpen; });
+  }
+  void waitEntered() {
+    std::unique_lock<std::mutex> g(m);
+    cv.wait(g, [&] { return entered; });
+  }
+  void release() {
+    std::lock_guard<std::mutex> g(m);
+    gateOpen = true;
+    cv.notify_all();
+  }
+  int flock(int fd, int how) override {
+    // An unlock stops after it is made (the lock is given back first), any other before.
+    const int rc = how == LOCK_UN ? RealIO::flock(fd, how) : 0;
+    {
+      std::unique_lock<std::mutex> g(m);
+      if (op != 0 && how == op)
+        stopHere(g);
+    }
+    return how == LOCK_UN ? rc : RealIO::flock(fd, how);
+  }
+  int unlink(const std::string& path) override {
+    {
+      std::unique_lock<std::mutex> g(m);
+      if (atUnlink)
+        stopHere(g);
+    }
+    return RealIO::unlink(path);
+  }
+};
+// An entry of `key` holding two pages of 'B' (bytes of a copy found bad), stored.
+std::shared_ptr<FileEntry> badEntry(CacheStore& store, const UrlKey& key, uint64_t P) {
+  std::vector<char> buf(2 * P, 'B');
+  auto e = store.open(key, 8 * P);
+  if (e) {
+    e->writePages(0, 2 * P, buf.data());
+    e->flushAll();
+  }
+  return e;
+}
+} // namespace
+
+// An open of a key while another open removes the files of the key's dropped entry: it waits for
+// the removal and never takes over the dropped pages (the entry stays registered, dropped, until
+// its files are gone).
+TEST(CacheStore, OpenDuringTheRemovalOfADroppedEntry) {
+  TempDir td;
+  GateIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const uint64_t P = cfg.pageSize;
+  auto e = badEntry(store, keyN(21), P);
+  ASSERT_TRUE(e);
+  ASSERT_TRUE(store.markDropped(e));
+  io.arm(LOCK_EX); // the removal's lock
+  std::shared_ptr<FileEntry> f1;
+  std::thread t([&] { f1 = store.open(keyN(21), 8 * P); });
+  io.waitEntered(); // t is inside the removal
+  std::atomic<bool> f2done{false};
+  std::shared_ptr<FileEntry> f2;
+  std::thread u([&] {
+    f2 = store.open(keyN(21), 8 * P);
+    f2done = true;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_FALSE(f2done.load()) << "a second open waits for the removal";
+  io.release();
+  t.join();
+  u.join();
+  ASSERT_TRUE(f1);
+  ASSERT_TRUE(f2);
+  EXPECT_FALSE(f1->dropped());
+  EXPECT_EQ(f1.get(), f2.get()) << "one entry per key";
+  std::vector<char> out(P, 0);
+  EXPECT_FALSE(f1->hasRange(0, P)) << "the dropped entry's pages are not served";
+  EXPECT_FALSE(f1->readCached(0, P, out.data()));
+}
+
+// The same while the executor's half of a drop made on a callback thread (removeDropped) runs.
+TEST(CacheStore, OpenDuringRemoveDropped) {
+  TempDir td;
+  GateIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const uint64_t P = cfg.pageSize;
+  auto e = badEntry(store, keyN(22), P);
+  ASSERT_TRUE(e);
+  ASSERT_TRUE(store.markDropped(e));
+  io.arm(LOCK_EX);
+  std::thread t([&] { store.removeDropped(e); });
+  io.waitEntered();
+  std::atomic<bool> done{false};
+  std::shared_ptr<FileEntry> f;
+  std::thread u([&] {
+    f = store.open(keyN(22), 8 * P);
+    done = true;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_FALSE(done.load()) << "the open waits for the removal";
+  io.release();
+  t.join();
+  u.join();
+  ASSERT_TRUE(f);
+  std::vector<char> out(P, 0);
+  EXPECT_FALSE(f->hasRange(0, P));
+  EXPECT_FALSE(f->readCached(0, P, out.data())) << "the dropped entry's pages are not served";
+}
+
+// dropEntry with no entry in this process (a warm entry found cut at an open): an open of the key
+// while it unlinks waits, and never takes over the files being removed.
+TEST(CacheStore, OpenDuringADropByKey) {
+  TempDir td;
+  GateIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const uint64_t P = cfg.pageSize;
+  ASSERT_TRUE(badEntry(store, keyN(23), P)); // made and let go: its files stay
+  io.arm(0, /*unlinkToo=*/true);
+  std::thread t([&] { store.dropEntry(keyN(23)); });
+  io.waitEntered(); // t is about to unlink the data file
+  std::atomic<bool> done{false};
+  std::shared_ptr<FileEntry> f;
+  std::thread u([&] {
+    f = store.open(keyN(23), 8 * P);
+    done = true;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_FALSE(done.load()) << "the open waits for the drop's removal";
+  io.release();
+  t.join();
+  u.join();
+  ASSERT_TRUE(f);
+  EXPECT_FALSE(f->hasRange(0, P)) << "the dropped files' pages are not served";
+}
+
+// An open that made its entry from the files while a drop of the key began and ended (the entry it
+// made holds the dropped pages): it makes its entry again, and serves nothing of them.
+TEST(CacheStore, OpenThatMadeItsEntryDuringADrop) {
+  TempDir td;
+  GateIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const uint64_t P = cfg.pageSize;
+  ASSERT_TRUE(badEntry(store, keyN(24), P)); // made and let go: its files stay
+  io.arm(LOCK_UN); // the first open's shared read of the sidecar, done: it holds the pages
+  std::shared_ptr<FileEntry> a;
+  std::thread t([&] { a = store.open(keyN(24), 8 * P); });
+  io.waitEntered();
+  auto x = store.open(keyN(24), 8 * P); // another handle's, which then finds the copy bad
+  ASSERT_TRUE(x);
+  ASSERT_TRUE(x->hasRange(0, P));
+  ASSERT_TRUE(store.markDropped(x));
+  store.removeDropped(x);
+  io.release();
+  t.join();
+  ASSERT_TRUE(a);
+  EXPECT_FALSE(a->dropped());
+  std::vector<char> out(P, 0);
+  EXPECT_FALSE(a->hasRange(0, P)) << "the entry made during the drop was made again";
+  EXPECT_FALSE(a->readCached(0, P, out.data()));
+}
+
+// The final stats dump removes the files of a dropped entry whose removal had not run (a drop on a
+// client callback thread just before the process ends).
+TEST(CacheStore, FinalDumpRemovesPendingDrops) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const uint64_t P = cfg.pageSize;
+  auto e = badEntry(store, keyN(25), P);
+  ASSERT_TRUE(e);
+  ASSERT_TRUE(store.markDropped(e));
+  struct ::stat st;
+  ASSERT_EQ(io.stat(keyN(25).metaPath(cfg.cacheDir), &st), 0);
+  store.dumpStats(/*finalDump=*/true);
+  EXPECT_NE(io.stat(keyN(25).metaPath(cfg.cacheDir), &st), 0) << "its sidecar is gone";
+  EXPECT_NE(io.stat(keyN(25).dataPath(cfg.cacheDir), &st), 0);
 }
 
 TEST(CacheStore, PinningAClosedEntryKeepsItsConfirmedSize) {

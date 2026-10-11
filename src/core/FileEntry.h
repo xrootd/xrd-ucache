@@ -196,6 +196,9 @@ class FileEntry {
   // found another one removing them. I/O: not for a client callback thread; the
   // destructor of a dropped entry calls it when no one has.
   void removeDroppedFiles();
+  // An entry the store made and never handed out (CacheStore::open made it while a drop began):
+  // it keeps nothing, never stores its sidecar, and removes no file at its release. No I/O.
+  void abandon();
   // The files of the entry of `key`: its data, sidecar and freshness marker,
   // and the replicas made from them.
   static void removeFiles(IOBackend& io, const UrlKey& key, const std::string& cacheDir);

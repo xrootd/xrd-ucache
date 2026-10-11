@@ -1352,6 +1352,14 @@ bool FileEntry::drop() {
   return !dropped_.exchange(true, std::memory_order_acq_rel);
 }
 
+void FileEntry::abandon() {
+  {
+    std::lock_guard<std::mutex> r(removeMu_);
+    removed_ = true; // the files are not this entry's to remove
+  }
+  dropped_.store(true, std::memory_order_release);
+}
+
 void FileEntry::removeDroppedFiles() {
   std::lock_guard<std::mutex> r(removeMu_);
   if (removed_ || !dropped())

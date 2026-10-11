@@ -990,10 +990,12 @@ A copy that answered a read with bad bytes (a basket that failed the check, a sh
 answer inside the confirmed size) is never taken again for that file handle: the
 regional redirector's list of copies no longer offers it, and an open the redirector
 sends back to it is refused. Nor does anything it sent stay cached: when the file's cache
-entry holds bytes this process fetched from that copy, the whole entry is dropped
+entry holds bytes this process fetched from that copy (or from a copy an open refuses for what
+it is, above), the whole entry is dropped
 (`bad_entries_dropped`, STATS.md). No handle of the process is served from it again (their
 reads go to the origin, and move as above), and its files are removed, so the next open of
-the file starts a new entry. The same holds when a block fails its own checksum where
+the file starts a new entry (at once, or when the job ends: a job killed first, or ending with
+`_exit`, can leave them). The same holds when a block fails its own checksum where
 `recompress` converts it. This needs `check_origin_integrity`, which the switch forces on.
 Only this process's own fetches are known: an entry another process filled from that copy,
 or this process before it opened the file this time, is not dropped, and another process

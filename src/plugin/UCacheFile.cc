@@ -767,6 +767,12 @@ void noteBadCopy(HandleState& st, const std::string& server, const std::string& 
   }
   noteOriginFailure(st, e ? &e->obs().servers : nullptr, "open", 0, 0,
                     XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, why), server);
+  // The copy was refused for what it is: an entry of the file this process holds (this handle's,
+  // or another's: an open sets its own up only later) that took bytes from it is dropped.
+  if (!e && st.store)
+    if (const auto key = UrlKey::parse(st.url, globalConfig().keepCgi))
+      e = st.store->liveEntry(*key);
+  dropEntryOfBadCopy(st, e, server);
 } catch (...) {
 }
 
@@ -2271,7 +2277,7 @@ void noteOriginFailure(HandleState& st, ServerTally* tally, const char* op, uint
 void dropEntryOfBadCopy(HandleState& st, const std::shared_ptr<FileEntry>& entry,
                         const std::string& server) noexcept try {
   if (!entry || !st.store || !globalConfig().checkOriginIntegrity ||
-      !entry->obs().servers.tookFrom(server) || !entry->drop())
+      !entry->obs().servers.tookFrom(server) || !st.store->markDropped(entry))
     return;
   st.store->stats().badEntriesDropped.fetch_add(1, std::memory_order_relaxed);
   UCACHE_WARN("%s: the cache entry holds bytes from %s, whose copy failed a check: the entry is "

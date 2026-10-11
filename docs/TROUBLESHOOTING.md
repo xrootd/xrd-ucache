@@ -533,8 +533,9 @@ answered from what the open returned.
 
 ## A cache entry was dropped (`bad_entries_dropped`)
 
-With `adaptive_federation = on`, uCache drops a file's cache entry when what it holds came
-from a bad copy, and the next open of the file fills a new one. The log says why, once per
+uCache drops a file's cache entry when what it holds came from a bad copy, and the next open
+of the file fills a new one. The first case below needs `adaptive_federation = on`; the second
+needs `check_origin_integrity = on`, which the switch forces on. The log says why, once per
 entry:
 
 - `<file>: the cache entry holds <M> bytes and the header it holds says the file is <N>
@@ -547,15 +548,19 @@ entry:
   entry is dropped, and the file is read from the origin until it is opened again`: a read
   found that copy bad (a basket that failed the key-position check or its own checksum, or
   a short answer inside the file's confirmed size; see "uCache read the file at another
-  site" above) after the entry had taken bytes from it. Those bytes may be damaged in ways
+  site" above), or an open refused it for what it is (empty, cut short of its header's end,
+  or its header or list of top-level objects not those of a whole ROOT file), after the
+  entry had taken bytes from it. Those bytes may be damaged in ways
   no check sees (inside a ZSTD or uncompressed block), so none of them are kept. Until the
   job opens the file again, its reads of it go to the origin.
 
 `bad_entries_dropped` (STATS.md) counts both. Only the process that found the copy bad
 knows it: another job that has the file open at that moment goes on reading what its view
 of the entry holds until it closes the file, and an entry filled from the same copy by an
-earlier job is dropped only when a read finds the copy bad again. To be sure, remove the
-file's entry (`ucache rm <url>`) or clear the cache.
+earlier job is dropped only when a read finds the copy bad again. The files of a dropped entry
+are removed at once, or when the job ends; a job killed before that (or ending with `_exit`,
+as a worker of a Python process pool does) can leave them, and the next job reads them. To be
+sure, remove the file's entry (`ucache rm <url>`) or clear the cache.
 
 ## The cache is filling my disk
 

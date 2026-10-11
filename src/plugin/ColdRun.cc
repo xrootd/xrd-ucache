@@ -1245,9 +1245,12 @@ void ColdRequest::finish() {
 // retry fetches them from the origin): they may have been cached from another
 // source, or by a uCache that did not check them. Bytes the origin sent for this
 // read fail it, reported with where they came from, and are never kept or served.
+// `from`: the server the bytes came from, as the fetch that brought them named it (the handle's
+// account of its servers takes that name; "" when not known, then the handle's data server).
 void failOriginCheck(const std::shared_ptr<ColdRequest>& req, uint64_t pos, uint32_t len,
                      const std::string& what, const char* why, bool fromCache, uint64_t rStart,
-                     uint64_t rLen, const std::string& codec = std::string()) {
+                     uint64_t rLen, const std::string& codec = std::string(),
+                     const std::string& from = std::string()) {
   if (fromCache) {
     req->entry->releaseRanges({{rStart, rStart + rLen}});
     req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError));
@@ -1267,10 +1270,10 @@ void failOriginCheck(const std::shared_ptr<ColdRequest>& req, uint64_t pos, uint
   if (req->st->store)
     req->st->store->stats().originChecksFailed.fetch_add(1, std::memory_order_relaxed);
   const XRootDStatus refused(XrdCl::stError, XrdCl::errDataError, 0, msg);
-  const std::string from = answeredBy(*req->st, nullptr);
-  noteOriginFailure(*req->st, &req->entry->obs().servers, "first_pass", pos, len, refused, from,
+  const std::string at = answeredBy(*req->st, nullptr);
+  noteOriginFailure(*req->st, &req->entry->obs().servers, "first_pass", pos, len, refused, at,
                     codec);
-  dropEntryOfBadCopy(*req->st, req->entry, from);
+  dropEntryOfBadCopy(*req->st, req->entry, from.empty() ? at : from);
   req->checkFailed.store(true);
   req->fail(refused);
 }
@@ -1281,7 +1284,7 @@ void failOriginCheck(const std::shared_ptr<ColdRequest>& req, uint64_t pos, uint
 // there is freed once the record is committed). Runs on the conversion pool.
 void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
                 std::shared_ptr<std::vector<char>> rounded, uint64_t rStart, uint64_t recOff,
-                uint32_t recLen, bool fromCache) try {
+                uint32_t recLen, bool fromCache, const std::string& from = std::string()) try {
   ColdFill& cf = *req->cf;
   const tp::FillSlot& slot = cf.slot(i);
   const auto* rec = reinterpret_cast<const uint8_t*>(rounded->data() + recOff);
@@ -1296,7 +1299,7 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
       // reader could no longer detect it. Fail the read, as ROOT would.
       if (cf.checkConverted) {
         failOriginCheck(req, slot.origSeek, recLen, "an RNTuple page", p.error.c_str(), fromCache,
-                        rStart, rounded->size());
+                        rStart, rounded->size(), std::string(), from);
       } else {
         UCACHE_WARN("slot run for %s: page at %llu: %s", cf.key.key.c_str(),
                     static_cast<unsigned long long>(slot.origSeek), p.error.c_str());
@@ -1365,7 +1368,7 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
   if (cf.checkConverted && c.check == tp::ConvertedBasket::kFailed) {
     failOriginCheck(req, slot.origSeek, recLen,
                     c.codec.empty() ? std::string("a basket") : "a basket (" + c.codec + ")",
-                    c.checkWhy, fromCache, rStart, rounded->size(), c.codec);
+                    c.checkWhy, fromCache, rStart, rounded->size(), c.codec, from);
     req->done();
     return;
   }
@@ -1499,6 +1502,9 @@ class PartHandler : public ResponseHandler {
     for (const auto& w : wire_)
       bytes += w.len;
     auto& st = req_->st;
+    // The server, as the entry's account of its servers names it: a basket that fails its check
+    // later names the copy by it (failOriginCheck), so the copy is matched as it was counted.
+    const std::string server = answeredBy(*st, h.get());
     if (st->store) {
       auto& stats = st->store->stats();
       stats.originBytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -1506,7 +1512,6 @@ class PartHandler : public ResponseHandler {
       const uint64_t rt = nowUs() - t0_;
       stats.originRtUs.add(rt);
       req_->entry->obs().originRtUs.add(rt);
-      const std::string server = answeredBy(*st, h.get());
       req_->entry->obs().servers.add(server, bytes, rt, inflight_.nc);
       if (stats.tracer)
         stats.tracer->rec("wire", req_->entry->key().key, wire_.empty() ? 0 : wire_.front().off,
@@ -1527,8 +1532,8 @@ class PartHandler : public ResponseHandler {
         const uint32_t idx = it.index;
         const uint64_t rs = it.rs;
         convertPool().post(
-            [req, idx, buf, rs, recOff, recLen] {
-              convertOne(req, idx, buf, rs, recOff, recLen, /*fromCache=*/false);
+            [req, idx, buf, rs, recOff, recLen, server] {
+              convertOne(req, idx, buf, rs, recOff, recLen, /*fromCache=*/false, server);
             });
       } else {
         const auto& p = req_->origPieces[it.index];

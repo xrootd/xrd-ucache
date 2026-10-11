@@ -235,105 +235,126 @@ std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSi
     *declinedForSpace = false;
   if (declinedSizeDiffers)
     *declinedSizeDiffers = false;
-  std::shared_ptr<FileEntry> dropped; // a dropped entry found here: removed before a new one
-  {
-    std::lock_guard<std::mutex> g(regMu_);
-    auto it = registry_.find(key.hashHex);
-    if (it != registry_.end()) {
-      auto live = it->second.lock();
-      if (live && live->dropped()) {
-        dropped = std::move(live);
-        registry_.erase(it);
-      } else if (live) {
-        // One entry per key per process — for one size. A source of another
-        // size is another copy of the file (a damaged or truncated one, or the
-        // file rewritten): its bytes never join an entry whose readers hold
-        // the first size.
-        if (live->fileSize() != originSize) {
-          stats_.sizeDisagreements.fetch_add(1, std::memory_order_relaxed);
-          UCACHE_WARN("%s: the origin reports %llu bytes, the open cache entry holds %llu; "
-                      "not mixing them, this handle reads uncached",
-                      key.key.c_str(), static_cast<unsigned long long>(originSize),
-                      static_cast<unsigned long long>(live->fileSize()));
-          if (declinedSizeDiffers)
-            *declinedSizeDiffers = true;
-          return nullptr;
+  // A dropped entry (FileEntry::drop) stays in the registry until its files are gone, and a drop by
+  // key with no entry here (dropEntry) is marked in removing_ while it unlinks them: an open finds
+  // either and waits for the removal, so it never opens the files a removal is about to unlink and
+  // takes over their pages. An open that made its entry while any drop began (drops_ moved) makes
+  // it again: the files it opened may be those of an entry dropped meanwhile.
+  for (int attempt = 0;; ++attempt) {
+    if (attempt >= kOpenDropRetries)
+      return nullptr; // drops kept coming: read uncached (fail-open)
+    uint64_t drops0 = 0;
+    std::shared_ptr<FileEntry> dropped;
+    {
+      std::unique_lock<std::mutex> g(regMu_);
+      dropCv_.wait(g, [&] { return removing_.count(key.hashHex) == 0; });
+      drops0 = drops_.load(std::memory_order_acquire);
+      auto it = registry_.find(key.hashHex);
+      if (it != registry_.end()) {
+        auto live = it->second.lock();
+        if (live && live->dropped()) {
+          dropped = std::move(live);
+        } else if (live) {
+          // One entry per key per process — for one size. A source of another
+          // size is another copy of the file (a damaged or truncated one, or the
+          // file rewritten): its bytes never join an entry whose readers hold
+          // the first size.
+          if (live->fileSize() != originSize) {
+            stats_.sizeDisagreements.fetch_add(1, std::memory_order_relaxed);
+            UCACHE_WARN("%s: the origin reports %llu bytes, the open cache entry holds %llu; "
+                        "not mixing them, this handle reads uncached",
+                        key.key.c_str(), static_cast<unsigned long long>(originSize),
+                        static_cast<unsigned long long>(live->fileSize()));
+            if (declinedSizeDiffers)
+              *declinedSizeDiffers = true;
+            return nullptr;
+          }
+          live->obs().opens.fetch_add(1, std::memory_order_relaxed);
+          return live;
+        } else {
+          registry_.erase(it);
         }
-        live->obs().opens.fetch_add(1, std::memory_order_relaxed);
-        return live;
-      } else {
-        registry_.erase(it);
       }
     }
-  }
-  if (dropped)
-    dropped->removeDroppedFiles(); // its files go before a new entry is made where they are
-  // Decide on CURRENT state, not on what the last check happened to leave behind.
-  // The latch lives in this process and starts clear, and open() otherwise runs
-  // its eviction check only AFTER admitting — so without this a fresh process
-  // would admit one entry before protection engaged, and a workload of one file
-  // per process would never engage it at all. maybeEvict() is rate-limited, so
-  // the amortised cost of asking here is a compare against a timestamp.
-  {
-    struct ::stat probe{};
-    if (io_.stat(key.metaPath(cfg_.cacheDir), &probe) != 0)
-      maybeEvict(); // a would-be NEW entry: refresh the verdict before deciding
-  }
-  // Growth has stopped: every resident entry was read too recently to evict.
-  // Decline entries we do not already hold, and hold that line PER ENTRY. Doing
-  // it per PAGE instead would converge on every file partially cached, which for
-  // a columnar read still needs an origin round trip per file and so keeps the
-  // bytes while giving up most of the benefit. An entry already on disk is always
-  // admitted: it is not growth, and refusing it would leave a partial entry.
-  struct ::stat mst{};
-  if (admissionBlocked_.load(std::memory_order_relaxed) &&
-      io_.stat(key.metaPath(cfg_.cacheDir), &mst) != 0) {
-    if (declinedForSpace)
-      *declinedForSpace = true;
-    stats_.admissionsBypassed.fetch_add(1, std::memory_order_relaxed);
-    if (!blockedWarned_.exchange(true, std::memory_order_relaxed))
-      UCACHE_WARN("cache is full of entries used within the last %us, so new files are "
-                  "no longer being cached (reads still work, uncached). Free space with "
-                  "`ucache evict --older-than <dur>`, lower `in_use_seconds`, or "
-                  "use a bigger cache disk",
-                  cfg_.inUseSeconds);
-    return nullptr; // NOT a fail-open: the caller must not count it as one
-  }
+    if (dropped) {
+      removeDropped(dropped); // its files go before a new entry is made where they are
+      continue;
+    }
+    // Decide on CURRENT state, not on what the last check happened to leave behind.
+    // The latch lives in this process and starts clear, and open() otherwise runs
+    // its eviction check only AFTER admitting — so without this a fresh process
+    // would admit one entry before protection engaged, and a workload of one file
+    // per process would never engage it at all. maybeEvict() is rate-limited, so
+    // the amortised cost of asking here is a compare against a timestamp.
+    {
+      struct ::stat probe{};
+      if (io_.stat(key.metaPath(cfg_.cacheDir), &probe) != 0)
+        maybeEvict(); // a would-be NEW entry: refresh the verdict before deciding
+    }
+    // Growth has stopped: every resident entry was read too recently to evict.
+    // Decline entries we do not already hold, and hold that line PER ENTRY. Doing
+    // it per PAGE instead would converge on every file partially cached, which for
+    // a columnar read still needs an origin round trip per file and so keeps the
+    // bytes while giving up most of the benefit. An entry already on disk is always
+    // admitted: it is not growth, and refusing it would leave a partial entry.
+    struct ::stat mst{};
+    if (admissionBlocked_.load(std::memory_order_relaxed) &&
+        io_.stat(key.metaPath(cfg_.cacheDir), &mst) != 0) {
+      if (declinedForSpace)
+        *declinedForSpace = true;
+      stats_.admissionsBypassed.fetch_add(1, std::memory_order_relaxed);
+      if (!blockedWarned_.exchange(true, std::memory_order_relaxed))
+        UCACHE_WARN("cache is full of entries used within the last %us, so new files are "
+                    "no longer being cached (reads still work, uncached). Free space with "
+                    "`ucache evict --older-than <dur>`, lower `in_use_seconds`, or "
+                    "use a bigger cache disk",
+                    cfg_.inUseSeconds);
+      return nullptr; // NOT a fail-open: the caller must not count it as one
+    }
 
-  auto entry = FileEntry::open(io_, cfg_, stats_, key, originSize, originMtime, cksumKind,
-                               originCksum,
-                               [this](uint64_t b, bool ev) { notePersisted(b, ev); });
-  if (!entry)
-    return nullptr;
-  // Record reads into the store's footprint for this file, not the entry's
-  // own: the entry dies with its last handle, and a second pass over the same
-  // file would then start from nothing. Stable for the life of the process --
-  // the table holds owning pointers and never erases.
-  entry->useSharedFootprint(footprintFor(key.key));
-  {
-    std::lock_guard<std::mutex> g(regMu_);
-    // Racing opens of the same key: keep the first registered one.
-    auto it = registry_.find(key.hashHex);
-    if (it != registry_.end()) {
-      if (auto live = it->second.lock()) {
-        live->obs().opens.fetch_add(1, std::memory_order_relaxed);
-        return live;
+    auto entry = FileEntry::open(io_, cfg_, stats_, key, originSize, originMtime, cksumKind,
+                                 originCksum,
+                                 [this](uint64_t b, bool ev) { notePersisted(b, ev); });
+    if (!entry)
+      return nullptr;
+    // Record reads into the store's footprint for this file, not the entry's
+    // own: the entry dies with its last handle, and a second pass over the same
+    // file would then start from nothing. Stable for the life of the process --
+    // the table holds owning pointers and never erases.
+    entry->useSharedFootprint(footprintFor(key.key));
+    {
+      std::lock_guard<std::mutex> g(regMu_);
+      if (drops_.load(std::memory_order_acquire) != drops0 || removing_.count(key.hashHex)) {
+        entry->abandon(); // made while a drop began: never handed out, made again
+        continue;
       }
-      it->second = entry;
-    } else {
-      registry_.emplace(key.hashHex, entry);
+      // Racing opens of the same key: keep the first registered one.
+      auto it = registry_.find(key.hashHex);
+      if (it != registry_.end()) {
+        if (auto live = it->second.lock()) {
+          if (live->dropped()) { // dropped since (drops_ moved, above): cannot be
+            entry->abandon();
+            continue;
+          }
+          live->obs().opens.fetch_add(1, std::memory_order_relaxed);
+          return live;
+        }
+        it->second = entry;
+      } else {
+        registry_.emplace(key.hashHex, entry);
+      }
+      // Distinct-key count; CLI invocations (disableStatsDump) write
+      // neither the counters line nor Layer-2 records — don't litter for them.
+      if (dumpStatsOnDtor_) {
+        if (seenKeys_.insert(key.hashHex).second)
+          stats_.filesOpened.fetch_add(1, std::memory_order_relaxed);
+        entry->setObsSink(obsSink_);
+      }
     }
-    // Distinct-key count; CLI invocations (disableStatsDump) write
-    // neither the counters line nor Layer-2 records — don't litter for them.
-    if (dumpStatsOnDtor_) {
-      if (seenKeys_.insert(key.hashHex).second)
-        stats_.filesOpened.fetch_add(1, std::memory_order_relaxed);
-      entry->setObsSink(obsSink_);
-    }
+    entry->obs().opens.fetch_add(1, std::memory_order_relaxed);
+    maybeEvict();
+    return entry;
   }
-  entry->obs().opens.fetch_add(1, std::memory_order_relaxed);
-  maybeEvict();
-  return entry;
 }
 
 void CacheStore::notePersisted(uint64_t bytes, bool allowEvict) {
@@ -706,31 +727,71 @@ void CacheStore::invalidate(const UrlKey& key) {
 void CacheStore::dropEntry(const UrlKey& key) {
   std::shared_ptr<FileEntry> live;
   {
-    std::lock_guard<std::mutex> g(regMu_);
+    std::unique_lock<std::mutex> g(regMu_);
+    dropCv_.wait(g, [&] { return removing_.count(key.hashHex) == 0; });
     auto it = registry_.find(key.hashHex);
-    if (it != registry_.end()) {
+    if (it != registry_.end())
       live = it->second.lock();
-      registry_.erase(it);
+    if (live) {
+      if (live->drop()) // under regMu_: an open sees it dropped from now on
+        drops_.fetch_add(1, std::memory_order_acq_rel);
+    } else {
+      removing_.insert(key.hashHex); // opens of the key wait until the files are gone
+      drops_.fetch_add(1, std::memory_order_acq_rel);
     }
   }
   if (live) {
-    live->drop();
-    live->removeDroppedFiles();
-  } else {
-    FileEntry::removeFiles(io_, key, cfg_.cacheDir);
+    removeDropped(live);
+    return;
   }
+  FileEntry::removeFiles(io_, key, cfg_.cacheDir);
+  {
+    std::lock_guard<std::mutex> g(regMu_);
+    removing_.erase(key.hashHex);
+  }
+  dropCv_.notify_all();
+}
+
+bool CacheStore::markDropped(const std::shared_ptr<FileEntry>& e) {
+  if (!e)
+    return false;
+  std::lock_guard<std::mutex> g(regMu_);
+  if (!e->drop())
+    return false;
+  drops_.fetch_add(1, std::memory_order_acq_rel);
+  return true;
 }
 
 void CacheStore::removeDropped(const std::shared_ptr<FileEntry>& e) {
   if (!e || !e->dropped())
     return;
+  // The files first, the registry after: until they are gone an open of the key finds the entry
+  // dropped and waits here (FileEntry::removeDroppedFiles, one removal at a time).
+  e->removeDroppedFiles();
   {
     std::lock_guard<std::mutex> g(regMu_);
     auto it = registry_.find(e->key().hashHex);
     if (it != registry_.end() && it->second.lock() == e)
       registry_.erase(it);
   }
-  e->removeDroppedFiles();
+}
+
+std::shared_ptr<FileEntry> CacheStore::liveEntry(const UrlKey& key) {
+  std::lock_guard<std::mutex> g(regMu_);
+  auto it = registry_.find(key.hashHex);
+  return it == registry_.end() ? nullptr : it->second.lock();
+}
+
+void CacheStore::removePendingDrops() {
+  std::vector<std::shared_ptr<FileEntry>> pending;
+  {
+    std::lock_guard<std::mutex> g(regMu_);
+    for (auto& [hash, weak] : registry_)
+      if (auto e = weak.lock(); e && e->dropped())
+        pending.push_back(std::move(e));
+  }
+  for (const auto& e : pending)
+    removeDropped(e);
 }
 
 bool CacheStore::removeEntry(const UrlKey& key) {
@@ -1320,8 +1381,10 @@ void CacheStore::checkpoint() {
 }
 
 void CacheStore::dumpStats(bool finalDump) {
-  if (finalDump)
+  if (finalDump) {
     drainRecords();
+    removePendingDrops(); // a drop whose removal had not run yet: its files never outlive the process
+  }
   // A forked child that never used the store did no work of its own through
   // it, and the counters and entries it inherited were the parent's to report.
   if (forkStale_.load(std::memory_order_acquire))
