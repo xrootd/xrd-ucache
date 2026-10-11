@@ -954,6 +954,8 @@ for c in len lenv; do
   [ "$F14" = 1 ] && [ "${FL[0]:-x}" = "${SV[0]}" ] && [ "$(failtext "$why")" = 1 ]
   verdict "$c: one failed read with code 14, at the server the handle landed on, its warning saying \"$why\" (${FL[*]})" $?
   [ "${#MV[@]}" -ge 1 ] && [ "${MV[-1]}" = "${SV[1]}" ]; verdict "$c: a move of route read ended at the server the bytes came from (${MV[*]})" $?
+  ND=$(counter "$RFC" bad_entries_dropped); [ "$ND" = 1 ] && [ -z "$(find "$RFC/objects" -name '*.meta' 2>/dev/null)" ]
+  verdict "$c: the entry, which holds bytes of the damaged copy (the checks' at open), is dropped (bad_entries_dropped $ND, no sidecar left)" $?
 done
 L=/store/ci/zr-len-off.root; placefix $L a b c
 zr lenerr $L off land "$W/len.sh"
@@ -977,6 +979,8 @@ for c in rec recv; do
   [ "$F14" = 1 ] && [ "${FL[0]:-x}" = "$AX" ] && [ "${SV[0]:-}" = "$AX" ] && [ "$(failtext "$why")" = 1 ]
   verdict "$c: the handle landed on a (the regional listed $RL), one failed read with code 14 at a, its warning saying \"$why\" (${FL[*]})" $?
   [ "${#MV[@]}" -ge 1 ] && [ "${MV[-1]}" = "${SV[1]}" ] && [ "${SV[1]}" != "$AX" ]; verdict "$c: a move of route read ended at the server the bytes came from, not a (${MV[*]})" $?
+  ND=$(counter "$RFC" bad_entries_dropped); [ "$ND" = 1 ] && [ -z "$(find "$RFC/objects" -name '*.meta' 2>/dev/null)" ]
+  verdict "$c: the entry, which holds a's record, is dropped (bad_entries_dropped $ND, no sidecar left)" $?
 done
 L=/store/ci/zr-rec-off.root; placefix $L a b c; rec_at $L a b c
 zr recerr $L off
