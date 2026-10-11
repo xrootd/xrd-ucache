@@ -259,6 +259,40 @@ BasketKeyCheck checkBasketKey(const KeyInfo& k, const BasketHeader& b, const Bra
   return c;
 }
 
+void basketMap(const FileMeta& fm, std::vector<uint64_t>& seeks, std::vector<int32_t>& bytes) {
+  std::vector<std::pair<uint64_t, int32_t>> all;
+  for (const auto& b : fm.branches)
+    if (!b.externalFile)
+      for (size_t i = 0; i < b.basketSeek.size(); ++i)
+        if (b.basketSeek[i] > 0)
+          all.emplace_back(static_cast<uint64_t>(b.basketSeek[i]),
+                           i < b.basketBytes.size() && b.basketBytes[i] > 0 ? b.basketBytes[i] : 0);
+  std::sort(all.begin(), all.end());
+  seeks.clear();
+  bytes.clear();
+  for (const auto& [s, n] : all) {
+    if (!seeks.empty() && seeks.back() == s) {
+      if (bytes.back() != n)
+        bytes.back() = 0; // two records of one position disagree: no length to hold it to
+      continue;
+    }
+    seeks.push_back(s);
+    bytes.push_back(n);
+  }
+}
+
+std::string basketMapBad(const FileMeta& fm, const std::vector<uint64_t>& seeks,
+                         const std::vector<int32_t>& bytes, uint64_t fileSize) {
+  if (!fm.error.empty())
+    return fm.recordFailed ? "the tree's record fails its own check" : "";
+  for (size_t i = 0; i < seeks.size() && i < bytes.size(); ++i)
+    if (bytes[i] > 0 && (seeks[i] > fileSize || uint64_t(bytes[i]) > fileSize - seeks[i]))
+      return "the tree's record places a basket at " + std::to_string(seeks[i]) + " of " +
+             std::to_string(bytes[i]) + " bytes past the copy's end at " +
+             std::to_string(fileSize);
+  return "";
+}
+
 std::vector<uint64_t> basketSeeks(const FileMeta& fm) {
   std::vector<uint64_t> s;
   for (const auto& b : fm.branches)
@@ -273,7 +307,14 @@ std::vector<uint64_t> basketSeeks(const FileMeta& fm) {
 
 MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks, uint64_t spanOff,
                                 const void* bytes, uint64_t n, uint64_t lo, uint64_t hi) {
+  return firstMisplacedKey(seeks, std::vector<int32_t>(), spanOff, bytes, n, lo, hi);
+}
+
+MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks,
+                                const std::vector<int32_t>& lengths, uint64_t spanOff,
+                                const void* bytes, uint64_t n, uint64_t lo, uint64_t hi) {
   const auto* p = static_cast<const uint8_t*>(bytes);
+  const bool withLengths = lengths.size() == seeks.size();
   MisplacedKeys m;
   for (auto it = std::lower_bound(seeks.begin(), seeks.end(), spanOff);
        it != seeks.end() && *it - spanOff < n; ++it) {
@@ -289,11 +330,25 @@ MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks, uint64_t spa
     if (n - at < (wide ? 26u : 22u))
       break;
     const int64_t key = wide ? beGet<int64_t>(p + at + 18) : int64_t{beGet<uint32_t>(p + at + 18)};
-    if (key == static_cast<int64_t>(*it))
+    bool fails = key != static_cast<int64_t>(*it);
+    bool byLength = false;
+    if (!fails && withLengths) {
+      // The key's own fields, read as TKey::ReadKeyBuffer reads them (fNbytes and fObjlen signed
+      // 32-bit, fKeylen signed 16-bit), against the map's length of the basket.
+      const int32_t want = lengths[static_cast<size_t>(it - seeks.begin())];
+      const int32_t nbytes = beGet<int32_t>(p + at);
+      const int32_t objlen = beGet<int32_t>(p + at + 6);
+      const int16_t keylen = beGet<int16_t>(p + at + 14);
+      byLength = (want > 0 && nbytes != want) || keylen <= 0 || keylen > nbytes || objlen < 0;
+      fails = byLength;
+    }
+    if (!fails)
       continue;
     if (*it >= lo && *it < hi) {
-      if (m.count++ == 0)
+      if (m.count++ == 0) {
         m.first = *it;
+        m.length = byLength;
+      }
     } else {
       m.outside = true;
     }
@@ -751,9 +806,12 @@ ContainerMeta parseContainerFrom(Reader& r) {
   return fm;
 }
 
-std::vector<uint8_t> readKeyPayloadFrom(Reader& r, const KeyInfo& k, bool* unreadable = nullptr) {
+std::vector<uint8_t> readKeyPayloadFrom(Reader& r, const KeyInfo& k, bool* unreadable = nullptr,
+                                        bool* checkFailed = nullptr) {
   if (unreadable)
     *unreadable = false;
+  if (checkFailed)
+    *checkFailed = false;
   if (k.nbytes <= 0 || k.keylen > k.nbytes || k.objlen < 0 || k.seekkey < 0)
     return {};
   std::vector<uint8_t> rec(k.nbytes);
@@ -763,10 +821,17 @@ std::vector<uint8_t> readKeyPayloadFrom(Reader& r, const KeyInfo& k, bool* unrea
     return {};
   }
   std::vector<uint8_t> out;
-  if (k.objlen == k.nbytes - k.keylen)
+  if (k.objlen == k.nbytes - k.keylen) {
     out.assign(rec.begin() + k.keylen, rec.end());
-  else
-    out = decompressFrames(rec.data() + k.keylen, rec.size() - k.keylen, k.objlen);
+  } else {
+    DecodedFrames d = decodeFrames(rec.data() + k.keylen, rec.size() - k.keylen, k.objlen);
+    if (d.check == FrameCheck::kFailed) {
+      if (checkFailed)
+        *checkFailed = true;
+      return {};
+    }
+    out = std::move(d.out);
+  }
   if (out.size() != static_cast<size_t>(k.objlen))
     return {};
   return out;
@@ -808,10 +873,15 @@ FileMeta parseTreeFrom(Reader& r, const std::string& tree) {
   // valid tree metadata" (final) used to cost a whole second read of the
   // record, which on a large LZMA file is multiple megabytes off the cache
   // disk, CRC-verified, on every parse and on each of its retries.
-  bool unreadable = false;
-  fm.treeBlob = readKeyPayloadFrom(r, fm.treeKey, &unreadable);
+  bool unreadable = false, checkFailed = false;
+  fm.treeBlob = readKeyPayloadFrom(r, fm.treeKey, &unreadable, &checkFailed);
   if (unreadable)
     return fail("tree record not readable");
+  if (checkFailed) {
+    fail("tree metadata failed its own check");
+    fm.recordFailed = true; // ROOT cannot read the tree from these bytes either
+    return fm;
+  }
   if (fm.treeBlob.size() != static_cast<size_t>(fm.treeKey.objlen))
     return fail("tree metadata decompression failed");
   if (!parseTreeBlob(fm.treeBlob.data(), fm.treeBlob.size(), fm.treeKey.keylen, fm))

@@ -59,7 +59,8 @@ struct KeySeekTable {
   std::weak_ptr<FileEntry> entry; // compared by identity, never locked
   bool parsing = false;
   uint64_t failedUs = 0; // when a failed origin read last stopped a parse
-  std::shared_ptr<const std::vector<uint64_t>> seeks; // null until built
+  uint64_t badUs = 0;    // when a parse last made a map that shows its copy bad
+  std::shared_ptr<const KeyMap> seeks; // null until built
 };
 std::mutex& tablesMu() {
   static auto* m = new std::mutex;
@@ -78,10 +79,23 @@ std::deque<std::shared_ptr<KeySeekTable>>& tables() {
 // (not ROOT, no tree: RNTuple) leaves the table empty for good; one that a
 // failed origin read stopped leaves it unbuilt, for a miss after the retry
 // interval to try again.
-std::shared_ptr<const std::vector<uint64_t>> keySeeksFor(const std::shared_ptr<HandleState>& st,
-                                                         const std::shared_ptr<FileEntry>& entry,
-                                                         XrdTimeout timeout,
-                                                         const tp::FileMeta* fm) {
+KeyMap keyMapOf(const tp::FileMeta& fm, uint64_t fileSize, const std::string& server) {
+  KeyMap m;
+  if (fm.error.empty())
+    tp::basketMap(fm, m.seeks, m.bytes);
+  m.bad = tp::basketMapBad(fm, m.seeks, m.bytes, fileSize);
+  if (!m.bad.empty()) { // no basket is checked against a map that shows its copy bad
+    m.server = server;
+    m.seeks.clear();
+    m.bytes.clear();
+  }
+  return m;
+}
+
+std::shared_ptr<const KeyMap>
+keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEntry>& entry,
+            XrdTimeout timeout, const tp::FileMeta* fm, const std::string& fmServer,
+            const std::string* current) {
   std::unique_lock<std::mutex> g(tablesMu());
   std::shared_ptr<KeySeekTable> t;
   for (const auto& x : tables())
@@ -94,7 +108,12 @@ std::shared_ptr<const std::vector<uint64_t>> keySeeksFor(const std::shared_ptr<H
     if (tables().size() > kMaxKeySeekTables)
       tables().pop_front();
   }
-  if (!fm && (t->seeks || t->parsing || (t->failedUs && nowUs() - t->failedUs < kKeySeekRetryUs)))
+  // A map that shows its copy bad is parsed again for another copy, at most once a second.
+  const bool again = t->seeks && !t->seeks->bad.empty() && current &&
+                     *current != t->seeks->server &&
+                     (!t->badUs || nowUs() - t->badUs >= kKeySeekRetryUs);
+  if (!fm && ((t->seeks && !again) || t->parsing ||
+              (t->failedUs && nowUs() - t->failedUs < kKeySeekRetryUs)))
     return t->seeks;
   OriginSource src;
   tp::FileMeta own;
@@ -113,8 +132,10 @@ std::shared_ptr<const std::vector<uint64_t>> keySeeksFor(const std::shared_ptr<H
     }
     fm = &own;
   }
-  t->seeks = std::make_shared<const std::vector<uint64_t>>(
-      fm->error.empty() ? tp::basketSeeks(*fm) : std::vector<uint64_t>());
+  auto m = std::make_shared<const KeyMap>(
+      keyMapOf(*fm, entry->fileSize(), fm == &own ? src.fetchedFrom : fmServer));
+  t->badUs = m->bad.empty() ? 0 : nowUs();
+  t->seeks = std::move(m);
   return t->seeks;
 }
 
@@ -196,10 +217,12 @@ ReadRule::State ReadRule::observe(const std::vector<std::pair<uint64_t, uint64_t
   if (!parsed_) {
     parsed_ = true;
     tp::FileMeta fm = tp::parseReaderTree(src, static_cast<int64_t>(size_));
+    if (fm.recordFailed && globalConfig().checkOriginIntegrity) // the copy shown bad, for the check
+      keySeeksFor(src.st, src.entry, 0, &fm, src.fetchedFrom);
     if (fm.error.empty()) {
       map_ = std::make_unique<tp::ReadMap>(tp::ReadMap::fromTree(fm));
       if (globalConfig().checkOriginIntegrity) // the key-position check's table, from this parse
-        keySeeksFor(src.st, src.entry, 0, &fm);
+        keySeeksFor(src.st, src.entry, 0, &fm, src.fetchedFrom);
     } else if (fm.error.find("not found") != std::string::npos && src.fetchHead()) {
       tp::RNTupleMeta rm = tp::parseRNTuple(src, static_cast<int64_t>(size_), "");
       if (rm.error.empty())

@@ -33,6 +33,7 @@ struct OriginSource : transpose::Source {
   std::shared_ptr<HandleState> st;
   std::shared_ptr<FileEntry> entry;
   bool readFailed = false; // a read from the origin failed (which says nothing of the file)
+  std::string fetchedFrom; // the server of its last read from the origin ("" for none)
   XrdTimeout timeout = 0;  // of each read from the origin (0: the client's default)
 
   bool has(uint64_t off, uint64_t n) override {
@@ -104,6 +105,7 @@ struct OriginSource : transpose::Source {
     entry->writePages(ws, got, buf.data());
     if (n)
       std::memcpy(dst, buf.data() + (off - ws), n);
+    fetchedFrom = server;
     return true;
   }
 };

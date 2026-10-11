@@ -3106,17 +3106,50 @@ static bool ruleReadsData(const std::shared_ptr<ReadRule>& r, uint64_t off, uint
 // reads carry the miss's own timeout; the miss's completion reads it (null:
 // not checked). A file whose tree does not parse has an empty one. (A build
 // without the tree parser checks nothing.)
-static std::shared_ptr<const std::vector<uint64_t>> keySeeksOf(HandleState& st) {
+static std::shared_ptr<const KeyMap> keySeeksOf(HandleState& st) {
   std::lock_guard<std::mutex> g(st.mu);
   return st.keySeeks;
 }
+// A handle's map is kept, unless it showed its copy bad and the handle reads from another copy
+// now (it moved): then the map is made again, from what that copy holds.
 static void armKeyCheck(const std::shared_ptr<HandleState>& st,
                         const std::shared_ptr<FileEntry>& entry, XrdTimeout timeout) {
-  if (!globalConfig().checkOriginIntegrity || keySeeksOf(*st))
+  if (!globalConfig().checkOriginIntegrity)
     return;
-  auto seeks = keySeeksFor(st, entry, timeout);
+  const auto had = keySeeksOf(*st);
+  const std::string current = issueServer(*st, nullptr);
+  if (had && (had->bad.empty() || had->server == current))
+    return;
+  auto seeks = keySeeksFor(st, entry, timeout, nullptr, std::string(), &current);
   std::lock_guard<std::mutex> g(st->mu);
   st->keySeeks = std::move(seeks);
+}
+// The key check of fetched bytes [spanOff, spanOff + n) that `server` answered, with the handle's
+// map `m` (check_origin_integrity): each basket that starts in them, its key header wholly in
+// them, must state its position and the length the map gives it (transpose::firstMisplacedKey). A
+// map that showed its copy bad fails the bytes that copy answered as one failure at `lo` (with
+// lo == hi, as outside), and makes no claim on another copy's. `why`: the failure's reason.
+static transpose::MisplacedKeys keyCheck(const KeyMap& m, const std::string& server,
+                                         uint64_t spanOff, const void* p, uint64_t n, uint64_t lo,
+                                         uint64_t hi, std::string* why = nullptr) {
+  transpose::MisplacedKeys r;
+  if (!m.bad.empty()) {
+    if (m.server.empty() || server != m.server)
+      return r;
+    if (hi > lo) {
+      r.count = 1;
+      r.first = lo;
+    } else {
+      r.outside = true;
+    }
+    if (why)
+      *why = m.bad;
+    return r;
+  }
+  r = transpose::firstMisplacedKey(m.seeks, m.bytes, spanOff, p, n, lo, hi);
+  if (why && r.count && r.length)
+    *why = "key length differs from the tree's record";
+  return r;
 }
 #else
 static std::shared_ptr<ReadRule> directRule(const std::shared_ptr<HandleState>&,
@@ -3607,7 +3640,8 @@ namespace {
 [[maybe_unused]] XRootDStatus* originCheckFailed(HandleState& st, ServerTally* tally,
                                                  const char* op, uint64_t pos, uint32_t n,
                                                  uint64_t spanOff, uint64_t spanLen,
-                                                 const std::string& server);
+                                                 const std::string& server,
+                                                 const std::string& why = std::string());
 } // namespace
 
 // The one handler that hands a pass-through completion back to the caller.
@@ -3794,8 +3828,13 @@ struct RelayHandler : XrdCl::ResponseHandler {
     if (!seeks || !r)
       return nullptr;
     transpose::MisplacedKeys bad;
+    std::string why;
+    const std::string server = answeredBy(*st, h);
     const auto look = [&](uint64_t o, const void* p, uint64_t n) {
-      const auto m = transpose::firstMisplacedKey(*seeks, o, p, n, o, o + n);
+      std::string w;
+      const auto m = keyCheck(*seeks, server, o, p, n, o, o + n, &w);
+      if (m.count && !bad.count)
+        why = w;
       bad.first = bad.count ? bad.first : m.first;
       bad.count += m.count;
     };
@@ -3809,7 +3848,7 @@ struct RelayHandler : XrdCl::ResponseHandler {
       for (const auto& c : vi->GetChunks())
         look(c.offset, c.buffer, c.length);
     return bad.count ? originCheckFailed(*st, &st->relayServers, vi ? "readv" : "read", bad.first,
-                                         bad.count, off, len, answeredBy(*st, h))
+                                         bad.count, off, len, server, why)
                      : nullptr;
   }
 #endif
@@ -4225,13 +4264,14 @@ void persistPagesReserved(const std::shared_ptr<HandleState>& st,
 [[maybe_unused]] XRootDStatus* originCheckFailed(HandleState& st, ServerTally* tally,
                                                  const char* op, uint64_t pos, uint32_t n,
                                                  uint64_t spanOff, uint64_t spanLen,
-                                                 const std::string& server) {
+                                                 const std::string& server,
+                                                 const std::string& why) {
   char msg[600];
-  std::snprintf(msg, sizeof msg,
-                "%s: a basket at %llu from %s failed its check (key position differs from the "
-                "tree's record); not served",
-                recordFile(st.url).c_str(), static_cast<unsigned long long>(pos),
-                server.empty() ? "the origin" : server.c_str());
+  std::snprintf(msg, sizeof msg, "%s: a %s at %llu from %s failed its check (%s); not served",
+                recordFile(st.url).c_str(), why.empty() ? "basket" : "read",
+                static_cast<unsigned long long>(pos),
+                server.empty() ? "the origin" : server.c_str(),
+                why.empty() ? "key position differs from the tree's record" : why.c_str());
   UCACHE_WARN("%s", msg);
   if (st.store)
     st.store->stats().originChecksFailed.fetch_add(n, std::memory_order_relaxed);
@@ -4343,14 +4383,16 @@ class MissReadHandler : public ResponseHandler {
     bool keepNone = false;
 #ifdef UCACHE_HAVE_COLDRUN
     if (auto seeks = keySeeksOf(*st_)) {
-      const auto m = transpose::firstMisplacedKey(*seeks, wireOff_, wireBuf_->data(), got,
-                                                  userOff_, userOff_ + userLen_);
+      std::string why;
+      const std::string server = answeredBy(*st_, h.get());
+      const auto m = keyCheck(*seeks, server, wireOff_, wireBuf_->data(), got, userOff_,
+                              userOff_ + userLen_, &why);
       if (m.count) {
         if (gateLen_)
           entry_->endFetch(wireOff_, gateLen_); // waiters fetch, and are checked, on their own
         std::unique_ptr<XRootDStatus> refused(originCheckFailed(*st_, &entry_->obs().servers,
                                                                 "read", m.first, m.count, wireOff_,
-                                                                got, answeredBy(*st_, h.get())));
+                                                                got, server, why));
         if (!handOff(*refused, h, true))
           complete(user_, refused.release(), nullptr);
         delete this;
@@ -4568,16 +4610,20 @@ class MissVReadHandler : public ResponseHandler {
       // Every element overlaps a miss chunk (it is one's rounded run), so a
       // failing key in no chunk is "outside" for each chunk of its element.
       transpose::MisplacedKeys bad;
+      std::string why;
+      const std::string server = answeredBy(*st_, h.get());
       for (const auto& w : wire_) {
-        if (!transpose::firstMisplacedKey(*seeks, w.off, w.buf->data(), w.len, w.off, w.off)
-                 .outside)
+        if (!keyCheck(*seeks, server, w.off, w.buf->data(), w.len, w.off, w.off).outside)
           continue;
         for (size_t idx : missIdx_) {
           const auto& c = userChunks_[idx];
           if (c.offset >= w.off + w.len || c.offset + c.length <= w.off)
             continue;
-          const auto m = transpose::firstMisplacedKey(*seeks, w.off, w.buf->data(), w.len,
-                                                      c.offset, c.offset + c.length);
+          std::string cw;
+          const auto m = keyCheck(*seeks, server, w.off, w.buf->data(), w.len, c.offset,
+                                  c.offset + c.length, &cw);
+          if (m.count && !bad.count)
+            why = cw;
           bad.first = bad.count ? bad.first : m.first;
           bad.count += m.count;
           keepNone = keepNone || m.outside;
@@ -4586,7 +4632,7 @@ class MissVReadHandler : public ResponseHandler {
       if (bad.count) {
         std::unique_ptr<XRootDStatus> refused(
             originCheckFailed(*st_, &entry_->obs().servers, "readv", bad.first, bad.count,
-                              wire_.front().off, wireBytes, answeredBy(*st_, h.get())));
+                              wire_.front().off, wireBytes, server, why));
         if (!handOff(*refused, h, true))
           complete(user_, refused.release(), nullptr);
         delete this;
@@ -5221,8 +5267,8 @@ void storeOpenBytesIn(HandleState& st, const std::shared_ptr<FileEntry>& entry,
       continue;
 #ifdef UCACHE_HAVE_COLDRUN
     if (seeks) {
-      const auto m = transpose::firstMisplacedKey(*seeks, sp.off, sp.bytes.data(), sp.bytes.size(),
-                                                  sp.off, sp.off);
+      const auto m =
+          keyCheck(*seeks, ob.server, sp.off, sp.bytes.data(), sp.bytes.size(), sp.off, sp.off);
       if (m.count || m.outside)
         continue;
     }

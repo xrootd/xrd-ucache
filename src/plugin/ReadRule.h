@@ -38,6 +38,17 @@ struct OriginSource;
 struct HandleState;
 class FileEntry;
 
+// check_origin_integrity: the file map of a file's tree, for the key check of byte-cache misses
+// (keySeeksFor). Immutable once made.
+struct KeyMap {
+  std::vector<uint64_t> seeks; // where each basket starts, sorted
+  std::vector<int32_t> bytes;  // beside seeks: its length, 0 for none known
+  // Non-empty: the map shows the copy it was read from bad (why), and holds no basket; `server`
+  // is that copy's server ("" when not known).
+  std::string bad;
+  std::string server;
+};
+
 class ReadRule : public std::enable_shared_from_this<ReadRule> {
  public:
   enum State : uint8_t { kUndecided = 0, kCache = 1, kDirect = 2, kNoRule = 3 };
@@ -99,10 +110,22 @@ bool readRuleDirect(const std::string& key);
 // runs for a second. It keeps the pages of the records it reads in the byte
 // cache, and their other bytes are not checked. `fm`: the tree the caller
 // parsed already, which builds the table instead (ReadRule::observe).
-std::shared_ptr<const std::vector<uint64_t>> keySeeksFor(const std::shared_ptr<HandleState>& st,
-                                                         const std::shared_ptr<FileEntry>& entry,
-                                                         XrdTimeout timeout,
-                                                         const transpose::FileMeta* fm = nullptr);
+//
+// The table is the file map (KeyMap): each basket's position and
+// the length the tree's record gives it. A parse that shows the copy it read
+// from bad makes a map that holds no basket and says why (KeyMap::bad), with
+// that copy's server: the tree's record failed its own check (ROOT fails to
+// read the tree too), or it places a basket past the copy's end. A parse this
+// walk does not support makes no claim (an empty map), as before. A bad map
+// is parsed again when `current` (the server the handle reads from now) is
+// another (the handle moved), at most once a second. `fmServer`: with `fm`,
+// the server its records were read from.
+std::shared_ptr<const KeyMap>
+keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEntry>& entry,
+            XrdTimeout timeout, const transpose::FileMeta* fm = nullptr,
+            const std::string& fmServer = std::string(), const std::string* current = nullptr);
+// The file map of the parse `fm` of a copy of `fileSize` bytes read from `server`.
+KeyMap keyMapOf(const transpose::FileMeta& fm, uint64_t fileSize, const std::string& server);
 
 // fork(): a child decides afresh for every file (a decision costs at most a
 // few early fills, and the bytes read are the same). Before is called from the

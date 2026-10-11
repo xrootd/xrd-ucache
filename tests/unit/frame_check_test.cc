@@ -617,3 +617,158 @@ TEST(KeyPosition, CodecCheckOfZerosPassesToday) {
   const std::vector<uint8_t> zeros(1647, 0);
   EXPECT_EQ(decode(zeros, 0).check, FrameCheck::kPassed);
 }
+
+// The file map (basketMap): each basket's position and the length the tree's record gives it, and
+// the key check of fetched bytes against both (firstMisplacedKey with lengths).
+namespace {
+void putBe32(std::vector<uint8_t>& r, size_t at, int32_t v) {
+  for (int i = 0; i < 4; ++i)
+    r[at + i] = static_cast<uint8_t>(static_cast<uint32_t>(v) >> (8 * (3 - i)));
+}
+MisplacedKeys checkLen(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
+                       const Span& s, uint64_t lo, uint64_t hi) {
+  return firstMisplacedKey(seeks, lengths, s.off, s.b.data(), s.b.size(), lo, hi);
+}
+} // namespace
+
+TEST(FileMap, LengthsAreTheTreesOwn) {
+  FileMeta fm;
+  BranchInfo a, b, ext;
+  a.basketSeek = {500, 100, 0};
+  a.basketBytes = {50, 40, 0};
+  b.basketSeek = {300, 100, 900};
+  b.basketBytes = {60, 41, -5};
+  ext.basketSeek = {700};
+  ext.basketBytes = {70};
+  ext.externalFile = true;
+  fm.branches = {a, b, ext};
+  std::vector<uint64_t> seeks;
+  std::vector<int32_t> bytes;
+  basketMap(fm, seeks, bytes);
+  EXPECT_EQ(seeks, (std::vector<uint64_t>{100, 300, 500, 900}));
+  EXPECT_EQ(bytes, (std::vector<int32_t>{0, 60, 50, 0}))
+      << "100: two records disagree; 900: no length above 0";
+  EXPECT_EQ(seeks, basketSeeks(fm)) << "the same positions as the key-position check";
+}
+
+TEST(FileMap, KeyLengthAndFieldsAgainstTheMap) {
+  const uint64_t S = kLzmaRecordSeek;
+  const std::vector<uint8_t> rec = wideAt(S);
+  const int32_t nb = 195; // the record's fNbytes, ROOT's basket length
+  const uint64_t hi = S + rec.size();
+  // As ROOT wrote it: passes with its length, with no length known, with no lengths at all.
+  EXPECT_EQ(checkLen({S}, {nb}, spanWith(rec, 0, S, 4096), S, hi).count, 0u);
+  EXPECT_EQ(checkLen({S}, {0}, spanWith(rec, 0, S, 4096), S, hi).count, 0u);
+  EXPECT_EQ(checkLen({S}, {}, spanWith(rec, 0, S, 4096), S, hi).count, 0u);
+  // The map gives another length: not the basket the tree's record names.
+  MisplacedKeys m = checkLen({S}, {nb + 1}, spanWith(rec, 0, S, 4096), S, hi);
+  EXPECT_EQ(m.count, 1u);
+  EXPECT_EQ(m.first, S);
+  EXPECT_TRUE(m.length);
+  // The key states another length (its fNbytes changed), its position intact.
+  std::vector<uint8_t> r = rec;
+  putBe32(r, 0, nb - 8);
+  m = checkLen({S}, {nb}, spanWith(r, 0, S, 4096), S, hi);
+  EXPECT_EQ(m.count, 1u);
+  EXPECT_TRUE(m.length);
+  EXPECT_EQ(checkLen({S}, {}, spanWith(r, 0, S, 4096), S, hi).count, 0u)
+      << "without the map's lengths, only the position is held to";
+  // The key's own fields: a key length of 0, one past its record, an object length below 0.
+  r = rec;
+  r[14] = 0; // fKeylen, after fNbytes, fVersion, fObjlen and fDatime
+  r[15] = 0;
+  EXPECT_EQ(checkLen({S}, {0}, spanWith(r, 0, S, 4096), S, hi).count, 1u) << "key length 0";
+  r = rec;
+  r[14] = 0x10; // 4096 + ...: past the record's 195 bytes
+  EXPECT_EQ(checkLen({S}, {nb}, spanWith(r, 0, S, 4096), S, hi).count, 1u) << "key past its record";
+  r = rec;
+  putBe32(r, 6, -1);
+  EXPECT_EQ(checkLen({S}, {nb}, spanWith(r, 0, S, 4096), S, hi).count, 1u) << "object length < 0";
+  // A 32-bit key is held to its length the same way.
+  const std::vector<uint8_t> n = narrowAt(S);
+  EXPECT_EQ(checkLen({S}, {nb - 8}, spanWith(n, 0, S, 4096), S, S + n.size()).count, 0u);
+  m = checkLen({S}, {nb}, spanWith(n, 0, S, 4096), S, S + n.size());
+  EXPECT_EQ(m.count, 1u);
+  EXPECT_TRUE(m.length);
+  // A position that fails is reported as one, not as a length.
+  m = checkLen({S}, {nb}, spanWith(wideAt(S + 1), 0, S, 4096), S, hi);
+  EXPECT_EQ(m.count, 1u);
+  EXPECT_FALSE(m.length);
+  // Outside the reader's bytes: noted, not counted.
+  m = checkLen({S}, {nb + 1}, spanWith(rec, 0, S, 4096), S + 1, S + 2);
+  EXPECT_EQ(m.count, 0u);
+  EXPECT_TRUE(m.outside);
+  // A header the span cuts is not judged (the length lies in its first 18 bytes, the position
+  // past them: judged only once the position fits).
+  Span cut = spanWith(rec, 0, S, 4096);
+  cut.b.resize(S + 25);
+  EXPECT_EQ(checkLen({S}, {nb + 1}, cut, S, S + 25).count, 0u);
+}
+
+TEST(FileMap, AMapThatShowsTheCopyBad) {
+  FileMeta fm;
+  std::vector<uint64_t> seeks{100, 300};
+  std::vector<int32_t> bytes{200, 50};
+  EXPECT_EQ(basketMapBad(fm, seeks, bytes, 350), "");
+  EXPECT_EQ(basketMapBad(fm, seeks, bytes, 349),
+            "the tree's record places a basket at 300 of 50 bytes past the copy's end at 349");
+  EXPECT_EQ(basketMapBad(fm, {100, 400}, {0, 0}, 300), "") << "no length known: no claim";
+  EXPECT_EQ(basketMapBad(fm, {1000}, {10}, 300),
+            "the tree's record places a basket at 1000 of 10 bytes past the copy's end at 300");
+  fm.error = "TTree v19 unsupported";
+  EXPECT_EQ(basketMapBad(fm, {}, {}, 300), "") << "a parse this walk does not support";
+  fm.error = "tree metadata failed its own check";
+  fm.recordFailed = true;
+  EXPECT_EQ(basketMapBad(fm, {}, {}, 300), "the tree's record fails its own check");
+}
+
+#ifdef UCACHE_TEST_DATA_DIR
+namespace {
+struct BytesSource : Source {
+  std::vector<uint8_t> b;
+  bool read(void* dst, uint64_t n, uint64_t off) override {
+    if (off > b.size() || n > b.size() - off)
+      return false;
+    std::memcpy(dst, b.data() + off, n);
+    return true;
+  }
+  bool has(uint64_t off, uint64_t n) override { return off <= b.size() && n <= b.size() - off; }
+};
+} // namespace
+
+// A tree record whose compressed data fails its own check: ROOT cannot read the tree, and the parse
+// says so (recordFailed), unlike a parse it does not support.
+TEST(FileMap, ATreeRecordThatFailsItsOwnCheck) {
+  int checked = 0;
+  for (const char* f : {"unnamed_codec_fixture.root", "unnamed_codec_wide_fixture.root"}) {
+    BytesSource src;
+    FILE* fp = std::fopen((std::string(UCACHE_TEST_DATA_DIR) + "/" + f).c_str(), "rb");
+    ASSERT_NE(fp, nullptr) << f;
+    uint8_t buf[65536];
+    size_t r;
+    while ((r = std::fread(buf, 1, sizeof buf, fp)) > 0)
+      src.b.insert(src.b.end(), buf, buf + r);
+    std::fclose(fp);
+    const int64_t size = static_cast<int64_t>(src.b.size());
+    FileMeta good = parseFile(src, size, "Events");
+    if (!good.error.empty())
+      good = parseFile(src, size, "t");
+    if (!good.error.empty())
+      continue; // no tree this walk reads in it
+    EXPECT_FALSE(good.recordFailed);
+    const KeyInfo& k = good.treeKey;
+    ASSERT_GT(k.objlen, k.nbytes - k.keylen) << f << ": a compressed tree record";
+    const std::string codec = blockCodec(src.b.data() + k.seekkey + k.keylen, 9);
+    if (codec != "lzma" && codec != "zlib")
+      continue; // a codec with no check of its own
+    src.b[static_cast<size_t>(k.seekkey + k.keylen + 40)] ^= 0x10; // inside the compressed data
+    const FileMeta bad = parseFile(src, size, good.treeKey.name);
+    EXPECT_FALSE(bad.error.empty()) << f;
+    EXPECT_TRUE(bad.recordFailed) << f << ": " << bad.error;
+    EXPECT_EQ(basketMapBad(bad, {}, {}, static_cast<uint64_t>(size)),
+              "the tree's record fails its own check");
+    ++checked;
+  }
+  EXPECT_GT(checked, 0) << "a fixture with a checked tree record";
+}
+#endif

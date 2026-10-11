@@ -194,6 +194,10 @@ struct FileMeta {
   std::vector<int64_t> clusterSize;     // fClusterSize[fNClusterRange]
   std::vector<BranchInfo> branches;
   std::string error; // non-empty => parse failed (fail open, no transpose)
+  // With `error`: the tree's record is compressed and its data failed its own check (FrameCheck
+  // kFailed): ROOT fails to read the tree from these bytes too. False for a parse this walk does
+  // not support, a record it cannot check, and every other failure.
+  bool recordFailed = false;
 };
 
 // Parse `path` (whole file is pread as needed; the tree metadata blob is
@@ -230,6 +234,17 @@ BasketKeyCheck checkBasketKey(const KeyInfo& k, const BasketHeader& b, const Bra
 // each branch's basket seeks (seek > 0; branches whose baskets live in another
 // file are left out), sorted and unique.
 std::vector<uint64_t> basketSeeks(const FileMeta& fm);
+// The file map: basketSeeks, and beside each the length the tree's record gives that basket
+// (its fBasketBytes, which ROOT reads it by); 0 where two records of one position disagree or
+// give no length above 0 (no length is checked there).
+void basketMap(const FileMeta& fm, std::vector<uint64_t>& seeks, std::vector<int32_t>& bytes);
+// Why the parse `fm` (and, when it parsed, its map `seeks`, `bytes`) shows the copy of `fileSize`
+// bytes it was read from bad, in words; "" when it does not. Bad: the tree's record failed its own
+// check (fm.recordFailed: ROOT fails to read the tree from those bytes too), or the map places a
+// basket past the copy's end (ROOT's read of it comes back short). A parse that failed otherwise
+// (a layout this walk does not support, no tree) makes no claim.
+std::string basketMapBad(const FileMeta& fm, const std::vector<uint64_t>& seeks,
+                         const std::vector<int32_t>& bytes, uint64_t fileSize);
 
 // The key-position check of fetched bytes [spanOff, spanOff + n) held in `p`:
 // a basket that starts at S in the span, and whose key header lies wholly in
@@ -241,8 +256,17 @@ struct MisplacedKeys {
   uint64_t first = 0;  // the first failing S in [lo, hi), when count > 0
   uint32_t count = 0;  // failing S in [lo, hi): the bytes the reader asked for
   bool outside = false; // a failing S in the span but outside [lo, hi)
+  bool length = false;  // the first failing S states its position but not its length (below)
 };
 MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks, uint64_t spanOff,
+                                const void* p, uint64_t n, uint64_t lo, uint64_t hi);
+// The same with the file map's lengths (basketMap; `bytes` empty, or beside `seeks`): a key whose
+// header lies wholly in the span must also state the length the map gives its basket (its first
+// four bytes, signed, as TKey reads them), a key length above 0 and at most that length, and an
+// object length of 0 or more. ROOT writes every basket so; a key that says otherwise is not the
+// basket the tree's record names (a basket shifted, cut, or of another version of the file).
+MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks,
+                                const std::vector<int32_t>& bytes, uint64_t spanOff,
                                 const void* p, uint64_t n, uint64_t lo, uint64_t hi);
 
 } // namespace ucache::transpose

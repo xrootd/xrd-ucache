@@ -58,6 +58,7 @@ struct ColdMap; // StoreMaps.h
 }
 using ColdMap = transpose::ColdMap;
 class ReadRule; // ReadRule.h
+struct KeyMap;  // ReadRule.h
 
 class UCacheFile;
 
@@ -155,11 +156,11 @@ struct HandleState {
   // max_read_fraction (ReadRule.h), set with the entry: null when no rule
   // applies. Shared by every handle of the file in the process.
   std::shared_ptr<ReadRule> rule;
-  // check_origin_integrity: where the file's baskets start (keySeeksFor), for
-  // the key-position check of the handle's byte-cache misses. Under mu; null
-  // until a miss with the check on finds the file's table built (each miss
-  // asks until then); empty for a file that is not checked.
-  std::shared_ptr<const std::vector<uint64_t>> keySeeks;
+  // check_origin_integrity: the file map (keySeeksFor), for the key check of
+  // the handle's byte-cache misses. Under mu; null until a miss with the check
+  // on finds the file's map built (each miss asks until then); empty for a file
+  // that is not checked.
+  std::shared_ptr<const KeyMap> keySeeks; // KeyMap: ReadRule.h
   std::unique_ptr<XrdCl::StatInfo> statInfo;   // clone source for Stat(false)
   std::mutex setupMu;                          // serializes lazy entry setup
   bool setupDone = false;                      // entry setup attempted (ok or not)

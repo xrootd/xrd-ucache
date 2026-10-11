@@ -145,6 +145,19 @@ void keyPositionFuzz(uint64_t iters, uint64_t seed) {
       violate("firstMisplacedKey: reported a basket it may not judge", i, seed);
     if (a.count > seeks.size())
       violate("firstMisplacedKey: more failures than baskets", i, seed);
+    // With the file map's lengths (random, some unknown): never fewer failures than by position
+    // alone, never a basket outside the span or the reader's bytes, and the same answer twice.
+    std::vector<int32_t> lengths(seeks.size());
+    for (auto& l : lengths)
+      l = rng() % 3 ? static_cast<int32_t>(rng() % 100000) : 0;
+    const MisplacedKeys c = firstMisplacedKey(seeks, lengths, spanOff, p.get(), n, lo, hi);
+    const MisplacedKeys d = firstMisplacedKey(seeks, lengths, spanOff, p.get(), n, lo, hi);
+    if (c.count != d.count || c.first != d.first || c.outside != d.outside || c.length != d.length)
+      violate("firstMisplacedKey with lengths: not deterministic", i, seed);
+    if (c.count < a.count || c.count > seeks.size() ||
+        (c.count && (c.first < lo || c.first >= hi || c.first < spanOff ||
+                     !std::binary_search(seeks.begin(), seeks.end(), c.first))))
+      violate("firstMisplacedKey with lengths: a count or basket it may not report", i, seed);
     // And it catches what it must: a good key the reader asked for, with one
     // byte of its position changed, fails.
     for (size_t g = 0; g < good.size(); ++g) {
