@@ -949,14 +949,14 @@ verdict "cut: a move of route read ended at a copy of $FIXW_SIZE bytes" $?
 # The handle's entry holds what the checks at open read of the copy it was opened at: the copy found bad, the
 # entry is dropped (nothing of a bad copy stays cached)
 dropped() { [ "$(counter "$RFC" bad_entries_dropped)" = 1 ] && [ -z "$(find "$RFC/objects" -name '*.meta' 2>/dev/null)" ]; }
-dropped; verdict "cut: the entry, which holds bytes of the cut copy, is dropped (bad_entries_dropped $(counter "$RFC" bad_entries_dropped), no sidecar left)" $?
+dropped; r=$?; verdict "cut: the entry, which holds bytes of the cut copy, is dropped (bad_entries_dropped $(counter "$RFC" bad_entries_dropped), no sidecar left)" $r
 # the same with a PgRead across the cut (from 20000), which the cache passes straight to the origin: a page read's short answer
 ct cutpg cut /store/ci/ct-cutpg.root
 echo "$RES" | grep -q '^read-failover cutpg: clean$'; verdict "cutpg: a PgRead across the cut is the file's own bytes, from another server, once (${SV[*]})" $?
 [ "$F14" = 1 ] && [ "$F14OPS" = "relay " ]; verdict "cutpg: the short answer is one failed read of class data, code 14, op relay: the passed-through PgRead ($F14, $F14OPS)" $?
 recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | tail -1 | grep -q "\"size\":$FIXW_SIZE,"
 verdict "cutpg: a move of route read ended at a copy of $FIXW_SIZE bytes" $?
-dropped; verdict "cutpg: the entry, which holds bytes of the cut copy, is dropped (bad_entries_dropped $(counter "$RFC" bad_entries_dropped), no sidecar left)" $?
+dropped; r=$?; verdict "cutpg: the entry, which holds bytes of the cut copy, is dropped (bad_entries_dropped $(counter "$RFC" bad_entries_dropped), no sidecar left)" $r
 # the same with a PgRead wholly past the cut (from 40000): the copy answers it with no bytes, which the client
 # fails itself with an invalid response (303) and leaves its File unusable; inside the file's confirmed size that
 # is a data failure of the copy, and the read moves
@@ -969,7 +969,7 @@ grep -q 'kXR_pgread (handle: [^,]*, offset: 40000, size: 65536): user supplied b
 verdict "cutpgpast: the client failed the page read at 40000 itself, for an empty answer (its log): the fault was in place" $?
 recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | tail -1 | grep -q "\"size\":$FIXW_SIZE,"
 verdict "cutpgpast: a move of route read ended at a copy of $FIXW_SIZE bytes" $?
-dropped; verdict "cutpgpast: the entry, which holds bytes of the cut copy, is dropped for the empty answer (bad_entries_dropped $(counter "$RFC" bad_entries_dropped), no sidecar left)" $?
+dropped; r=$?; verdict "cutpgpast: the entry, which holds bytes of the cut copy, is dropped for the empty answer (bad_entries_dropped $(counter "$RFC" bad_entries_dropped), no sidecar left)" $r
 ct cutonly cutall /store/ci/ct-all.root
 echo "$RES" | grep -q '^read-failover cutonly: clean$'; verdict "cutonly: every copy is cut, the read fails with the data error and says why" $?
 [ "$F14" -ge 1 ] && [ "$F14" -le 4 ]; verdict "cutonly: $F14 failed reads (one to four)" $?
