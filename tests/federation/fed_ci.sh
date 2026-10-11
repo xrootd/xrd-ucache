@@ -1017,7 +1017,8 @@ n=0; for p in $AX $BX $CX; do echo "$RES" | grep '^MSG read' | grep -q "(127.0.0
 verdict "lost trust: no read got the client's answer for a File that never opened (Invalid operation): none was given to it" $?
 
 echo; echo "=== the same with the switch off (the default)"
-# The same fault with adaptive_federation off: each read gets the handle's own open's error, the server's refusal,
+# The same fault with adaptive_federation off: each request (a Read, a VectorRead, a Stat, an Fcntl, a Visa, then a
+# PgRead) gets the handle's own open's error, the server's refusal,
 # which is what the reader's open would have got without the cache; no copy is named and no other is tried. Then
 # the test makes the copies readable again (UCACHE_RESTORE_CMD), and after the open's cool-down (a second) a Read
 # and a PgRead are exact: the open is made again and stands.
@@ -1044,10 +1045,10 @@ RES=$(fuzz "$DO" "$W/degraded-off.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 r
 echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-600
 recs "$DO" open | tail -n +$((N0 + 1)) | sed 's/^/    rec: /' | cut -c1-230
 echo "$RES" | grep -q '^read-failover degradedoff: clean$'
-verdict "lost trust, switch off: a Read and a PgRead each fail once with the open's own error (the server's refusal), and once the copies are readable again a Read and a PgRead are exact" $?
+verdict "lost trust, switch off: a Read, a VectorRead, a Stat, an Fcntl, a Visa and a PgRead each fail once with the open's own error (the server's refusal), and once the copies are readable again a Read and a PgRead are exact" $?
 NPD=$(echo "$RES" | grep '^MSG ' | grep -c 'permission denied')
-[ "$NPD" = 2 ] && ! echo "$RES" | grep '^MSG ' | grep -q 'no copy could serve'
-verdict "lost trust, switch off: both errors are the server's refusal, permission denied ($NPD of 2), naming no copies" $?
+[ "$NPD" = 6 ] && ! echo "$RES" | grep '^MSG ' | grep -q 'no copy could serve'
+verdict "lost trust, switch off: the errors of the Read, VectorRead, Stat, Fcntl, Visa and PgRead are the server's refusal, permission denied ($NPD of 6), naming no copies" $?
 # A read given to the File that never opened gets the client's own answer, "Invalid operation" (it sends nothing,
 # so the client's log cannot show it), and a PgRead there brings the test client down: the line it prints after
 # the PgRead, and its last line, are the client still running.

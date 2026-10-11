@@ -1587,10 +1587,11 @@ int runZero(const char* url, const char* local, const std::string& which) {
 //            once (at the call or through the handler), with the open's error, which names the
 //            copies ("no copy could serve the read"); never the client's error for a File that
 //            never opened, and the PgRead is never sent on that File (the client crashes there)
-//   degradedoff the same with adaptive_federation off: the Read and the PgRead each fail, once,
-//            with the open's own error, the one the reader's open would have got without the
-//            cache (here a refusal to authorize, kXR_NotAuthorized), naming no copies; never the
-//            client's error for a File that never opened. Then UCACHE_RESTORE_CMD, when set, makes
+//   degradedoff the same with adaptive_federation off: a Read, a VectorRead, a Stat, an Fcntl, a
+//            Visa and a PgRead (last) each fail, once, with the open's own error, the one the
+//            reader's open would have got without the cache (here a refusal to authorize,
+//            kXR_NotAuthorized), naming no copies; never the client's error for a File that never
+//            opened. Then UCACHE_RESTORE_CMD, when set, makes
 //            the copies readable again, and after the open's cool-down (a second) a Read and a
 //            PgRead at the same place are exact: the handle's own open is made again and stands
 //   end      nothing is cut. A Read and a PgRead that reach past the end of the file are answered
@@ -1672,13 +1673,43 @@ int runCut(const char* url, const char* local, const std::string& which) {
     verdict(now == y, "after the third Read the handle still reads from " + now +
                           " (X, whose read answered short, is not taken again though whole)");
     std::printf("LEFTDATA %s %s %s\n", landed.c_str(), y.c_str(), now.c_str());
-  } else if (which == "degraded" || which == "degradedoff") { // each read gets the open's error
+  } else if (which == "degraded" || which == "degradedoff") { // each request gets the open's error
     const bool on = which == "degraded";
-    for (const bool pg : {false, true}) {
+    // r Read, v VectorRead, s Stat, f Fcntl, z Visa, p PgRead (last: on a File that never opened it
+    // crashes the client)
+    const std::string kinds = on ? "rp" : "rvsfzp";
+    for (const char k : kinds) {
+      const char* name = k == 'r'   ? "read"
+                         : k == 'v' ? "vectorread"
+                         : k == 's' ? "stat"
+                         : k == 'f' ? "fcntl"
+                         : k == 'z' ? "visa"
+                                    : "pgread";
       auto* w = new ReadWait(); // leaked with its buffer: a late completion lands safely
       auto* b = new std::vector<char>(65536, 0x5A);
-      const XrdCl::XRootDStatus s =
-          pg ? file->PgRead(40000, 65536, b->data(), w) : file->Read(40000, 65536, b->data(), w);
+      XrdCl::XRootDStatus s;
+      switch (k) {
+      case 'r':
+        s = file->Read(40000, 65536, b->data(), w);
+        break;
+      case 'v':
+        s = file->VectorRead(XrdCl::ChunkList{XrdCl::ChunkInfo(40000, 4096, b->data()),
+                                              XrdCl::ChunkInfo(50000, 4096, b->data() + 4096)},
+                             nullptr, w);
+        break;
+      case 's':
+        s = file->Stat(false, w);
+        break;
+      case 'f':
+        s = file->Fcntl(XrdCl::Buffer(), w);
+        break;
+      case 'z':
+        s = file->Visa(w);
+        break;
+      default:
+        s = file->PgRead(40000, 65536, b->data(), w);
+        break;
+      }
       XrdCl::XRootDStatus got = s;
       bool once = true;
       if (s.IsOK()) {
@@ -1690,11 +1721,17 @@ int runCut(const char* url, const char* local, const std::string& which) {
         once = answered;
       }
       const std::string msg = got.GetErrorMessage();
-      std::printf("MSG %s %s\n", pg ? "pgread" : "read", msg.c_str());
+      std::printf("MSG %s %s\n", name, msg.c_str());
+      const char* what = k == 'r'   ? "a Read"
+                         : k == 'v' ? "a VectorRead"
+                         : k == 's' ? "a Stat"
+                         : k == 'f' ? "an Fcntl"
+                         : k == 'z' ? "a Visa"
+                                    : "a PgRead";
       if (on)
         verdict(!got.IsOK() && got.code != XrdCl::errInvalidOp &&
                     msg.find("no copy could serve the read") != std::string::npos,
-                std::string(pg ? "a PgRead" : "a Read") +
+                std::string(what) +
                     " fails with the open's error, which names "
                     "the copies (" +
                     got.ToStr() + (s.IsOK() ? ", through the handler" : ", at the call") + ")");
@@ -1702,11 +1739,11 @@ int runCut(const char* url, const char* local, const std::string& which) {
         verdict(!got.IsOK() && got.code == XrdCl::errErrorResponse &&
                     got.errNo == 3010 && // kXR_NotAuthorized
                     msg.find("no copy could serve the read") == std::string::npos,
-                std::string(pg ? "a PgRead" : "a Read") +
-                    " fails with the open's own error, the server's refusal (" + got.ToStr() +
+                std::string(what) + " fails with the open's own error, the server's refusal (" +
+                    got.ToStr() +
                     (s.IsOK() ? ", through the handler" : ", at the call") + ")");
       verdict(once && (!s.IsOK() || w->contractKept()),
-              std::string(pg ? "the PgRead" : "the Read") + " is answered once");
+              std::string("it is answered once (") + what + ")");
     }
     if (!on)
       if (const char* cmd = ::getenv("UCACHE_RESTORE_CMD")) {
