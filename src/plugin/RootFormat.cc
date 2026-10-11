@@ -5,6 +5,7 @@
 namespace ucache {
 
 namespace {
+constexpr int64_t kPidOffsetMask = 0xffffffffffffLL; // TKey: the offset lives in the top 16 bits
 // The bytes of a record, read in order; every read is checked against the end.
 struct Cursor {
   const unsigned char* b;
@@ -26,8 +27,9 @@ struct Cursor {
   int32_t i32() { return static_cast<int32_t>(static_cast<uint32_t>(take(4))); }
   uint32_t u32() { return static_cast<uint32_t>(take(4)); }
   int64_t i64() { return static_cast<int64_t>(take(8)); }
-  // One of ROOT's names: a length byte, or 255 and a 32-bit length; then the characters.
-  void name() {
+  // One of ROOT's names: a length byte, or 255 and a 32-bit length; then the characters (`from`,
+  // `len`: where they lie).
+  void name(size_t* from = nullptr, size_t* chars = nullptr) {
     uint64_t len = take(1);
     if (len == 255) {
       const int32_t l = i32();
@@ -39,10 +41,29 @@ struct Cursor {
       ok = false;
       return;
     }
+    if (from)
+      *from = at;
+    if (chars)
+      *chars = static_cast<size_t>(len);
     at += static_cast<size_t>(len);
   }
+  // A label's fields up to its directory's position (TKey::ReadKeyBuffer).
+  void keyFields(RootKeyLabel& r) {
+    r.nbytes = i32();
+    r.version = i16();
+    r.objlen = i32();
+    r.datime = u32();
+    r.keylen = i16();
+    r.cycle = i16();
+    if (r.version > 1000) {
+      r.seekKey = i64();
+      r.seekPdir = i64() & kPidOffsetMask;
+    } else {
+      r.seekKey = u32();
+      r.seekPdir = u32();
+    }
+  }
 };
-constexpr int64_t kPidOffsetMask = 0xffffffffffffLL; // TKey: the offset lives in the top 16 bits
 } // namespace
 
 size_t rootHeaderFieldsEnd(int32_t version) {
@@ -104,26 +125,26 @@ bool parseRootKeyLabel(const unsigned char* b, size_t n, size_t& at, RootKeyLabe
     return false;
   Cursor c{b, n, at};
   RootKeyLabel r;
-  r.nbytes = c.i32();
-  r.version = c.i16();
-  r.objlen = c.i32();
-  r.datime = c.u32();
-  r.keylen = c.i16();
-  r.cycle = c.i16();
-  if (r.version > 1000) {
-    r.seekKey = c.i64();
-    r.seekPdir = c.i64() & kPidOffsetMask;
-  } else {
-    r.seekKey = c.u32();
-    r.seekPdir = c.u32();
-  }
-  c.name(); // class
-  c.name(); // name
+  c.keyFields(r);
+  c.name(&r.classAt, &r.classLen);
+  c.name(&r.nameAt, &r.nameLen);
   c.name(); // title
   if (!c.ok)
     return false;
   k = r;
   at = c.at;
+  return true;
+}
+
+bool parseRootKeyFields(const unsigned char* b, size_t n, RootKeyLabel& k) {
+  if (!b)
+    return false;
+  Cursor c{b, n, 0};
+  RootKeyLabel r;
+  c.keyFields(r);
+  if (!c.ok)
+    return false;
+  k = r;
   return true;
 }
 

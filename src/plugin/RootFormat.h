@@ -67,10 +67,18 @@ struct RootKeyLabel {
   int16_t cycle = 0;
   int64_t seekKey = 0;  // where the record says it begins
   int64_t seekPdir = 0; // where the record of its directory begins
+  // Where its class and its name lie in the bytes it was parsed from (parseRootKeyLabel only).
+  size_t classAt = 0, classLen = 0, nameAt = 0, nameLen = 0;
 };
+// The bytes of a label's fields up to its directory's position: 26, or 34 with 64-bit positions.
+inline constexpr size_t kRootKeyFieldsBytes = 34;
 // The label at `at` in the `n` bytes of `b`, with its three names (class, name, title: each a
 // length byte, 255 then a 32-bit length for a long one, and the characters): on success `at` is
 // moved past it. False, `at` unchanged, when it does not fit in the bytes.
 bool parseRootKeyLabel(const unsigned char* b, size_t n, size_t& at, RootKeyLabel& k);
+// The label's fields alone, its names left out, at the start of the `n` bytes of `b`, read as
+// TKey::ReadKeyBuffer reads them: false when they end before the directory's position does (26
+// bytes, or 34 with 64-bit positions).
+bool parseRootKeyFields(const unsigned char* b, size_t n, RootKeyLabel& k);
 
 } // namespace ucache

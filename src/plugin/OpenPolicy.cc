@@ -425,6 +425,12 @@ void judgeDirRecord(RootHeaderVerdict& v, const RootDirRecord& d) {
   v.nextAt = d.seekKeys;
   v.nextLen = static_cast<uint32_t>(d.nbytesKeys);
 }
+// Whether an object of class `cls` is one the reader's ROOT reads right after its open: a tree or
+// an RNTuple (its anchor).
+bool firstRead(const std::string& cls) {
+  return cls == "TTree" || cls == "TNtuple" || cls == "TNtupleD" || cls == "ROOT::RNTuple" ||
+         cls == "ROOT::Experimental::RNTuple";
+}
 // The list of top-level objects, read whole (TDirectoryFile::ReadKeys): its own label (its
 // position and its directory), the count, and each object's label. The label's length is not
 // compared with the directory's record: ROOT reads the record's length of bytes and never the
@@ -452,6 +458,11 @@ void judgeKeysList(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
   if (count < 0)
     return refuse(v, list + " gives a count of " + num(count) + " objects");
   const int64_t to = listBound(v);
+  // The labels to read next (F7): the class descriptions', then the trees' and RNTuples', then the
+  // other objects', at most kRootLabelsMax in all, each list kept within that while the list is
+  // read so that a list of very many objects costs no more memory.
+  std::vector<RootHeaderVerdict::Label> trees, others;
+  uint32_t listed = 0;
   for (int32_t i = 0; i < count; ++i) {
     RootKeyLabel k;
     if (!parseRootKeyLabel(b, n, at, k))
@@ -471,8 +482,44 @@ void judgeKeysList(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
       return refuse(v, "its list of top-level objects names an object at " + num(k.seekKey) +
                            " in the directory at " + num(k.seekPdir) + ", below the " +
                            num(kRootKeyMinPos) + " ROOT reads a list from");
+    ++listed;
+    const std::string cls(reinterpret_cast<const char*>(b + k.classAt),
+                          std::min<size_t>(k.classLen, 64));
+    const bool tree = firstRead(cls);
+    std::vector<RootHeaderVerdict::Label>& into = tree ? trees : others;
+    if (into.size() < kRootLabelsMax)
+      into.push_back(RootHeaderVerdict::Label{
+          k.seekKey, static_cast<uint32_t>(std::min<int64_t>(k.nbytes, kRootKeyFieldsBytes)), tree,
+          cls.substr(0, 24) + " " +
+              std::string(reinterpret_cast<const char*>(b + k.nameAt), std::min<size_t>(k.nameLen, 16))});
   }
-  v.next = RootHeaderVerdict::kNone;
+  v.labels.clear();
+  if (own.nbytes < 0) { // a writer stopped inside a save (see above): no claim on the records
+    // The list carries ROOT's mark of a freed record (TFile::MakeFree): the writer had freed it to
+    // write a new one (TDirectoryFile::WriteKeys) and stopped before the directory's record placed
+    // that. Records it names may have been deleted and their space reused since, and the class
+    // descriptions freed with it (TFile::WriteStreamerInfo comes first in a save); ROOT reads such
+    // a file with no error, so their labels make no claim.
+    v.labelsNotRead = listed;
+    v.next = RootHeaderVerdict::kNone;
+    return;
+  }
+  if (h.seekInfo > h.begin && h.nbytesInfo > 0) // where ROOT reads them (TFile::Init), F5 above
+    v.labels.push_back(RootHeaderVerdict::Label{
+        h.seekInfo, static_cast<uint32_t>(std::min<int64_t>(h.nbytesInfo, kRootKeyFieldsBytes)),
+        true, "class descriptions"});
+  for (auto* from : {&trees, &others})
+    for (auto& l : *from)
+      if (v.labels.size() < kRootLabelsMax)
+        v.labels.push_back(std::move(l));
+  const uint32_t objectLabels =
+      static_cast<uint32_t>(v.labels.size()) - (h.seekInfo > h.begin && h.nbytesInfo > 0 ? 1 : 0);
+  v.labelsNotRead = listed - objectLabels;
+  v.next = v.labels.empty() ? RootHeaderVerdict::kNone : RootHeaderVerdict::kLabels;
+  v.nextAt = 0;
+  v.nextLen = 0;
+  for (const auto& l : v.labels)
+    v.nextLen += l.len;
 }
 } // namespace
 
@@ -548,7 +595,8 @@ RootHeaderVerdict rootHeaderVerdict(const unsigned char* b, size_t n, long long 
 }
 
 void rootCheckRead(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
-  if (v.next == RootHeaderVerdict::kNone || v.kind == RootHeaderVerdict::kBad)
+  if (v.next == RootHeaderVerdict::kNone || v.next == RootHeaderVerdict::kLabels ||
+      v.kind == RootHeaderVerdict::kBad)
     return;
   if (!b || n < v.nextLen)
     return refuse(v, "a read of " + num(v.nextLen) + " bytes at " + num(v.nextAt) + " answered " +
@@ -560,6 +608,39 @@ void rootCheckRead(RootHeaderVerdict& v, const unsigned char* b, size_t n) {
     return judgeDirRecord(v, d);
   }
   judgeKeysList(v, b, v.nextLen);
+}
+
+bool viewsHold(const std::vector<ByteView>& views, uint64_t off, uint64_t len) {
+  for (const auto& w : views)
+    if (w.b && off >= w.off && off - w.off <= w.n && len <= w.n - (off - w.off))
+      return true;
+  return false;
+}
+
+void rootCheckLabels(RootHeaderVerdict& v, const std::vector<ByteView>& views) {
+  if (v.next != RootHeaderVerdict::kLabels || v.kind == RootHeaderVerdict::kBad)
+    return;
+  for (const auto& l : v.labels) {
+    const uint64_t at = static_cast<uint64_t>(l.at);
+    const ByteView* w = nullptr;
+    for (const auto& x : views)
+      if (x.b && at >= x.off && at - x.off <= x.n && l.len <= x.n - (at - x.off)) {
+        w = &x;
+        break;
+      }
+    if (!w)
+      return refuse(v, "a read of " + num(l.len) + " bytes at " + num(l.at) + " answered short");
+    RootKeyLabel k;
+    if (!parseRootKeyFields(w->b + (at - w->off), l.len, k))
+      continue; // its fields do not fit in the record: no claim
+    if (k.seekKey != l.at)
+      return refuse(v, "the label at " + num(l.at) + " (" + l.what + ") states position " +
+                           num(k.seekKey));
+    if (!topDirectory(v, k.seekPdir))
+      return refuse(v, "the label at " + num(l.at) + " (" + l.what + ") states directory " +
+                           num(k.seekPdir) + ", not the top one at " + num(v.header.begin));
+  }
+  v.next = RootHeaderVerdict::kNone;
 }
 
 int headerReadTimeoutS(int attemptLimitS, int64_t elapsedMs, int64_t openLeftMs) {
@@ -591,6 +672,39 @@ ByteSpan checkReadSpan(bool keep, uint32_t pageSize, uint64_t size, uint64_t at,
   if (r.first > at || r.second < at + len || r.second - r.first > room)
     return asked;
   return ByteSpan{r.first, r.second - r.first, true};
+}
+
+std::vector<ByteSpan> rootLabelSpans(const RootHeaderVerdict& v, const std::vector<ByteView>& kept,
+                                     bool keep, uint32_t pageSize, uint64_t room) {
+  std::vector<ByteSpan> spans;
+  if (v.next != RootHeaderVerdict::kLabels || v.kind == RootHeaderVerdict::kBad)
+    return spans;
+  const uint64_t size = v.size > 0 ? static_cast<uint64_t>(v.size) : 0;
+  for (const auto& l : v.labels) {
+    const uint64_t at = static_cast<uint64_t>(l.at);
+    if (viewsHold(kept, at, l.len))
+      continue;
+    const ByteSpan sp = checkReadSpan(keep && l.first, pageSize, size, at, l.len, room);
+    if (sp.kept)
+      room -= sp.len;
+    spans.push_back(sp);
+  }
+  std::sort(spans.begin(), spans.end(),
+            [](const ByteSpan& a, const ByteSpan& b) { return a.off < b.off; });
+  std::vector<ByteSpan> out;
+  for (const auto& sp : spans) {
+    if (!out.empty()) {
+      ByteSpan& p = out.back();
+      if (sp.off >= p.off && sp.off + sp.len <= p.off + p.len)
+        continue; // held whole in the one before
+      if (p.kept && sp.kept && sp.off <= p.off + p.len) {
+        p.len = sp.off + sp.len - p.off;
+        continue;
+      }
+    }
+    out.push_back(sp);
+  }
+  return out;
 }
 
 std::string ageText(uint64_t s) {

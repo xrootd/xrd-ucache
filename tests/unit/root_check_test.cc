@@ -57,9 +57,28 @@ RootHeaderVerdict check(const Image& img, std::vector<std::string>* reads = null
     reads->push_back("0+" + std::to_string(rootHeaderBytes(img.size)));
   RootHeaderVerdict v = rootHeaderVerdict(b.data(), b.size(), img.size);
   for (int i = 1; v.next != RootHeaderVerdict::kNone; ++i) {
-    EXPECT_LT(i, 4) << "the checks make at most three reads";
-    if (i >= 4)
+    EXPECT_LT(i, 5) << "the checks make at most four reads";
+    if (i >= 5)
       break;
+    if (v.next == RootHeaderVerdict::kLabels) { // one vector read, nothing kept
+      const std::vector<ByteSpan> spans = rootLabelSpans(v, {}, false, 0, 0);
+      std::vector<std::vector<unsigned char>> got;
+      std::string r = "labels:";
+      for (size_t k = 0; k < spans.size(); ++k) {
+        EXPECT_LE(spans[k].off + spans[k].len, static_cast<uint64_t>(img.size))
+            << "a read inside the copy";
+        got.push_back(img.read(static_cast<int64_t>(spans[k].off), spans[k].len,
+                               shortAt == i && k + 1 == spans.size() ? 1 : 0));
+        r += (k ? "," : "") + std::to_string(spans[k].off) + "+" + std::to_string(spans[k].len);
+      }
+      if (reads)
+        reads->push_back(r);
+      std::vector<ByteView> views;
+      for (size_t k = 0; k < spans.size(); ++k)
+        views.push_back(ByteView{spans[k].off, got[k].data(), got[k].size()});
+      rootCheckLabels(v, views);
+      continue;
+    }
     EXPECT_GE(v.nextAt, 0);
     EXPECT_LE(v.nextAt + static_cast<long long>(v.nextLen), img.size) << "a read inside the copy";
     if (reads)
@@ -155,7 +174,8 @@ struct Synth {
     pos += nbytesInfo;
     listed.clear();
     for (int i = 0; i < objects; ++i) {
-      Label l{1000 + 37 * i, kv, pos, begin, "TH1F", "h" + std::to_string(i), "a histogram"};
+      Label l{1000 + 37 * i, kv, pos, begin, get("treeAt", -1) == i ? "TTree" : "TH1F",
+              "h" + std::to_string(i), "a histogram"};
       img.put(pos, label(l));
       listed.push_back(l);
       pos += l.nbytes;
@@ -324,8 +344,15 @@ TEST(RootCheck, WholeFilesStand) {
     RootHeaderVerdict v = check(img, &reads);
     EXPECT_EQ(v.kind, K::kConfirmed) << v.why;
     EXPECT_EQ(v.next, RootHeaderVerdict::kNone);
-    ASSERT_EQ(reads.size(), 2u) << "the first bytes, then the list of top-level objects";
+    ASSERT_EQ(reads.size(), 3u) << "the first bytes, the list of top-level objects, its objects' labels";
     EXPECT_EQ(reads[1], std::to_string(s.seekKeys) + "+" + std::to_string(s.nbytesKeys));
+    // The labels: the class descriptions' and each object's, its fields alone, in one read.
+    std::string want = "labels:" + std::to_string(s.seekInfo) + "+" + "34";
+    for (const auto& l : s.listed)
+      want += "," + std::to_string(l.seekKey) + "+34";
+    EXPECT_EQ(reads[2], want);
+    EXPECT_EQ(v.labels.size(), 1u + s.listed.size());
+    EXPECT_EQ(v.labelsNotRead, 0u);
     EXPECT_EQ(v.dir.seekKeys, s.seekKeys);
     img.size = s.end + 4096; // bytes past the end (appended, or a file updated in place)
     EXPECT_EQ(check(img).kind, K::kNoClaim) << wide;
@@ -369,7 +396,7 @@ TEST(RootCheck, VersionsReadAsRootReadsThem) {
     EXPECT_FALSE(v.header.wide());
     EXPECT_EQ(v.end, s.end);
     EXPECT_EQ(v.header.end, s.end);
-    ASSERT_EQ(reads.size(), 2u) << "the first bytes, then the list of top-level objects";
+    ASSERT_EQ(reads.size(), 3u) << "the first bytes, the list of top-level objects, its objects' labels";
     EXPECT_EQ(reads[1], std::to_string(s.seekKeys) + "+" + std::to_string(s.nbytesKeys));
     img.size = s.end + 4096;
     EXPECT_EQ(check(img).kind, K::kNoClaim);
@@ -388,7 +415,7 @@ TEST(RootCheck, VersionsReadAsRootReadsThem) {
     std::vector<std::string> reads;
     const RootHeaderVerdict v = check(img, &reads);
     EXPECT_EQ(v.kind, K::kConfirmed) << v.why;
-    ASSERT_EQ(reads.size(), 3u);
+    ASSERT_EQ(reads.size(), 4u);
     EXPECT_EQ(reads[1], "500+48") << "TDirectoryFile::Sizeof for a version below 40000";
   }
   // The header's version, 64-bit positions: ROOT reads the fields as 32-bit ones, and the end it
@@ -415,7 +442,7 @@ TEST(RootCheck, VersionsReadAsRootReadsThem) {
     const RootHeaderVerdict v = check(img, &reads);
     EXPECT_EQ(v.kind, K::kConfirmed) << v.why;
     EXPECT_LT(v.dir.version, 0);
-    EXPECT_EQ(reads.size(), 2u);
+    EXPECT_EQ(reads.size(), 3u);
   }
   // 1005 with the top bit: ROOT reads 32-bit positions from the record, finds the list's position 0
   // (the top half of the parent's 64-bit position) and takes the file as never completed: no claim,
@@ -661,7 +688,7 @@ TEST(RootCheck, DirectoryRecord) {
     std::vector<std::string> reads;
     v = check(l.build(), &reads);
     EXPECT_EQ(v.kind, K::kConfirmed) << v.why;
-    ASSERT_EQ(reads.size(), 3u);
+    ASSERT_EQ(reads.size(), 4u);
     EXPECT_EQ(reads[1], "1000+60") << "the record's 60 bytes at begin + nbytesName";
     // That read answered short: the copy is refused.
     v = check(l.build(), nullptr, 1);
@@ -673,11 +700,11 @@ TEST(RootCheck, DirectoryRecord) {
   edge.nameLen = 140;
   std::vector<std::string> reads;
   EXPECT_EQ(check(edge.build(), &reads).kind, K::kConfirmed);
-  EXPECT_EQ(reads.size(), 2u);
+  EXPECT_EQ(reads.size(), 3u);
   edge.nameLen = 141;
   reads.clear();
   EXPECT_EQ(check(edge.build(), &reads).kind, K::kConfirmed);
-  EXPECT_EQ(reads.size(), 3u) << "ending at 301: read";
+  EXPECT_EQ(reads.size(), 4u) << "ending at 301: read";
   // A copy shorter than 300 bytes whose record lies inside it.
   Synth tiny;
   tiny.objects = 0;
@@ -774,7 +801,7 @@ TEST(RootCheck, SavedWithoutTheHeader) {
     const RootHeaderVerdict v = check(s.build(), &reads);
     EXPECT_EQ(v.kind, K::kNoClaim) << v.why;
     EXPECT_EQ(v.end, stale);
-    ASSERT_EQ(reads.size(), 2u) << "the list is read and judged";
+    ASSERT_EQ(reads.size(), 3u) << "the list is read and judged, then the labels";
     EXPECT_EQ(reads[1], std::to_string(s.seekKeys) + "+" + std::to_string(s.nbytesKeys));
     EXPECT_GT(s.seekKeys, stale) << "the list lies past the header's end";
     EXPECT_GE(s.listed[0].seekKey, stale) << "and so do the objects, from that end on";
@@ -812,13 +839,18 @@ TEST(RootCheck, SavedWithoutTheHeader) {
     Synth s; // an object listed between the header's end and the size: as ROOT, read
     saved(s);
     s.set["entrySeek"] = full - 1037;
-    EXPECT_EQ(check(s.build()).kind, K::kNoClaim);
+    Image img = s.build();
+    EXPECT_EQ(check(img).kind, K::kBad) << "no record there: its label is not h1's";
+    img.put(full - 1037, label({1037, 4, full - 1037, 100, "TH1F", "h1", "a histogram"}));
+    EXPECT_EQ(check(img).kind, K::kNoClaim) << "its record there";
   }
   {
     Synth s; // the class descriptions past the header's end, inside the size: as ROOT, read
     saved(s);
     s.set["seekInfo"] = stale + 100;
-    const RootHeaderVerdict v = check(s.build());
+    Image img = s.build();
+    img.put(stale + 100, label({400, 4, stale + 100, 100, "TList", "StreamerInfo", "list"}));
+    const RootHeaderVerdict v = check(img);
     EXPECT_EQ(v.kind, K::kNoClaim) << v.why;
   }
   {
@@ -859,7 +891,7 @@ TEST(RootCheck, SavedWithoutTheHeader) {
     const RootHeaderVerdict v = check(img, &reads);
     EXPECT_EQ(v.kind, K::kNoClaim) << v.why;
     EXPECT_EQ(v.dir.version, 1005);
-    ASSERT_EQ(reads.size(), 2u);
+    ASSERT_EQ(reads.size(), 3u);
     EXPECT_EQ(reads[1], std::to_string(w.seekKeys) + "+" + std::to_string(w.nbytesKeys));
     w.set["entrySeek"] = wfull + 5;
     EXPECT_EQ(check(w.build()).kind, K::kBad) << "an object past the size";
@@ -1005,6 +1037,24 @@ TEST(RootCheck, TextsFitTheError) {
     longest = std::max(longest, v.why.size());
   }
   EXPECT_GT(longest, 130u) << "the rows reached the long texts";
+  // The labels' texts, with 10-digit positions, the longest class and names cut as they are.
+  for (int kind = 0; kind < 3; ++kind) {
+    RootHeaderVerdict v;
+    v.size = 9999999999LL;
+    v.header.begin = 9999999998LL;
+    v.next = RootHeaderVerdict::kLabels;
+    v.labels = {{9999999990LL, 34, true,
+                 std::string("ROOT::Experimental::RNTuple").substr(0, 24) + " " +
+                     std::string(16, 'n')}};
+    Label l{100, 1004, kind == 0 ? 9999999991LL : 9999999990LL,
+            kind == 1 ? 9999999992LL : 9999999998LL};
+    std::vector<unsigned char> b = label(l);
+    if (kind == 2)
+      b.resize(10);
+    rootCheckLabels(v, {ByteView{9999999990ULL, b.data(), b.size()}});
+    EXPECT_EQ(v.kind, K::kBad) << kind;
+    EXPECT_LE(v.why.size(), 150u) << v.why;
+  }
 }
 
 // rootCheckRead on a verdict that asks for nothing, or with no bytes: no change, or a short answer.
@@ -1064,7 +1114,28 @@ namespace {
 // their end) that reports `size`, and holds every rule of the contract: at most three reads, each
 // inside the copy and within the bound; a final verdict; a refusal says why. What the mutants came
 // to: [reads made][kind].
-uint64_t gOutcomes[4][3] = {};
+uint64_t gOutcomes[5][3] = {};
+// The labels' read (kLabels) over the dense bytes of a copy of `size` bytes (a read past them comes
+// back short), judged; `spansOut`: the spans read.
+void labelsFrom(RootHeaderVerdict& v, const std::vector<unsigned char>& file, long long size,
+                std::vector<ByteSpan>* spansOut = nullptr) {
+  const std::vector<ByteSpan> spans = rootLabelSpans(v, {}, false, 0, 0);
+  std::vector<std::vector<unsigned char>> got;
+  for (const auto& sp : spans) {
+    std::vector<unsigned char> out;
+    for (uint64_t i = 0; i < sp.len && sp.off + i < file.size() &&
+                         static_cast<long long>(sp.off + i) < size;
+         ++i)
+      out.push_back(file[sp.off + i]);
+    got.push_back(std::move(out));
+  }
+  std::vector<ByteView> views;
+  for (size_t k = 0; k < spans.size(); ++k)
+    views.push_back(ByteView{spans[k].off, got[k].data(), got[k].size()});
+  rootCheckLabels(v, views);
+  if (spansOut)
+    *spansOut = spans;
+}
 void hostile(const std::vector<unsigned char>& file, long long size, const char* what,
              uint64_t iter) {
   const auto readAt = [&](long long at, size_t len) {
@@ -1080,7 +1151,19 @@ void hostile(const std::vector<unsigned char>& file, long long size, const char*
   RootHeaderVerdict v = rootHeaderVerdict(b.data(), b.size(), size);
   int reads = 1;
   while (v.next != RootHeaderVerdict::kNone) {
-    ASSERT_LT(reads, 3) << what << " " << iter;
+    ASSERT_LT(reads, 4) << what << " " << iter;
+    if (v.next == RootHeaderVerdict::kLabels) {
+      ASSERT_LE(v.labels.size(), kRootLabelsMax) << what << " " << iter;
+      std::vector<ByteSpan> spans;
+      labelsFrom(v, file, size, &spans);
+      for (const auto& sp : spans) {
+        ASSERT_LE(sp.off + sp.len, static_cast<uint64_t>(size)) << what << " " << iter;
+        ASSERT_LE(sp.len, kRootKeyFieldsBytes) << what << " " << iter;
+        ASSERT_GT(sp.len, 0u) << what << " " << iter;
+      }
+      ++reads;
+      continue;
+    }
     ASSERT_GE(v.nextAt, 0) << what << " " << iter;
     ASSERT_LE(v.nextAt + static_cast<long long>(v.nextLen), size) << what << " " << iter;
     ASSERT_LE(v.nextLen, kRootKeysListMaxBytes) << what << " " << iter;
@@ -1089,7 +1172,7 @@ void hostile(const std::vector<unsigned char>& file, long long size, const char*
     rootCheckRead(v, b.data(), b.size());
     ++reads;
   }
-  ++gOutcomes[std::min(reads, 3)][v.kind];
+  ++gOutcomes[std::min(reads, 4)][v.kind];
   ASSERT_TRUE(v.kind == K::kBad || v.kind == K::kConfirmed || v.kind == K::kNoClaim);
   ASSERT_EQ(v.kind == K::kBad, !v.why.empty()) << what << " " << iter;
   if (v.kind == K::kConfirmed) {
@@ -1135,6 +1218,11 @@ TEST(RootCheck, HostileBytes) {
                                                               static_cast<long long>(b.size()))));
       v = rootHeaderVerdict(h.data(), h.size(), static_cast<long long>(b.size()));
       while (v.next != RootHeaderVerdict::kNone) {
+        if (v.next == RootHeaderVerdict::kLabels) {
+          EXPECT_FALSE(v.labels.empty()) << f;
+          labelsFrom(v, b, static_cast<long long>(b.size()));
+          continue;
+        }
         std::vector<unsigned char> x(b.begin() + v.nextAt, b.begin() + v.nextAt + v.nextLen);
         rootCheckRead(v, x.data(), x.size());
       }
@@ -1157,6 +1245,12 @@ TEST(RootCheck, HostileBytes) {
       RootHeaderVerdict v =
           rootHeaderVerdict(h.data(), h.size(), static_cast<long long>(file.size()));
       while (v.next != RootHeaderVerdict::kNone) {
+        if (v.next == RootHeaderVerdict::kLabels) { // the labels: mutations land there too
+          for (const auto& l : v.labels)
+            parts.push_back({static_cast<size_t>(l.at), l.len});
+          labelsFrom(v, file, static_cast<long long>(file.size()));
+          continue;
+        }
         parts.push_back({static_cast<size_t>(v.nextAt), v.nextLen});
         std::vector<unsigned char> x(file.begin() + v.nextAt, file.begin() + v.nextAt + v.nextLen);
         rootCheckRead(v, x.data(), x.size());
@@ -1217,12 +1311,306 @@ TEST(RootCheck, HostileBytes) {
     }
   }
   // How far the mutants got, so that a run shows the deeper rules were reached.
-  std::printf("mutants by reads made (1, 2, 3) and kind (no claim, confirmed, bad):");
-  for (int r = 1; r <= 3; ++r)
+  std::printf("mutants by reads made (1, 2, 3, 4) and kind (no claim, confirmed, bad):");
+  for (int r = 1; r <= 4; ++r)
     std::printf(" [%d: %llu %llu %llu]", r, static_cast<unsigned long long>(gOutcomes[r][0]),
                 static_cast<unsigned long long>(gOutcomes[r][1]),
                 static_cast<unsigned long long>(gOutcomes[r][2]));
   std::printf("\n");
   EXPECT_GT(gOutcomes[2][2] + gOutcomes[3][2], 0u)
       << "some mutants refused by the list's own rules";
+  EXPECT_GT(gOutcomes[3][2] + gOutcomes[4][2], 0u) << "some refused by the labels' rules";
 }
+
+namespace {
+// The verdict over the dense bytes of a whole copy, every read made from them.
+RootHeaderVerdict checkDense(const std::vector<unsigned char>& b, long long size = -1) {
+  if (size < 0)
+    size = static_cast<long long>(b.size());
+  std::vector<unsigned char> h(b.begin(),
+                               b.begin() + static_cast<long>(std::min<size_t>(
+                                               rootHeaderBytes(size), b.size())));
+  RootHeaderVerdict v = rootHeaderVerdict(h.data(), h.size(), size);
+  for (int i = 0; v.next != RootHeaderVerdict::kNone && i < 4; ++i) {
+    if (v.next == RootHeaderVerdict::kLabels) {
+      labelsFrom(v, b, size);
+      continue;
+    }
+    std::vector<unsigned char> x(b.begin() + v.nextAt, b.begin() + v.nextAt + v.nextLen);
+    rootCheckRead(v, x.data(), x.size());
+  }
+  return v;
+}
+#ifdef UCACHE_TEST_DATA_DIR
+std::vector<unsigned char> fixture(const char* f) {
+  std::vector<unsigned char> b;
+  FILE* fp = std::fopen((std::string(UCACHE_TEST_DATA_DIR) + "/" + f).c_str(), "rb");
+  if (!fp)
+    return b;
+  unsigned char buf[65536];
+  size_t r;
+  while ((r = std::fread(buf, 1, sizeof buf, fp)) > 0)
+    b.insert(b.end(), buf, buf + r);
+  std::fclose(fp);
+  return b;
+}
+// The objects a whole copy's list names (the list's own parse, as the checks make it).
+std::vector<RootHeaderVerdict::Label> labelsOf(const std::vector<unsigned char>& b) {
+  const long long size = static_cast<long long>(b.size());
+  std::vector<unsigned char> h(b.begin(), b.begin() + static_cast<long>(rootHeaderBytes(size)));
+  RootHeaderVerdict v = rootHeaderVerdict(h.data(), h.size(), size);
+  while (v.next != RootHeaderVerdict::kNone && v.next != RootHeaderVerdict::kLabels) {
+    std::vector<unsigned char> x(b.begin() + v.nextAt, b.begin() + v.nextAt + v.nextLen);
+    rootCheckRead(v, x.data(), x.size());
+  }
+  return v.labels;
+}
+#endif
+} // namespace
+
+// The labels of the records the list names, and of the class descriptions (the reference's F7):
+// each must state the position it was read from and the top directory, read as ROOT reads a label.
+TEST(RootCheck, LabelsOfTheListedRecords) {
+  for (bool wide : {false, true}) {
+    Synth s;
+    s.wide = wide;
+    if (wide)
+      s.base = 5000000000LL;
+    const Image good = s.build();
+    EXPECT_EQ(check(good).kind, K::kConfirmed) << wide;
+    const std::string b = std::to_string(s.begin);
+    { // an object's label zeroed, its entry in the list intact
+      Image img = good;
+      img.put(s.listed[1].seekKey, std::vector<unsigned char>(34, 0));
+      const RootHeaderVerdict v = check(img);
+      EXPECT_EQ(v.kind, K::kBad);
+      EXPECT_EQ(v.why, "size " + std::to_string(s.end) + ": the label at " +
+                           std::to_string(s.listed[1].seekKey) + " (TH1F h1) states position 0");
+    }
+    { // the class descriptions' label overwritten with another record's label
+      Image img = good;
+      img.put(s.seekInfo, label({1000, wide ? int16_t(1004) : int16_t(4), s.listed[0].seekKey,
+                                 s.begin, "TH1F", "h0", "a histogram"}));
+      const RootHeaderVerdict v = check(img);
+      EXPECT_EQ(v.kind, K::kBad);
+      EXPECT_EQ(v.why, "size " + std::to_string(s.end) + ": the label at " +
+                           std::to_string(s.seekInfo) + " (class descriptions) states position " +
+                           std::to_string(s.listed[0].seekKey));
+    }
+    { // a label naming another directory
+      Image img = good;
+      Label l = s.listed[2];
+      l.seekPdir = 4321;
+      img.put(l.seekKey, label(l));
+      const RootHeaderVerdict v = check(img);
+      EXPECT_EQ(v.kind, K::kBad);
+      EXPECT_EQ(v.why, "size " + std::to_string(s.end) + ": the label at " +
+                           std::to_string(l.seekKey) + " (TH1F h2) states directory 4321, not " +
+                           "the top one at " + b);
+    }
+    { // the process-id offset in the top 16 bits of a 64-bit directory: not part of it, stands
+      Image img = good;
+      Label l = s.listed[2];
+      l.version = 1004;
+      l.seekPdir = (int64_t(3) << 48) | s.begin;
+      img.put(l.seekKey, label(l));
+      EXPECT_EQ(check(img).kind, K::kConfirmed) << wide;
+    }
+    { // the top directory by its own record's position also stands (TFile::Init takes it)
+      Image img = good;
+      Label l = s.listed[0];
+      l.seekPdir = s.begin; // fBEGIN
+      img.put(l.seekKey, label(l));
+      EXPECT_EQ(check(img).kind, K::kConfirmed);
+    }
+  }
+  // Versions read signed: a 32-bit label whose version has its top bit set is still a 32-bit
+  // label to ROOT, and stands; a 64-bit one with it set is read with 32-bit positions, as ROOT
+  // reads it, which then state another position.
+  {
+    Synth s;
+    const Image good = s.build();
+    Image img = good;
+    Label l = s.listed[0];
+    l.version = static_cast<int16_t>(4 | 0x8000);
+    img.put(l.seekKey, label(l));
+    EXPECT_EQ(check(img).kind, K::kConfirmed);
+    l.version = 1004;
+    std::vector<unsigned char> w = label(l); // 64-bit positions, then the version's top bit set
+    w[4] |= 0x80;
+    img.put(l.seekKey, w);
+    EXPECT_EQ(check(img).kind, K::kBad) << "64-bit positions read as two 32-bit ones";
+    l.version = 1004; // a 64-bit label in a small file: ROOT reads it as written, and so do these
+    img.put(l.seekKey, label(l));
+    EXPECT_EQ(check(img).kind, K::kConfirmed);
+  }
+  // A record shorter than its label's fields: only its length is read, and it makes no claim.
+  {
+    Synth s;
+    s.set["entryNbytes"] = 20;
+    Image img = s.build();
+    img.put(s.listed[1].seekKey, std::vector<unsigned char>(20, 0));
+    std::vector<std::string> reads;
+    EXPECT_EQ(check(img, &reads).kind, K::kConfirmed);
+    ASSERT_EQ(reads.size(), 3u);
+    EXPECT_NE(reads[2].find(std::to_string(s.listed[1].seekKey) + "+20"), std::string::npos)
+        << reads[2];
+  }
+  // A read of the labels answered short.
+  {
+    Synth s;
+    const RootHeaderVerdict v = check(s.build(), nullptr, /*shortAt=*/2);
+    EXPECT_EQ(v.kind, K::kBad);
+    EXPECT_EQ(v.why, "size " + std::to_string(s.end) + ": a read of 34 bytes at " +
+                         std::to_string(s.listed.back().seekKey) + " answered short");
+  }
+  // A list that carries ROOT's mark of a freed record (a writer stopped inside a save): records it
+  // names may have been deleted and their space reused since, and ROOT reads the file with no
+  // error; no label makes a claim, and none is read.
+  {
+    Synth s;
+    s.set["ownNbytes"] = -500;
+    Image img = s.build();
+    img.put(s.listed[1].seekKey, std::vector<unsigned char>(34, 0));
+    img.put(s.seekInfo, std::vector<unsigned char>(34, 0));
+    std::vector<std::string> reads;
+    const RootHeaderVerdict v = check(img, &reads);
+    EXPECT_EQ(v.kind, K::kConfirmed) << v.why;
+    EXPECT_EQ(reads.size(), 2u) << "no labels' read";
+    EXPECT_EQ(v.labelsNotRead, 3u);
+  }
+  // No objects and no class descriptions: nothing to read.
+  {
+    Synth s;
+    s.objects = 0;
+    s.set["seekInfo"] = 0;
+    std::vector<std::string> reads;
+    EXPECT_EQ(check(s.build(), &reads).kind, K::kConfirmed);
+    EXPECT_EQ(reads.size(), 2u) << "no labels' read";
+  }
+}
+
+// A list of very many objects: at most kRootLabelsMax labels are read (the class descriptions,
+// then the trees and RNTuples, then the rest, in the list's order), and the others are counted.
+TEST(RootCheck, LabelsReadAreBounded) {
+  Synth s;
+  s.objects = 3000;
+  Image img = s.build();
+  RootHeaderVerdict v = check(img);
+  EXPECT_EQ(v.kind, K::kConfirmed) << v.why;
+  // Read the list again to see what the labels' read asks for.
+  std::vector<unsigned char> h = img.read(0, 300);
+  v = rootHeaderVerdict(h.data(), h.size(), img.size);
+  std::vector<unsigned char> l = img.read(v.nextAt, v.nextLen);
+  rootCheckRead(v, l.data(), l.size());
+  ASSERT_EQ(v.next, RootHeaderVerdict::kLabels);
+  EXPECT_EQ(v.labels.size(), kRootLabelsMax);
+  EXPECT_EQ(v.labelsNotRead, 3000u - (kRootLabelsMax - 1));
+  EXPECT_EQ(v.labels[0].what, "class descriptions");
+  EXPECT_EQ(v.labels[1].at, s.listed[0].seekKey);
+  EXPECT_EQ(v.labels.back().at, s.listed[kRootLabelsMax - 2].seekKey);
+  // A zeroed label past the bound is not read: the copy stands.
+  Image past = img;
+  past.put(s.listed[2999].seekKey, std::vector<unsigned char>(34, 0));
+  EXPECT_EQ(check(past).kind, K::kConfirmed);
+  // A tree is read before the other objects, wherever the list places it.
+  Synth t;
+  t.objects = 3000;
+  t.set["treeAt"] = 2999;
+  Image ti = t.build();
+  h = ti.read(0, 300);
+  v = rootHeaderVerdict(h.data(), h.size(), ti.size);
+  l = ti.read(v.nextAt, v.nextLen);
+  rootCheckRead(v, l.data(), l.size());
+  ASSERT_EQ(v.next, RootHeaderVerdict::kLabels);
+  EXPECT_EQ(v.labels[1].at, t.listed[2999].seekKey);
+  EXPECT_EQ(v.labels[1].what, "TTree h2999");
+  EXPECT_TRUE(v.labels[1].first);
+  EXPECT_FALSE(v.labels[2].first);
+  Image tz = ti;
+  tz.put(t.listed[2999].seekKey, std::vector<unsigned char>(34, 0));
+  EXPECT_EQ(check(tz).kind, K::kBad) << "the tree's label is read, past the bound in the list";
+}
+
+// Which spans the labels' read asks for: none for a label in the bytes kept already; a label the
+// reader reads first as its whole pages when the bytes are to be kept, others as they are; spans
+// in the order of their positions, one held in another left out, overlapping pages made one.
+TEST(RootCheck, LabelSpans) {
+  RootHeaderVerdict v;
+  v.size = 100000;
+  v.next = RootHeaderVerdict::kLabels;
+  v.labels = {{50000, 34, true, "class descriptions"},
+              {60000, 34, false, "TH1F h"},
+              {50100, 34, true, "TTree Events"},
+              {8000, 34, false, "TH1F g"},
+              {61000, 20, false, "TH1F k"}};
+  // Nothing kept, nothing widened: each as it is, by position.
+  std::vector<ByteSpan> sp = rootLabelSpans(v, {}, false, 4096, 1u << 20);
+  ASSERT_EQ(sp.size(), 5u);
+  EXPECT_EQ(sp[0].off, 8000u);
+  EXPECT_EQ(sp[1].off, 50000u);
+  EXPECT_EQ(sp[2].off, 50100u);
+  for (const auto& x : sp)
+    EXPECT_FALSE(x.kept);
+  // Widened: the two first-read labels share a page, read once and kept; the others as they are.
+  sp = rootLabelSpans(v, {}, true, 4096, 1u << 20);
+  ASSERT_EQ(sp.size(), 4u);
+  EXPECT_EQ(sp[0].off, 8000u);
+  EXPECT_EQ(sp[0].len, 34u);
+  EXPECT_FALSE(sp[0].kept);
+  EXPECT_EQ(sp[1].off, 49152u);
+  EXPECT_EQ(sp[1].len, 4096u);
+  EXPECT_TRUE(sp[1].kept);
+  EXPECT_EQ(sp[2].off, 60000u);
+  EXPECT_EQ(sp[3].off, 61000u);
+  // No room left to keep: as they are.
+  sp = rootLabelSpans(v, {}, true, 4096, 100);
+  ASSERT_EQ(sp.size(), 5u);
+  // Labels in the bytes kept already: not read.
+  std::vector<unsigned char> keptBytes(16384, 0);
+  sp = rootLabelSpans(v, {ByteView{49152, keptBytes.data(), keptBytes.size()}}, true, 4096,
+                      1u << 20);
+  ASSERT_EQ(sp.size(), 1u) << "60000 and 61000 lie in the kept bytes too";
+  EXPECT_EQ(sp[0].off, 8000u);
+  // Judged from the kept bytes and the read's: a zero label at 8000 is refused.
+  RootHeaderVerdict w = v;
+  w.header.begin = 100;
+  std::vector<unsigned char> zeros(34, 0);
+  rootCheckLabels(w, {ByteView{49152, keptBytes.data(), keptBytes.size()},
+                      ByteView{8000, zeros.data(), zeros.size()}});
+  EXPECT_EQ(w.kind, K::kBad);
+  EXPECT_EQ(w.next, RootHeaderVerdict::kNone);
+}
+
+#ifdef UCACHE_TEST_DATA_DIR
+// ROOT files written by ROOT (a tree, an RNTuple): they stand with their labels read; with the
+// label of the tree description, of the RNTuple's anchor, or of the class descriptions zeroed or
+// overwritten (the list left intact), they are refused.
+TEST(RootCheck, LabelsOfRootFiles) {
+  for (const char* f : {"unnamed_codec_fixture.root", "unnamed_codec_wide_fixture.root",
+                        "rntuple_fixture.root", "rntuple_unnamed_codec_fixture.root"}) {
+    const std::vector<unsigned char> b = fixture(f);
+    ASSERT_FALSE(b.empty()) << f;
+    EXPECT_EQ(checkDense(b).kind, K::kConfirmed) << f << ": " << checkDense(b).why;
+    const auto labels = labelsOf(b);
+    ASSERT_GE(labels.size(), 2u) << f << ": the class descriptions and an object";
+    EXPECT_EQ(labels[0].what, "class descriptions") << f;
+    bool sawFirst = false;
+    for (const auto& l : labels) {
+      sawFirst = sawFirst || (l.first && l.what != "class descriptions");
+      // Each label zeroed in turn, the rest of the copy as it is.
+      std::vector<unsigned char> m = b;
+      std::fill(m.begin() + l.at, m.begin() + l.at + l.len, 0);
+      const RootHeaderVerdict v = checkDense(m);
+      EXPECT_EQ(v.kind, K::kBad) << f << ": " << l.what;
+      EXPECT_NE(v.why.find("the label at " + std::to_string(l.at)), std::string::npos) << v.why;
+      // Overwritten with the bytes of another label (another record's position).
+      m = b;
+      const auto& o = labels[&l == &labels[0] ? 1 : 0];
+      std::copy(b.begin() + o.at, b.begin() + o.at + std::min(o.len, l.len), m.begin() + l.at);
+      EXPECT_EQ(checkDense(m).kind, K::kBad) << f << ": " << l.what << " overwritten";
+    }
+    EXPECT_TRUE(sawFirst) << f << ": its tree or RNTuple anchor is read first";
+  }
+}
+#endif

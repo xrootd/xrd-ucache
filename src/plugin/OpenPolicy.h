@@ -280,7 +280,22 @@ bool storedEntryCut(const unsigned char* b, size_t n, uint64_t storedSize);
 //       list, its length above 0, its end at or before the copy's size), or has another directory
 //       than the top one, or one below 64, or the list ends inside its entries. The top directory
 //       is where the header places its record, or where that record says it is (ROOT takes the
-//       latter once it has read it; the two agree in every file ROOT writes).
+//       latter once it has read it; the two agree in every file ROOT writes);
+//     - the label at the head of a record the list names, or of the class descriptions, does not
+//       state the position it was read from and the top directory (read as TKey::ReadKeyBuffer
+//       reads them: a signed version above 1000 marks 64-bit positions, 32-bit ones are unsigned,
+//       the top 16 bits of a 64-bit directory position are not part of it). Every record ROOT
+//       writes states both; a label zeroed or overwritten (a tree description or the class
+//       descriptions lost at the end of a copy whose list survived) does not. Only the label's
+//       fields are read (kRootKeyFieldsBytes, or the record's length when shorter: a label whose
+//       fields do not fit in it makes no claim). At most kRootLabelsMax labels are read: the class
+//       descriptions', then the trees' and RNTuples' (TTree, TNtuple, TNtupleD, ROOT::RNTuple,
+//       ROOT::Experimental::RNTuple), then the other objects', each in the list's order; the labels
+//       of the objects past that are not read (labelsNotRead counts them). A list that carries
+//       ROOT's mark of a freed record (a writer stopped inside a save, above) makes no claim on
+//       any label: records it names may have been deleted and their space reused since, and ROOT
+//       reads such a file with no error. Damage inside those records, past their labels, is not
+//       looked at.
 //  - kConfirmed: its size equals the end its header states, which confirms the file's size;
 //  - kNoClaim: its size is larger than that end (ROOT reads such a file normally and ignores the
 //    bytes past the end: a file updated in place, bytes appended, a writer that stopped after a
@@ -300,21 +315,48 @@ struct RootHeaderVerdict {
   long long end = -1; // the end the header states; -1 for none
   std::string why;    // kBad: what is wrong with the copy
   // The read the check needs next, before the verdict is final: the top directory's record (when
-  // it lies past the first bytes) or the list of top-level objects; `nextLen` bytes at `nextAt`.
-  enum Next : uint8_t { kNone, kDirRecord, kKeysList };
+  // it lies past the first bytes) or the list of top-level objects, `nextLen` bytes at `nextAt`; or
+  // the labels (kLabels: the bytes of each of `labels`, read in one vector read, rootCheckLabels).
+  enum Next : uint8_t { kNone, kDirRecord, kKeysList, kLabels };
   Next next = kNone;
   long long nextAt = 0;
   uint32_t nextLen = 0;
+  // A label to be read: its `len` bytes at `at`; `first`: a record the reader's ROOT reads right
+  // after its open (the class descriptions, a tree, an RNTuple), whose bytes may be kept; `what`
+  // names it in a refusal.
+  struct Label {
+    long long at = 0;
+    uint32_t len = 0;
+    bool first = false;
+    std::string what;
+  };
+  std::vector<Label> labels;
+  uint32_t labelsNotRead = 0; // objects listed whose labels are past kRootLabelsMax
   long long size = 0;    // the size the copy reported
   RootFileHeader header; // what the header says, once read
   RootDirRecord dir;     // what the top directory's record says, once read
 };
 inline constexpr uint32_t kRootKeysListMaxBytes = 16u << 20;
+inline constexpr size_t kRootLabelsMax = 64;
 RootHeaderVerdict rootHeaderVerdict(const unsigned char* b, size_t n, long long size);
 // Judges the answer to the read `v.next` asked for: the `n` bytes of `b`, which a read of
 // `v.nextLen` bytes at `v.nextAt` answered with (fewer than asked: the copy ends there, kBad).
-// Sets the next read the check needs, or kNone. Does nothing when `v` asks for no read.
+// Sets the next read the check needs, or kNone. Does nothing when `v` asks for no read, or for the
+// labels (rootCheckLabels judges those).
 void rootCheckRead(RootHeaderVerdict& v, const unsigned char* b, size_t n);
+// Bytes of the copy at hand: `n` bytes at `off`, held in `b`.
+struct ByteView {
+  uint64_t off = 0;
+  const unsigned char* b = nullptr;
+  size_t n = 0;
+};
+// Whether one of `views` holds all of `len` bytes at `off`.
+bool viewsHold(const std::vector<ByteView>& views, uint64_t off, uint64_t len);
+// Judges the labels `v` asks for (kLabels) from `views`: the bytes the checks read so far and the
+// spans the vector read answered (a span answered short holds fewer bytes). A label no view holds
+// was answered short: the copy is bad. Sets `next` to kNone. Does nothing unless `v` asks for the
+// labels.
+void rootCheckLabels(RootHeaderVerdict& v, const std::vector<ByteView>& views);
 // The time limit of the header read, in seconds: what is left of the open attempt's own limit
 // (`attemptLimitS`, the attempt issued `elapsedMs` ago), and at least kHeaderReadFloorS. The
 // floor gives a copy that answered its open at the very end of that limit a moment to answer
@@ -361,6 +403,13 @@ struct ByteSpan {
 // inside the copy, exactly as asked, and not kept.
 ByteSpan checkReadSpan(bool keep, uint32_t pageSize, uint64_t size, uint64_t at, uint64_t len,
                        uint64_t room);
+// The spans a vector read of the labels `v` asks for (kLabels) reads: each label not held in
+// `kept` (the bytes the checks read so far), as it is, or, for one the reader reads first, as the
+// whole pages around it (checkReadSpan with `keep`, `pageSize` and what is left of `room`, which
+// the widened spans take from in turn); in the order of their positions, a span held whole in an
+// earlier one left out, and widened spans that overlap made one.
+std::vector<ByteSpan> rootLabelSpans(const RootHeaderVerdict& v, const std::vector<ByteView>& kept,
+                                     bool keep, uint32_t pageSize, uint64_t room);
 
 // ---- An earlier copy of the file, when no copy passes at the open (adaptive_federation on) ----
 // When the freshness window of the file's entry has expired and no copy passes at the open (each

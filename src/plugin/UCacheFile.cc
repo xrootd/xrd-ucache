@@ -123,7 +123,8 @@ bool readFaultFire() {
 // the copy's server answers it short; =delay: it is sent kHeaderFaultDelayMs late, so that a
 // test can break the copy's connection between the open's answer and the read.
 // UCACHE_TEST_HEADER_FAIL_STAGE=list: the faults strike the checks' read of the list of top-level
-// objects instead (=dir: the read of the top directory's record, when one is made).
+// objects instead (=dir: the read of the top directory's record, when one is made; =labels: the
+// vector read of the labels, whose last span is then sent one byte short for =short).
 static std::atomic<int> gHeaderFaultBudget{[] {
   const char* v = ::getenv("UCACHE_TEST_HEADER_FAIL_N");
   return v ? ::atoi(v) : 0;
@@ -137,9 +138,10 @@ static const HeaderFault gHeaderFaultKind = [] {
 static const RootHeaderVerdict::Next gHeaderFaultStage = [] {
   const char* v = ::getenv("UCACHE_TEST_HEADER_FAIL_STAGE");
   const std::string k = v ? v : "";
-  return k == "list" ? RootHeaderVerdict::kKeysList
-         : k == "dir" ? RootHeaderVerdict::kDirRecord
-                      : RootHeaderVerdict::kNone; // kNone: the first read
+  return k == "list"     ? RootHeaderVerdict::kKeysList
+         : k == "dir"    ? RootHeaderVerdict::kDirRecord
+         : k == "labels" ? RootHeaderVerdict::kLabels
+                         : RootHeaderVerdict::kNone; // kNone: the first read
 }();
 constexpr uint64_t kHeaderFaultDelayMs = 5000;
 bool headerFaultFires() {
@@ -1732,7 +1734,10 @@ class RetryingOpenHandler : public ResponseHandler {
                                               : new XRootDStatus(XrdCl::stError, XrdCl::errInternal));
       std::unique_ptr<AnyObject> resp(response);
       std::unique_ptr<HostList> unused(hosts);
-      if (rs->IsOK()) {
+      if (rs->IsOK() && stage == RootHeaderVerdict::kLabels) {
+        judgeLabels(resp.get());
+        resp.reset();
+      } else if (rs->IsOK()) {
         XrdCl::ChunkInfo* ci = nullptr;
         if (resp)
           resp->Get(ci);
@@ -1818,6 +1823,45 @@ class RetryingOpenHandler : public ResponseHandler {
           return true;
       return false;
     }
+    // The bytes kept so far, as the checks read them.
+    std::vector<ByteView> keptViews() const {
+      std::vector<ByteView> v;
+      for (const auto& k : kept)
+        v.push_back(ByteView{k.off, reinterpret_cast<const unsigned char*>(k.bytes.data()),
+                             k.bytes.size()});
+      return v;
+    }
+    // The labels' vector read (kLabels): `lspans`, each read into `buf` after the one before.
+    std::vector<ByteSpan> lspans;
+    // Judges the labels from the bytes kept and the spans the vector read answered (`resp`, a
+    // VectorReadInfo; a span answered short holds fewer bytes), then keeps the widened spans.
+    void judgeLabels(AnyObject* resp) {
+      XrdCl::VectorReadInfo* vi = nullptr;
+      if (resp)
+        resp->Get(vi);
+      std::vector<ByteView> views = keptViews();
+      std::vector<size_t> got(lspans.size(), 0);
+      size_t pos = 0;
+      for (size_t i = 0; i < lspans.size(); ++i) {
+        if (vi && i < vi->GetChunks().size())
+          got[i] = std::min<size_t>(vi->GetChunks()[i].length, lspans[i].len);
+        views.push_back(ByteView{lspans[i].off, buf.data() + pos, got[i]});
+        pos += lspans[i].len;
+      }
+      rootCheckLabels(w.header, views);
+      pos = 0;
+      for (size_t i = 0; i < lspans.size(); ++i) {
+        if (lspans[i].kept && got[i]) {
+          keptBytes += got[i];
+          kept.push_back(HandleState::OpenBytes::Span{
+              lspans[i].off,
+              std::vector<char>(buf.begin() + static_cast<long>(pos),
+                                buf.begin() + static_cast<long>(pos + got[i])),
+              sentUs, nowUs() - sentUs});
+        }
+        pos += lspans[i].len;
+      }
+    }
   };
   void checkHeader(std::unique_ptr<XRootDStatus> s, std::unique_ptr<AnyObject> r,
                    std::unique_ptr<HostList> h, AttemptView w) {
@@ -1850,7 +1894,40 @@ class RetryingOpenHandler : public ResponseHandler {
   void nextCheckRead(HeaderRead* hr) {
     RootHeaderVerdict& v = hr->w.header;
     hr->stage = v.next;
+    if (v.next == RootHeaderVerdict::kLabels)
+      return sendLabelsRead(hr);
     sendCheckRead(hr, static_cast<uint64_t>(v.nextAt), v.nextLen);
+  }
+  // The labels' read: one vector read of the spans rootLabelSpans gives (a label in the bytes kept
+  // so far is judged from them; one the reader reads first is read as its whole pages, kept, when
+  // the bytes are to be kept), or the test's fault in its place; none at all when the bytes kept
+  // hold every label. Sent as sendCheckRead sends its read.
+  void sendLabelsRead(HeaderRead* hr) {
+    const bool fault = hr->f && hr->stage == gHeaderFaultStage && headerFaultFires();
+    const std::vector<ByteView> held = hr->keptViews();
+    try {
+      hr->lspans = rootLabelSpans(hr->w.header, held, keep_ && !fault, globalConfig().pageSize,
+                                  kOpenCheckKeepBytes - std::min(hr->keptBytes, kOpenCheckKeepBytes));
+      uint64_t total = 0;
+      for (const auto& sp : hr->lspans)
+        total += sp.len;
+      hr->buf.assign(static_cast<size_t>(total), 0);
+    } catch (...) {
+      return HeaderRead::end(std::unique_ptr<HeaderRead>(hr), std::make_unique<XRootDStatus>());
+    }
+    if (hr->lspans.empty()) { // every label is in the bytes kept
+      rootCheckLabels(hr->w.header, held);
+      return HeaderRead::end(std::unique_ptr<HeaderRead>(hr), std::make_unique<XRootDStatus>());
+    }
+    hr->at = hr->readAt = hr->lspans.front().off;
+    hr->want = static_cast<uint32_t>(std::min<size_t>(hr->buf.size(), UINT32_MAX));
+    hr->widened = false; // each span says whether it is kept
+    if (fault && gHeaderFaultKind == HeaderFault::kDelay) { // a test's: the read is sent late
+      RetryingOpenHandler* self = this;
+      moveExecutor().postAfter(kHeaderFaultDelayMs, [self, hr] { self->issueCheckRead(hr, false); });
+      return;
+    }
+    issueCheckRead(hr, fault);
   }
   // Sends the read of `hr`'s stage, `want` bytes at `at`, or the test's fault in its place; a
   // delayed one is posted (never waited for on a client thread) and sent later. The read asks for
@@ -1911,7 +1988,17 @@ class RetryingOpenHandler : public ResponseHandler {
     else if (limitS == 0)
       rs = XRootDStatus(XrdCl::stError, XrdCl::errOperationExpired, 0,
                         "the checks made at open ran out of time");
-    else if (hr->f)
+    else if (hr->f && hr->stage == RootHeaderVerdict::kLabels) {
+      XrdCl::ChunkList chunks;
+      size_t pos = 0;
+      for (const auto& sp : hr->lspans) {
+        chunks.emplace_back(sp.off, static_cast<uint32_t>(sp.len), hr->buf.data() + pos);
+        pos += sp.len;
+      }
+      if (answeredShort && chunks.back().length >= 2)
+        --chunks.back().length;
+      rs = hr->f->VectorRead(chunks, nullptr, hr, static_cast<ucache::XrdTimeout>(limitS));
+    } else if (hr->f)
       rs = hr->f->Read(hr->readAt, answeredShort ? want - 1 : want, hr->buf.data(), hr,
                        static_cast<ucache::XrdTimeout>(limitS));
     if (!rs.IsOK()) // nothing was sent, so no completion will come: the failure is the answer
@@ -2474,9 +2561,23 @@ static void checkOwnOpen(HandleState& st, XrdCl::File* f, const OpenAttempt& a,
   uint64_t deadlineUs = 0;
   bool first = true;
   for (;;) {
+    const bool labels = !first && w.header.next == RootHeaderVerdict::kLabels;
+    std::vector<ByteSpan> spans; // the labels' spans, read as they are (nothing is kept here)
+    if (labels) {
+      try {
+        spans = rootLabelSpans(w.header, {}, false, 0, 0);
+      } catch (...) {
+        break;
+      }
+    }
     const uint64_t at = first ? 0 : static_cast<uint64_t>(w.header.nextAt);
-    const uint32_t len =
-        first ? static_cast<uint32_t>(rootHeaderBytes(w.size)) : w.header.nextLen;
+    uint32_t len = first ? static_cast<uint32_t>(rootHeaderBytes(w.size)) : w.header.nextLen;
+    if (labels) {
+      uint64_t total = 0;
+      for (const auto& sp : spans)
+        total += sp.len;
+      len = static_cast<uint32_t>(std::min<uint64_t>(total, UINT32_MAX));
+    }
     const uint64_t now = nowUs();
     const int64_t openLeftMs = seq.remainingMs() + int64_t(kHeaderReadFloorS) * 1000;
     int limitS = 0;
@@ -2496,6 +2597,30 @@ static void checkOwnOpen(HandleState& st, XrdCl::File* f, const OpenAttempt& a,
       buf.assign(len, 0);
     } catch (...) {
       break; // without the memory for it, the checks end where they are
+    }
+    if (labels) {
+      XrdCl::ChunkList chunks;
+      size_t pos = 0;
+      for (const auto& sp : spans) {
+        chunks.emplace_back(sp.off, static_cast<uint32_t>(sp.len), buf.data() + pos);
+        pos += sp.len;
+      }
+      XrdCl::VectorReadInfo* vri = nullptr;
+      rs = f->VectorRead(chunks, nullptr, vri, static_cast<ucache::XrdTimeout>(limitS));
+      std::unique_ptr<XrdCl::VectorReadInfo> answered(vri);
+      if (!rs.IsOK())
+        break;
+      std::vector<ByteView> views;
+      pos = 0;
+      for (size_t i = 0; i < spans.size(); ++i) {
+        const size_t got = answered && i < answered->GetChunks().size()
+                               ? std::min<size_t>(answered->GetChunks()[i].length, spans[i].len)
+                               : 0;
+        views.push_back(ByteView{spans[i].off, buf.data() + pos, got});
+        pos += spans[i].len;
+      }
+      rootCheckLabels(w.header, views);
+      break; // the labels are the checks' last read
     }
     uint32_t got = 0;
     rs = f->Read(at, len, buf.data(), got, static_cast<ucache::XrdTimeout>(limitS));
