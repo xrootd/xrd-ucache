@@ -4521,6 +4521,7 @@ UCacheFile::~UCacheFile() {
     cold.swap(st_->cold);
     openBytes = std::move(st_->openBytes);
   }
+  st_->openCv.notify_all(); // a request waiting for the reader's open (ensureEntry) stops waiting
 #ifdef UCACHE_HAVE_COLDRUN
   coldDetach(cold);
 #endif
@@ -5220,6 +5221,7 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
     cold.swap(st_->cold);
     openBytes = std::move(st_->openBytes);
   }
+  st_->openCv.notify_all(); // a request waiting for the reader's open (ensureEntry) stops waiting
 #ifdef UCACHE_HAVE_COLDRUN
   coldDetach(cold); // the process's last handle on the file commits what it converted
 #endif
