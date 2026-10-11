@@ -357,6 +357,12 @@ it reads), and refuses:
   outside the file's records (100 to ...)`, the last
   number being the copy's size; `... in the directory at ..., not the top directory at
   100`), or ending inside its own entries;
+- one whose tree description, RNTuple, other listed object or class descriptions were zeroed
+  or overwritten while the list survived, read in one vector read of the labels of at most 64
+  of those records (`the label at 1749103 (TTree t) states position 0, and no block follows
+  it`, `the label at 1750332 (class descriptions) states position ... and class "..."`): only
+  where ROOT cannot read the record from those bytes either; a label whose own fields alone
+  were damaged, and an object stored uncompressed, are not held against the copy;
 - one whose server answers any of those reads short (`size 16935324: a read of its first
   300 bytes answered 120`, `size 1756917: a read of 159 bytes at 1750173 answered 158`).
 
@@ -446,7 +452,11 @@ another site, and the job gets the bytes. The log says so, once for every move:
   what it said (`uCache: <file>: no copy could serve the read: <site>
   (<host>:<port>, <size> bytes): <error>; ...`). This holds whatever made the read
   move: a server's failure, a short answer (below), or a basket that failed the
-  key-position check of `check_origin_integrity`. A read that fails within a second
+  key check of `check_origin_integrity` (`failed its check (key position differs from the
+  tree's record)`, `(key length differs from the tree's record)`), or a read of a copy whose
+  tree's record showed it bad (`a read at ... failed its check (the tree's record fails its
+  own check)`, `(the tree's record places a basket at ... of ... bytes past the copy's end at
+  ...)`). A read that fails within a second
   after such a move gets that move's error at once, without another attempt, saying so
   (`no copy could serve the read: a move made <time> ago for an earlier read of the
   handle found none, ...`: the offsets in the list that follows are that earlier
