@@ -636,12 +636,16 @@ reading was re-reading, and what the cache disk was asked to do.
     a failed one to the server that delivered most of its bytes). The same requests as `origin_rt_us`; read-ahead's are
     in neither.
 
-  `ucache summary`, `history` and `publish` take a file's origin from
-  `data_server` when it names one, and from the host in the file's URL
-  otherwise (older records, and files that read nothing from the origin). For
-  a file opened through a redirector, the origin is therefore the data server
+  `ucache summary`, `history` and `publish` take a file's origin from the
+  host in the file's URL, as they always have, unless the run had
+  `adaptive_federation = on` (its counter line's `run_settings` say so). For
+  such a run they take it from `data_server` when it names one, and from the
+  host in the file's URL otherwise (files that read nothing from the origin):
+  for a file opened through a redirector the origin is then the data server
   the reads went to, and `history --json` and `publish` show that server's
-  domain under `origins` and `origins_rt`, not the redirector's.
+  domain under `origins` and `origins_rt`, not the redirector's. A run whose
+  records do not say (written before `run_settings` existed, or a job killed
+  before it wrote a counter line) is taken as one with the switch off.
 
   **`orig_bytes` and `unique_bytes` are exact or absent**, never estimated:
   absent means unknown, and a file opened and not read has 0. How each route

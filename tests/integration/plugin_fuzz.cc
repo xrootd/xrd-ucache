@@ -19,8 +19,9 @@
 //   inner-race-relay   retries of the reader's own open (an untrusted handle),
 //                      raced from the moment Open() returns until it completes
 //
-// open-refused checks that an open the client refuses at once still reaches
-// the reader through its handler (see runOpenRefused).
+// open-refused checks how an open the client refuses at once is answered: from
+// Open itself with the switch off, as without uCache; through the reader's
+// handler with the switch on (see runOpenRefused).
 //
 // Two more cover an open made again, with adaptive_federation on:
 //   open-property      a property set while the open is retried reaches the
@@ -701,27 +702,33 @@ int runInnerRace(const char* url, const char* local, uint64_t cycles, int racers
   return 0;
 }
 
-// open-refused: an open the client refuses at once reaches the reader through
-// its handler. Within the client's error window after a server failed, a new
-// request to that host:port fails inside Open, before anything is sent. So:
-// the test open fault sends every open to port 1 (never bound, so refused);
-// the first open fails through its handler, as any connection failure does;
-// the second, of a second handle in the same process, is the one refused at
-// once. For a handle the cache serves, Open must return OK for both, and each
-// handler get exactly one failure, with a host list, on another thread than
-// the one in Open (a completion given inside Open would run there). A plugin
-// without this returns the second failure from Open itself, which is also
-// what shows that the second open was refused at once.
+// open-refused: an open the client refuses at once. Within the client's error
+// window after a server failed, a new request to that host:port fails inside
+// Open, before anything is sent. So: the test open fault sends every open to
+// port 1 (never bound, so refused); the first open fails through its handler,
+// as any connection failure does; the second, of a second handle in the same
+// process, is the one refused at once.
 //
-// With UCACHE_OPEN_RETRIES=1 and the fault on both attempts
-// (UCACHE_TEST_OPEN_FAIL_N=2), the opens go through the retrying handler: the
-// first handle's retry is the one refused at once, and its failure must carry
-// the host list of the attempt that reached the client (naming 127.0.0.1:1);
-// the second handle's first attempt is refused at once, inside Open, and what
-// follows must still be answered off the opening thread.
+// With adaptive_federation off (the default) a handle the cache serves answers
+// as the client does without uCache: the first open's failure comes through its
+// handler (once, with a host list, on another thread than the one in Open), and
+// the second Open returns the error itself, with no completion ever after. With
+// UCACHE_OPEN_RETRIES=1 and the fault on both attempts (UCACHE_TEST_OPEN_FAIL_N=2)
+// the opens go through the retries of open_retries: both Open calls return OK,
+// and each handler gets one failure, with an empty host list, off the opening
+// thread (the second handle's first attempt is refused inside Open, and its
+// retry is scheduled, not made there).
+//
+// With UCACHE_ADAPTIVE_FEDERATION=on, Open returns OK for both, and each handler
+// gets exactly one failure, with a host list, on another thread than the one in
+// Open. With UCACHE_OPEN_RETRIES=1 the first handle's failure carries the host
+// list of the attempt that reached the client (naming 127.0.0.1:1).
 int runOpenRefused(const char* url) {
   const char* mode = "open-refused";
   const int retries = envInt("UCACHE_OPEN_RETRIES", 0);
+  const char* sw = ::getenv("UCACHE_ADAPTIVE_FEDERATION");
+  const bool fed = sw && (std::string(sw) == "on" || std::string(sw) == "1" ||
+                          std::string(sw) == "true" || std::string(sw) == "yes");
   if ((retries != 0 && retries != 1) || envInt("UCACHE_TEST_OPEN_FAIL_N", 0) < retries + 1 ||
       envInt("UCACHE_REVALIDATE_S", -1) != 0 || envInt("XRD_CONNECTIONRETRY", 0) != 1) {
     std::printf("%s: SETUP: needs UCACHE_OPEN_RETRIES=0 with UCACHE_TEST_OPEN_FAIL_N>=1, or "
@@ -730,6 +737,7 @@ int runOpenRefused(const char* url) {
                 mode);
     return 2;
   }
+  std::printf("%s: adaptive_federation %s, open_retries %d\n", mode, fed ? "on" : "off", retries);
   struct Handler : StrictOpenHandler {
     std::thread::id on;
     bool nullHosts = false;
@@ -755,6 +763,26 @@ int runOpenRefused(const char* url) {
     auto* h = new Handler();
     const XrdCl::XRootDStatus st = f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h);
     std::printf("%s: open %d: Open() returned %s\n", mode, i, st.ToString().c_str());
+    // Switch off, no retries: the second open, refused at once, is answered by Open itself.
+    const bool fromOpen = !fed && retries == 0 && i == 2;
+    if (fromOpen) {
+      if (st.IsOK()) {
+        std::printf("%s: open 2: FAIL: Open() returned OK; the client's own refusal is an error "
+                    "from Open\n",
+                    mode);
+        ++bad;
+      }
+      std::this_thread::sleep_for(std::chrono::seconds(2)); // room for a completion, which must not come
+      std::lock_guard<std::mutex> g(h->mu);
+      std::printf("%s: open 2: %d completion(s) after the error from Open()\n", mode,
+                  h->completions);
+      if (h->completions != 0) {
+        std::printf("%s: open 2: FAIL: a completion came after Open() %s\n", mode,
+                    st.IsOK() ? "returned OK" : "returned the error");
+        ++bad;
+      }
+      continue;
+    }
     if (!st.IsOK()) {
       ++bad;
       continue;
@@ -782,10 +810,16 @@ int runOpenRefused(const char* url) {
       std::printf("%s: open %d: FAIL: the failure came with a null host list\n", mode, i);
       ++bad;
     }
-    if (retries == 1 && i == 1 && h->hosts.find("127.0.0.1:1") == std::string::npos) {
+    if (fed && retries == 1 && i == 1 && h->hosts.find("127.0.0.1:1") == std::string::npos) {
       std::printf("%s: open 1: FAIL: the failure does not carry the hosts of the attempt that "
                   "reached the client\n",
                   mode);
+      ++bad;
+    }
+    if (!fed && retries == 1 && !h->hosts.empty()) {
+      std::printf("%s: open %d: FAIL: the failure of the retries carries hosts; open_retries "
+                  "gives an empty host list\n",
+                  mode, i);
       ++bad;
     }
   }

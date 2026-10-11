@@ -178,7 +178,9 @@ struct Run {
   // signatures instead, since two routes can honestly disagree about a file
   // or two out of hundreds without having done different work.
   std::string readSig;
-  // Origin hosts seen, by file count. A dataset can be served from several
+  // Origin hosts seen, by file count: with adaptive_federation on (the run's
+  // run_settings), the data server each file's record names; otherwise the
+  // host of the file's URL. A dataset can be served from several
   // sites (redirectors, distributed sets), and the mix is a property of a RUN,
   // not of the input set: a baseline drawn from one site is weak evidence for
   // a run whose data came from another.
@@ -351,6 +353,10 @@ struct Run {
 // performance record outlives a measurement window -- losing months of history
 // to a command documented as "start a fresh measurement" would be a poor trade.
 std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiveDir = "");
+
+// Whether a run's `run_settings` (docs/STATS.md) say adaptive_federation was
+// on. False for an empty string: a record written before the field existed.
+bool federationRun(const std::string& runSettings);
 
 // What the cache bought, measured against a BASELINE run -- the same work done
 // once with the cache out of the loop (UCACHE_DISABLE=1), which the plugin

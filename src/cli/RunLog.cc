@@ -308,6 +308,19 @@ std::string readSignatureOf(const std::map<std::string, Run::FileRec>& files);
 std::string hostOf(const std::string& url);
 } // namespace
 
+bool federationRun(const std::string& runSettings) {
+  // Tokens are separated by single spaces (docs/STATS.md `run_settings`).
+  const std::string tok = "adaptive_federation=on";
+  for (size_t at = runSettings.find(tok); at != std::string::npos;
+       at = runSettings.find(tok, at + 1)) {
+    const size_t end = at + tok.size();
+    if ((at == 0 || runSettings[at - 1] == ' ') &&
+        (end == runSettings.size() || runSettings[end] == ' '))
+      return true;
+  }
+  return false;
+}
+
 std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiveDir) {
   std::vector<Run> runs;
   std::vector<std::pair<std::string, std::string>> stems; // (dir, stem)
@@ -347,12 +360,16 @@ std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiv
     // Identity: which files this run opened, and where they came from.
     r.sig = signatureOf(r.files);
     r.readSig = readSignatureOf(r.files);
-    // Where the bytes came from: the data server a record names, which for a
-    // file opened through a redirector is the server it sent the reads to;
-    // else, for older records and files that read nothing from the origin,
-    // the host the file was asked of.
+    // Where the bytes came from. A run with adaptive_federation on (its
+    // run_settings say so) names the data server a record names, which for a
+    // file opened through a redirector is the server it sent the reads to, or
+    // for a file that read nothing from the origin the host the file was asked
+    // of. Every other run -- the switch off, or a record that does not say
+    // (written before run_settings existed, or a run killed before its counter
+    // line) -- names the host the file was asked of, the host of its URL.
+    const bool byServer = federationRun(r.runSettings);
     for (const auto& [k, f] : r.files) {
-      const std::string h = f.dataServer.empty() ? hostOf(k) : f.dataServer;
+      const std::string h = byServer && !f.dataServer.empty() ? f.dataServer : hostOf(k);
       if (h.empty())
         continue;
       ++r.originHosts[h];

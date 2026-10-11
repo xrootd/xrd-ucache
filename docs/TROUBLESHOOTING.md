@@ -277,9 +277,11 @@ needed bytes it did not hold; the redirector then picked the bad server for
 that open.
 
 Find the server's full host name in the error, in uCache's warning when it is
-uCache's own open that failed (`<file>: opening it at <host>:<port> failed
-(...)`), or in the client's log (`XRD_LOGLEVEL=Debug`, the host the open was
-redirected to), and add it to the file's URL as `?tried=<full host name>`
+uCache's own open that failed with `adaptive_federation = on` (`<file>: opening
+it at <host>:<port> failed (...)`; with the switch off the warning is `lazy
+origin open failed for <URL> (...)`, which names no server), or in the
+client's log (`XRD_LOGLEVEL=Debug`, the host the open was redirected to), and
+add it to the file's URL as `?tried=<full host name>`
 (comma separated for several; `&tried=` if the URL already has a query without
 a `tried=`). If the URL already carries
 a `tried=`, add the name to that list with a comma instead: XRootD keeps only
