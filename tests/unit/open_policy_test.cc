@@ -505,19 +505,33 @@ TEST(OpenPolicy, ParkedRefetchTimeout) {
 // A read parked behind a fetch that ran out of time at the server its handle reads, on a handle
 // whose reads do not move, takes that error; anything else fetches for itself.
 TEST(OpenPolicy, ParkedGetsOwnersError) {
+  const std::string A = "a.example.org:1094", B = "b.example.org:1094";
+  constexpr uint64_t S = 1000000;          // 1 s in microseconds
+  constexpr uint64_t D = 100 * S, R = S;   // the fetch's deadline; the client's resolution
+  const auto gets = [&](int code, bool moves, const std::string& fs, const std::string& own,
+                        uint64_t fd, uint64_t od) {
+    return parkedGetsOwnersError(code, moves, fs, own, fd, od, R);
+  };
   for (int code : {kErrOperationExpired, kErrSocketTimeout}) {
-    EXPECT_TRUE(parkedGetsOwnersError(code, false, "a.example.org:1094", "a.example.org:1094"));
-    EXPECT_TRUE(parkedGetsOwnersError(code, false, "A.Example.org:1094", "a.example.org:1094"));
-    EXPECT_TRUE(parkedGetsOwnersError(code, false, "", "a.example.org:1094")) << "not known";
-    EXPECT_TRUE(parkedGetsOwnersError(code, false, "a.example.org:1094", "")) << "not known";
-    EXPECT_FALSE(parkedGetsOwnersError(code, true, "a.example.org:1094", "a.example.org:1094"))
-        << "its reads move";
-    EXPECT_FALSE(parkedGetsOwnersError(code, false, "a.example.org:1094", "b.example.org:1094"))
-        << "its handle reads another server";
+    // The same server, its own time no longer than the fetch's: the fetch's error is its answer.
+    EXPECT_TRUE(gets(code, false, A, A, D, D));
+    EXPECT_TRUE(gets(code, false, A, A, D, D - 5 * S)) << "its own time ran out first";
+    EXPECT_TRUE(gets(code, false, A, A, D, D + R)) << "within the client's resolution";
+    EXPECT_TRUE(gets(code, false, "A.Example.org:1094", A, D, D)) << "in any case";
+    EXPECT_TRUE(gets(code, false, "", A, D, D)) << "the fetch's server not known: the same";
+    // More time of its own than the fetch had: it fetches for itself (a slow server may answer).
+    EXPECT_FALSE(gets(code, false, A, A, D, D + R + 1));
+    EXPECT_FALSE(gets(code, false, A, A, D, D + 7 * S)) << "the fetch had 3 s, the read 10";
+    // Its own server not known (a handle that has not opened its origin): it fetches for itself.
+    EXPECT_FALSE(gets(code, false, A, "", D, D));
+    EXPECT_FALSE(gets(code, false, "", "", D, D));
+    // The fetch's deadline not known: never handed over.
+    EXPECT_FALSE(gets(code, false, A, A, 0, D));
+    EXPECT_FALSE(gets(code, true, A, A, D, D)) << "its reads move";
+    EXPECT_FALSE(gets(code, false, A, B, D, D)) << "its handle reads another server";
   }
   for (int code : {0, kErrConnectionError, kErrSocketError, kErrErrorResponse, kErrDataError})
-    EXPECT_FALSE(parkedGetsOwnersError(code, false, "a.example.org:1094", "a.example.org:1094"))
-        << code;
+    EXPECT_FALSE(gets(code, false, A, A, D, D)) << code;
 }
 
 // Every status of a failed read and what follows it.

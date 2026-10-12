@@ -4432,6 +4432,11 @@ class MissReadHandler : public ResponseHandler {
         if (s && !s->IsOK()) {
           o.code = s->code;
           o.server = answeredBy(*st_, h.get());
+          // Its time limit: sent at t0_ with the reader's own timeout (originTimeout), or with
+          // the client's request timeout when it gave none. An armed handle's reads have their
+          // own limits; their waiters never take the error (parkedGetsOwnersError).
+          const int limitS = readerT_ > 0 ? readerT_ : currentRequestTimeoutS();
+          o.deadlineUs = t0_ + static_cast<uint64_t>(std::max(limitS, 0)) * 1000000;
         }
         entry_->endFetch(wireOff_, gateLen_, o);
       }
@@ -4677,10 +4682,11 @@ void redispatchRead(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> 
 
 // What a read parked behind another read's fetch of its span does when that fetch ends
 // (FileEntry::beginFetch). A fetch that ran out of time at its server, on a handle whose reads do
-// not move, from the server this handle reads (parkedGetsOwnersError), gives every read parked on
-// it that error at once, as each read's own request to that server would have met it at the same
-// moment without the cache; otherwise the read is classified again (usually served from the pages
-// just staged, or fetched for itself within its own time left, redispatchRead). Fires once,
+// not move, from the server this handle reads (parkedGetsOwnersError), gives that error at once to
+// every read parked on it whose own time would have run out no later than the fetch's (its own
+// request to that server would have met it then without the cache); otherwise the read is
+// classified again (usually served from the pages just staged, or fetched for itself within its
+// own time left, redispatchRead: a server that answers again in it serves it). Fires once,
 // whichever of the fetch's end and the insurance timer comes first.
 FileEntry::FetchDone parkedRead(std::shared_ptr<HandleState> st,
                                std::shared_ptr<FileEntry> entry, uint64_t offset, uint32_t size,
@@ -4691,9 +4697,14 @@ FileEntry::FetchDone parkedRead(std::shared_ptr<HandleState> st,
           fired](const FileEntry::FetchOutcome& o) {
     if (fired->exchange(true))
       return;
+    const uint64_t ownDeadlineUs =
+        startUs +
+        static_cast<uint64_t>(std::max(readBudgetS(readerT, currentRequestTimeoutS()), 0)) * 1000000;
     if (o.code &&
-        parkedGetsOwnersError(o.code, st->moveOnReads.load(std::memory_order_relaxed), o.server,
-                              answeredBy(*st, nullptr))) {
+        parkedGetsOwnersError(
+            o.code, st->moveOnReads.load(std::memory_order_relaxed), o.server,
+            answeredBy(*st, nullptr), o.deadlineUs, ownDeadlineUs,
+            static_cast<uint64_t>(std::max(currentTimeoutResolutionS(), 1)) * 1000000)) {
       const int code = o.code;
       Executor::instance().post([handler, code] {
         complete(handler,
@@ -6114,7 +6125,8 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
   if (entry->hasRange(offset, size)) {
     // HIT: disk read + verification on the executor (§5.3).
     auto st = st_;
-    Executor::instance().post([st, entry, offset, size, buffer, handler] {
+    const int readerT = static_cast<int>(timeout);
+    Executor::instance().post([st, entry, offset, size, buffer, handler, readerT] {
       uint64_t t0 = nowUs();
       if (entry->readCached(offset, size, buffer)) {
         if (st->store) {
@@ -6128,13 +6140,13 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
         complete(handler, okStatus(), chunkResponse(offset, size, buffer));
         return;
       }
-      // CRC quarantine: demote to wire miss (counted by core).
+      // CRC quarantine: demote to wire miss (counted by core), with the reader's own timeout.
       auto [ws, we] = roundChunk(*entry, offset, size);
       auto wireBuf = std::make_shared<std::vector<char>>(we - ws);
       if (XrdCl::File* f = st->acquireInner()) {
         auto* mh = new MissReadHandler(st, f, entry, offset, size, buffer, handler, ws,
-                                       wireBuf, nowUs());
-        XRootDStatus s = issueWireRead(st, f, ws, we - ws, wireBuf->data(), mh, 0);
+                                       wireBuf, nowUs(), 0, readerT);
+        XRootDStatus s = issueWireRead(st, f, ws, we - ws, wireBuf->data(), mh, readerT);
         if (!s.IsOK()) {
           delete mh;
           st->releaseInner();

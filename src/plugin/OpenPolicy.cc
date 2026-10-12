@@ -1128,15 +1128,18 @@ int parkedRefetchTimeoutS(int readerTimeoutS, int requestTimeoutS, int elapsedS)
 }
 
 bool parkedGetsOwnersError(int code, bool moves, const std::string& fetchServer,
-                           const std::string& ownServer) {
-  if (!fetchRanOutOfTime(code) || moves)
+                           const std::string& ownServer, uint64_t fetchDeadlineUs,
+                           uint64_t ownDeadlineUs, uint64_t slackUs) {
+  if (!fetchRanOutOfTime(code) || moves || ownServer.empty() || fetchDeadlineUs == 0)
     return false;
+  if (ownDeadlineUs > fetchDeadlineUs && ownDeadlineUs - fetchDeadlineUs > slackUs)
+    return false; // it had more time than the fetch it waited for
   const auto lower = [](std::string x) {
     for (char& c : x)
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return x;
   };
-  return fetchServer.empty() || ownServer.empty() || lower(fetchServer) == lower(ownServer);
+  return fetchServer.empty() || lower(fetchServer) == lower(ownServer);
 }
 
 ReadStep readStep(int code, int errNo) {

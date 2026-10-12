@@ -675,13 +675,19 @@ int missRelayTimeoutS(int code, int readerTimeoutS, int requestTimeoutS, int ela
 int parkedRefetchTimeoutS(int readerTimeoutS, int requestTimeoutS, int elapsedS);
 // Whether a read parked behind another read's fetch of its span takes that fetch's failure
 // `code` as its own answer: the fetch ran out of time at its server (fetchRanOutOfTime), the
-// parked read's handle does not move its reads to another site (`moves`), and the fetch failed
-// at the server the parked read's handle reads from (`fetchServer`, `ownServer`; either "" when
-// not known, which counts as the same: one file's handles in one process reach it through one
-// URL). Any other failure, a handle whose reads move, or another server: the parked read makes
-// its own fetch.
+// parked read's handle does not move its reads to another site (`moves`), the fetch failed at
+// the server the parked read's handle reads from (`fetchServer`, `ownServer`, in any case; the
+// fetch's server not known counts as the same, the handle's own not known does not: a handle
+// that has not opened its origin yet may reach another server), and the parked read's own time
+// would have run out no later: its deadline (`ownDeadlineUs`, when it was made plus its own
+// time, readBudgetS) is at or before the fetch's (`fetchDeadlineUs`) plus `slackUs` (the
+// client's timeout resolution: its expiries are checked that often). A fetch whose deadline is
+// not known (0) is never handed over. Otherwise the parked read makes its own fetch, with its
+// own time left: a server that only answered late may still answer it, as it would a plain
+// client's read with that time.
 bool parkedGetsOwnersError(int code, bool moves, const std::string& fetchServer,
-                           const std::string& ownServer);
+                           const std::string& ownServer, uint64_t fetchDeadlineUs,
+                           uint64_t ownDeadlineUs, uint64_t slackUs);
 // Attempts of one read, at as many servers.
 inline constexpr int kReadMaxAttempts = 4;
 
