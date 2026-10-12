@@ -122,7 +122,8 @@ void keyPositionFuzz(uint64_t iters, uint64_t seed) {
     std::vector<bool> goodWide;
     uint64_t end = spanOff; // keys are written in order and never overlap
     for (uint64_t s : seeks) {
-      if (s < end || s - spanOff + 26 > n || rng() % 2)
+      // (A seek drawn below the span's start, near 0, wraps around: it is never a key here.)
+      if (s < end || s < spanOff || s - spanOff > n || n - (s - spanOff) < 26 || rng() % 2)
         continue;
       uint8_t* k = p.get() + (s - spanOff);
       const bool wide = s > INT32_MAX || rng() % 2;
@@ -158,6 +159,65 @@ void keyPositionFuzz(uint64_t iters, uint64_t seed) {
         (c.count && (c.first < lo || c.first >= hi || c.first < spanOff ||
                      !std::binary_search(seeks.begin(), seeks.end(), c.first))))
       violate("firstMisplacedKey with lengths: a count or basket it may not report", i, seed);
+    // The whole verdict (checkFetched with the block checksum): the same key failures as
+    // firstMisplacedKey with the lengths, each a basket of the table; a data failure only for a
+    // basket wholly in the span; the same answer twice; and the span cut in two pieces at a random
+    // point and judged as one run (checkPieces) gives the same verdict. Some good keys get a
+    // compressed basket's fields and a block header, so the decoders run on hostile bytes.
+    for (size_t g = 0; g < good.size(); ++g) {
+      if (rng() % 2)
+        continue;
+      uint8_t* k = p.get() + (good[g] - spanOff);
+      const uint64_t room = n - (good[g] - spanOff);
+      const int16_t keylen = goodWide[g] ? 34 : 26;
+      const size_t li = static_cast<size_t>(std::lower_bound(seeks.begin(), seeks.end(), good[g]) -
+                                            seeks.begin());
+      const int32_t len = static_cast<int32_t>(std::min<uint64_t>(room, keylen + 9 + rng() % 400));
+      lengths[li] = len;
+      const int32_t objlen = len + 1 + static_cast<int32_t>(rng() % 5000);
+      for (int b = 0; b < 4; ++b) {
+        k[b] = static_cast<uint8_t>(static_cast<uint32_t>(len) >> (8 * (3 - b)));
+        k[6 + b] = static_cast<uint8_t>(static_cast<uint32_t>(objlen) >> (8 * (3 - b)));
+      }
+      k[14] = 0;
+      k[15] = static_cast<uint8_t>(keylen);
+      if (static_cast<uint64_t>(keylen) + 9 <= room) {
+        static const char* const tags[] = {"ZL", "XZ", "L4", "ZS", "CS", "QQ"};
+        const char* t = tags[rng() % 6];
+        k[keylen] = static_cast<uint8_t>(t[0]);
+        k[keylen + 1] = static_cast<uint8_t>(t[1]);
+      }
+    }
+    const FetchVerdict v1 = checkFetched(seeks, lengths, spanOff, p.get(), n, true);
+    const FetchVerdict v2 = checkFetched(seeks, lengths, spanOff, p.get(), n, true);
+    const MisplacedKeys keyOnly = firstMisplacedKey(seeks, lengths, spanOff, p.get(), n, lo, hi);
+    uint32_t keyIn = 0;
+    for (const auto& f : v1.faults) {
+      if (!std::binary_search(seeks.begin(), seeks.end(), f.at))
+        violate("checkFetched: a fault at no basket of the table", i, seed);
+      if (f.kind == FetchFault::kData && (f.at < spanOff || f.end > spanOff + n))
+        violate("checkFetched: a data fault for a basket not wholly in the span", i, seed);
+      if ((f.kind == FetchFault::kPosition || f.kind == FetchFault::kLength) && f.at >= lo &&
+          f.at < hi)
+        ++keyIn;
+    }
+    if (keyIn != keyOnly.count)
+      violate("checkFetched: key failures differ from firstMisplacedKey's", i, seed);
+    if (v1.faults.size() != v2.faults.size() || v1.passed != v2.passed || v1.none != v2.none)
+      violate("checkFetched: not deterministic", i, seed);
+    if (n) {
+      const uint64_t cut = rng() % n;
+      std::unique_ptr<uint8_t[]> a1(cut ? new uint8_t[cut] : nullptr);
+      std::unique_ptr<uint8_t[]> a2(new uint8_t[n - cut]);
+      std::memcpy(a1.get(), p.get(), cut);
+      std::memcpy(a2.get(), p.get() + cut, n - cut);
+      const std::vector<BytePiece> two{
+          {spanOff, reinterpret_cast<const char*>(a1.get()), cut},
+          {spanOff + cut, reinterpret_cast<const char*>(a2.get()), n - cut}};
+      const FetchVerdict j = checkPieces(seeks, lengths, two, true);
+      if (j.faults.size() != v1.faults.size() || j.passed != v1.passed || j.none != v1.none)
+        violate("checkPieces: two pieces judged otherwise than the span they make", i, seed);
+    }
     // And it catches what it must: a good key the reader asked for, with one
     // byte of its position changed, fails.
     for (size_t g = 0; g < good.size(); ++g) {
