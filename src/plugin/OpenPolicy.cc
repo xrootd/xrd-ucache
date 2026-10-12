@@ -1122,18 +1122,20 @@ int missRelayTimeoutS(int code, int readerTimeoutS, int requestTimeoutS, int ela
   return left >= 1 ? left : -1;
 }
 
-int parkedRefetchTimeoutS(int readerTimeoutS, int requestTimeoutS, int elapsedS) {
-  const int left = readBudgetS(readerTimeoutS, requestTimeoutS) - std::max(elapsedS, 0);
-  return left >= 1 ? left : -1;
+int parkedRefetchTimeoutS(int readerTimeoutS, int requestTimeoutS, int64_t elapsedUs) {
+  const int64_t leftUs = int64_t{readBudgetS(readerTimeoutS, requestTimeoutS)} * 1000000 -
+                         std::max<int64_t>(elapsedUs, 0);
+  if (leftUs <= 0)
+    return -1;
+  return static_cast<int>((leftUs + 999999) / 1000000);
 }
 
 bool parkedGetsOwnersError(int code, bool moves, const std::string& fetchServer,
-                           const std::string& ownServer, uint64_t fetchDeadlineUs,
-                           uint64_t ownDeadlineUs, uint64_t slackUs) {
-  if (!fetchRanOutOfTime(code) || moves || ownServer.empty() || fetchDeadlineUs == 0)
+                           const std::string& ownServer, int64_t failedAtS, int64_t ownExpiryS) {
+  if (!fetchRanOutOfTime(code) || moves || ownServer.empty() || failedAtS <= 0)
     return false;
-  if (ownDeadlineUs > fetchDeadlineUs && ownDeadlineUs - fetchDeadlineUs > slackUs)
-    return false; // it had more time than the fetch it waited for
+  if (ownExpiryS > failedAtS)
+    return false; // its own time had not run out: it fetches for itself
   const auto lower = [](std::string x) {
     for (char& c : x)
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));

@@ -4432,11 +4432,7 @@ class MissReadHandler : public ResponseHandler {
         if (s && !s->IsOK()) {
           o.code = s->code;
           o.server = answeredBy(*st_, h.get());
-          // Its time limit: sent at t0_ with the reader's own timeout (originTimeout), or with
-          // the client's request timeout when it gave none. An armed handle's reads have their
-          // own limits; their waiters never take the error (parkedGetsOwnersError).
-          const int limitS = readerT_ > 0 ? readerT_ : currentRequestTimeoutS();
-          o.deadlineUs = t0_ + static_cast<uint64_t>(std::max(limitS, 0)) * 1000000;
+          o.failedAtS = static_cast<int64_t>(::time(nullptr)); // as the client counts expiry
         }
         entry_->endFetch(wireOff_, gateLen_, o);
       }
@@ -4644,8 +4640,8 @@ void redispatchRead(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> 
     complete(handler, okStatus(), chunkResponse(offset, size, buffer));
     return;
   }
-  const int elapsedS = static_cast<int>((t0 - std::min(startUs, t0)) / 1000000);
-  const int left = parkedRefetchTimeoutS(readerT, currentRequestTimeoutS(), elapsedS);
+  const int left = parkedRefetchTimeoutS(readerT, currentRequestTimeoutS(),
+                                         static_cast<int64_t>(t0 - std::min(startUs, t0)));
   if (left < 0) {
     complete(handler,
              new XRootDStatus(XrdCl::stError, XrdCl::errOperationExpired, 0,
@@ -4683,8 +4679,9 @@ void redispatchRead(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> 
 // What a read parked behind another read's fetch of its span does when that fetch ends
 // (FileEntry::beginFetch). A fetch that ran out of time at its server, on a handle whose reads do
 // not move, from the server this handle reads (parkedGetsOwnersError), gives that error at once to
-// every read parked on it whose own time would have run out no later than the fetch's (its own
-// request to that server would have met it then without the cache); otherwise the read is
+// every read parked on it whose own time had run out when the failure was seen, in whole seconds
+// as the client counts (its own request to that server would have expired at that same check of
+// the client's timer without the cache); otherwise the read is
 // classified again (usually served from the pages just staged, or fetched for itself within its
 // own time left, redispatchRead: a server that answers again in it serves it). Fires once,
 // whichever of the fetch's end and the insurance timer comes first.
@@ -4693,18 +4690,18 @@ FileEntry::FetchDone parkedRead(std::shared_ptr<HandleState> st,
                                void* buffer, ResponseHandler* handler, int readerT,
                                uint64_t startUs) {
   auto fired = std::make_shared<std::atomic<bool>>(false);
-  return [st, entry, offset, size, buffer, handler, readerT, startUs,
+  // When the read was made, on the wall clock in whole seconds, as the client stamps a request.
+  const uint64_t ago = nowUs() - std::min(startUs, nowUs());
+  const int64_t wallStartS = static_cast<int64_t>(::time(nullptr)) -
+                             static_cast<int64_t>(ago / 1000000);
+  return [st, entry, offset, size, buffer, handler, readerT, startUs, wallStartS,
           fired](const FileEntry::FetchOutcome& o) {
     if (fired->exchange(true))
       return;
-    const uint64_t ownDeadlineUs =
-        startUs +
-        static_cast<uint64_t>(std::max(readBudgetS(readerT, currentRequestTimeoutS()), 0)) * 1000000;
+    const int64_t ownExpiryS = wallStartS + readBudgetS(readerT, currentRequestTimeoutS());
     if (o.code &&
-        parkedGetsOwnersError(
-            o.code, st->moveOnReads.load(std::memory_order_relaxed), o.server,
-            answeredBy(*st, nullptr), o.deadlineUs, ownDeadlineUs,
-            static_cast<uint64_t>(std::max(currentTimeoutResolutionS(), 1)) * 1000000)) {
+        parkedGetsOwnersError(o.code, st->moveOnReads.load(std::memory_order_relaxed), o.server,
+                              answeredBy(*st, nullptr), o.failedAtS, ownExpiryS)) {
       const int code = o.code;
       Executor::instance().post([handler, code] {
         complete(handler,

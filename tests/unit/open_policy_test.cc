@@ -491,47 +491,60 @@ TEST(OpenPolicy, FetchRanOutOfTime) {
 // A read that waited, parked, for another read's fetch of its span makes its own fetch within its
 // own time left; with nothing left it fails with an expiry.
 TEST(OpenPolicy, ParkedRefetchTimeout) {
+  constexpr int64_t S = 1000000; // 1 s in microseconds
   EXPECT_EQ(parkedRefetchTimeoutS(0, RT, 0), 1800);
-  EXPECT_EQ(parkedRefetchTimeoutS(0, RT, 10), 1790);
-  EXPECT_EQ(parkedRefetchTimeoutS(0, 10, 9), 1);
-  EXPECT_EQ(parkedRefetchTimeoutS(0, 10, 10), -1) << "the client's request timeout spent";
-  EXPECT_EQ(parkedRefetchTimeoutS(0, 10, 25), -1);
-  EXPECT_EQ(parkedRefetchTimeoutS(45, RT, 20), 25) << "the reader's own timeout, not the client's";
-  EXPECT_EQ(parkedRefetchTimeoutS(45, RT, 45), -1);
-  EXPECT_EQ(parkedRefetchTimeoutS(30, RT, -3), 30) << "a clock that went back";
+  EXPECT_EQ(parkedRefetchTimeoutS(0, RT, 10 * S), 1790);
+  EXPECT_EQ(parkedRefetchTimeoutS(0, 10, 9 * S), 1);
+  EXPECT_EQ(parkedRefetchTimeoutS(0, 10, 9 * S + S / 2), 1) << "half a second left: 1 s";
+  EXPECT_EQ(parkedRefetchTimeoutS(0, 10, 10 * S - 1), 1) << "any time left: 1 s, not an expiry";
+  EXPECT_EQ(parkedRefetchTimeoutS(0, 6, 5 * S + S / 10), 1) << "the slow server's case: 0.9 s left";
+  EXPECT_EQ(parkedRefetchTimeoutS(0, 10, 3 * S + S / 2), 7) << "6.5 s left, rounded up";
+  EXPECT_EQ(parkedRefetchTimeoutS(0, 10, 10 * S), -1) << "the client's request timeout spent";
+  EXPECT_EQ(parkedRefetchTimeoutS(0, 10, 25 * S), -1);
+  EXPECT_EQ(parkedRefetchTimeoutS(45, RT, 20 * S), 25) << "the reader's own timeout, not the client's";
+  EXPECT_EQ(parkedRefetchTimeoutS(45, RT, 45 * S), -1);
+  EXPECT_EQ(parkedRefetchTimeoutS(30, RT, -3 * S), 30) << "a clock that went back";
   EXPECT_EQ(parkedRefetchTimeoutS(0, 0, 0), kReadDeadlineS) << "no request timeout known";
 }
 
 // A read parked behind a fetch that ran out of time at the server its handle reads, on a handle
-// whose reads do not move, takes that error; anything else fetches for itself.
+// whose reads do not move, takes that error when its own time had run out by the moment the
+// failure was seen (the client's own rule: a request's expiry is time(0) plus its timeout, in
+// whole seconds, and the client ends it at the first check at or past it); anything else fetches
+// for itself.
 TEST(OpenPolicy, ParkedGetsOwnersError) {
   const std::string A = "a.example.org:1094", B = "b.example.org:1094";
-  constexpr uint64_t S = 1000000;          // 1 s in microseconds
-  constexpr uint64_t D = 100 * S, R = S;   // the fetch's deadline; the client's resolution
   const auto gets = [&](int code, bool moves, const std::string& fs, const std::string& own,
-                        uint64_t fd, uint64_t od) {
-    return parkedGetsOwnersError(code, moves, fs, own, fd, od, R);
+                        int64_t failedAtS, int64_t ownExpiryS) {
+    return parkedGetsOwnersError(code, moves, fs, own, failedAtS, ownExpiryS);
   };
+  constexpr int64_t F = 1000000; // the fetch's own expiry (wall seconds); the client's timer checks
+  constexpr int64_t R = 15;      // every R s (its timeout resolution, 15 by default)
   for (int code : {kErrOperationExpired, kErrSocketTimeout}) {
-    // The same server, its own time no longer than the fetch's: the fetch's error is its answer.
-    EXPECT_TRUE(gets(code, false, A, A, D, D));
-    EXPECT_TRUE(gets(code, false, A, A, D, D - 5 * S)) << "its own time ran out first";
-    EXPECT_TRUE(gets(code, false, A, A, D, D + R)) << "within the client's resolution";
-    EXPECT_TRUE(gets(code, false, "A.Example.org:1094", A, D, D)) << "in any case";
-    EXPECT_TRUE(gets(code, false, "", A, D, D)) << "the fetch's server not known: the same";
-    // More time of its own than the fetch had: it fetches for itself (a slow server may answer).
-    EXPECT_FALSE(gets(code, false, A, A, D, D + R + 1));
-    EXPECT_FALSE(gets(code, false, A, A, D, D + 7 * S)) << "the fetch had 3 s, the read 10";
+    // Seen at the fetch's own expiry: a read with the same expiry, or an earlier one, takes it.
+    EXPECT_TRUE(gets(code, false, A, A, F, F));
+    EXPECT_TRUE(gets(code, false, A, A, F, F - 5)) << "its own time ran out first";
+    EXPECT_TRUE(gets(code, false, A, A, F + 3, F + 3)) << "seen 3 s late, its expiry then";
+    EXPECT_TRUE(gets(code, false, "A.Example.org:1094", A, F, F)) << "in any case";
+    EXPECT_TRUE(gets(code, false, "", A, F, F)) << "the fetch's server not known: the same";
+    // Its own time had not run out when the failure was seen: it fetches for itself, whatever the
+    // fetch's own expiry and the timer's period.
+    EXPECT_FALSE(gets(code, false, A, A, F, F + 1));
+    EXPECT_FALSE(gets(code, false, A, A, F, F + R - 1))
+        << "its expiry the fetch's plus the resolution less 1 s, the failure seen at the fetch's";
+    EXPECT_FALSE(gets(code, false, A, A, F + 3, F + 4))
+        << "the fetch had 2 s, seen at 5 s; the read had 6 s (the slow server's case)";
+    EXPECT_FALSE(gets(code, false, A, A, F, F + 7)) << "the fetch had 3 s, the read 10";
     // Its own server not known (a handle that has not opened its origin): it fetches for itself.
-    EXPECT_FALSE(gets(code, false, A, "", D, D));
-    EXPECT_FALSE(gets(code, false, "", "", D, D));
-    // The fetch's deadline not known: never handed over.
-    EXPECT_FALSE(gets(code, false, A, A, 0, D));
-    EXPECT_FALSE(gets(code, true, A, A, D, D)) << "its reads move";
-    EXPECT_FALSE(gets(code, false, A, B, D, D)) << "its handle reads another server";
+    EXPECT_FALSE(gets(code, false, A, "", F, F));
+    EXPECT_FALSE(gets(code, false, "", "", F, F));
+    // When the failure was seen not known: never handed over.
+    EXPECT_FALSE(gets(code, false, A, A, 0, F));
+    EXPECT_FALSE(gets(code, true, A, A, F, F)) << "its reads move";
+    EXPECT_FALSE(gets(code, false, A, B, F, F)) << "its handle reads another server";
   }
   for (int code : {0, kErrConnectionError, kErrSocketError, kErrErrorResponse, kErrDataError})
-    EXPECT_FALSE(gets(code, false, A, A, D, D)) << code;
+    EXPECT_FALSE(gets(code, false, A, A, F, F)) << code;
 }
 
 // Every status of a failed read and what follows it.

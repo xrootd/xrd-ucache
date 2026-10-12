@@ -720,8 +720,8 @@ it.
   read whose fetch from the origin ran out of time at its server (the server
   stopped answering) gets that error, as the read would without uCache, and so
   does every read of the job that was waiting for the same bytes from the same
-  server and whose own time would have run out no later; a waiting read with
-  more time left sends its own read with that time (TROUBLESHOOTING.md).
+  server and whose own time had run out by then; a waiting read with time
+  left sends its own read with what it has (TROUBLESHOOTING.md).
 - **Servers to avoid (`?tried=`).** A reader can keep a redirector from
   sending it to a given server by adding `?tried=<full host name>` (a comma
   separated list for several) to the file's URL. uCache honours it on every

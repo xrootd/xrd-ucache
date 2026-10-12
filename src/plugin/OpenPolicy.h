@@ -669,25 +669,25 @@ bool fetchRanOutOfTime(int code);
 int missRelayTimeoutS(int code, int readerTimeoutS, int requestTimeoutS, int elapsedS);
 // The timeout of the fetch a read makes for itself after it waited, parked, for another read's
 // fetch of the same span that did not bring its bytes (or after the wait's own insurance timer),
-// `elapsedS` after the read was made: what is left of its own time (readBudgetS), at least 1 s;
-// -1 when nothing is left, and the read then fails with an expiry, as it would have without the
-// cache.
-int parkedRefetchTimeoutS(int readerTimeoutS, int requestTimeoutS, int elapsedS);
+// `elapsedUs` after the read was made: what is left of its own time (readBudgetS), rounded up to
+// whole seconds, so at least 1 s while any is left; -1 when none is left, and the read then fails
+// with an expiry, as it would have without the cache.
+int parkedRefetchTimeoutS(int readerTimeoutS, int requestTimeoutS, int64_t elapsedUs);
 // Whether a read parked behind another read's fetch of its span takes that fetch's failure
 // `code` as its own answer: the fetch ran out of time at its server (fetchRanOutOfTime), the
 // parked read's handle does not move its reads to another site (`moves`), the fetch failed at
 // the server the parked read's handle reads from (`fetchServer`, `ownServer`, in any case; the
 // fetch's server not known counts as the same, the handle's own not known does not: a handle
 // that has not opened its origin yet may reach another server), and the parked read's own time
-// would have run out no later: its deadline (`ownDeadlineUs`, when it was made plus its own
-// time, readBudgetS) is at or before the fetch's (`fetchDeadlineUs`) plus `slackUs` (the
-// client's timeout resolution: its expiries are checked that often). A fetch whose deadline is
-// not known (0) is never handed over. Otherwise the parked read makes its own fetch, with its
-// own time left: a server that only answered late may still answer it, as it would a plain
-// client's read with that time.
+// had run out when the fetch's failure was seen: its expiry (`ownExpiryS`: the wall clock in whole
+// seconds when it was made, time(0), plus its own time, readBudgetS) is at or before that moment
+// (`failedAtS`, the same clock). That is the client's own rule: it gives a request time(0) plus its
+// timeout and ends it at the first check of its timer at or past it, so a plain client's read
+// would have expired at that same check. A failure whose moment is not known (0) is never handed
+// over. Otherwise the parked read makes its own fetch, with its own time left: a server that
+// answers again within it serves it, as it would a plain client's read.
 bool parkedGetsOwnersError(int code, bool moves, const std::string& fetchServer,
-                           const std::string& ownServer, uint64_t fetchDeadlineUs,
-                           uint64_t ownDeadlineUs, uint64_t slackUs);
+                           const std::string& ownServer, int64_t failedAtS, int64_t ownExpiryS);
 // Attempts of one read, at as many servers.
 inline constexpr int kReadMaxAttempts = 4;
 

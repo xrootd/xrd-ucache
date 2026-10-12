@@ -220,14 +220,14 @@ class FileEntry {
   // How the owner's fetch ended, as endFetch gives it to every parked caller:
   // `code` 0 when it brought its bytes (or ended for a reason of its own),
   // else the client's status code of its failure, with the server that failed
-  // it (`server`, "" when not known), and when its time limit ran out
-  // (`deadlineUs`: when it was sent plus the timeout it was given, on the
-  // monotonic clock of the plug-in's nowUs; 0 when not known), so a caller can
-  // tell whether its own fetch would meet the same failure.
+  // it (`server`, "" when not known), and when that failure was seen
+  // (`failedAtS`: the wall clock in whole seconds, time(0), as the client
+  // counts its own requests' expiry; 0 when not known), so a caller can tell
+  // whether its own request would have met the same failure then.
   struct FetchOutcome {
     int code = 0;
     std::string server;
-    uint64_t deadlineUs = 0;
+    int64_t failedAtS = 0;
   };
   using FetchDone = std::function<void(const FetchOutcome&)>;
   bool beginFetch(uint64_t off, uint64_t len, FetchDone onOwnerDone);

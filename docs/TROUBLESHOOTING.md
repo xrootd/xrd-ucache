@@ -247,12 +247,13 @@ client's stream timeout ends it on a connection gone quiet) its read is not
 sent to that server again, which would wait as long once more. Single reads of
 other threads or handles of the job that need the same bytes (the same span of
 the file) wait for that one fetch rather than sending their own. When it runs out
-of time at the server their handle reads, a waiting read whose own time would have
-run out no later (its own timeout, or the client's request timeout, counted from
-when it was made; within the client's timeout resolution) gets the same error at
-that moment, as its own read to that server would have; one that has more time
-left, or whose handle has not opened the origin yet, sends its own read with that
-time, and a server that answers again within it serves it. A fetch that fails otherwise (a lost
+of time at the server their handle reads, a waiting read whose own time had run
+out by the moment that failure is seen (its own timeout, or the client's request
+timeout, counted in whole seconds from when it was made, as the client counts its
+requests' time) gets the same error at that moment, as its own read to that
+server would have at that same check of the client's timer; one with time left,
+or whose handle has not opened the origin yet, sends its own read with what it has
+(at least 1 s), and a server that answers again within it serves it. A fetch that fails otherwise (a lost
 connection, a server's error) is followed by the job's own read, sent to the
 origin as it is, within the time that read has left (counted against the
 client's request timeout as the client holds it at that moment when the job
