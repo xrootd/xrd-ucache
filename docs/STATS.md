@@ -324,9 +324,18 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   zlib adler32, LZ4 XXH64, a ZSTD content checksum, the RNTuple page
   checksum); that failed it — never kept or served, the read fails with "data
   is corrupted" and the log names the file, the position, the codec and the
-  server; or that carry no checksum (ZSTD as ROOT writes it, baskets stored
-  uncompressed), which nothing can check. Only what a first pass converts is
-  checked by checksum; other bytes are not counted here except as follows.
+  server; or that carry no checksum this build can check (ZSTD as ROOT writes it, baskets
+  stored uncompressed, a block this build cannot decode), which nothing can check.
+  `origin_checks_not_examined` counts the baskets of a converted branch that a first pass
+  did not decode, so that their own checksum, which they may carry, was not checked: a
+  basket whose own codec is not in `recompress_codecs` though its branch's is (a file merged
+  from inputs written with different codecs keeps each input's baskets as they were), or
+  one that cannot be read as a basket record. Such a basket is kept and served as stored,
+  as without the cache (shown only when not 0). A branch whose own codec is not in
+  `recompress_codecs` is not converted at all: in a file that has a replica its baskets are
+  fetched as original bytes, which are not checked, even with `check_origin_integrity` on,
+  and are not counted here. Only what a first pass converts is checked by checksum; other
+  bytes are not counted here except as follows.
   With `check_origin_integrity` on, these counters also count the byte path: the baskets of a
   fetch from the origin (a byte-cache miss, a read the cache relays to the origin for a handle
   that holds the file's map, read-ahead, the bytes the checks at open keep) that lie wholly in

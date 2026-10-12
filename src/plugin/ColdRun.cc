@@ -1372,10 +1372,16 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     req->done();
     return;
   }
-  if (cf.checkConverted && req->st->store)
-    (c.check == tp::ConvertedBasket::kPassed ? req->st->store->stats().originChecksPassed
-                                             : req->st->store->stats().originChecksNone)
+  // Counted by what the check could say: passed; none, for a basket that carries no check this
+  // build can make; not examined, for one the conversion did not decode (a codec not in
+  // recompress_codecs, among them), whose check was not made.
+  if (cf.checkConverted && req->st->store) {
+    auto& stats = req->st->store->stats();
+    (c.check == tp::ConvertedBasket::kPassed         ? stats.originChecksPassed
+     : c.check == tp::ConvertedBasket::kNotCheckable ? stats.originChecksNone
+                                                     : stats.originChecksNotExamined)
         .fetch_add(1, std::memory_order_relaxed);
+  }
   const uint64_t us = nowUs() - t0;
   cf.convertUs.fetch_add(us, std::memory_order_relaxed);
   cf.inBytes.fetch_add(recLen, std::memory_order_relaxed);

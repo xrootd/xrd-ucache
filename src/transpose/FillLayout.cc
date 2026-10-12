@@ -441,8 +441,10 @@ ConvertedBasket convertBasket(const uint8_t* rec, size_t n, uint32_t slotLen,
   const uint8_t* pay = rec + k->keylen;
   const size_t payLen = n - k->keylen;
   const bool storedRaw = k->objlen == k->nbytes - static_cast<int32_t>(k->keylen);
-  if (storedRaw)
-    return original(); // nothing for the reader to decode already
+  if (storedRaw) {
+    c.check = ConvertedBasket::kNotCheckable; // stored as it is: no checksum to hold it to
+    return original();                        // nothing for the reader to decode already
+  }
   if (k->objlen <= 0)
     return original();
   // The basket's own blocks name what it holds, never the branch's setting.

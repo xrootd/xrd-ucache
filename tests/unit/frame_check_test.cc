@@ -555,6 +555,18 @@ TEST(ConvertBasket, ReportsWhatItsDecodeSaid) {
                                     std::vector<std::string>{"zlib"});
   EXPECT_EQ(n.kind, ConvertedBasket::kOriginal);
   EXPECT_EQ(n.check, ConvertedBasket::kNotExamined);
+  // A basket stored uncompressed carries no check: not one left unexamined.
+  std::vector<uint8_t> stored(kLzmaRecord, kLzmaRecord + 70);
+  stored.insert(stored.end(), 40, 0x2a);
+  const uint32_t nbytes = static_cast<uint32_t>(stored.size()), objlen = nbytes - 70;
+  for (int i = 0; i < 4; ++i) {
+    stored[i] = static_cast<uint8_t>(nbytes >> (24 - 8 * i));
+    stored[6 + i] = static_cast<uint8_t>(objlen >> (24 - 8 * i));
+  }
+  ConvertedBasket r = convertBasket(stored.data(), stored.size(), 3 * stored.size(), lzma);
+  ASSERT_TRUE(r.error.empty()) << r.error;
+  EXPECT_EQ(r.kind, ConvertedBasket::kOriginal);
+  EXPECT_EQ(r.check, ConvertedBasket::kNotCheckable);
 }
 
 TEST(BasketKey, FieldsRootIgnoresAreOnlyNoted) {

@@ -125,6 +125,7 @@ std::string Stats::toJsonBody() const {
   f("origin_checks_failed", originChecksFailed);
   f("origin_checks_none", originChecksNone);
   f("origin_checks_unjudged", originChecksUnjudged);
+  f("origin_checks_not_examined", originChecksNotExamined);
   f("cold_replica_convert_us", coldReplicaConvertUs);
   f("cold_replica_declined", coldReplicaDeclined);
   f("cold_replica_skipped", coldReplicaSkipped);
@@ -272,6 +273,7 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.originChecksFailed += extractU64(last, "origin_checks_failed");
     t.originChecksNone += extractU64(last, "origin_checks_none");
     t.originChecksUnjudged += extractU64(last, "origin_checks_unjudged");
+    t.originChecksNotExamined += extractU64(last, "origin_checks_not_examined");
     t.coldReplicaConvertUs += extractU64(last, "cold_replica_convert_us");
     t.coldReplicaDeclined += extractU64(last, "cold_replica_declined");
     t.coldReplicaSkipped += extractU64(last, "cold_replica_skipped");
