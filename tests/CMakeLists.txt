@@ -140,6 +140,16 @@ if(UCACHE_BUILD_PLUGIN)
   add_executable(ucache-plugin-fuzz integration/plugin_fuzz.cc)
   target_include_directories(ucache-plugin-fuzz SYSTEM PRIVATE ${XRDCL_INCLUDE_DIR})
   target_link_libraries(ucache-plugin-fuzz PRIVATE ${XRDCL_LIBRARY})
+  # Under the thread sanitizer the harness keeps every symbol of its own local. Its
+  # instrumented static libraries carry out-of-line copies of inline std:: code (the
+  # shared_ptr release); exported, libXrdCl binds to them, so the sanitizer sees one side
+  # of libXrdCl's reference counting and not the other and reports a race in libXrdCl's
+  # own close, in every run.
+  if (UCACHE_SANITIZE MATCHES "thread" AND NOT APPLE)
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/plugin_fuzz_local.map "{ local: *; };\n")
+    target_link_options(ucache-plugin-fuzz PRIVATE
+                        "LINKER:--version-script=${CMAKE_CURRENT_BINARY_DIR}/plugin_fuzz_local.map")
+  endif()
   if (TARGET ucache-transpose) # the seed's basket map drives a TTree-shaped fill stream
     target_link_libraries(ucache-plugin-fuzz PRIVATE ucache-transpose)
     target_compile_definitions(ucache-plugin-fuzz PRIVATE UCACHE_FUZZ_HAVE_TRANSPOSE=1)
