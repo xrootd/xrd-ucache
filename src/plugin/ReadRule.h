@@ -141,8 +141,18 @@ using FetchPiece = transpose::BytePiece;
 // on them. Pieces that follow each other without a gap (in offset order) are judged as one run, so
 // a key header or a basket a cut between two pieces divides is judged whole (such a run is copied
 // into one buffer first). Pieces that overlap are judged apart. Thread-safe; reads only the pieces.
-transpose::FetchVerdict fetchVerdict(const KeyMap& m, const std::string& server,
-                                     std::vector<FetchPiece> pieces);
+transpose::FetchVerdict
+fetchVerdict(const KeyMap& m, const std::string& server, std::vector<FetchPiece> pieces,
+             const std::vector<std::pair<uint64_t, uint64_t>>* reach = nullptr);
+// The same, made in parallel on the decode pool (FetchCheck.h): `done` is called once, with the
+// verdict, on the pool thread that finished it (at once, on this thread, when there is nothing
+// to judge). `m` is kept alive until then; the pieces' bytes are the caller's to keep. `reach`:
+// decode only the baskets these ranges reach (transpose::FetchJudge), for bytes of which nothing
+// else is kept (read-ahead's padding).
+void fetchVerdictAsync(const std::shared_ptr<const KeyMap>& m, const std::string& server,
+                       std::vector<FetchPiece> pieces,
+                       std::shared_ptr<const std::vector<std::pair<uint64_t, uint64_t>>> reach,
+                       std::function<void(transpose::FetchVerdict)> done);
 // Whether fetchVerdict would decode anything, or join pieces: work kept off the client's callback
 // threads. A few bytes read per basket.
 bool fetchNeedsWork(const KeyMap& m, const std::string& server, std::vector<FetchPiece> pieces);

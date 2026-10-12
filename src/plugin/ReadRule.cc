@@ -1,8 +1,10 @@
 #include "ReadRule.h"
 
 #include "Executor.h"
+#include "FetchCheck.h"
 #include "Log.h"
 #include "OriginSource.h"
+#include "ParseEnd.h"
 #include "RNTupleMeta.h"
 #include "TreeMeta.h"
 
@@ -12,6 +14,7 @@
 #include <deque>
 #include <iterator>
 #include <new>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 
@@ -71,15 +74,25 @@ struct KeySeekTable {
 };
 // The waiters of a parse that ended, each posted to the executor (none runs on the parsing
 // thread, which may be a client callback thread). A waiter that cannot be posted runs here.
-void postWaiters(std::vector<std::function<void()>>& w) {
-  for (auto& f : w) {
-    try {
-      Executor::instance().post(f);
-    } catch (...) {
-      f();
-    }
+void postWaiter(std::function<void()>& f) {
+  try {
+    Executor::instance().post(f);
+  } catch (...) {
+    f();
   }
+}
+void postWaiters(std::vector<std::function<void()>>& w) {
+  for (auto& f : w)
+    postWaiter(f);
   w.clear();
+}
+// The parse of a file's records for its map. Test hook: UCACHE_TEST_KEYMAP_THROW makes it throw,
+// as a parse that runs out of memory would, so that a test sees its waiters still answered.
+tp::FileMeta parseRecords(OriginSource& src, int64_t size) {
+  static const bool throwIt = std::getenv("UCACHE_TEST_KEYMAP_THROW") != nullptr;
+  if (throwIt)
+    throw std::bad_alloc();
+  return tp::parseReaderTree(src, size);
 }
 std::mutex& tablesMu() {
   static auto* m = new std::mutex;
@@ -137,8 +150,12 @@ keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEn
     return t->seeks;
   OriginSource src;
   tp::FileMeta own;
+  // A parse this call makes ends, however it leaves (an exception included), with the table no
+  // longer parsing and the requests that waited for it posted (ParseEnd).
+  std::optional<ParseEnd<KeySeekTable>> end;
   if (!fm) {
     t->parsing = true;
+    end.emplace(*t, g, &postWaiter);
     g.unlock();
     // Test hook: the parse held this long before its first read, so that another handle's miss
     // is answered while it runs (that answer waits for the map, keySeeksBuilt).
@@ -151,16 +168,12 @@ keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEn
     src.st = st;
     src.entry = entry;
     src.timeout = timeout;
-    own = tp::parseReaderTree(src, static_cast<int64_t>(entry->fileSize()));
+    own = parseRecords(src, static_cast<int64_t>(entry->fileSize()));
     g.lock();
-    t->parsing = false;
     if (src.readFailed) {
       t->failedUs = nowUs();
       auto seeks = t->seeks;
-      std::vector<std::function<void()>> w;
-      w.swap(t->waiters);
-      g.unlock();
-      postWaiters(w);
+      end->finish();
       return seeks;
     }
     fm = &own;
@@ -174,6 +187,10 @@ keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEn
   auto m = std::make_shared<const KeyMap>(keyMapOf(*fm, entry->fileSize(), from));
   t->badUs = m->bad.empty() ? 0 : nowUs();
   t->seeks = m;
+  if (end) {
+    end->finish();
+    return m;
+  }
   std::vector<std::function<void()>> w;
   w.swap(t->waiters);
   g.unlock();
@@ -182,11 +199,22 @@ keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEn
 }
 
 tp::FetchVerdict fetchVerdict(const KeyMap& m, const std::string& server,
-                              std::vector<FetchPiece> pieces) {
+                              std::vector<FetchPiece> pieces, const Ranges* reach) {
   if (!m.bad.empty() && (m.server.empty() || server != m.server))
     return tp::FetchVerdict();
   return tp::checkPieces(m.seeks, m.bytes, std::move(pieces), /*data=*/true,
-                         m.bad.empty() ? nullptr : &m.badSpans, m.bad);
+                         m.bad.empty() ? nullptr : &m.badSpans, m.bad, reach);
+}
+
+void fetchVerdictAsync(const std::shared_ptr<const KeyMap>& m, const std::string& server,
+                       std::vector<FetchPiece> pieces, std::shared_ptr<const Ranges> reach,
+                       std::function<void(tp::FetchVerdict)> done) {
+  if (!m->bad.empty() && (m->server.empty() || server != m->server)) {
+    done(tp::FetchVerdict());
+    return;
+  }
+  checkPiecesOn(decodePool(), m, m->seeks, m->bytes, std::move(pieces), /*data=*/true,
+                m->bad.empty() ? nullptr : &m->badSpans, m->bad, std::move(reach), std::move(done));
 }
 
 bool fetchNeedsWork(const KeyMap& m, const std::string& server, std::vector<FetchPiece> pieces) {

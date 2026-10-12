@@ -94,7 +94,7 @@ function(ucache_add_plugin target include_dir library suffix)
   # Read-ahead needs the tree parser (and so the codecs it decompresses the
   # metadata record with); a codec-less build ships the plugin without it.
   if (TARGET ucache-transpose)
-    target_sources(${target} PRIVATE Prefetch.cc ColdRun.cc ReadRule.cc)
+    target_sources(${target} PRIVATE Prefetch.cc ColdRun.cc ReadRule.cc FetchCheck.cc)
     target_link_libraries(${target} PRIVATE ucache-transpose)
     target_compile_definitions(${target} PRIVATE UCACHE_HAVE_PREFETCH=1 UCACHE_HAVE_COLDRUN=1)
   endif()

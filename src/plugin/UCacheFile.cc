@@ -3120,7 +3120,13 @@ static void armKeyCheck(const std::shared_ptr<HandleState>& st,
   const std::string current = issueServer(*st, nullptr);
   if (had && (had->bad.empty() || had->server == current))
     return;
-  auto seeks = keySeeksFor(st, entry, timeout, nullptr, std::string(), &current);
+  std::shared_ptr<const KeyMap> seeks;
+  try {
+    seeks = keySeeksFor(st, entry, timeout, nullptr, std::string(), &current);
+  } catch (...) {
+    return; // a parse that threw (no memory): no map, the miss goes unchecked, as after a failed
+            // read
+  }
   // A map that shows a copy bad: what the entry took from that copy is dropped now (its records,
   // read by the parse, among them), not only at the first read the map refuses.
   if (seeks && !seeks->bad.empty() && seeks != had)
@@ -3136,43 +3142,44 @@ static void countChecks(HandleState& st, const transpose::FetchVerdict& v) {
     st.store->stats().originChecksNone.fetch_add(v.none, std::memory_order_relaxed);
   }
 }
-// check_origin_integrity, for the answer of a fetch from the origin: `go` is called with the map
-// the answer is checked against (null: none, not checked). At once, on this thread, when nothing
-// needs decoding; on the executor when something does (a basket's data to decode, pieces to join:
-// fetchNeedsWork), so that no client callback thread decodes; and, when the handle holds no map
-// while another handle's parse of the file is building it (`entry`; `wait`), once that parse ends,
-// on the executor: such an answer is checked rather than let through. `pieces` must stay valid
-// until `go` runs.
-using KeyMapGo = std::function<void(std::shared_ptr<const KeyMap>)>;
+// check_origin_integrity, for the answer of a fetch from the origin: `go` is called once, with the
+// map the answer is checked against (null: none, not checked) and the verdict on `pieces`
+// (fetchVerdict). At once, on this thread, when nothing needs decoding; when something does (a
+// basket's data to decode, pieces to join: fetchNeedsWork), the verdict is made in parallel on the
+// decode pool (fetchVerdictAsync), never on a client callback thread nor on the executor that
+// serves hits, and `go` runs on the pool thread that finished it; and, when the handle holds no
+// map while another handle's parse of the file is building it (`entry`; `wait`), once that parse
+// ends: such an answer is checked rather than let through. `pieces` must stay valid until `go`
+// runs.
+using KeyMapGo = std::function<void(std::shared_ptr<const KeyMap>, transpose::FetchVerdict)>;
 static void withKeyMap(const std::shared_ptr<HandleState>& st,
                        const std::shared_ptr<FileEntry>& entry, const std::string& server,
-                       const std::vector<FetchPiece>& pieces, const KeyMapGo& go, bool wait = true,
-                       bool offThread = false) {
+                       const std::vector<FetchPiece>& pieces, const KeyMapGo& go,
+                       bool wait = true) {
   if (!globalConfig().checkOriginIntegrity) {
-    go(nullptr);
+    go(nullptr, transpose::FetchVerdict());
     return;
   }
   std::shared_ptr<const KeyMap> m = keySeeksOf(*st);
   if (!m && entry) {
     std::function<void()> then;
     if (wait)
-      then = [st, entry, server, pieces, go] {
-        withKeyMap(st, entry, server, pieces, go, false, true);
-      };
+      then = [st, entry, server, pieces, go] { withKeyMap(st, entry, server, pieces, go, false); };
     const KeySeeksBuilt b = keySeeksBuilt(entry, wait ? &then : nullptr);
     if (b.parked)
       return;
     m = b.map;
   }
-  if (m && !offThread && fetchNeedsWork(*m, server, pieces)) {
-    try {
-      Executor::instance().post([go, m] { go(m); });
-      return;
-    } catch (...) {
-      // could not be posted: checked here
-    }
+  if (!m) {
+    go(nullptr, transpose::FetchVerdict());
+    return;
   }
-  go(m);
+  if (fetchNeedsWork(*m, server, pieces)) {
+    fetchVerdictAsync(m, server, pieces, nullptr,
+                      [go, m](transpose::FetchVerdict v) { go(m, std::move(v)); });
+    return;
+  }
+  go(m, fetchVerdict(*m, server, pieces));
 }
 #else
 static std::shared_ptr<ReadRule> directRule(const std::shared_ptr<HandleState>&,
@@ -3874,7 +3881,8 @@ struct RelayHandler : XrdCl::ResponseHandler {
   // answer of a handle that holds the file's map is checked (a handle that made a miss, or reads
   // a file read directly), the first attempt's as a moved one's; a handle that never missed holds
   // none (a copy's: pure pass-through), and its answers are not checked.
-  XRootDStatus* misplaced(XrdCl::AnyObject* r, const HostList* h, const KeyMap& m) {
+  XRootDStatus* misplaced(XrdCl::AnyObject* r, const HostList* h,
+                          const transpose::FetchVerdict& v) {
     std::vector<FetchPiece> pieces = answerPieces(r);
     if (pieces.empty())
       return nullptr;
@@ -3882,7 +3890,6 @@ struct RelayHandler : XrdCl::ResponseHandler {
     for (const auto& x : pieces)
       asked.emplace_back(x.off, x.off + x.n);
     const std::string server = answeredBy(*st, h);
-    const transpose::FetchVerdict v = fetchVerdict(m, server, std::move(pieces));
     countChecks(*st, v);
     std::string why;
     const auto bad = v.against(asked, &why);
@@ -3903,20 +3910,23 @@ struct RelayHandler : XrdCl::ResponseHandler {
       if (!pieces.empty()) {
         withKeyMap(
             st, nullptr, answeredBy(*st, h), pieces,
-            [this, s, r, h](std::shared_ptr<const KeyMap> m) { respond(s, r, h, m.get()); },
+            [this, s, r, h](std::shared_ptr<const KeyMap> m, transpose::FetchVerdict v) {
+              respond(s, r, h, m.get(), &v);
+            },
             /*wait=*/false);
         return;
       }
     }
 #endif
-    respond(s, r, h, nullptr);
+    respond(s, r, h, nullptr, nullptr);
   }
-  // The answer, with the map it is checked against (null: not checked).
-  void respond(XrdCl::XRootDStatus* s, XrdCl::AnyObject* r, XrdCl::HostList* h, const KeyMap* m) {
+  // The answer, with the map it is checked against and its verdict (null: not checked).
+  void respond(XrdCl::XRootDStatus* s, XrdCl::AnyObject* r, XrdCl::HostList* h, const KeyMap* m,
+               const transpose::FetchVerdict* v) {
     bool checkFailed = false;
 #ifdef UCACHE_HAVE_COLDRUN
-    if (m && s && s->IsOK())
-      if (XRootDStatus* refused = misplaced(r, h, *m)) {
+    if (m && v && s && s->IsOK())
+      if (XRootDStatus* refused = misplaced(r, h, *v)) {
         delete s;
         delete r;
         s = refused;
@@ -3925,6 +3935,7 @@ struct RelayHandler : XrdCl::ResponseHandler {
       }
 #else
     (void)m;
+    (void)v;
 #endif
     // A plain or page read answered short inside the file's confirmed size: the copy ends
     // there, and the read is a data failure of it (moved on an armed handle).
@@ -4448,8 +4459,8 @@ class MissReadHandler : public ResponseHandler {
 #ifdef UCACHE_HAVE_COLDRUN
     const std::vector<FetchPiece> pieces{FetchPiece{wireOff_, wireBuf_->data(), got}};
     withKeyMap(st_, entry_, server, pieces,
-               [this, a, got, server](std::shared_ptr<const KeyMap> m) {
-                 finish(*a, got, server, m.get());
+               [this, a, got, server](std::shared_ptr<const KeyMap> m, transpose::FetchVerdict v) {
+                 finish(*a, got, server, m.get(), v);
                });
 #else
     finish(*a, got, server, nullptr);
@@ -4467,13 +4478,16 @@ class MissReadHandler : public ResponseHandler {
     std::unique_ptr<HostList> h;
   };
   // The rest, with the map the fetch is checked against (null: not checked).
+#ifdef UCACHE_HAVE_COLDRUN
+  void finish(Answer& a, uint64_t got, const std::string& server, const KeyMap* m,
+              const transpose::FetchVerdict& v) {
+#else
   void finish(Answer& a, uint64_t got, const std::string& server, const KeyMap* m) {
+#endif
     bool keepNone = false;
 #ifdef UCACHE_HAVE_COLDRUN
     if (m) {
       std::string why;
-      std::vector<FetchPiece> pieces{FetchPiece{wireOff_, wireBuf_->data(), got}};
-      const transpose::FetchVerdict v = fetchVerdict(*m, server, std::move(pieces));
       countChecks(*st_, v);
       const auto mk = v.against(userOff_, userOff_ + userLen_, &why);
       if (mk.count) {
@@ -4701,10 +4715,11 @@ class MissVReadHandler : public ResponseHandler {
     pieces.reserve(wire_.size());
     for (const auto& w : wire_)
       pieces.push_back(FetchPiece{w.off, w.buf->data(), w.len});
-    withKeyMap(st_, entry_, server, pieces,
-               [this, a, wireBytes, server](std::shared_ptr<const KeyMap> m) {
-                 finish(*a, wireBytes, server, m.get());
-               });
+    withKeyMap(
+        st_, entry_, server, pieces,
+        [this, a, wireBytes, server](std::shared_ptr<const KeyMap> m, transpose::FetchVerdict v) {
+          finish(*a, wireBytes, server, m.get(), v);
+        });
 #else
     finish(*a, wireBytes, server, nullptr);
 #endif
@@ -4720,15 +4735,15 @@ class MissVReadHandler : public ResponseHandler {
     std::unique_ptr<HostList> h;
   };
   // The rest, with the map the answer is checked against (null: not checked).
+#ifdef UCACHE_HAVE_COLDRUN
+  void finish(Answer& a, uint64_t wireBytes, const std::string& server, const KeyMap* m,
+              const transpose::FetchVerdict& v) {
+#else
   void finish(Answer& a, uint64_t wireBytes, const std::string& server, const KeyMap* m) {
+#endif
     bool keepNone = false;
 #ifdef UCACHE_HAVE_COLDRUN
     if (m) {
-      std::vector<FetchPiece> pieces;
-      pieces.reserve(wire_.size());
-      for (const auto& w : wire_)
-        pieces.push_back(FetchPiece{w.off, w.buf->data(), w.len});
-      const transpose::FetchVerdict v = fetchVerdict(*m, server, std::move(pieces));
       countChecks(*st_, v);
       std::vector<std::pair<uint64_t, uint64_t>> asked;
       asked.reserve(missIdx_.size());

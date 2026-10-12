@@ -93,7 +93,8 @@ if (TARGET ucache-transpose) # learner + seek-width + hole-verification contract
                  unit/transpose_hole_test.cc unit/rntuple_meta_test.cc
                  unit/rntuple_rewrite_test.cc unit/fill_layout_test.cc unit/readmap_test.cc
                  unit/slot_table_test.cc unit/store_layout_test.cc unit/store_maps_test.cc
-                 unit/store_sweep_test.cc unit/frame_check_test.cc)
+                 unit/store_sweep_test.cc unit/frame_check_test.cc unit/fetch_check_test.cc
+                 ${CMAKE_SOURCE_DIR}/src/plugin/FetchCheck.cc)
   target_link_libraries(ucache-unit-tests PRIVATE ucache-transpose)
   target_include_directories(ucache-unit-tests PRIVATE ${CMAKE_SOURCE_DIR}/src/cli) # CacheSource.h
   target_compile_definitions(ucache-unit-tests PRIVATE UCACHE_CPUBENCH_CODECS=1)

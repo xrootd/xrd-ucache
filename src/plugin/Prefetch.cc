@@ -2,6 +2,7 @@
 
 #include "Config.h"
 #include "Executor.h"
+#include "FetchCheck.h"
 #include "FileEntry.h"
 #include "Log.h"
 #include "OriginInFlight.h"
@@ -767,42 +768,38 @@ struct Shard {
           return;
         }
         std::vector<FetchPiece> pieces;
-        for (const auto& e : elems_)
+        auto reach = std::make_shared<Ranges>();
+        for (const auto& e : elems_) {
           pieces.push_back(FetchPiece{e.off, e.buf->data(), e.len});
-        if (fetchNeedsWork(*map, server, pieces)) {
-          try {
-            Executor::instance().post(
-                [this, map, server, wire] { checkThenStage(*map, server, wire); });
-            return;
-          } catch (...) {
-            // could not be posted: checked here
-          }
+          for (const auto& r : e.stage)
+            reach->emplace_back(r.first, r.first + r.second);
         }
-        checkThenStage(*map, server, wire);
+        // Only the baskets the staged ranges reach are decoded: bridge padding is never staged.
+        auto then = [this, server, wire](transpose::FetchVerdict v) { checked(v, server, wire); };
+        if (fetchNeedsWork(*map, server, pieces))
+          fetchVerdictAsync(map, server, std::move(pieces), std::move(reach), then);
+        else
+          then(fetchVerdict(*map, server, std::move(pieces), reach.get()));
         return;
       }
       stage(server, wire);
     }
 
    private:
-    void checkThenStage(const KeyMap& map, const std::string& server, uint64_t wire) {
-      std::vector<FetchPiece> pieces;
-      for (const auto& e : elems_)
-        pieces.push_back(FetchPiece{e.off, e.buf->data(), e.len});
-      const transpose::FetchVerdict v = fetchVerdict(map, server, std::move(pieces));
-      if (stats_) {
-        stats_->originChecksPassed.fetch_add(v.passed, std::memory_order_relaxed);
-        stats_->originChecksNone.fetch_add(v.none, std::memory_order_relaxed);
-        stats_->originChecksFailed.fetch_add(v.faults.size(), std::memory_order_relaxed);
-      }
-      if (!v.faults.empty()) {
-        UCACHE_DEBUG("read-ahead of %s from %s: %zu basket(s) failed their check; nothing staged",
-                     entry_->key().key.c_str(), server.c_str(), v.faults.size());
-        delete this;
-        return;
-      }
-      stage(server, wire);
-    }
+     void checked(const transpose::FetchVerdict& v, const std::string& server, uint64_t wire) {
+       if (stats_) {
+         stats_->originChecksPassed.fetch_add(v.passed, std::memory_order_relaxed);
+         stats_->originChecksNone.fetch_add(v.none, std::memory_order_relaxed);
+         stats_->originChecksFailed.fetch_add(v.faults.size(), std::memory_order_relaxed);
+       }
+       if (!v.faults.empty()) {
+         UCACHE_DEBUG("read-ahead of %s from %s: %zu basket(s) failed their check; nothing staged",
+                      entry_->key().key.c_str(), server.c_str(), v.faults.size());
+         delete this;
+         return;
+       }
+       stage(server, wire);
+     }
     void stage(const std::string& server, uint64_t wire) {
       Stats* stats = stats_;
       uint64_t late = 0, dropped = 0, staged = 0;

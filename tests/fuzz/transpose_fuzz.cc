@@ -218,6 +218,19 @@ void keyPositionFuzz(uint64_t iters, uint64_t seed) {
       const FetchVerdict j = checkPieces(seeks, lengths, two, true);
       if (j.faults.size() != v1.faults.size() || j.passed != v1.passed || j.none != v1.none)
         violate("checkPieces: two pieces judged otherwise than the span they make", i, seed);
+      // The same pieces as jobs of a random slice, run in reverse order (as a pool may finish
+      // them): merged, the same verdict, the faults at the same places.
+      const std::vector<CheckJob> jobs = checkJobs(seeks, lengths, two, 1 + rng() % (n + 1));
+      FetchVerdict r;
+      for (auto it = jobs.rbegin(); it != jobs.rend(); ++it)
+        r.merge(runCheckJob(seeks, lengths, *it, true));
+      r.sortFaults();
+      bool sameAt =
+          r.faults.size() == v1.faults.size() && r.passed == v1.passed && r.none == v1.none;
+      for (size_t k = 0; sameAt && k < r.faults.size(); ++k)
+        sameAt = r.faults[k].at == v1.faults[k].at && r.faults[k].kind == v1.faults[k].kind;
+      if (!sameAt)
+        violate("checkJobs: jobs judged otherwise than the span they make", i, seed);
     }
     // And it catches what it must: a good key the reader asked for, with one
     // byte of its position changed, fails.
