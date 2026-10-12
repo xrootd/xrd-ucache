@@ -399,14 +399,36 @@ namespace {
 // own checksum can be verified: zlib (adler32), LZMA (the xz stream's check), LZ4 (when this build
 // has lz4; its XXH64), ZSTD only with a content checksum. A tag ROOT does not know is judged too
 // (ROOT fails on it, and the decoder says so without decoding). Stored data, ZSTD without a
-// checksum and ROOT's old algorithm carry none.
+// checksum, an xz stream that declares no check and ROOT's old algorithm carry none: none of them
+// is decompressed for the check (it would verify nothing).
 enum class DataCheck : uint8_t { kNone, kDecode };
+// The xz stream header that follows ROOT's 9-byte block header (`p`, `n` bytes from the block's
+// start) declares no check (its check type, the low four bits of its second flag byte, is None),
+// and its own CRC32 over the two flag bytes holds, so the declaration is the writer's, not damage:
+// decoding it would verify nothing. ROOT writes CRC32 (check type 1); this is for other writers.
+bool xzDeclaresNoCheck(const uint8_t* p, uint64_t n) {
+  static const uint8_t kMagic[6] = {0xFD, '7', 'z', 'X', 'Z', 0x00};
+  if (n < 9 + 12 || std::memcmp(p + 9, kMagic, 6) != 0 || p[15] != 0 || (p[16] & 0x0F) != 0)
+    return false;
+  uint32_t crc = 0xFFFFFFFFu; // CRC-32 (IEEE), as xz computes it
+  for (int i = 15; i <= 16; ++i) {
+    crc ^= p[i];
+    for (int k = 0; k < 8; ++k)
+      crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+  }
+  crc ^= 0xFFFFFFFFu;
+  const uint32_t stored = uint32_t{p[17]} | uint32_t{p[18]} << 8 | uint32_t{p[19]} << 16 |
+                          uint32_t{p[20]} << 24;
+  return crc == stored;
+}
 DataCheck dataCheckOf(const uint8_t* pay, uint64_t n) {
   if (n < 9)
     return DataCheck::kDecode; // no block header: the decoder fails it at once
   const uint8_t a = pay[0], b = pay[1], m = pay[2];
+  if (a == 'X' && b == 'Z') // judged unless its stream declares no check
+    return xzDeclaresNoCheck(pay, n) ? DataCheck::kNone : DataCheck::kDecode;
   // LZ4: judged by its hash, in any build (verifyFrames).
-  if ((a == 'Z' && b == 'L') || (a == 'X' && b == 'Z') || (a == 'L' && b == '4'))
+  if ((a == 'Z' && b == 'L') || (a == 'L' && b == '4'))
     return DataCheck::kDecode;
   if (a == 'Z' && b == 'S') // judged when it carries a content checksum, or ROOT refuses its header
     return m != 1 || (n >= 14 && (pay[13] & 0x04)) ? DataCheck::kDecode : DataCheck::kNone;

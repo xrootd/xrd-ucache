@@ -342,16 +342,18 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   a replica its baskets are fetched as original bytes, checked (and counted) only with
   `check_origin_integrity` on, below. With `check_origin_integrity` off, only what a first
   pass converts is checked by checksum; other bytes are not counted here except as follows.
-  With `check_origin_integrity` on, these counters count every basket of a fetch from the
-  origin, by one rule, whatever `recompress` says and whatever the codec: zlib and LZMA blocks,
-  and ZSTD blocks written with a content checksum, are decompressed and checked; an LZ4 block is
-  checked by its XXH64 over the compressed bytes, never decompressed; ZSTD written without a
-  checksum (as ROOT writes it), ROOT's old algorithm and baskets stored uncompressed are not
-  decompressed at all (nothing could be checked), and count under `origin_checks_none`. In a file
-  that has a replica (`recompress = on`) that covers the original bytes a read fetches outside the
-  converted baskets (a branch of a codec not converted among them) and a converted branch's
-  basket the conversion leaves as stored; a basket the conversion decodes is checked once, by its
-  conversion.
+  With `check_origin_integrity` on, these counters count every basket wholly in a fetch from
+  the origin, by one rule, whatever `recompress` says and whatever the codec: zlib and LZMA
+  blocks, and ZSTD blocks written with a content checksum, are decompressed and checked; an LZ4
+  block is checked by its XXH64 over the compressed bytes, never decompressed; ZSTD written
+  without a checksum (as ROOT writes it), an xz stream that declares no check, ROOT's old
+  algorithm and baskets stored uncompressed are not decompressed at all (nothing could be
+  checked), and count under `origin_checks_none`. In a file that has a replica (`recompress =
+  on`) that covers the original bytes a read fetches outside the converted baskets (a branch of a
+  codec not converted among them) and a converted branch's basket the conversion leaves as
+  stored; a basket the conversion decodes has its data checked once, by its conversion, and its
+  key against the tree's record (counted under `origin_checks_failed` when it fails). A basket a
+  fetch does not hold whole (cut by its edge) is judged by the fetch that holds it whole.
   With `check_origin_integrity` on, these counters also count the byte path: the baskets of a
   fetch from the origin (a byte-cache miss, a read the cache relays to the origin for a handle
   that holds the file's map, read-ahead, the bytes the checks at open keep) that lie wholly in

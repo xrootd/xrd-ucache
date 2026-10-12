@@ -862,8 +862,10 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   // for adaptive_federation).
   std::atomic<bool> checkFailed{false};
   // check_origin_integrity: the file map the original pieces' bytes are checked against (null: not
-  // checked), made before the fetch is issued (originCheckMapFor), on the issuing thread.
+  // checked, and then not kept), taken before the fetch is issued (originCheckMapFor; the reader's
+  // thread parsed; a request made during another handle's parse waits for it, serveRequest).
   std::shared_ptr<const KeyMap> checkMap;
+  bool mapWaited = false; // served again after waiting for another handle's parse: waits no more
   std::mutex emu;
   XRootDStatus err;
 
@@ -1374,14 +1376,19 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     c.kind = tp::ConvertedBasket::kOriginal;
     c.record.assign(rec, rec + recLen);
   }
-  // check_origin_integrity: a basket the conversion did not decode (its own codec not converted, a
-  // block tag it does not know, blocks of more than one codec, not a basket record) is judged as
-  // the byte path judges a fetched basket (transpose::checkFetched, by the same rule: nothing
-  // without a checksum is decompressed, LZ4 only hashed): its key, and its data by its own checksum.
-  if (cf.checkAll && c.check == tp::ConvertedBasket::kNotExamined) {
+  // check_origin_integrity: every basket placed in a slot is judged as the byte path judges a
+  // fetched basket (transpose::checkFetched against where the tree's record puts it and the length
+  // it gives it): its key, always (its fSeekKey is rewritten for the slot, so ROOT's own check of
+  // it could no longer catch a basket fetched from the wrong place); and its data by its own
+  // checksum only where the conversion did not decode it (its own codec not converted, a block tag
+  // it does not know, blocks of more than one codec, not a basket record), by the same rule:
+  // nothing without a checksum is decompressed, LZ4 only hashed. A converted basket's data is
+  // decoded once, by its conversion.
+  if (cf.checkAll) {
+    const bool dataToo = c.check == tp::ConvertedBasket::kNotExamined;
     const tp::FetchVerdict v = tp::checkFetched(std::vector<uint64_t>{slot.origSeek},
                                                 std::vector<int32_t>{static_cast<int32_t>(recLen)},
-                                                slot.origSeek, rec, recLen, /*data=*/true);
+                                                slot.origSeek, rec, recLen, dataToo);
     if (!v.faults.empty()) {
       const tp::FetchFault& f = v.faults.front();
       const std::string why = f.kind == tp::FetchFault::kData     ? "its data fails its own check: " + f.why
@@ -1393,9 +1400,9 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
       req->done();
       return;
     }
-    if (v.passed)
+    if (dataToo && v.passed)
       c.check = tp::ConvertedBasket::kPassed;
-    else if (v.none)
+    else if (dataToo && v.none)
       c.check = tp::ConvertedBasket::kNotCheckable;
   }
   // The basket's own checksum, checked by its decode: a basket that fails is never converted
@@ -1670,8 +1677,8 @@ class PartHandler : public ResponseHandler {
       if (req_->checkMap)
         checkOriginalPieces(req_, std::move(origs), server, wire_.empty() ? 0 : wire_.front().off,
                             bytes);
-      else
-        serveOriginalPieces(req_, origs, true);
+      else // not checked (the setting off, or no map could be made): kept only with the setting off
+        serveOriginalPieces(req_, origs, !req_->cf->checkAll);
     }
     req_->done();
     delete this;
@@ -2061,6 +2068,30 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
   ColdFill& cf = *req->cf;
   std::vector<uint32_t> need;
   classify(req, need);
+  // check_origin_integrity: the map the original pieces are checked against. While another
+  // handle's parse of the file runs and has built none yet, the request waits for it and is served
+  // again from the start once it ends (as a byte-cache miss's answer waits): never served
+  // unchecked meanwhile. Nothing here parses or blocks: the reader's thread made the parse.
+  if (cf.checkAll && !req->origPieces.empty() && !req->checkMap) {
+    std::function<void()> then = [req] {
+      auto r2 = std::make_shared<ColdRequest>();
+      r2->st = req->st;
+      r2->entry = req->entry;
+      r2->cf = req->cf;
+      r2->chunks = req->chunks;
+      r2->isVRead = req->isVRead;
+      r2->user = req->user;
+      r2->attempt = req->attempt;
+      r2->mayPark = req->mayPark;
+      r2->t0 = req->t0;
+      r2->mapWaited = true;
+      serveRequest(r2);
+    };
+    bool parked = false;
+    req->checkMap = originCheckMapFor(req->st, req->entry, req->mapWaited ? nullptr : &then, parked);
+    if (parked)
+      return; // served again by `then`, on the executor (this request is dropped unanswered)
+  }
   std::sort(need.begin(), need.end());
   need.erase(std::unique(need.begin(), need.end()), need.end());
   if (!need.empty()) {
@@ -2167,10 +2198,6 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
   // range: known before any of what is fetched arrives, on this thread.
   if (!req->claimed.empty() || !req->origPieces.empty())
     cf.ensureRelocatedOrig();
-  // check_origin_integrity: the map the original pieces are checked against, before anything is
-  // fetched (it may read the file's records), on this thread.
-  if (cf.checkAll && !req->origPieces.empty() && !req->checkMap)
-    req->checkMap = originCheckMapFor(req->st, req->entry);
 
   // What to fetch: claimed baskets the byte cache does not hold, and original
   // bytes it did not have. A claimed basket already in the byte cache (a

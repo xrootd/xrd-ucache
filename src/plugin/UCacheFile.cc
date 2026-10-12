@@ -3185,11 +3185,16 @@ static void withKeyMap(const std::shared_ptr<HandleState>& st,
   go(m, fetchVerdict(*m, server, pieces));
 }
 std::shared_ptr<const KeyMap> originCheckMapFor(const std::shared_ptr<HandleState>& st,
-                                                const std::shared_ptr<FileEntry>& entry) {
+                                                const std::shared_ptr<FileEntry>& entry,
+                                                std::function<void()>* then, bool& parked) {
+  parked = false;
   if (!globalConfig().checkOriginIntegrity || !st || !entry)
     return nullptr;
-  armKeyCheck(st, entry, 0);
-  return keySeeksOf(*st);
+  if (auto m = keySeeksOf(*st))
+    return m;
+  const KeySeeksBuilt b = keySeeksBuilt(entry, then);
+  parked = b.parked;
+  return b.map;
 }
 void countOriginChecks(HandleState& st, const transpose::FetchVerdict& v) { countChecks(st, v); }
 #else
@@ -6119,6 +6124,7 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
     }
     if (!st_->copyGuard.allow(entry->fileSize(), shownSize(), offset, size))
       return refuseCopy(st_);
+    armKeyCheck(st_, entry, timeout); // check_origin_integrity: the map, on this thread (as a miss)
     auto st = st_;
     ChunkList one;
     one.emplace_back(offset, served, buffer);
@@ -6336,6 +6342,7 @@ XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void
     pg->off = offset;
     pg->size = size;
     pg->buf = buffer;
+    armKeyCheck(st_, entry, timeout); // check_origin_integrity: the map, on this thread (as a miss)
     auto st = st_;
     ChunkList one;
     one.emplace_back(offset, size, buffer);
@@ -6543,6 +6550,7 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
         return XRootDStatus(XrdCl::stError, XrdCl::errInvalidArgs);
     if (!guardAllowsChunks(st_, entry->fileSize(), shownSize(), chunks))
       return refuseCopy(st_);
+    armKeyCheck(st_, entry, timeout); // check_origin_integrity: the map, on this thread (as a miss)
     auto st = st_;
     noteVectorRequest(st_, chunks);
     ChunkList userChunks = chunks;

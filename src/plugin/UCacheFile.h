@@ -530,11 +530,15 @@ void dropEntryOfBadCopy(HandleState& st, const std::shared_ptr<FileEntry>& entry
 // The same, with the handle's own entry.
 void dropEntryOfBadCopy(HandleState& st, const std::string& server) noexcept;
 // check_origin_integrity for the fetches of a file that has a replica (the slot run, ColdRun.cc):
-// the handle's file map, made now when it has none (the byte path's parse, through the byte cache
-// first, with the client's request timeout; it blocks this thread, as max_read_fraction's parse
-// does); null when the setting is off or no map can be made (then nothing is checked).
+// the handle's file map, or the entry's when another handle's parse has built it; never parses
+// (the reader's own thread made the parse before the request reached the slot run, with the
+// reader's timeout, as a byte-cache miss does). While another handle's parse runs and has built
+// none yet, `parked` is set and `then` (when given and set) is posted to the executor once that
+// parse ends (keySeeksBuilt): the caller serves the request again then, rather than unchecked.
+// Null, not parked: the setting is off, or no map could be made (a failed parse).
 std::shared_ptr<const KeyMap> originCheckMapFor(const std::shared_ptr<HandleState>& st,
-                                                const std::shared_ptr<FileEntry>& entry);
+                                                const std::shared_ptr<FileEntry>& entry,
+                                                std::function<void()>* then, bool& parked);
 // The verdict's passed, none and unjudged counts, to the store's counters (the byte path's).
 void countOriginChecks(HandleState& st, const transpose::FetchVerdict& v);
 // A fetch's basket that failed the byte path's check: said, counted (`n` baskets), recorded, and

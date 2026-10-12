@@ -1312,3 +1312,38 @@ TEST(BlockChecksum, EveryBasketOfARootFile) {
   EXPECT_EQ(seen, (std::set<std::string>{"lzma", "zlib"}));
 }
 #endif
+
+// An xz stream that declares no check (check type None, its header's own CRC32 holding) carries
+// nothing to verify: it is not decompressed for the check, and counts as carrying none, even with
+// its data damaged. The same block with its flag byte damaged (the header's CRC32 no longer
+// holding) is decoded, and fails.
+TEST(BlockChecksum, XzStreamDeclaringNoCheckIsNotDecoded) {
+  const uint64_t S = 300;
+  std::vector<uint8_t> pay(kLzmaPayload, kLzmaPayload + sizeof(kLzmaPayload));
+  ASSERT_EQ(pay[9], 0xFD);
+  ASSERT_EQ(pay[16], 0x01) << "ROOT writes CRC32";
+  EXPECT_FALSE(dataCarriesNoCheck(pay.data(), pay.size()));
+  std::vector<uint8_t> none = pay;
+  none[16] = 0x00; // check type None, and the header's CRC32 of {00, 00}
+  none[17] = 0xff;
+  none[18] = 0x12;
+  none[19] = 0xd9;
+  none[20] = 0x41;
+  EXPECT_TRUE(dataCarriesNoCheck(none.data(), none.size()));
+  none[9 + 12 + (none.size() - 21) / 2] ^= 0x10; // damage inside its data: nothing to judge it by
+  const std::vector<uint8_t> rec = basketOf(none.data(), none.size(), S);
+  const int32_t nb = static_cast<int32_t>(rec.size());
+  const FetchVerdict v = verdictOf({S}, {nb}, spanWith(rec, 0, S, 4096));
+  EXPECT_TRUE(v.faults.empty());
+  EXPECT_EQ(v.none, 1u);
+  EXPECT_EQ(v.passed, 0u);
+  // The flag byte itself damaged to None: the header's CRC32 does not hold, so it is decoded (and
+  // the decoder fails it), not taken for a writer's choice.
+  std::vector<uint8_t> flag = pay;
+  flag[16] = 0x00;
+  EXPECT_FALSE(dataCarriesNoCheck(flag.data(), flag.size()));
+  const std::vector<uint8_t> frec = basketOf(flag.data(), flag.size(), S);
+  const FetchVerdict fv =
+      verdictOf({S}, {static_cast<int32_t>(frec.size())}, spanWith(frec, 0, S, 4096));
+  EXPECT_EQ(fv.faults.size(), 1u);
+}
