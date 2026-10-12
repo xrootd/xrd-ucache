@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -266,4 +267,35 @@ TEST(ParseEnd, WaitersAreAnsweredWhenTheParseThrows) {
     end.finish();
   }
   EXPECT_EQ(answered, 1);
+}
+
+// A job that throws (out of memory; here a test's hook) leaves its part not judged and the
+// verdict's other parts as they are: the continuation runs once, on the pool, and nothing ends
+// the process. The same when a job runs on the caller's thread.
+TEST(FetchCheck, AJobThatThrowsStillCompletesOnce) {
+  Fixture f;
+  ASSERT_TRUE(f.load());
+  Executor pool(3);
+  std::atomic<int> jobs{0};
+  FetchCheckOptions o;
+  o.sliceBytes = 2048;
+  o.onJob = [&] {
+    if (jobs.fetch_add(1) == 0)
+      throw std::bad_alloc();
+  };
+  int calls = 0;
+  std::thread::id on;
+  const FetchVerdict v = onPool(pool, f, f.pieces(f.b, 4000, 9000), o, calls, on);
+  EXPECT_EQ(calls, 1);
+  EXPECT_EQ(v.unjudged, 1u);
+  EXPECT_GT(jobs.load(), 1);
+  EXPECT_TRUE(v.faults.empty());
+  EXPECT_GT(v.passed, 0u) << "the other jobs' baskets are judged";
+  EXPECT_LE(v.passed, 12u);
+  // Every job throwing: still one completion, with nothing judged.
+  o.onJob = [] { throw std::bad_alloc(); };
+  const FetchVerdict w = onPool(pool, f, f.pieces(f.b, 4000, 9000), o, calls, on);
+  EXPECT_EQ(calls, 1);
+  EXPECT_EQ(w.passed + w.none, 0u);
+  EXPECT_GT(w.unjudged, 0u);
 }

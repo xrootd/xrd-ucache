@@ -45,21 +45,40 @@ struct Join {
   std::atomic<size_t> left{0};
 };
 
-void runJob(const std::shared_ptr<Join>& j, size_t i) {
-  if (j->onJob)
-    j->onJob();
-  if (const long ms = decodeDelayMs(); ms > 0)
-    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-  j->parts[i] = tp::runCheckJob(*j->seeks, *j->lengths, j->jobs[i], j->data, j->reach.get());
+// One job, on whichever thread: never throws. A job that throws (out of memory, or a test's hook)
+// leaves its part not judged (no claim; `unjudged`), and the count goes down in any case, so the
+// continuation runs once whatever happened.
+void runJob(const std::shared_ptr<Join>& j, size_t i) noexcept {
+  try {
+    if (j->onJob)
+      j->onJob();
+    if (const long ms = decodeDelayMs(); ms > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    j->parts[i] = tp::runCheckJob(*j->seeks, *j->lengths, j->jobs[i], j->data, j->reach.get());
+  } catch (...) {
+    j->parts[i] = tp::FetchVerdict();
+    j->parts[i].unjudged = 1;
+  }
   if (j->left.fetch_sub(1, std::memory_order_acq_rel) != 1)
     return;
-  tp::FetchVerdict v = std::move(j->base);
-  for (auto& part : j->parts)
-    v.merge(std::move(part));
-  v.sortFaults();
+  tp::FetchVerdict v;
+  try {
+    v = std::move(j->base);
+    for (auto& part : j->parts)
+      v.merge(std::move(part));
+    v.sortFaults();
+  } catch (...) {
+    v = tp::FetchVerdict(); // the merge could not be made: no claim
+    v.unjudged = static_cast<uint32_t>(j->parts.size());
+  }
   auto done = std::move(j->done);
-  done(std::move(v));
+  try {
+    done(std::move(v));
+  } catch (...) {
+    // the caller's continuation must not throw; nothing may leave a pool thread
+  }
 }
+
 } // namespace
 
 void checkPiecesOn(Executor& pool, std::shared_ptr<const void> keep,
@@ -89,7 +108,10 @@ void checkPiecesOn(Executor& pool, std::shared_ptr<const void> keep,
   const size_t n = j->jobs.size();
   for (size_t i = 0; i < n; ++i) {
     try {
-      pool.post([j, i] { runJob(j, i); });
+      pool.post([j, i] {
+        tp::keepDecodersOnThisThread(); // the pool's threads keep their decoders (TreeMeta.h)
+        runJob(j, i);
+      });
     } catch (...) {
       runJob(j, i); // could not be posted: judged here
     }
