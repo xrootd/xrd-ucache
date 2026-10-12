@@ -716,7 +716,10 @@ it.
   holds, and the window with which a job reads it from the cache without asking
   an origin (`UCACHE_REVALIDATE_S=<seconds>`; TROUBLESHOOTING.md). The entry is
   kept.
-- **Fail-open.** Every failure path degrades to a normal uncached read.
+- **Fail-open.** Every failure path degrades to a normal uncached read. A
+  read whose fetch from the origin ran out of time at its server (the server
+  stopped answering) gets that error, as the read would without uCache; it is
+  not sent to the same server again (TROUBLESHOOTING.md).
 - **Servers to avoid (`?tried=`).** A reader can keep a redirector from
   sending it to a given server by adding `?tried=<full host name>` (a comma
   separated list for several) to the file's URL. uCache honours it on every

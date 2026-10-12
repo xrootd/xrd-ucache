@@ -4417,7 +4417,10 @@ class MissReadHandler : public ResponseHandler {
     if (!covers) {
       // Wire failure or short read on the rounded span: fail open — retry
       // the exact user request as pure pass-through, completing the user
-      // from that operation faithfully (§5.2 step 5).
+      // from that operation faithfully (§5.2 step 5), with what is left of the
+      // time the reader's request has. A fetch that ran out of time at its
+      // server gives the reader its error instead (missRelayTimeoutS): the
+      // retry would wait for the same server on the same connection again.
       if (!s || !s->IsOK())
         noteOriginFailure(*st_, &entry_->obs().servers, "read", wireOff_, wireBuf_->size(),
                           s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal),
@@ -4431,9 +4434,20 @@ class MissReadHandler : public ResponseHandler {
         delete this;
         return;
       }
+      const int relayS =
+          missRelayTimeoutS(!s ? xrdwire::kErrInternal : s->IsOK() ? 0 : s->code, readerT_,
+                            defaultRequestTimeoutS(), static_cast<int>((nowUs() - t0_) / 1000000));
+      if (relayS < 0) {
+        complete(user_,
+                 new XRootDStatus(s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal)),
+                 nullptr);
+        delete this;
+        return;
+      }
       if (XrdCl::File* f = st_->acquireInner()) {
         auto* relay = newRelay(st_, f, user_, userOff_, userLen_);
-        XRootDStatus s2 = f->Read(userOff_, userLen_, userBuf_, relay, 0);
+        XRootDStatus s2 =
+            f->Read(userOff_, userLen_, userBuf_, relay, static_cast<ucache::XrdTimeout>(relayS));
         if (s2.IsOK()) {
           delete this;
           return;
@@ -4678,19 +4692,27 @@ class MissVReadHandler : public ResponseHandler {
 
     if (!s || !s->IsOK()) {
       // Wire failure: fail open — reissue the FULL original chunk list as
-      // pure pass-through (hits included; wasteful but simple and faithful).
+      // pure pass-through (hits included; wasteful but simple and faithful),
+      // with what is left of the request's time; a fetch that ran out of time
+      // at its server gives the reader its error instead (missRelayTimeoutS).
+      // The fetch was sent with the client's request timeout, as the reader's
+      // own vector read is when it gives none.
+      const XRootDStatus failed = s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal);
       noteOriginFailure(*st_, &entry_->obs().servers, "readv", wire_.front().off, wireBytes,
-                        s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal),
-                        answeredBy(*st_, h.get()));
+                        failed, answeredBy(*st_, h.get()));
       st_->noteCacheError(globalConfig());
       if (s && handOff(*s, h, false)) {
         delete this;
         return;
       }
-      if (XrdCl::File* f = st_->acquireInner()) {
+      const int relayS = missRelayTimeoutS(failed.code, 0, defaultRequestTimeoutS(),
+                                           static_cast<int>((nowUs() - t0_) / 1000000));
+      XrdCl::File* f = relayS < 0 ? nullptr : st_->acquireInner();
+      if (f) {
         auto* relay =
             newRelay(st_, f, user_, chunksFirst(userChunks_), chunksBytes(userChunks_));
-        XRootDStatus s2 = f->VectorRead(userChunks_, nullptr, relay, 0);
+        XRootDStatus s2 = f->VectorRead(userChunks_, nullptr, relay,
+                                        static_cast<ucache::XrdTimeout>(relayS));
         if (s2.IsOK()) {
           delete this;
           return;
@@ -4699,7 +4721,7 @@ class MissVReadHandler : public ResponseHandler {
         st_->releaseInner();
         complete(user_, new XRootDStatus(s2), nullptr);
       } else {
-        complete(user_, new XRootDStatus(*s), nullptr);
+        complete(user_, new XRootDStatus(failed), nullptr);
       }
       delete this;
       return;

@@ -415,6 +415,40 @@ TEST(OpenPolicy, ReadAttemptTimeout) {
   EXPECT_EQ(again(0, 1796, RT, 5), 0) << "the floor is 5 here: 4 left is below it";
 }
 
+// A miss whose fetch did not bring the reader's bytes: the reader's request is sent again on the
+// same File with what is left of its time, unless the fetch ran out of time at its server.
+TEST(OpenPolicy, MissRelayTimeout) {
+  // The fetch ran out of time at its server: its error is the reader's, whatever time is left
+  // (a request sent again would wait for the same server on the same connection as long again).
+  for (int code : {kErrOperationExpired, kErrSocketTimeout})
+    for (int readerT : {0, 10, 3600})
+      for (int elapsed : {0, 9, 10, 60, 1800, 4000})
+        EXPECT_EQ(missRelayTimeoutS(code, readerT, RT, elapsed), -1)
+            << code << " " << readerT << " " << elapsed;
+  // Any other failure, and an answer without the reader's bytes: sent again with what is left of
+  // the reader's own timeout, or of the client's request timeout when it gave none.
+  for (int code : {0, kErrConnectionError, kErrSocketError, kErrSocketDisconnected,
+                   kErrStreamDisconnect, kErrInvalidSession, kErrErrorResponse, kErrInternal,
+                   kErrDataError}) {
+    EXPECT_EQ(missRelayTimeoutS(code, 0, RT, 0), 1800) << code;
+    EXPECT_EQ(missRelayTimeoutS(code, 0, RT, 30), 1770) << code;
+    EXPECT_EQ(missRelayTimeoutS(code, 45, RT, 0), 45) << code;
+    EXPECT_EQ(missRelayTimeoutS(code, 45, RT, 44), 1) << code;
+    EXPECT_EQ(missRelayTimeoutS(code, 0, 10, 3), 7) << code;
+    EXPECT_EQ(missRelayTimeoutS(code, 0, 0, 0), kReadDeadlineS) << code << ": no request timeout";
+    EXPECT_EQ(missRelayTimeoutS(code, 30, RT, -5), 30) << code << ": a clock that went back";
+  }
+  // Nothing left of the reader's time: a failure is the reader's answer; an answer without its
+  // bytes is still sent again, for 1 s (it has no error to give).
+  for (int code : {kErrConnectionError, kErrSocketError, kErrErrorResponse}) {
+    EXPECT_EQ(missRelayTimeoutS(code, 45, RT, 45), -1) << code;
+    EXPECT_EQ(missRelayTimeoutS(code, 0, RT, 1800), -1) << code;
+    EXPECT_EQ(missRelayTimeoutS(code, 0, RT, 5000), -1) << code;
+  }
+  EXPECT_EQ(missRelayTimeoutS(0, 45, RT, 45), 1);
+  EXPECT_EQ(missRelayTimeoutS(0, 0, RT, 5000), 1);
+}
+
 // Every status of a failed read and what follows it.
 TEST(OpenPolicy, ReadStepClasses) {
   EXPECT_EQ(kReadMaxAttempts, 4);

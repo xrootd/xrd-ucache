@@ -638,6 +638,17 @@ int readBudgetS(int readerTimeoutS, int requestTimeoutS);
 // would otherwise never be moved).
 int readAttemptTimeoutS(int readerTimeoutS, int requestTimeoutS, int deadlineS, int elapsedS,
                         bool again);
+// The timeout of the read a miss sends again when its fetch from the origin did not bring the
+// reader's bytes: the fetch failed with `code`, or answered without them (`code` 0), `elapsedS`
+// after it was sent. The reader's exact request is then sent as it is, on the same File (fail
+// open), with what is left of the time the reader's request would have had without the cache
+// (readBudgetS: the reader's own timeout, else the client's request timeout), at least 1 s after
+// an answer. -1: the fetch's error is the reader's answer, and nothing is sent again. That is so
+// when the fetch ran out of time at its server (an expiry, or the client's stream timeout on a
+// connection that went quiet): the request sent again goes to the same server on the same
+// connection and waits as long again, where the reader's own request would have met that error
+// once. It is also so when a failed fetch left nothing of the reader's time.
+int missRelayTimeoutS(int code, int readerTimeoutS, int requestTimeoutS, int elapsedS);
 // Attempts of one read, at as many servers.
 inline constexpr int kReadMaxAttempts = 4;
 

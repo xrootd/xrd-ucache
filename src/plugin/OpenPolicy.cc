@@ -1091,6 +1091,15 @@ int readAttemptTimeoutS(int readerTimeoutS, int requestTimeoutS, int deadlineS, 
   return std::max(std::min(deadlineS, left), 1);
 }
 
+int missRelayTimeoutS(int code, int readerTimeoutS, int requestTimeoutS, int elapsedS) {
+  if (code == kErrOperationExpired || code == kErrSocketTimeout)
+    return -1;
+  const int left = readBudgetS(readerTimeoutS, requestTimeoutS) - std::max(elapsedS, 0);
+  if (left >= 1)
+    return left;
+  return code == 0 ? 1 : -1;
+}
+
 ReadStep readStep(int code, int errNo) {
   static constexpr int kCodes[] = {
       kErrInternal,       kErrSocketError,    kErrSocketTimeout,    kErrSocketDisconnected,

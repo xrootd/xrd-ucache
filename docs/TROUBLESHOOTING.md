@@ -235,6 +235,19 @@ so a server that is down is given up after about a minute, and the failure is
 remembered for 180 s (`ucache doctor` and the run's `run_settings` show the
 values in force).
 
+A server that stays up but stops answering (it keeps the connection and never
+replies) is different: a read then fails when its time runs out, with
+`operation expired`: the job's own timeout for the read, or the client's request
+timeout (`XRD_REQUESTTIMEOUT`, 1800 s by default). Through uCache, with
+`adaptive_federation = off`, a read the cache does not hold fails at the same
+moment, with the same error: the cache's fetch from the server ran out of time,
+and its read is not sent to that server again, which would wait as long once
+more. A fetch that fails otherwise (a lost connection, a server's error, an
+answer short of the bytes asked for) is followed by the job's own read, sent to
+the origin as it is, within the time that read has left. (With
+`adaptive_federation = on` such a read is made again at another site; see
+below.)
+
 ## An open fails after a minute (`did not complete within 60 s`)
 
 With `adaptive_federation = on`, every read open of a file uCache serves has a
