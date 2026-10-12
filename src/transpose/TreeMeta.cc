@@ -415,6 +415,13 @@ DataCheck dataCheckOf(const uint8_t* pay, uint64_t n) {
   return DataCheck::kDecode;
 }
 
+} // namespace
+
+bool dataCarriesNoCheck(const uint8_t* pay, uint64_t n) {
+  return dataCheckOf(pay, n) == DataCheck::kNone;
+}
+
+namespace {
 // The basket at `at` (map length `want`, its key passed) wholly in the fetched bytes: whether ROOT
 // decompresses it (fObjlen > fNbytes - fKeylen, from the key, as TBasket::ReadBasketBuffers
 // decides), and where its data starts. False when it is stored as it is.

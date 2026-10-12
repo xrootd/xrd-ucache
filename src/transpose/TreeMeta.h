@@ -121,6 +121,11 @@ std::optional<BasketHeader> parseBasketHeader(const uint8_t* p, size_t n, uint64
 // here, and for fewer than 9 bytes. The one reading of these bytes, so that
 // every place that asks what a basket or page holds gets the same answer.
 std::string blockCodec(const uint8_t* p, size_t n);
+// Whether a compressed basket's data `pay` (`n` bytes, its first block's header first) carries no
+// check anything can verify: its first block is ZSTD written without a content checksum, or ROOT's
+// old algorithm ("CS", method 8). The rule checkFetched counts such a basket by (origin_checks_none);
+// every other block, a tag ROOT does not know included, is one a decoder can judge.
+bool dataCarriesNoCheck(const uint8_t* pay, uint64_t n);
 
 // The TFile container level: header geometry, root directory, keys list. This
 // is shared by every payload type — a TTree and an RNTuple differ only in the

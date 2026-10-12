@@ -567,6 +567,34 @@ TEST(ConvertBasket, ReportsWhatItsDecodeSaid) {
   ASSERT_TRUE(r.error.empty()) << r.error;
   EXPECT_EQ(r.kind, ConvertedBasket::kOriginal);
   EXPECT_EQ(r.check, ConvertedBasket::kNotCheckable);
+  // An object no longer than its data (fObjlen <= fNbytes - fKeylen; 0 here): ROOT reads it as
+  // stored, so it carries no check either, as the byte path's check counts it.
+  std::vector<uint8_t> zero(kLzmaRecord, kLzmaRecord + sizeof(kLzmaRecord));
+  for (int i = 6; i < 10; ++i)
+    zero[i] = 0;
+  ConvertedBasket z = convertBasket(zero.data(), zero.size(), 3 * zero.size(), lzma);
+  EXPECT_EQ(z.kind, ConvertedBasket::kOriginal);
+  EXPECT_EQ(z.check, ConvertedBasket::kNotCheckable);
+  // ROOT's old algorithm ("CS", method 8) carries no check: not checkable, as the byte path says.
+  std::vector<uint8_t> cs(kLzmaRecord, kLzmaRecord + sizeof(kLzmaRecord));
+  cs[70] = 'C';
+  cs[71] = 'S';
+  cs[72] = 8;
+  ConvertedBasket o = convertBasket(cs.data(), cs.size(), 3 * cs.size(), lzma);
+  EXPECT_EQ(o.kind, ConvertedBasket::kOriginal);
+  EXPECT_EQ(o.check, ConvertedBasket::kNotCheckable);
+  // A tag ROOT does not know is not decoded: not examined (a decoder would judge it).
+  std::vector<uint8_t> unk = cs;
+  unk[70] = 'Q';
+  unk[71] = 'Q';
+  ConvertedBasket u = convertBasket(unk.data(), unk.size(), 3 * unk.size(), lzma);
+  EXPECT_EQ(u.kind, ConvertedBasket::kOriginal);
+  EXPECT_EQ(u.check, ConvertedBasket::kNotExamined);
+  // Not a basket record at all: not examined.
+  std::vector<uint8_t> notb(kLzmaRecord, kLzmaRecord + sizeof(kLzmaRecord));
+  notb[35] = 'X'; // TBasket -> XBasket
+  EXPECT_EQ(convertBasket(notb.data(), notb.size(), 3 * notb.size(), lzma).check,
+            ConvertedBasket::kNotExamined);
 }
 
 TEST(BasketKey, FieldsRootIgnoresAreOnlyNoted) {

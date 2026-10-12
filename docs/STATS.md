@@ -330,8 +330,12 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   did not decode, so that their own checksum, which they may carry, was not checked: a
   basket whose own codec is not in `recompress_codecs` though its branch's is (a file merged
   from inputs written with different codecs keeps each input's baskets as they were), or
-  one that cannot be read as a basket record. Such a basket is kept and served as stored,
-  as without the cache (shown only when not 0). A branch whose own codec is not in
+  whose block tag the conversion does not know; one whose blocks name more than one codec;
+  and one that cannot be read as a basket record, or does not fit its slot. Such a basket is
+  kept and served as stored, as without the cache (shown only when not 0). A basket left
+  unconverted whose data carries no check at all (stored uncompressed, an object of no
+  length, its first block ZSTD without a content checksum or ROOT's old algorithm) counts
+  under `origin_checks_none`, as on the byte path below. A branch whose own codec is not in
   `recompress_codecs` is not converted at all: in a file that has a replica its baskets are
   fetched as original bytes, which are not checked, even with `check_origin_integrity` on,
   and are not counted here. Only what a first pass converts is checked by checksum; other

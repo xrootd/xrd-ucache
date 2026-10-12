@@ -440,18 +440,24 @@ ConvertedBasket convertBasket(const uint8_t* rec, size_t n, uint32_t slotLen,
   }
   const uint8_t* pay = rec + k->keylen;
   const size_t payLen = n - k->keylen;
+  // Stored as it is, or an object of no length (ROOT reads either as stored: it decompresses a
+  // basket only when its object is longer than its data, TBasket::ReadBasketBuffers, as
+  // checkFetched decides too): no checksum to hold it to, and nothing for the reader to decode.
   const bool storedRaw = k->objlen == k->nbytes - static_cast<int32_t>(k->keylen);
-  if (storedRaw) {
-    c.check = ConvertedBasket::kNotCheckable; // stored as it is: no checksum to hold it to
-    return original();                        // nothing for the reader to decode already
-  }
-  if (k->objlen <= 0)
+  if (storedRaw || k->objlen <= 0) {
+    c.check = ConvertedBasket::kNotCheckable;
     return original();
-  // The basket's own blocks name what it holds, never the branch's setting.
+  }
+  // The basket's own blocks name what it holds, never the branch's setting. One not converted is
+  // not decoded: not examined, unless its data carries no check at all (ZSTD without a content
+  // checksum, ROOT's old algorithm), as checkFetched counts it.
   c.codec = blockCodec(pay, payLen);
   if (!listed(codecs, c.codec) ||
-      payloadCodec(pay, payLen, static_cast<uint64_t>(k->objlen)) != c.codec)
+      payloadCodec(pay, payLen, static_cast<uint64_t>(k->objlen)) != c.codec) {
+    if (dataCarriesNoCheck(pay, payLen))
+      c.check = ConvertedBasket::kNotCheckable;
     return original();
+  }
   DecodedFrames d = decodeFrames(pay, payLen, static_cast<uint64_t>(k->objlen));
   c.check = d.check == FrameCheck::kPassed   ? ConvertedBasket::kPassed
             : d.check == FrameCheck::kFailed ? ConvertedBasket::kFailed
