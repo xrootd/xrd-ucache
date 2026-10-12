@@ -51,7 +51,9 @@
 // they share -- the switches, the byte counters and the cache of parsed
 // basket maps -- is either atomic or under one mutex. Wire completions run on
 // XrdCl threads and touch only the entry (itself thread-safe) and atomics.
-// Nothing here runs on the hit-serving executor.
+// Nothing here runs on the hit-serving executor, except, with
+// check_origin_integrity on, the check of what a fetch brought (its baskets'
+// data decoded), which runs there before anything of it is staged.
 #pragma once
 
 #include <atomic>

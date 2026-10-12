@@ -327,16 +327,25 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   server; or that carry no checksum (ZSTD as ROOT writes it, baskets stored
   uncompressed), which nothing can check. Only what a first pass converts is
   checked by checksum; other bytes are not counted here except as follows.
-  With `check_origin_integrity` on, `origin_checks_failed` also counts the baskets of a byte-cache fetch from the
-  origin that the reader asked for and whose key does not say they sit where
-  the tree's record puts them, or whose length differs from the one that record
-  gives them where it changes ROOT's reading (the file map), and, as one each, the reads a copy answered whose tree's
-  record showed it bad (its record failing its own checksum, or placing a basket
-  past the copy's end): the read fails with "failed its check (the reason) ...
-  not served", naming the position and the server, and nothing of that fetch is
-  kept; the fetch's bytes are not counted in `origin_bytes`, and its
-  `origin_failure` record, not a `wire` trace line, shows it. This check
-  counts no passes.
+  With `check_origin_integrity` on, these counters also count the byte path: the baskets of a
+  fetch from the origin (a byte-cache miss, a read the cache relays to the origin for a handle
+  that holds the file's map, read-ahead, the bytes the checks at open keep) that lie wholly in
+  the fetched bytes, whose key passes and whose length the file map gives:
+  `origin_checks_passed` those whose compressed data was decoded and whose checksum held (ZLIB,
+  LZMA, LZ4 in a build with lz4), `origin_checks_none` those that carry none (stored
+  uncompressed, ZSTD without a content checksum, ROOT's old algorithm, LZ4 in a build without
+  lz4). `origin_checks_failed` counts the baskets of such a fetch that the reader asked for
+  whose key does not say they sit where the tree's record puts them, whose length differs from
+  the one that record gives them where it changes ROOT's reading (the file map), or whose data
+  fails its own checksum or does not decode; and, as one each, the reads a copy answered of the
+  parts of a tree whose record showed the copy bad (its record failing its own checksum, or
+  placing a basket past the copy's end; the tree's record and, where it could be read, its
+  baskets: a read of another tree of that copy is not refused). Such a read fails with "failed
+  its check (the reason) ... not served", naming the position and the server, and nothing of
+  that fetch is kept; the fetch's bytes are not counted in `origin_bytes`, and its
+  `origin_failure` record, not a `wire` trace line, shows it. Read-ahead counts the baskets of
+  its own fetches that fail (nothing of such a fetch is staged; no record, since no reader
+  asked for them).
 - `cold_replica_convert_us` — time spent converting, summed over the threads that did
   it; it is CPU a pass spends that a pass without recompression does not.
 - `cold_replica_declined` — converted records not kept: they still did not fit

@@ -451,12 +451,15 @@ another site, and the job gets the bytes. The log says so, once for every move:
   read that failed, that names each copy tried, its size where it is known and
   what it said (`uCache: <file>: no copy could serve the read: <site>
   (<host>:<port>, <size> bytes): <error>; ...`). This holds whatever made the read
-  move: a server's failure, a short answer (below), or a basket that failed the
-  key check of `check_origin_integrity` (`failed its check (key position differs from the
-  tree's record)`, `(key length differs from the tree's record)`), or a read of a copy whose
-  tree's record showed it bad (`a read at ... failed its check (the tree's record fails its
-  own check)`, `(the tree's record places a basket at ... of ... bytes past the copy's end at
-  ...)`). A read that fails within a second
+  move: a server's failure, a short answer (below), a basket that failed the
+  check of `check_origin_integrity` (`failed its check (key position differs from the
+  tree's record)`, `(key length differs from the tree's record)`, or, for a basket whose
+  compressed data fails its own checksum, `(its data fails its own check: lzma block failed
+  its check or did not decode)`, with `zlib` or `lz4` as the codec may be), or a read of the
+  parts of a tree whose record showed the copy bad (`a read at ... failed its check (the
+  tree's record fails its own check)`, `(the tree's record places a basket at ... of ... bytes
+  past the copy's end at ...)`; a read of another tree of that copy is served). A read that
+  fails within a second
   after such a move gets that move's error at once, without another attempt, saying so
   (`no copy could serve the read: a move made <time> ago for an earlier read of the
   handle found none, ...`: the offsets in the list that follows are that earlier
@@ -558,7 +561,9 @@ entry:
   entry is dropped, and the file is read from the origin until it is opened again`: a read
   found that copy bad (a basket that failed the key-position check or its own checksum, or
   a short answer inside the file's confirmed size; see "uCache read the file at another
-  site" above), or an open refused it for what it is (empty, cut short of its header's end,
+  site" above), the file map read from that copy showed one of its trees damaged (dropped
+  as soon as the map is read, whatever the job reads next), or an open refused it for what
+  it is (empty, cut short of its header's end,
   or its header or list of top-level objects not those of a whole ROOT file), after the
   entry had taken bytes from it. Those bytes may be damaged in ways
   no check sees (inside a ZSTD or uncompressed block), so none of them are kept. Until the
