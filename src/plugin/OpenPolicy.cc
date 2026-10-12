@@ -224,6 +224,21 @@ int openDeadlineS(int readerTimeoutS, int deadlineS) {
   return readerTimeoutS > 0 && readerTimeoutS < d ? readerTimeoutS : d;
 }
 
+bool stalledOrLost(int code) {
+  switch (code) {
+  case kErrOperationExpired:
+  case kErrSocketTimeout:
+  case kErrConnectionError:
+  case kErrSocketError:
+  case kErrSocketDisconnected:
+  case kErrStreamDisconnect:
+  case kErrInvalidSession:
+    return true;
+  default:
+    return false;
+  }
+}
+
 OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bool offline,
                    bool excluded, bool repeats, bool regionalKnown) {
   if (!v.viaRedirector) // a direct open has nowhere else to go
@@ -238,16 +253,15 @@ OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bo
   // site has it. Otherwise the client's own retry at its load balancer found
   // none either, though a listed copy may be missing or hidden.
   const OpenStep notFound = first && !excluded ? OpenStep::kFinal : OpenStep::kLocate;
+  // The server stalled or its connection failed: a retry through the redirector may meet the
+  // same site again (its other server, which stalls as well), so the regional's list is asked.
+  if (stalledOrLost(code))
+    return regionalKnown && !first ? OpenStep::kLocate : elsewhere;
   switch (code) {
   case kErrRedirectLimit:
     return OpenStep::kFailOver;
   case kErrNotFound:
     return notFound;
-  case kErrOperationExpired: // the server stalled: the retry would meet its site's other server
-    return regionalKnown && !first ? OpenStep::kLocate : elsewhere;
-  case kErrSocketTimeout:
-  case kErrConnectionError:
-    return elsewhere;
   case kErrErrorResponse:
     switch (errNo) {
     case kXrNotFound:

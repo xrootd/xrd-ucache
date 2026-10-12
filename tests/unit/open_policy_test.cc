@@ -262,16 +262,18 @@ TEST(OpenPolicy, StepAfterAnAttempt) {
   // Bounced past the redirect limit: anywhere in a federation.
   EXPECT_EQ(step(v, kErrRedirectLimit), OpenStep::kFailOver);
   EXPECT_EQ(step(kRedirectorOnly, kErrRedirectLimit), OpenStep::kFailOver);
-  // A site that stalled or could not be reached.
-  for (int code : {kErrOperationExpired, kErrSocketTimeout, kErrConnectionError})
+  // A site that stalled, could not be reached, or whose connection was lost.
+  for (int code : {kErrOperationExpired, kErrSocketTimeout, kErrConnectionError, kErrSocketError,
+                   kErrSocketDisconnected, kErrStreamDisconnect, kErrInvalidSession})
     EXPECT_EQ(step(v, code), OpenStep::kFailOver) << code;
   // A server's or its storage's failure.
   for (int errNo : {kXrFileLocked, kXrFSError, kXrIOError, kXrServerError, kXrNoServer,
                     kXrCancelled, kXrItExists, kXrOverloaded})
     EXPECT_EQ(step(v, kErrErrorResponse, errNo), OpenStep::kFailOver) << errNo;
-  // Anything else is final.
-  for (int code : {kErrSocketError, kErrSocketDisconnected, kErrStreamDisconnect, kErrTlsError,
-                   kErrAuthFailed, kErrInvalidSession, kErrDataError, 101, 7})
+  // Anything else is final: a name that does not resolve, TLS, the handshake, authentication,
+  // the client's own local faults.
+  for (int code : {kErrTlsError, kErrAuthFailed, kErrHandShakeFailed, kErrDataError, 101, 105, 106,
+                   7})
     EXPECT_EQ(step(v, code), OpenStep::kFinal) << code;
   EXPECT_EQ(step(v, kErrErrorResponse, 3013), OpenStep::kFinal); // unsupported
   // A success is final where it lands, unless it serves another size than the
@@ -290,12 +292,13 @@ TEST(OpenPolicy, StepAfterAnAttempt) {
   EXPECT_EQ(stepAfter(kDirect, 0, 0, false, false, false, true), OpenStep::kFinal);
   // A failure is judged as without it.
   EXPECT_EQ(stepAfter(v, kErrOperationExpired, 0, false, false, false, true), OpenStep::kFailOver);
-  EXPECT_EQ(stepAfter(v, kErrSocketError, 0, false, false, false, true), OpenStep::kFinal);
-  // A server that did not answer within the deadline: with a regional redirector
-  // to ask, the copies are asked for, as a retry through the redirector would
-  // meet the site's other server; without one, another site is tried as before.
-  // The redirector's own stall and a direct open stay final, and no other
-  // failure changes.
+  EXPECT_EQ(stepAfter(v, kErrSocketError, 0, false, false, false, true), OpenStep::kFailOver);
+  EXPECT_EQ(stepAfter(v, kErrTlsError, 0, false, false, false, true), OpenStep::kFinal);
+  // A server that did not answer within the deadline, or whose connection timed
+  // out, was lost or could not be made: with a regional redirector to ask, the
+  // copies are asked for, as a retry through the redirector may meet the same
+  // site again; without one, another site is tried as before. The redirector's
+  // own stall and a direct open stay final, and no other failure changes.
   const auto withRegional = [](const ChainView& c, int code, int errNo = 0) {
     return stepAfter(c, code, errNo, false, false, false, false, true);
   };
@@ -303,12 +306,32 @@ TEST(OpenPolicy, StepAfterAnAttempt) {
   EXPECT_EQ(step(v, kErrOperationExpired), OpenStep::kFailOver);
   EXPECT_EQ(withRegional(kRedirectorOnly, kErrOperationExpired), OpenStep::kFinal);
   EXPECT_EQ(withRegional(kDirect, kErrOperationExpired), OpenStep::kFinal);
-  for (int code : {kErrSocketTimeout, kErrConnectionError, kErrRedirectLimit})
+  for (int code : {kErrSocketTimeout, kErrConnectionError, kErrSocketError, kErrSocketDisconnected,
+                   kErrStreamDisconnect, kErrInvalidSession}) {
+    EXPECT_EQ(withRegional(v, code), OpenStep::kLocate) << code;
+    EXPECT_EQ(withRegional(kRedirectorOnly, code), OpenStep::kFinal) << code;
+    EXPECT_EQ(withRegional(kDirect, code), OpenStep::kFinal) << code;
+  }
+  for (int code : {kErrRedirectLimit})
     EXPECT_EQ(withRegional(v, code), OpenStep::kFailOver) << code;
+  for (int code : {kErrTlsError, kErrAuthFailed, kErrHandShakeFailed, kErrInvalidAddr, 105, 106})
+    EXPECT_EQ(withRegional(v, code), OpenStep::kFinal) << code;
   for (int errNo : {kXrNotAuthorized, kXrServerError, kXrIOError})
     EXPECT_EQ(withRegional(v, kErrErrorResponse, errNo), OpenStep::kFailOver) << errNo;
   EXPECT_EQ(withRegional(v, kErrErrorResponse, kXrNotFound), OpenStep::kLocate);
-  EXPECT_EQ(withRegional(v, kErrSocketError), OpenStep::kFinal);
+}
+
+// The failures that say a server stopped answering or its connection failed: the client's
+// status codes (XrdClStatus.hh), each as the client gives it.
+TEST(OpenPolicy, StalledOrLost) {
+  for (int code : {kErrOperationExpired, kErrSocketTimeout, kErrConnectionError, kErrSocketError,
+                   kErrSocketDisconnected, kErrStreamDisconnect, kErrInvalidSession})
+    EXPECT_TRUE(stalledOrLost(code)) << code;
+  for (int code : {0, kErrInternal, kErrDataError, kErrInvalidAddr, 105, 106, kErrTlsError,
+                   kErrHandShakeFailed, 203, kErrAuthFailed, kErrOperationInterrupted,
+                   kErrInvalidResponse, kErrNotFound, kErrRedirectLimit, kErrErrorResponse,
+                   kErrRedirect})
+    EXPECT_FALSE(stalledOrLost(code)) << code;
 }
 
 // A server or site that failed before, as an attempt that succeeded sees it:
@@ -1265,8 +1288,16 @@ TEST(OpenPolicy, StepAfterHeaderRead) {
   for (int errNo : {kXrIOError, kXrServerError, 3013, kXrNotAuthorized})
     EXPECT_EQ(stepAfterHeaderRead(v, kErrErrorResponse, errNo, false, false), OpenStep::kFailOver)
         << errNo;
-  // How another copy is found is the open's rule: a stall asks the regional for its list.
+  // How another copy is found is the open's rule: a stall, or a connection that timed out, was
+  // lost or could not be made, asks the regional for its list; any other failure of the read goes
+  // to another site through the redirector.
   EXPECT_EQ(stepAfterHeaderRead(v, kErrOperationExpired, 0, false, true), OpenStep::kLocate);
+  for (int code : {kErrSocketTimeout, kErrConnectionError, kErrSocketError, kErrSocketDisconnected,
+                   kErrStreamDisconnect, kErrInvalidSession})
+    EXPECT_EQ(stepAfterHeaderRead(v, code, 0, false, true), OpenStep::kLocate) << code;
+  for (int code : {kErrTlsError, kErrOperationInterrupted, kErrInternal, kErrDataError, kErrRedirect,
+                   101})
+    EXPECT_EQ(stepAfterHeaderRead(v, code, 0, false, true), OpenStep::kFailOver) << code;
   EXPECT_EQ(stepAfterHeaderRead(v, kErrOperationExpired, 0, false, false), OpenStep::kFailOver);
   EXPECT_EQ(stepAfterHeaderRead(v, kErrErrorResponse, kXrNotFound, false, false), OpenStep::kLocate);
   // No other copy: a direct URL, or a chain with no data server after the redirector.

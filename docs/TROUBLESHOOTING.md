@@ -329,9 +329,11 @@ in `tried=` (a redirector masks servers by full host name), so the redirector
 may send the next attempt to it again; uCache then asks the regional
 redirector for the other copies of the file and opens one directly (the
 per-file record file has route `candidate` for these attempts). It does the
-same after a server that stalled past the open deadline, so that the next
-attempt does not meet the other server of the same site, which stalls too;
-the copies at that server's domain are tried last. A copy listed
+same after a server that stalled past the open deadline, or whose connection
+timed out (the client's stream timeout), was lost or could not be made, so
+that the next attempt does not meet the same site again (the other server of
+the site, which stalls too); the copies at that server's domain are tried
+last. This holds for a failure of the checks' reads at open as well. A copy listed
 as on tape is skipped, with the log line `<file>: the copy at <host>:<port> is
 on tape (offline); not opened`. A copy of a file named `*.root` that holds no
 bytes is a bad copy: the open is made again at another site, with the log line

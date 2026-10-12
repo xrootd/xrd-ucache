@@ -925,8 +925,9 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
                   const AttemptView& w, const std::string& sentUrl, int sourceAttempt,
                   uint64_t want) noexcept {
   const bool ok = s.IsOK();
-  // With a sequence, an expiry at a server behind a redirector is not retried at the same URL,
-  // which meets the server that stalled or its neighbour: it goes on to another site. An open
+  // With a sequence, an expiry at a server behind a redirector, or a connection to it that timed
+  // out, was lost or could not be made (stalledOrLost), is not retried at the same URL, which
+  // meets the server that stalled or its neighbour: it goes on to another site. An open
   // that has no other site to go to (a direct URL, or the redirector itself) is retried. So is,
   // once, the open of a direct URL whose header read failed in a way the client would have
   // recovered by opening the file again, had its recovery been on for that read.
@@ -943,7 +944,7 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     return Next::kSameSource;
   };
   const bool retried = (sourceAttempt <= cfg.openRetries && isRetryableOpen(s.code, s.errNo) &&
-                        !(seq && s.code == xrdwire::kErrOperationExpired && elsewhere)) ||
+                        !(seq && stalledOrLost(s.code) && elsewhere)) ||
                        (onceMore && !elsewhere);
   if (!ok && retried)
     return sameSource();
@@ -1008,8 +1009,9 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     // The open goes on to the regional redirector's list of copies when it was
     // not found though a copy may exist, when the redirector handed back a
     // server or site that failed already, when a server did not answer within
-    // the deadline (a retry through the redirector would meet the site's other
-    // server), and after an attempt at a listed copy that failed (it has no
+    // the deadline or its connection timed out, was lost or could not be made
+    // (a retry through the redirector would meet the same site again), and
+    // after an attempt at a listed copy that failed (it has no
     // redirector to send it elsewhere). Without a regional redirector to ask,
     // it ends, or tries elsewhere through the redirector after a stall.
     const bool canAsk = !seq->regional.empty() || seq->located;

@@ -194,11 +194,23 @@ enum class OpenStep : uint8_t {
 // reads of the file stopped (the open of a read that moves): the redirector did
 // not keep it from there, so the regional redirector is asked for the copies.
 // `regionalKnown`: a regional redirector can be asked. A server that did not
-// answer within the deadline then sends the open to that list, not back through
-// the redirector, which would steer it to the other server of the same site,
-// and that one stalls as well.
+// answer within the deadline, or whose connection timed out, was lost or could
+// not be made (stalledOrLost), then sends the open to that list, not back
+// through the redirector, which would steer it to the same site again (the
+// other server of the site, which stalls as well).
 OpenStep stepAfter(const ChainView& v, int code, int errNo, bool sizeDiffers, bool offline,
                    bool excluded, bool repeats = false, bool regionalKnown = false);
+// Whether a failure with the client's status `code` says the server stopped answering or its
+// connection failed, so that an open sent back through the redirector may meet the same site
+// again: the request ran out of time (errOperationExpired), the client's stream timeout ended it
+// on a connection that went quiet (errSocketTimeout; also a handshake that never answered), the
+// connection could not be made (errConnectionError: refused or unreachable, after the client's
+// own retries), or it was lost (errSocketError: reset or broken; errSocketDisconnected: closed by
+// the peer; errStreamDisconnect; errInvalidSession: the connection the file was opened on is
+// gone). Not one of them: a name that does not resolve (errInvalidAddr), TLS, handshake, login
+// and authentication failures, and the client's own local faults (poller, socket options): those
+// are not a server that stalled, and are classified as before.
+bool stalledOrLost(int code);
 // The step after an open whose header read (rootHeaderVerdict) failed with (code, errNo) at
 // a copy reached through `v`: a failure of that copy, whatever the code, so another copy is
 // tried when the open went through a redirector; how (another site, or the regional's list
