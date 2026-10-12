@@ -1907,7 +1907,9 @@ TEST(CacheStore, CheckpointDrainsCommitsAndRecordsWithoutAClose) {
   std::shared_ptr<FileEntry> e;
   UrlKey key = keyN(1);
   uint64_t t0 = 0;
+  uint64_t tries = 0; // each try's 64 pages are written by the end, its own key's or the last's
   for (int n = 1; n < 50; ++n) {
+    ++tries;
     key = keyN(n);
     t0 = static_cast<uint64_t>(::time(nullptr));
     e = store.open(key, src.size());
@@ -1942,14 +1944,17 @@ TEST(CacheStore, CheckpointDrainsCommitsAndRecordsWithoutAClose) {
   }
   auto lines = completeLines(counterFile(io, td.path()));
   ASSERT_EQ(lines.size(), 1u);
-  EXPECT_NE(lines[0].find("\"page_writes\":64"), std::string::npos);
+  // A loaded machine (ctest -j16) can need more than one try above: the record counts the pages
+  // of every try (64 each), not only the last key's.
+  EXPECT_NE(lines[0].find("\"page_writes\":" + std::to_string(64 * tries)), std::string::npos)
+      << lines[0] << " (" << tries << " tries)";
   // A second checkpoint appends; the readers take the last line, so the run
   // counts exactly once however many checkpoints it lived through.
   store.checkpoint();
   EXPECT_EQ(completeLines(counterFile(io, td.path())).size(), 2u);
   StatsTotals t = aggregateStats(td.path() + "/stats");
   EXPECT_EQ(t.files, 1u);
-  EXPECT_EQ(t.pageWrites, 64u);
+  EXPECT_EQ(t.pageWrites, 64u * tries);
 }
 
 TEST(CacheStore, CheckpointHonoursTheDrainIntervalButRecordsAnyway) {
