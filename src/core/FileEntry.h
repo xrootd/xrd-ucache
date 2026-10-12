@@ -66,6 +66,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -216,8 +217,19 @@ class FileEntry {
   // owner's thread) and the caller must then RE-CLASSIFY the read (usually a
   // RAM hit against the staged pages). endFetch must run on every owner exit
   // path, success or failure; parked callers keep their own safety timer.
-  bool beginFetch(uint64_t off, uint64_t len, std::function<void()> onOwnerDone);
-  void endFetch(uint64_t off, uint64_t len);
+  // How the owner's fetch ended, as endFetch gives it to every parked caller:
+  // `code` 0 when it brought its bytes (or ended for a reason of its own),
+  // else the client's status code of its failure, with the server that failed
+  // it (`server`, "" when not known), so a caller can tell whether its own
+  // fetch would meet the same failure.
+  struct FetchOutcome {
+    int code = 0;
+    std::string server;
+  };
+  using FetchDone = std::function<void(const FetchOutcome&)>;
+  bool beginFetch(uint64_t off, uint64_t len, FetchDone onOwnerDone);
+  void endFetch(uint64_t off, uint64_t len, const FetchOutcome& outcome);
+  void endFetch(uint64_t off, uint64_t len) { endFetch(off, len, FetchOutcome{}); }
 
   // ---- ranges already on the wire -----------------------------------------
   // The gate above dedups EXACT ranges, which is why it only ever served the
@@ -462,7 +474,7 @@ class FileEntry {
   static std::atomic<uint64_t> g_specTotal_;   // process-wide speculative bytes
   static std::atomic<uint64_t> g_specDropped_; // process-wide never-used bytes
   // In-flight fetch table: (off,len) -> parked re-dispatch callbacks.
-  std::map<std::pair<uint64_t, uint64_t>, std::vector<std::function<void()>>> inflight_;
+  std::map<std::pair<uint64_t, uint64_t>, std::vector<FetchDone>> inflight_;
   // Page ranges read-ahead has on the wire, [firstPage, endPage), one entry
   // per wire element, and the reads parked behind them. Short: one window's
   // worth of elements per open handle.

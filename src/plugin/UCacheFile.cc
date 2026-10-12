@@ -3008,10 +3008,10 @@ void HandleState::unpark() {
 
 ucache::XrdTimeout HandleState::originTimeout(int readerTimeoutS, uint64_t startUs, bool again) {
   if (!moveOnReads.load(std::memory_order_relaxed))
-    return static_cast<ucache::XrdTimeout>(readerTimeoutS);
+    return ucache::xrdTimeoutOf(readerTimeoutS);
   const int elapsedS = startUs ? static_cast<int>((nowUs() - startUs) / 1000000) : 0;
-  return static_cast<ucache::XrdTimeout>(readAttemptTimeoutS(
-      readerTimeoutS, defaultRequestTimeoutS(), gReadDeadlineS, elapsedS, again));
+  return ucache::xrdTimeoutOf(readAttemptTimeoutS(readerTimeoutS, defaultRequestTimeoutS(),
+                                                  gReadDeadlineS, elapsedS, again));
 }
 
 // A forked child's first cache work -- a setup, a relayed byte, an open --
@@ -4427,8 +4427,14 @@ class MissReadHandler : public ResponseHandler {
         noteOriginFailure(*st_, &entry_->obs().servers, "read", wireOff_, wireBuf_->size(),
                           s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal),
                           answeredBy(*st_, h.get()));
-      if (gateLen_)
-        entry_->endFetch(wireOff_, gateLen_); // waiters refetch on their own
+      if (gateLen_) { // waiters refetch on their own, or take a stall's error (parkedRead)
+        FileEntry::FetchOutcome o;
+        if (s && !s->IsOK()) {
+          o.code = s->code;
+          o.server = answeredBy(*st_, h.get());
+        }
+        entry_->endFetch(wireOff_, gateLen_, o);
+      }
       st_->noteCacheError(globalConfig());
       // On an armed handle a failure another site may not share is not relayed
       // on the File that failed it: the request moves (moveRead).
@@ -4438,7 +4444,7 @@ class MissReadHandler : public ResponseHandler {
       }
       const int relayS =
           missRelayTimeoutS(!s ? xrdwire::kErrInternal : s->IsOK() ? 0 : s->code, readerT_,
-                            defaultRequestTimeoutS(), static_cast<int>((nowUs() - t0_) / 1000000));
+                            currentRequestTimeoutS(), static_cast<int>((nowUs() - t0_) / 1000000));
       if (relayS < 0) {
         complete(user_,
                  new XRootDStatus(s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal)),
@@ -4449,7 +4455,7 @@ class MissReadHandler : public ResponseHandler {
       if (XrdCl::File* f = st_->acquireInner()) {
         auto* relay = newRelay(st_, f, user_, userOff_, userLen_);
         XRootDStatus s2 =
-            f->Read(userOff_, userLen_, userBuf_, relay, static_cast<ucache::XrdTimeout>(relayS));
+            f->Read(userOff_, userLen_, userBuf_, relay, ucache::xrdTimeoutOf(relayS));
         if (s2.IsOK()) {
           delete this;
           return;
@@ -4602,14 +4608,24 @@ XRootDStatus issueWireRead(const std::shared_ptr<HandleState>& st, XrdCl::File* 
 
 std::pair<uint64_t, uint64_t> roundChunk(const FileEntry& e, uint64_t off, uint64_t len);
 
+FileEntry::FetchDone parkedRead(std::shared_ptr<HandleState> st,
+                               std::shared_ptr<FileEntry> entry, uint64_t offset, uint32_t size,
+                               void* buffer, ResponseHandler* handler, int readerT,
+                               uint64_t startUs);
+
 // Parked-read re-dispatch: runs on the executor after the owning fetch
 // released the gate. Usually a RAM hit against the just-staged pages; if the
-// owner failed, fetches for itself (joining any newer in-flight fetch).
+// owner failed, fetches for itself (joining any newer in-flight fetch), within
+// the time its own request has left: the reader's own timeout `readerT` (0:
+// none, the client's request timeout then) counted from when it was made
+// (`startUs`), as a read without the cache would have had. A read whose time
+// ran out while it waited gets the client's "operation expired", as it would
+// have without the cache.
 // Free function on (st, entry) by design — the UCacheFile object may be gone
 // (executor tasks must never capture the plugin object).
 void redispatchRead(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
                     uint64_t offset, uint32_t size, void* buffer,
-                    ResponseHandler* handler) {
+                    ResponseHandler* handler, int readerT, uint64_t startUs) {
   uint64_t t0 = nowUs();
   if (entry->readCached(offset, size, buffer)) {
     if (st->store) {
@@ -4623,24 +4639,30 @@ void redispatchRead(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> 
     complete(handler, okStatus(), chunkResponse(offset, size, buffer));
     return;
   }
-  auto [ws, we] = roundChunk(*entry, offset, size);
-  auto fired = std::make_shared<std::atomic<bool>>(false);
-  auto again = [st, entry, offset, size, buffer, handler, fired] {
-    if (fired->exchange(true))
-      return;
-    Executor::instance().post([st, entry, offset, size, buffer, handler] {
-      redispatchRead(st, entry, offset, size, buffer, handler);
-    });
-  };
-  if (!entry->beginFetch(ws, we - ws, again)) {
-    Executor::instance().postAfter(10000, again); // missed-endFetch insurance
+  const int elapsedS = static_cast<int>((t0 - std::min(startUs, t0)) / 1000000);
+  const int left = parkedRefetchTimeoutS(readerT, currentRequestTimeoutS(), elapsedS);
+  if (left < 0) {
+    complete(handler,
+             new XRootDStatus(XrdCl::stError, XrdCl::errOperationExpired, 0,
+                              "uCache: the read's time ran out while it waited for another read "
+                              "of the same bytes"),
+             nullptr);
     return;
   }
+  auto [ws, we] = roundChunk(*entry, offset, size);
+  auto again = parkedRead(st, entry, offset, size, buffer, handler, readerT, startUs);
+  if (!entry->beginFetch(ws, we - ws, again)) {
+    Executor::instance().postAfter(10000, [again] { again(FileEntry::FetchOutcome()); });
+    return; // missed-endFetch insurance, above
+  }
+  // Its own fetch, with what is left of its time (an armed handle's reads have their own
+  // limits, from the reader's own timeout: originTimeout).
+  const int t = st->moveOnReads.load(std::memory_order_relaxed) ? readerT : left;
   auto wireBuf = std::make_shared<std::vector<char>>(we - ws);
   if (XrdCl::File* f = st->acquireInner()) {
     auto* mh = new MissReadHandler(st, f, entry, offset, size, buffer, handler, ws, wireBuf,
-                                   nowUs(), we - ws);
-    XRootDStatus s = issueWireRead(st, f, ws, we - ws, wireBuf->data(), mh, 0);
+                                   nowUs(), we - ws, t);
+    XRootDStatus s = issueWireRead(st, f, ws, we - ws, wireBuf->data(), mh, t);
     if (!s.IsOK()) {
       delete mh;
       st->releaseInner();
@@ -4653,6 +4675,41 @@ void redispatchRead(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> 
   complete(handler, new XRootDStatus(st->missError()), nullptr);
 }
 
+// What a read parked behind another read's fetch of its span does when that fetch ends
+// (FileEntry::beginFetch). A fetch that ran out of time at its server, on a handle whose reads do
+// not move, from the server this handle reads (parkedGetsOwnersError), gives every read parked on
+// it that error at once, as each read's own request to that server would have met it at the same
+// moment without the cache; otherwise the read is classified again (usually served from the pages
+// just staged, or fetched for itself within its own time left, redispatchRead). Fires once,
+// whichever of the fetch's end and the insurance timer comes first.
+FileEntry::FetchDone parkedRead(std::shared_ptr<HandleState> st,
+                               std::shared_ptr<FileEntry> entry, uint64_t offset, uint32_t size,
+                               void* buffer, ResponseHandler* handler, int readerT,
+                               uint64_t startUs) {
+  auto fired = std::make_shared<std::atomic<bool>>(false);
+  return [st, entry, offset, size, buffer, handler, readerT, startUs,
+          fired](const FileEntry::FetchOutcome& o) {
+    if (fired->exchange(true))
+      return;
+    if (o.code &&
+        parkedGetsOwnersError(o.code, st->moveOnReads.load(std::memory_order_relaxed), o.server,
+                              answeredBy(*st, nullptr))) {
+      const int code = o.code;
+      Executor::instance().post([handler, code] {
+        complete(handler,
+                 new XRootDStatus(XrdCl::stError, static_cast<uint16_t>(code), 0,
+                                  "uCache: the read of the same bytes this read waited for, "
+                                  "from the same server, failed so"),
+                 nullptr);
+      });
+      return;
+    }
+    Executor::instance().post([st, entry, offset, size, buffer, handler, readerT, startUs] {
+      redispatchRead(st, entry, offset, size, buffer, handler, readerT, startUs);
+    });
+  };
+}
+
 struct WireElem {
   uint64_t off = 0;
   uint64_t len = 0;
@@ -4663,15 +4720,16 @@ struct WireElem {
 class MissVReadHandler : public ResponseHandler {
  public:
   // `direct`: the file's rule when it is read directly -- its data is served
-  // and not kept, only pages holding none of it are.
+  // and not kept, only pages holding none of it are. `readerT`: the reader's
+  // own timeout of the request, 0 for none.
   MissVReadHandler(std::shared_ptr<HandleState> st, XrdCl::File* f,
                    std::shared_ptr<FileEntry> entry, ChunkList userChunks,
                    std::vector<size_t> missIdx,
                    std::vector<WireElem> wire, ResponseHandler* user, uint64_t t0,
-                   std::shared_ptr<ReadRule> direct = nullptr)
+                   std::shared_ptr<ReadRule> direct = nullptr, int readerT = 0)
       : st_(std::move(st)), entry_(std::move(entry)), userChunks_(std::move(userChunks)),
         missIdx_(std::move(missIdx)), wire_(std::move(wire)), user_(user), t0_(t0),
-        direct_(std::move(direct)), on_(f),
+        direct_(std::move(direct)), on_(f), readerT_(readerT),
         inflight_(st_->store ? &st_->store->stats() : nullptr, issueServer(*st_, f)) {
     noteWaitTier(user_, ReaderWait::kOrigin);
   }
@@ -4697,8 +4755,8 @@ class MissVReadHandler : public ResponseHandler {
       // pure pass-through (hits included; wasteful but simple and faithful),
       // with what is left of the request's time; a fetch that ran out of time
       // at its server gives the reader its error instead (missRelayTimeoutS).
-      // The fetch was sent with the client's request timeout, as the reader's
-      // own vector read is when it gives none.
+      // The fetch was sent with the reader's own timeout (the client's request
+      // timeout when it gave none), as the reader's own vector read would be.
       const XRootDStatus failed = s ? *s : XRootDStatus(XrdCl::stError, XrdCl::errInternal);
       noteOriginFailure(*st_, &entry_->obs().servers, "readv", wire_.front().off, wireBytes,
                         failed, answeredBy(*st_, h.get()));
@@ -4707,14 +4765,14 @@ class MissVReadHandler : public ResponseHandler {
         delete this;
         return;
       }
-      const int relayS = missRelayTimeoutS(failed.code, 0, defaultRequestTimeoutS(),
+      const int relayS = missRelayTimeoutS(failed.code, readerT_, currentRequestTimeoutS(),
                                            static_cast<int>((nowUs() - t0_) / 1000000));
       XrdCl::File* f = relayS < 0 ? nullptr : st_->acquireInner();
       if (f) {
         auto* relay =
             newRelay(st_, f, user_, chunksFirst(userChunks_), chunksBytes(userChunks_));
         XRootDStatus s2 = f->VectorRead(userChunks_, nullptr, relay,
-                                        static_cast<ucache::XrdTimeout>(relayS));
+                                        ucache::xrdTimeoutOf(relayS));
         if (s2.IsOK()) {
           delete this;
           return;
@@ -4935,6 +4993,7 @@ class MissVReadHandler : public ResponseHandler {
   uint64_t t0_;
   std::shared_ptr<ReadRule> direct_;
   XrdCl::File* on_;         // the File the read was issued on
+  int readerT_;             // the reader's own timeout of the request, 0 for none
   OriginInFlight inflight_; // the origin read this handler waits for
   uint64_t arrivedUs_ = 0;  // when its answer arrived (the check may run later)
 };
@@ -4950,7 +5009,7 @@ std::pair<uint64_t, uint64_t> roundChunk(const FileEntry& e, uint64_t off, uint6
 void issueMissVRead(const std::shared_ptr<HandleState>& st,
                     const std::shared_ptr<FileEntry>& entry, ChunkList userChunks,
                     std::vector<size_t> missIdx, ResponseHandler* user,
-                    std::shared_ptr<ReadRule> direct = nullptr) {
+                    std::shared_ptr<ReadRule> direct = nullptr, int readerT = 0) {
   // Build rounded intervals in offset order, coalescing overlaps so the
   // origin never sees overlapping reads (§5.2 step 3). A file read directly
   // fetches its data exactly as asked: rounding is for pages to keep.
@@ -4996,10 +5055,10 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
     return;
   }
   auto* mh = new MissVReadHandler(st, f, entry, std::move(userChunks), std::move(missIdx),
-                                  std::move(wire), user, nowUs(), std::move(direct));
+                                  std::move(wire), user, nowUs(), std::move(direct), readerT);
   XRootDStatus s;
   if (!injectReadFault(false, mh, s)) // test hook: wire vector read dies mid-stream
-    s = f->VectorRead(wireChunks, nullptr, mh, st->originTimeout(0));
+    s = f->VectorRead(wireChunks, nullptr, mh, st->originTimeout(readerT));
   s = refusedLater(st, s, mh);
   if (!s.IsOK()) {
     delete mh;
@@ -6113,18 +6172,12 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
   noteWaitTier(handler, ReaderWait::kOrigin);
   auto [ws, we] = roundChunk(*entry, offset, size);
   {
-    auto st = st_;
-    auto fired = std::make_shared<std::atomic<bool>>(false);
-    auto redispatch = [st, entry, offset, size, buffer, handler, fired] {
-      if (fired->exchange(true))
-        return;
-      Executor::instance().post([st, entry, offset, size, buffer, handler] {
-        redispatchRead(st, entry, offset, size, buffer, handler);
-      });
-    };
+    auto redispatch = parkedRead(st_, entry, offset, size, buffer, handler,
+                                 static_cast<int>(timeout), nowUs());
     if (!entry->beginFetch(ws, we - ws, redispatch)) {
-      Executor::instance().postAfter(10000, redispatch); // missed-endFetch insurance
-      return XRootDStatus();
+      Executor::instance().postAfter(10000,
+                                     [redispatch] { redispatch(FileEntry::FetchOutcome()); });
+      return XRootDStatus(); // missed-endFetch insurance, above
     }
   }
   auto wireBuf = std::make_shared<std::vector<char>>(we - ws);
@@ -6265,7 +6318,7 @@ XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void
 // enough -- whatever is still missing then goes to the origin.
 static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
                                  const std::shared_ptr<FileEntry>& entry, ChunkList chunks,
-                                 ResponseHandler* handler, bool mayPark) {
+                                 ResponseHandler* handler, bool mayPark, int readerT = 0) {
   // Atomic per-chunk classification (§5.2 step 1).
   std::vector<size_t> missIdx;
   for (size_t i = 0; i < chunks.size(); ++i)
@@ -6314,14 +6367,14 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
     for (size_t i : missIdx)
       missLen += chunks[i].length;
     auto redispatch = [st, entry, again = std::move(again), handler, fired, parkedAt, missOff,
-                       missLen]() mutable {
+                       missLen, readerT]() mutable {
       if (fired->exchange(true))
         return;
       if (st->store && st->store->stats().tracer)
         st->store->stats().tracer->rec("join", entry->key().key, missOff, missLen,
                                        nowUs() - parkedAt, /*sampled=*/false);
-      Executor::instance().post([st, entry, again = std::move(again), handler]() mutable {
-        servePlainVectorRead(st, entry, std::move(again), handler, /*mayPark=*/false);
+      Executor::instance().post([st, entry, again = std::move(again), handler, readerT]() mutable {
+        servePlainVectorRead(st, entry, std::move(again), handler, /*mayPark=*/false, readerT);
       });
     };
     if (entry->waitForInFlight(want, redispatch)) {
@@ -6338,7 +6391,7 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
 
   if (missIdx.size() == chunks.size()) {
     // All-miss: no disk stage; issue the wire read from this thread.
-    issueMissVRead(st, entry, chunks, std::move(missIdx), handler, std::move(direct));
+    issueMissVRead(st, entry, chunks, std::move(missIdx), handler, std::move(direct), readerT);
     return;
   }
 
@@ -6347,7 +6400,7 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
   ChunkList userChunks = chunks;
   Executor::instance().post(
       [st, entry, userChunks = std::move(userChunks), missIdx = std::move(missIdx), handler,
-       direct = std::move(direct)]() mutable {
+       direct = std::move(direct), readerT]() mutable {
         uint64_t t0 = nowUs();
         uint64_t hitBytes = 0;
         std::vector<size_t> misses = std::move(missIdx);
@@ -6379,7 +6432,7 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
         }
         std::sort(misses.begin(), misses.end());
         issueMissVRead(st, entry, std::move(userChunks), std::move(misses), handler,
-                       std::move(direct));
+                       std::move(direct), readerT);
       });
   return;
 }
@@ -6471,7 +6524,7 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
           0, chunksFirst(chunks), chunksBytes(chunks), kept != nullptr);
     }
 
-  servePlainVectorRead(st_, entry, chunks, handler, /*mayPark=*/true);
+  servePlainVectorRead(st_, entry, chunks, handler, /*mayPark=*/true, static_cast<int>(timeout));
   return XRootDStatus();
 }
 

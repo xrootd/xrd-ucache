@@ -650,17 +650,38 @@ int readBudgetS(int readerTimeoutS, int requestTimeoutS);
 // would otherwise never be moved).
 int readAttemptTimeoutS(int readerTimeoutS, int requestTimeoutS, int deadlineS, int elapsedS,
                         bool again);
+// Whether a fetch from the origin that failed with the client's status `code` ran out of time
+// at its server: an expiry (errOperationExpired), or the client's stream timeout on a connection
+// that went quiet (errSocketTimeout). The same request sent again to that server, on that
+// connection, would wait as long again.
+bool fetchRanOutOfTime(int code);
 // The timeout of the read a miss sends again when its fetch from the origin did not bring the
 // reader's bytes: the fetch failed with `code`, or answered without them (`code` 0), `elapsedS`
 // after it was sent. The reader's exact request is then sent as it is, on the same File (fail
 // open), with what is left of the time the reader's request would have had without the cache
-// (readBudgetS: the reader's own timeout, else the client's request timeout), at least 1 s after
-// an answer. -1: the fetch's error is the reader's answer, and nothing is sent again. That is so
-// when the fetch ran out of time at its server (an expiry, or the client's stream timeout on a
-// connection that went quiet): the request sent again goes to the same server on the same
-// connection and waits as long again, where the reader's own request would have met that error
-// once. It is also so when a failed fetch left nothing of the reader's time.
+// (readBudgetS: the reader's own timeout, else the client's request timeout, `requestTimeoutS`,
+// as the client holds it then). After an answer without the reader's bytes (no error to give)
+// it is at least the floor of a later read attempt: 30 s, or half the reader's own timeout when
+// that is shorter, at least 1 s. -1: the fetch's error is the reader's answer, and nothing is
+// sent again. That is so when the fetch ran out of time at its server (fetchRanOutOfTime): the
+// request sent again would wait as long again, where the reader's own request would have met
+// that error once. It is also so when a failed fetch left nothing of the reader's time.
 int missRelayTimeoutS(int code, int readerTimeoutS, int requestTimeoutS, int elapsedS);
+// The timeout of the fetch a read makes for itself after it waited, parked, for another read's
+// fetch of the same span that did not bring its bytes (or after the wait's own insurance timer),
+// `elapsedS` after the read was made: what is left of its own time (readBudgetS), at least 1 s;
+// -1 when nothing is left, and the read then fails with an expiry, as it would have without the
+// cache.
+int parkedRefetchTimeoutS(int readerTimeoutS, int requestTimeoutS, int elapsedS);
+// Whether a read parked behind another read's fetch of its span takes that fetch's failure
+// `code` as its own answer: the fetch ran out of time at its server (fetchRanOutOfTime), the
+// parked read's handle does not move its reads to another site (`moves`), and the fetch failed
+// at the server the parked read's handle reads from (`fetchServer`, `ownServer`; either "" when
+// not known, which counts as the same: one file's handles in one process reach it through one
+// URL). Any other failure, a handle whose reads move, or another server: the parked read makes
+// its own fetch.
+bool parkedGetsOwnersError(int code, bool moves, const std::string& fetchServer,
+                           const std::string& ownServer);
 // Attempts of one read, at as many servers.
 inline constexpr int kReadMaxAttempts = 4;
 

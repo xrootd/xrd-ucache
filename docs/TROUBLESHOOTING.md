@@ -240,11 +240,22 @@ replies) is different: a read then fails when its time runs out, with
 `operation expired`: the job's own timeout for the read, or the client's request
 timeout (`XRD_REQUESTTIMEOUT`, 1800 s by default). Through uCache, with
 `adaptive_federation = off`, a read the cache does not hold fails at the same
-moment, with the same error: the cache's fetch from the server ran out of time,
-and its read is not sent to that server again, which would wait as long once
-more. A fetch that fails otherwise (a lost connection, a server's error, an
-answer short of the bytes asked for) is followed by the job's own read, sent to
-the origin as it is, within the time that read has left. (With
+moment, with the same error, single and vector reads alike: the cache's fetch
+from the server is sent with the read's own timeout (the client's request
+timeout when the job gives none), and when it runs out of time (or the
+client's stream timeout ends it on a connection gone quiet) its read is not
+sent to that server again, which would wait as long once more. Single reads of
+other threads or handles of the job that need the same bytes (the same span of
+the file) wait for that one fetch rather than sending their own; when it runs out of time at the server their
+handle reads, each of them gets the same error at the same moment, as their own
+reads to that server would have. A fetch that fails otherwise (a lost
+connection, a server's error) is followed by the job's own read, sent to the
+origin as it is, within the time that read has left (counted against the
+client's request timeout as the client holds it at that moment when the job
+gives none); a read that was waiting for it makes its own fetch, within its
+own time left, or fails with `operation expired` when none is left. An answer
+short of the bytes asked for is followed by the job's own read too, with at
+least 30 s (half the job's own timeout when that is shorter). (With
 `adaptive_federation = on` such a read is made again at another site; see
 below.)
 

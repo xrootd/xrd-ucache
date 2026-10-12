@@ -1691,3 +1691,35 @@ TEST(FileEntry, ServerTallyTookFrom) {
   t.noteTook("");
   EXPECT_FALSE(t.tookFrom(""));
 }
+
+// The fetch gate: the owner's end reaches every parked caller once, with how the owner's fetch
+// ended (its failure's code and server), and the gate is free again after it.
+TEST(FileEntry, FetchGateGivesParkedCallersTheOutcome) {
+  Fixture fx;
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  std::vector<FileEntry::FetchOutcome> seen;
+  auto park = [&seen](const FileEntry::FetchOutcome& o) { seen.push_back(o); };
+  ASSERT_TRUE(e->beginFetch(0, 8192, park)); // the owner
+  EXPECT_FALSE(e->beginFetch(0, 8192, park));
+  EXPECT_FALSE(e->beginFetch(0, 8192, park));
+  EXPECT_TRUE(e->beginFetch(8192, 8192, park)) << "another span has its own gate";
+  FileEntry::FetchOutcome failed;
+  failed.code = 206;
+  failed.server = "a.example.org:1094";
+  e->endFetch(0, 8192, failed);
+  ASSERT_EQ(seen.size(), 2u);
+  for (const auto& o : seen) {
+    EXPECT_EQ(o.code, 206);
+    EXPECT_EQ(o.server, "a.example.org:1094");
+  }
+  e->endFetch(0, 8192, failed); // ended already: no one is told again
+  EXPECT_EQ(seen.size(), 2u);
+  EXPECT_TRUE(e->beginFetch(0, 8192, park)) << "the gate is free again";
+  EXPECT_FALSE(e->beginFetch(0, 8192, park));
+  e->endFetch(0, 8192); // a fetch that brought its bytes: code 0
+  ASSERT_EQ(seen.size(), 3u);
+  EXPECT_EQ(seen.back().code, 0);
+  EXPECT_TRUE(seen.back().server.empty());
+  e->endFetch(8192, 8192);
+}

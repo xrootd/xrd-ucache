@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <ctime>
+#include <limits>
 
 namespace ucache {
 
@@ -32,5 +33,14 @@ using XrdTimeout = time_t;
 #else
 using XrdTimeout = uint16_t;
 #endif
+
+// `s` seconds as a timeout the client takes: 0 (the client's own default) for none, and the
+// type's largest value for more than it holds (65535 s on XRootD 5), never a value wrapped round.
+inline XrdTimeout xrdTimeoutOf(long long s) {
+  if (s <= 0)
+    return 0;
+  const long long most = static_cast<long long>(std::numeric_limits<XrdTimeout>::max());
+  return static_cast<XrdTimeout>(s > most ? most : s);
+}
 
 }  // namespace ucache

@@ -441,6 +441,13 @@ std::shared_ptr<CacheStore> globalStore() {
 
 int defaultRequestTimeoutS() { return gRequestTimeoutS.load(std::memory_order_relaxed); }
 
+int currentRequestTimeoutS() {
+  int v = XrdCl::DefaultRequestTimeout;
+  if (XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv())
+    env->GetInt("RequestTimeout", v);
+  return v;
+}
+
 bool processExiting() { return gExiting.load(std::memory_order_acquire); }
 
 void resumeAfterFork() {

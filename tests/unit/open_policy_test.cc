@@ -450,7 +450,7 @@ TEST(OpenPolicy, MissRelayTimeout) {
             << code << " " << readerT << " " << elapsed;
   // Any other failure, and an answer without the reader's bytes: sent again with what is left of
   // the reader's own timeout, or of the client's request timeout when it gave none.
-  for (int code : {0, kErrConnectionError, kErrSocketError, kErrSocketDisconnected,
+  for (int code : {kErrConnectionError, kErrSocketError, kErrSocketDisconnected,
                    kErrStreamDisconnect, kErrInvalidSession, kErrErrorResponse, kErrInternal,
                    kErrDataError}) {
     EXPECT_EQ(missRelayTimeoutS(code, 0, RT, 0), 1800) << code;
@@ -462,14 +462,62 @@ TEST(OpenPolicy, MissRelayTimeout) {
     EXPECT_EQ(missRelayTimeoutS(code, 30, RT, -5), 30) << code << ": a clock that went back";
   }
   // Nothing left of the reader's time: a failure is the reader's answer; an answer without its
-  // bytes is still sent again, for 1 s (it has no error to give).
+  // bytes is still sent again (it has no error to give), with the floor of a later attempt: 30 s,
+  // or half the reader's own timeout when shorter, at least 1 s.
   for (int code : {kErrConnectionError, kErrSocketError, kErrErrorResponse}) {
     EXPECT_EQ(missRelayTimeoutS(code, 45, RT, 45), -1) << code;
     EXPECT_EQ(missRelayTimeoutS(code, 0, RT, 1800), -1) << code;
     EXPECT_EQ(missRelayTimeoutS(code, 0, RT, 5000), -1) << code;
   }
-  EXPECT_EQ(missRelayTimeoutS(0, 45, RT, 45), 1);
-  EXPECT_EQ(missRelayTimeoutS(0, 0, RT, 5000), 1);
+  EXPECT_EQ(missRelayTimeoutS(0, 45, RT, 45), 22);
+  EXPECT_EQ(missRelayTimeoutS(0, 45, RT, 40), 22) << "5 s left, the floor is more";
+  EXPECT_EQ(missRelayTimeoutS(0, 0, RT, 5000), 30);
+  EXPECT_EQ(missRelayTimeoutS(0, 0, RT, 1790), 30);
+  EXPECT_EQ(missRelayTimeoutS(0, 1, RT, 5), 1);
+  EXPECT_EQ(missRelayTimeoutS(0, 0, RT, 100), 1700) << "more left than the floor: what is left";
+  EXPECT_EQ(missRelayTimeoutS(0, 0, RT, 0), 1800);
+  EXPECT_EQ(missRelayTimeoutS(0, 45, RT, 0), 45);
+  EXPECT_EQ(missRelayTimeoutS(0, 0, 10, 3), 30) << "7 s left, the floor of 30 s is more";
+}
+
+TEST(OpenPolicy, FetchRanOutOfTime) {
+  EXPECT_TRUE(fetchRanOutOfTime(kErrOperationExpired));
+  EXPECT_TRUE(fetchRanOutOfTime(kErrSocketTimeout));
+  for (int code : {0, kErrConnectionError, kErrSocketError, kErrSocketDisconnected,
+                   kErrInvalidSession, kErrErrorResponse, kErrDataError, kErrTlsError})
+    EXPECT_FALSE(fetchRanOutOfTime(code)) << code;
+}
+
+// A read that waited, parked, for another read's fetch of its span makes its own fetch within its
+// own time left; with nothing left it fails with an expiry.
+TEST(OpenPolicy, ParkedRefetchTimeout) {
+  EXPECT_EQ(parkedRefetchTimeoutS(0, RT, 0), 1800);
+  EXPECT_EQ(parkedRefetchTimeoutS(0, RT, 10), 1790);
+  EXPECT_EQ(parkedRefetchTimeoutS(0, 10, 9), 1);
+  EXPECT_EQ(parkedRefetchTimeoutS(0, 10, 10), -1) << "the client's request timeout spent";
+  EXPECT_EQ(parkedRefetchTimeoutS(0, 10, 25), -1);
+  EXPECT_EQ(parkedRefetchTimeoutS(45, RT, 20), 25) << "the reader's own timeout, not the client's";
+  EXPECT_EQ(parkedRefetchTimeoutS(45, RT, 45), -1);
+  EXPECT_EQ(parkedRefetchTimeoutS(30, RT, -3), 30) << "a clock that went back";
+  EXPECT_EQ(parkedRefetchTimeoutS(0, 0, 0), kReadDeadlineS) << "no request timeout known";
+}
+
+// A read parked behind a fetch that ran out of time at the server its handle reads, on a handle
+// whose reads do not move, takes that error; anything else fetches for itself.
+TEST(OpenPolicy, ParkedGetsOwnersError) {
+  for (int code : {kErrOperationExpired, kErrSocketTimeout}) {
+    EXPECT_TRUE(parkedGetsOwnersError(code, false, "a.example.org:1094", "a.example.org:1094"));
+    EXPECT_TRUE(parkedGetsOwnersError(code, false, "A.Example.org:1094", "a.example.org:1094"));
+    EXPECT_TRUE(parkedGetsOwnersError(code, false, "", "a.example.org:1094")) << "not known";
+    EXPECT_TRUE(parkedGetsOwnersError(code, false, "a.example.org:1094", "")) << "not known";
+    EXPECT_FALSE(parkedGetsOwnersError(code, true, "a.example.org:1094", "a.example.org:1094"))
+        << "its reads move";
+    EXPECT_FALSE(parkedGetsOwnersError(code, false, "a.example.org:1094", "b.example.org:1094"))
+        << "its handle reads another server";
+  }
+  for (int code : {0, kErrConnectionError, kErrSocketError, kErrErrorResponse, kErrDataError})
+    EXPECT_FALSE(parkedGetsOwnersError(code, false, "a.example.org:1094", "a.example.org:1094"))
+        << code;
 }
 
 // Every status of a failed read and what follows it.

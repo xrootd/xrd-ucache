@@ -1105,13 +1105,38 @@ int readAttemptTimeoutS(int readerTimeoutS, int requestTimeoutS, int deadlineS, 
   return std::max(std::min(deadlineS, left), 1);
 }
 
+bool fetchRanOutOfTime(int code) {
+  return code == kErrOperationExpired || code == kErrSocketTimeout;
+}
+
 int missRelayTimeoutS(int code, int readerTimeoutS, int requestTimeoutS, int elapsedS) {
-  if (code == kErrOperationExpired || code == kErrSocketTimeout)
+  if (fetchRanOutOfTime(code))
     return -1;
   const int left = readBudgetS(readerTimeoutS, requestTimeoutS) - std::max(elapsedS, 0);
-  if (left >= 1)
-    return left;
-  return code == 0 ? 1 : -1;
+  if (code == 0) { // an answer without the reader's bytes: no error to give it
+    int floorS = 30;
+    if (readerTimeoutS > 0)
+      floorS = std::min(floorS, readerTimeoutS / 2);
+    return std::max({left, floorS, 1});
+  }
+  return left >= 1 ? left : -1;
+}
+
+int parkedRefetchTimeoutS(int readerTimeoutS, int requestTimeoutS, int elapsedS) {
+  const int left = readBudgetS(readerTimeoutS, requestTimeoutS) - std::max(elapsedS, 0);
+  return left >= 1 ? left : -1;
+}
+
+bool parkedGetsOwnersError(int code, bool moves, const std::string& fetchServer,
+                           const std::string& ownServer) {
+  if (!fetchRanOutOfTime(code) || moves)
+    return false;
+  const auto lower = [](std::string x) {
+    for (char& c : x)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return x;
+  };
+  return fetchServer.empty() || ownServer.empty() || lower(fetchServer) == lower(ownServer);
 }
 
 ReadStep readStep(int code, int errNo) {

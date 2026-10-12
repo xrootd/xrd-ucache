@@ -718,8 +718,9 @@ it.
   kept.
 - **Fail-open.** Every failure path degrades to a normal uncached read. A
   read whose fetch from the origin ran out of time at its server (the server
-  stopped answering) gets that error, as the read would without uCache; it is
-  not sent to the same server again (TROUBLESHOOTING.md).
+  stopped answering) gets that error, as the read would without uCache, and so
+  does every read of the job that was waiting for the same bytes from the same
+  server; none is sent to that server again (TROUBLESHOOTING.md).
 - **Servers to avoid (`?tried=`).** A reader can keep a redirector from
   sending it to a given server by adding `?tried=<full host name>` (a comma
   separated list for several) to the file's URL. uCache honours it on every

@@ -535,6 +535,9 @@ std::shared_ptr<CacheStore> globalStore();
 // XrdCl's RequestTimeout as the plugin found it at load: what an origin
 // request given no timeout of its own is allowed.
 int defaultRequestTimeoutS();
+// The client's request timeout as it holds it now (its Env, read at each call; the value a request
+// given timeout 0 gets): what a failure path that sends a request again counts the time left by.
+int currentRequestTimeoutS();
 // True once the process has begun to exit (the plugin's exit handler has
 // started): an open trying other sites issues nothing more and ends with its
 // last error.

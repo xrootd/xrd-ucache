@@ -1003,12 +1003,12 @@ void FileEntry::flushBuffer(bool force) {
     onPersist_(written, !closing_); // count always; never evict from the dtor
 }
 
-bool FileEntry::beginFetch(uint64_t off, uint64_t len, std::function<void()> onOwnerDone) {
+bool FileEntry::beginFetch(uint64_t off, uint64_t len, FetchDone onOwnerDone) {
   std::lock_guard<std::mutex> g(mu_);
   auto k = std::make_pair(off, len);
   auto it = inflight_.find(k);
   if (it == inflight_.end()) {
-    inflight_.emplace(k, std::vector<std::function<void()>>{});
+    inflight_.emplace(k, std::vector<FetchDone>{});
     return true; // caller owns the wire fetch
   }
   it->second.push_back(std::move(onOwnerDone));
@@ -1135,8 +1135,8 @@ bool FileEntry::waitForInFlight(const std::vector<std::pair<uint64_t, uint64_t>>
   return true;
 }
 
-void FileEntry::endFetch(uint64_t off, uint64_t len) {
-  std::vector<std::function<void()>> cbs;
+void FileEntry::endFetch(uint64_t off, uint64_t len, const FetchOutcome& outcome) {
+  std::vector<FetchDone> cbs;
   {
     std::lock_guard<std::mutex> g(mu_);
     auto it = inflight_.find({off, len});
@@ -1146,7 +1146,7 @@ void FileEntry::endFetch(uint64_t off, uint64_t len) {
     inflight_.erase(it);
   }
   for (auto& cb : cbs)
-    cb(); // callbacks re-dispatch on their own executor — cheap here
+    cb(outcome); // callbacks re-dispatch on their own executor — cheap here
 }
 
 void FileEntry::flushAll() {
