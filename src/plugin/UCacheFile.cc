@@ -3918,12 +3918,18 @@ struct RelayHandler : XrdCl::ResponseHandler {
         return;
       }
     }
-#endif
     respond(s, r, h, nullptr, nullptr);
+#else
+    respond(s, r, h);
+#endif
   }
   // The answer, with the map it is checked against and its verdict (null: not checked).
+#ifdef UCACHE_HAVE_COLDRUN
   void respond(XrdCl::XRootDStatus* s, XrdCl::AnyObject* r, XrdCl::HostList* h, const KeyMap* m,
                const transpose::FetchVerdict* v) {
+#else
+  void respond(XrdCl::XRootDStatus* s, XrdCl::AnyObject* r, XrdCl::HostList* h) {
+#endif
     bool checkFailed = false;
 #ifdef UCACHE_HAVE_COLDRUN
     if (m && v && s && s->IsOK())
@@ -3934,9 +3940,6 @@ struct RelayHandler : XrdCl::ResponseHandler {
         r = nullptr;
         checkFailed = true;
       }
-#else
-    (void)m;
-    (void)v;
 #endif
     // A plain or page read answered short inside the file's confirmed size: the copy ends
     // there, and the read is a data failure of it (moved on an armed handle).
@@ -4504,6 +4507,7 @@ class MissReadHandler : public ResponseHandler {
       keepNone = mk.outside || v.unjudged; // a part not judged is served, never kept
     }
 #else
+    (void)a;
     (void)m;
 #endif
     // Serve the user first (memcpy only — no disk on this thread)...
@@ -4765,6 +4769,7 @@ class MissVReadHandler : public ResponseHandler {
       keepNone = bad.outside || v.unjudged; // a part not judged is served, never kept
     }
 #else
+    (void)a;
     (void)m;
 #endif
 
