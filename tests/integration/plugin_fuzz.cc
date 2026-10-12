@@ -1871,7 +1871,7 @@ int runCut(const char* url, const char* local, const std::string& which) {
     std::printf("%s: SETUP: %s is shorter than 104 KB\n", mode, local);
     return 2;
   }
-  int fails = 0;
+  std::atomic<int> fails{0}; // the leftdata case gives verdicts from two threads
   const auto verdict = [&](bool ok, const std::string& what) {
     std::printf("%s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
     fails += ok ? 0 : 1;
