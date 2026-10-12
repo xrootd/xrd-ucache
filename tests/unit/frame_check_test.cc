@@ -7,10 +7,12 @@
 
 #include <gtest/gtest.h>
 #include <lzma.h>
+#include <zlib.h>
 #include <zstd.h>
 
 #include <cstring>
 #include <set>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -279,9 +281,124 @@ TEST(FrameCheck, TwoBlocksBothChecked) {
   DecodedFrames d = decode(all, want.size());
   EXPECT_EQ(d.check, FrameCheck::kPassed) << d.why;
   EXPECT_EQ(d.out, want);
-  // An oversized first block is not the last one: it fails.
-  setSize(all, 6, getSize(all, 6) + 1);
-  EXPECT_EQ(decode(all, want.size()).check, FrameCheck::kFailed);
+  // A first block whose header states more output than it gives: ROOT goes on from what it gave
+  // (TBasket::ReadBasketBuffers advances by R__unzip's output), and reads the object exactly.
+  for (uint32_t more : {1u, 5000u, 0xffffffu - getSize(all, 6)}) {
+    std::vector<uint8_t> raised = all;
+    setSize(raised, 6, getSize(all, 6) + more);
+    d = decode(raised, want.size());
+    EXPECT_EQ(d.check, FrameCheck::kPassed) << more << " " << d.why;
+    EXPECT_EQ(d.out, want) << more;
+    EXPECT_EQ(verifyFrames(raised.data(), raised.size(), want.size()).check, FrameCheck::kPassed);
+  }
+  // One that states less than it gives does not fit its output, in ROOT too: it fails.
+  std::vector<uint8_t> lowered = all;
+  setSize(lowered, 6, getSize(all, 6) - 1);
+  EXPECT_EQ(decode(lowered, want.size()).check, FrameCheck::kFailed);
+  // Blocks that give less than the object: fails (the second header runs past the payload).
+  EXPECT_EQ(decode(all, want.size() + 1).check, FrameCheck::kFailed);
+}
+
+TEST(FrameCheck, ZlibBlockGivingLessThanItsHeaderStates) {
+  const auto want = expectedX();
+  const size_t half = want.size() / 2;
+  std::vector<uint8_t> all;
+  for (size_t part = 0; part < 2; ++part) {
+    const std::vector<uint8_t> src(want.begin() + part * half,
+                                   part ? want.end() : want.begin() + half);
+    uLongf zl = compressBound(src.size());
+    std::vector<uint8_t> z(zl);
+    ASSERT_EQ(compress2(z.data(), &zl, src.data(), src.size(), 6), Z_OK);
+    z.resize(zl);
+    std::vector<uint8_t> blk = rootBlock('Z', 'L', z, static_cast<uint32_t>(src.size()));
+    blk[2] = 8;
+    all.insert(all.end(), blk.begin(), blk.end());
+  }
+  EXPECT_EQ(decode(all, want.size()).check, FrameCheck::kPassed);
+  std::vector<uint8_t> raised = all;
+  setSize(raised, 6, getSize(all, 6) + 3000);
+  const DecodedFrames d = decode(raised, want.size());
+  EXPECT_EQ(d.check, FrameCheck::kPassed) << d.why;
+  EXPECT_EQ(d.out, want);
+  std::vector<uint8_t> lowered = all;
+  setSize(lowered, 6, getSize(all, 6) - 1);
+  EXPECT_EQ(decode(lowered, want.size()).check, FrameCheck::kFailed);
+}
+
+// verifyFrames judges as decodeFrames does, keeping nothing; LZ4 by its hash, in any build.
+TEST(FrameCheck, VerifyJudgesAsDecodeDoes) {
+  struct P {
+    const uint8_t* p;
+    size_t n;
+    uint64_t objlen;
+  };
+  for (const P& x : {P{kLzmaPayload, sizeof(kLzmaPayload), kLzmaObjlen},
+                     P{kZlibPayload, sizeof(kZlibPayload), kZlibObjlen},
+                     P{kZstdPayload, sizeof(kZstdPayload), kZstdObjlen}}) {
+    auto b = bytes(x.p, x.n);
+    for (int damage = 0; damage < 2; ++damage) {
+      if (damage)
+        b[9 + (b.size() - 9) / 2] ^= 0x10;
+      const DecodedFrames v = verifyFrames(b.data(), b.size(), x.objlen);
+      EXPECT_EQ(v.check, decode(b, x.objlen).check) << b[0] << b[1] << " damage " << damage;
+      EXPECT_TRUE(v.out.empty());
+    }
+  }
+  auto l = bytes(kLz4Payload, sizeof(kLz4Payload));
+  EXPECT_EQ(verifyFrames(l.data(), l.size(), kLz4Objlen).check, FrameCheck::kPassed);
+  l[l.size() - 5] ^= 0x01;
+  EXPECT_EQ(verifyFrames(l.data(), l.size(), kLz4Objlen).check, FrameCheck::kFailed);
+}
+
+// The decoders' state is kept per thread and reused: once this thread has decoded an LZMA, a ZLIB
+// and a ZSTD block, decoding many more (a damaged one among them) makes no large allocation (an
+// LZMA dictionary) and gives the same bytes each time; zlib and ZSTD allocate nothing more.
+TEST(FrameCheck, DecodersAreReusedAndGiveTheSameBytes) {
+  const auto want = expectedX();
+  auto lz = bytes(kLzmaPayload, sizeof(kLzmaPayload));
+  auto zl = bytes(kZlibPayload, sizeof(kZlibPayload));
+  auto zs = bytes(kZstdPayload, sizeof(kZstdPayload));
+  ASSERT_EQ(decode(lz, kLzmaObjlen).out, want);
+  ASSERT_EQ(decode(zl, kZlibObjlen).out, want);
+  ASSERT_EQ(decode(zs, kZstdObjlen).out, want);
+  ASSERT_EQ(verifyFrames(lz.data(), lz.size(), kLzmaObjlen).check, FrameCheck::kPassed);
+  // ROOT's LZMA level 9 is xz's preset 9: a 64 MiB dictionary, which liblzma allocates at each
+  // set-up of its decoder.
+  std::vector<uint8_t> x9(lzma_stream_buffer_bound(want.size()));
+  size_t pos = 0;
+  ASSERT_EQ(lzma_easy_buffer_encode(9, LZMA_CHECK_CRC32, nullptr, want.data(), want.size(),
+                                    x9.data(), &pos, x9.size()),
+            LZMA_OK);
+  x9.resize(pos);
+  const auto l9 = rootBlock('X', 'Z', x9, static_cast<uint32_t>(want.size()));
+  ASSERT_EQ(decode(l9, want.size()).out, want);
+  const uint64_t large = decoderLargeAllocations();
+  auto bad = l9;
+  bad[9 + (bad.size() - 9) / 2] ^= 0x10;
+  for (int i = 0; i < 200; ++i) {
+    EXPECT_EQ(decode(l9, want.size()).out, want);
+    EXPECT_EQ(verifyFrames(l9.data(), l9.size(), want.size()).check, FrameCheck::kPassed);
+    if (i % 50 == 0) {
+      EXPECT_EQ(decode(bad, want.size()).check, FrameCheck::kFailed);
+    }
+  }
+  EXPECT_EQ(decoderLargeAllocations(), large) << "an LZMA dictionary allocated again";
+  const uint64_t all = decoderAllocations();
+  for (int i = 0; i < 200; ++i) {
+    EXPECT_EQ(decode(zl, kZlibObjlen).out, want);
+    EXPECT_EQ(decode(zs, kZstdObjlen).out, want);
+    EXPECT_EQ(verifyFrames(zl.data(), zl.size(), kZlibObjlen).check, FrameCheck::kPassed);
+  }
+  EXPECT_EQ(decoderAllocations(), all) << "zlib or ZSTD set up again";
+  // Another thread sets up its own dictionary, once.
+  uint64_t other = 0;
+  std::thread([&] {
+    const uint64_t a = decoderLargeAllocations();
+    for (int i = 0; i < 20; ++i)
+      EXPECT_EQ(decode(l9, want.size()).out, want);
+    other = decoderLargeAllocations() - a;
+  }).join();
+  EXPECT_EQ(other, 1u) << "one dictionary for the thread, not one a block";
 }
 
 TEST(BasketKey, ParsesTheFieldsRootWrote) {

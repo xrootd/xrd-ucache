@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -71,8 +72,23 @@ struct DecodedFrames {
 };
 
 // Decode a ROOT multi-block compression container (XZ/ZL/ZS/L4) of an object
-// `objlen` bytes long, checking each block as ROOT would. Never throws.
+// `objlen` bytes long, checking each block as ROOT would: a block may give fewer
+// bytes than its header states (ROOT goes on from what it gave), never more and
+// never none, and the blocks together must give exactly `objlen`. Never throws.
 DecodedFrames decodeFrames(const uint8_t* payload, size_t n, uint64_t objlen);
+
+// The same check without keeping the object: each block decoded into a per-thread scratch buffer
+// (at most a block's 16 MiB), and an LZ4 block judged by its XXH64 alone (ROOT verifies that hash
+// before it decodes; this needs no lz4 in the build). `out` stays empty. For checks that only
+// judge.
+DecodedFrames verifyFrames(const uint8_t* payload, size_t n, uint64_t objlen);
+// Allocations the decoders of decodeFrames and verifyFrames made, process-wide, and those of 1 MiB
+// or more (an LZMA stream's dictionary: 64 MiB for ROOT's LZMA level 9, allocated by liblzma at
+// each set-up). Their state is kept per thread and reused from one block to the next: a thread
+// allocates its dictionary once, and again only when a stream asks for another size; liblzma still
+// makes a few small allocations per stream.
+uint64_t decoderAllocations();
+uint64_t decoderLargeAllocations();
 
 // The same, for callers that only need the bytes: exactly `objlen` bytes, or
 // empty when the object failed its check or cannot be decoded here.
@@ -296,6 +312,7 @@ struct FetchVerdict {
   void damaged(const std::vector<std::pair<uint64_t, uint64_t>>& spans, uint64_t spanOff,
                uint64_t n, const std::string& why);
   void merge(FetchVerdict&& o);
+  void sortFaults(); // by position, as one walk over the bytes would list them
   // The faults the reader's bytes `reader` (ranges [lo, hi)) concern: a key that starts in them, a
   // basket's data or a damaged part they reach into (counted, the first one's position and
   // reason given, `why`: "" for a key's position); the others are `outside`. With lo == hi every
@@ -304,16 +321,28 @@ struct FetchVerdict {
                         std::string* why = nullptr) const;
   MisplacedKeys against(uint64_t lo, uint64_t hi, std::string* why = nullptr) const;
 };
+// Which baskets checkFetched judges: those that start in [lo, hi); with `skipPastEnd`, not one the
+// bytes do not hold to its end (basketExtent: another job holds it whole); with `reach`, the data
+// only of a basket the ranges reach (the others' keys are still judged).
+struct FetchJudge {
+  uint64_t lo = 0, hi = ~uint64_t{0};
+  bool skipPastEnd = false;
+  const std::vector<std::pair<uint64_t, uint64_t>>* reach = nullptr;
+};
+// How far a basket of map length `length` reaches from its start for the checks: its length, and
+// at least the longest key header (34 bytes).
+uint64_t basketExtent(int32_t length);
 // The key check of firstMisplacedKey (with the map's lengths) of fetched bytes [spanOff, spanOff +
 // n) held in `p`, every failing key listed; and, with `data`, the block checksum of every basket
 // whose key passes, whose length the map gives, and that lies wholly in the bytes: where ROOT
 // decompresses it (fObjlen > fNbytes - fKeylen, from the key), its data, from the key's length to
-// the map's, is decoded as ROOT decodes it (decodeFrames), and a block that fails its own checksum
+// the map's, is judged as ROOT decodes it (verifyFrames), and a block that fails its own checksum
 // or does not decode is a kData fault. ZSTD blocks without a content checksum, ROOT's old
-// algorithm, LZ4 in a build without lz4 and stored data are not decoded (counted `none`). Reads
-// nothing outside [p, p + n). CPU: one decompression of each basket judged.
+// algorithm and stored data are not decoded (counted `none`). Reads nothing outside [p, p + n).
+// CPU: one decompression of each basket judged (an LZ4 one: its hash only).
 FetchVerdict checkFetched(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
-                          uint64_t spanOff, const void* p, uint64_t n, bool data);
+                          uint64_t spanOff, const void* p, uint64_t n, bool data,
+                          const FetchJudge& judge = FetchJudge());
 // Whether checkFetched(..., data = true) would decode any basket of these bytes: a few bytes read
 // per basket, for a caller that decodes off its own thread only when there is something to decode.
 bool fetchedDataToCheck(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
@@ -324,15 +353,39 @@ struct BytePiece {
   const char* p = nullptr;
   uint64_t n = 0;
 };
-// checkFetched over `pieces`: pieces that follow each other without a gap (in offset order) are
-// judged as one run, so a key header or a basket a cut between two pieces divides is judged whole
-// (such a run is copied into one buffer first); pieces that overlap are judged apart. `damaged`
-// (sorted, merged; with `why`): parts of the copy whose bytes fail as kDamaged where the pieces
-// hold them.
+// One piece of the work of judging fetched pieces (checkJobs): checkFetched over [off, off + n) at
+// `p`, judging the baskets that start in [lo, hi). `own`: bytes joined for it (a basket the cut
+// between two pieces divides), which it keeps alive.
+struct CheckJob {
+  uint64_t off = 0;
+  const char* p = nullptr;
+  uint64_t n = 0;
+  uint64_t lo = 0, hi = 0;
+  bool skipPastEnd = false;
+  std::shared_ptr<std::vector<char>> own;
+};
+// The work of judging `pieces`, as jobs that may run in any order and on any thread: pieces that
+// follow each other without a gap (in offset order) form a run. Each piece's baskets are judged in
+// place, in slices of `sliceBytes` by where they start, each with the piece's bytes to its end; a
+// basket that starts in a piece and runs past its end into the next is joined into a buffer of its
+// own (its bytes only, to the run's end at most) and judged there, once. Pieces that overlap are
+// judged apart. `runs`: each run's extent, for the parts of a copy shown bad. The joined bytes
+// in flight are at most one basket's per cut between two pieces.
+std::vector<CheckJob> checkJobs(const std::vector<uint64_t>& seeks,
+                                const std::vector<int32_t>& lengths, std::vector<BytePiece> pieces,
+                                uint64_t sliceBytes,
+                                std::vector<std::pair<uint64_t, uint64_t>>* runs = nullptr);
+FetchVerdict runCheckJob(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
+                         const CheckJob& job, bool data,
+                         const std::vector<std::pair<uint64_t, uint64_t>>* reach = nullptr);
+// checkFetched over `pieces`, as checkJobs cuts them, on this thread: a key header or a basket the
+// cut between two pieces divides is judged whole. `damaged` (sorted, merged; with `why`): parts of
+// the copy whose bytes fail as kDamaged where a run holds them. `reach`: as FetchJudge's.
 FetchVerdict checkPieces(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
                          std::vector<BytePiece> pieces, bool data,
                          const std::vector<std::pair<uint64_t, uint64_t>>* damaged = nullptr,
-                         const std::string& why = std::string());
+                         const std::string& why = std::string(),
+                         const std::vector<std::pair<uint64_t, uint64_t>>* reach = nullptr);
 // Whether checkPieces(..., data = true) would decode anything, or join pieces.
 bool piecesNeedWork(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
                     std::vector<BytePiece> pieces);

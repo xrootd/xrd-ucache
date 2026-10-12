@@ -1,6 +1,8 @@
 #include "TreeMeta.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 
 #include <cstring>
 #include <fcntl.h>
@@ -359,6 +361,11 @@ bool overlaps(uint64_t a, uint64_t b, uint64_t lo, uint64_t hi) {
 }
 } // namespace
 
+uint64_t basketExtent(int32_t length) {
+  // At least a 64-bit key's header (34 bytes), which the key check reads whatever the length says.
+  return std::max<uint64_t>(length > 0 ? static_cast<uint64_t>(length) : 0, 34);
+}
+
 MisplacedKeys firstMisplacedKey(const std::vector<uint64_t>& seeks,
                                 const std::vector<int32_t>& lengths, uint64_t spanOff,
                                 const void* bytes, uint64_t n, uint64_t lo, uint64_t hi) {
@@ -432,15 +439,20 @@ bool compressedData(const uint8_t* p, uint64_t at, int32_t want, const uint8_t*&
 } // namespace
 
 FetchVerdict checkFetched(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
-                          uint64_t spanOff, const void* bytes, uint64_t n, bool data) {
+                          uint64_t spanOff, const void* bytes, uint64_t n, bool data,
+                          const FetchJudge& judge) {
   const auto* p = static_cast<const uint8_t*>(bytes);
   const bool withLengths = lengths.size() == seeks.size();
   FetchVerdict v;
-  for (auto it = std::lower_bound(seeks.begin(), seeks.end(), spanOff);
-       it != seeks.end() && *it - spanOff < n; ++it) {
+  for (auto it = std::lower_bound(seeks.begin(), seeks.end(), std::max(spanOff, judge.lo));
+       it != seeks.end() && *it - spanOff < n && *it < judge.hi; ++it) {
     const size_t i = static_cast<size_t>(it - seeks.begin());
     const uint64_t at = *it - spanOff;
     const int32_t want = withLengths ? lengths[i] : 0;
+    // A basket the bytes do not hold to its end (its length, or a key header's most) is left to
+    // the job that holds it whole (checkJobs).
+    if (judge.skipPastEnd && basketExtent(want) > n - at)
+      continue;
     const KeyVerdict k = judgeKey(p, n, at, *it, want, withLengths);
     if (k == KeyVerdict::kCut)
       break;
@@ -452,9 +464,20 @@ FetchVerdict checkFetched(const std::vector<uint64_t>& seeks, const std::vector<
       v.faults.push_back(std::move(f));
       continue;
     }
-    // The basket's data: only one whose length the map gives and that lies wholly in the bytes.
+    // The basket's data: only one whose length the map gives and that lies wholly in the bytes,
+    // and, with `reach`, that the given ranges reach.
     if (!data || want <= 0 || static_cast<uint64_t>(want) > n - at)
       continue;
+    if (judge.reach) {
+      bool reached = false;
+      for (const auto& [lo, hi] : *judge.reach)
+        if (overlaps(*it, *it + static_cast<uint64_t>(want), lo, hi)) {
+          reached = true;
+          break;
+        }
+      if (!reached)
+        continue;
+    }
     const uint8_t* pay = nullptr;
     uint64_t payLen = 0, objlen = 0;
     if (!compressedData(p, at, want, pay, payLen, objlen) ||
@@ -462,7 +485,7 @@ FetchVerdict checkFetched(const std::vector<uint64_t>& seeks, const std::vector<
       ++v.none;
       continue;
     }
-    const DecodedFrames d = decodeFrames(pay, payLen, objlen);
+    const DecodedFrames d = verifyFrames(pay, payLen, objlen);
     if (d.check == FrameCheck::kPassed) {
       ++v.passed;
     } else if (d.check == FrameCheck::kFailed) {
@@ -521,27 +544,99 @@ std::vector<std::vector<BytePiece>> pieceRuns(std::vector<BytePiece> pieces) {
 }
 } // namespace
 
+std::vector<CheckJob> checkJobs(const std::vector<uint64_t>& seeks,
+                                const std::vector<int32_t>& lengths, std::vector<BytePiece> pieces,
+                                uint64_t sliceBytes,
+                                std::vector<std::pair<uint64_t, uint64_t>>* runs) {
+  const bool withLengths = lengths.size() == seeks.size();
+  if (sliceBytes == 0)
+    sliceBytes = 1;
+  std::vector<CheckJob> jobs;
+  for (const auto& run : pieceRuns(std::move(pieces))) {
+    const uint64_t runOff = run.front().off;
+    const uint64_t runEnd = run.back().off + run.back().n;
+    if (runs)
+      runs->emplace_back(runOff, runEnd - runOff);
+    for (size_t k = 0; k < run.size(); ++k) {
+      const BytePiece& x = run[k];
+      const bool last = k + 1 == run.size();
+      // The piece's baskets in slices of `sliceBytes` by where they start, each slice judging
+      // with the piece's bytes to its end.
+      for (uint64_t a = x.off; a < x.off + x.n;) {
+        CheckJob j;
+        j.off = x.off;
+        j.p = x.p;
+        j.n = x.n;
+        j.lo = a;
+        j.hi = x.off + x.n - a > sliceBytes ? a + sliceBytes : x.off + x.n;
+        j.skipPastEnd = !last;
+        a = j.hi;
+        jobs.push_back(std::move(j));
+      }
+      if (last)
+        continue;
+      // A basket that starts in this piece and runs past its end into the next ones: its bytes
+      // joined (to the run's end at most), judged on their own.
+      const uint64_t end = x.off + x.n;
+      for (auto it = std::lower_bound(seeks.begin(), seeks.end(), x.off);
+           it != seeks.end() && *it < end; ++it) {
+        const size_t i = static_cast<size_t>(it - seeks.begin());
+        const uint64_t ext = basketExtent(withLengths ? lengths[i] : 0);
+        if (ext <= end - *it)
+          continue;
+        const uint64_t to = runEnd - *it > ext ? *it + ext : runEnd;
+        auto own = std::make_shared<std::vector<char>>();
+        own->reserve(to - *it);
+        for (size_t q = k; q < run.size() && run[q].off < to; ++q) {
+          const uint64_t from = std::max(*it, run[q].off);
+          const uint64_t upto = std::min(to, run[q].off + run[q].n);
+          own->insert(own->end(), run[q].p + (from - run[q].off), run[q].p + (upto - run[q].off));
+        }
+        CheckJob j;
+        j.off = *it;
+        j.p = own->data();
+        j.n = own->size();
+        j.lo = *it;
+        j.hi = *it + 1;
+        j.own = std::move(own);
+        jobs.push_back(std::move(j));
+      }
+    }
+  }
+  return jobs;
+}
+
+FetchVerdict runCheckJob(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
+                         const CheckJob& j, bool data,
+                         const std::vector<std::pair<uint64_t, uint64_t>>* reach) {
+  FetchJudge judge;
+  judge.lo = j.lo;
+  judge.hi = j.hi;
+  judge.skipPastEnd = j.skipPastEnd;
+  judge.reach = reach;
+  return checkFetched(seeks, lengths, j.off, j.p, j.n, data, judge);
+}
+
+void FetchVerdict::sortFaults() {
+  std::stable_sort(faults.begin(), faults.end(),
+                   [](const FetchFault& a, const FetchFault& b) { return a.at < b.at; });
+}
+
 FetchVerdict checkPieces(const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
                          std::vector<BytePiece> pieces, bool data,
                          const std::vector<std::pair<uint64_t, uint64_t>>* damaged,
-                         const std::string& why) {
+                         const std::string& why,
+                         const std::vector<std::pair<uint64_t, uint64_t>>* reach) {
   FetchVerdict v;
-  std::vector<char> joined;
-  for (const auto& run : pieceRuns(std::move(pieces))) {
-    const char* p = run.front().p;
-    uint64_t n = run.front().n;
-    if (run.size() > 1) {
-      joined.clear();
-      for (const auto& x : run)
-        joined.insert(joined.end(), x.p, x.p + x.n);
-      p = joined.data();
-      n = joined.size();
-    }
-    const uint64_t off = run.front().off;
-    if (damaged)
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  const std::vector<CheckJob> jobs =
+      checkJobs(seeks, lengths, std::move(pieces), ~uint64_t{0}, &runs);
+  if (damaged)
+    for (const auto& [off, n] : runs)
       v.damaged(*damaged, off, n, why);
-    v.merge(checkFetched(seeks, lengths, off, p, n, data));
-  }
+  for (const auto& j : jobs)
+    v.merge(runCheckJob(seeks, lengths, j, data, reach));
+  v.sortFaults();
   return v;
 }
 
@@ -650,26 +745,87 @@ std::string blockCodec(const uint8_t* p, size_t n) {
   return "";
 }
 
-DecodedFrames decodeFrames(const uint8_t* payload, size_t n, uint64_t objlen) {
-  DecodedFrames d;
+namespace {
+// Decoder state kept per thread and reused from one block to the next (ROOT's own decoders are
+// set up per block; their acceptance is the same): an LZMA stream decoder, whose dictionary
+// liblzma keeps while the next stream asks for one of the same size; a zlib inflate state, reset
+// per block; a ZSTD context; and a scratch buffer for a block whose output is not kept. Every
+// allocation the decoders make goes through a counting allocator (decoderAllocations).
+std::atomic<uint64_t> g_decoderAllocs{0};
+std::atomic<uint64_t> g_decoderLargeAllocs{
+    0}; // 1 MiB or more: an LZMA dictionary, a zlib window is 32 KiB
+void* countedAlloc(void*, size_t nmemb, size_t size) {
+  g_decoderAllocs.fetch_add(1, std::memory_order_relaxed);
+  if (nmemb * size >= (1u << 20))
+    g_decoderLargeAllocs.fetch_add(1, std::memory_order_relaxed);
+  return std::malloc(nmemb * size);
+}
+void countedFree(void*, void* ptr) {
+  std::free(ptr);
+}
+void* zAlloc(void* o, uInt items, uInt size) {
+  return countedAlloc(o, items, size);
+}
+void zFree(void* o, void* ptr) {
+  countedFree(o, ptr);
+}
+const lzma_allocator kLzmaAlloc{countedAlloc, countedFree, nullptr};
+struct Decoders {
+  lzma_stream xz = LZMA_STREAM_INIT;
+  z_stream z{};
+  bool zInit = false;
+  ZSTD_DCtx* zs = nullptr;
+  std::vector<uint8_t> scratch;
+  Decoders() { xz.allocator = &kLzmaAlloc; }
+  ~Decoders() {
+    lzma_end(&xz);
+    if (zInit)
+      inflateEnd(&z);
+    if (zs)
+      ZSTD_freeDCtx(zs);
+  }
+};
+Decoders& decoders() {
+  thread_local Decoders d;
+  return d;
+}
+} // namespace
+
+uint64_t decoderAllocations() {
+  return g_decoderAllocs.load(std::memory_order_relaxed);
+}
+uint64_t decoderLargeAllocations() {
+  return g_decoderLargeAllocs.load(std::memory_order_relaxed);
+}
+
+namespace {
+// The blocks of a compressed object, each decoded as ROOT decodes it (R__unzip's ZLIB, LZMA,
+// ZSTD and LZ4 paths): a block may give fewer bytes than its header's size (ROOT goes on from
+// what it gave: TBasket::ReadBasketBuffers advances by R__unzip's output), never more, and never
+// none; the blocks together must give exactly `objlen`. `keep`: the object is kept in d.out;
+// otherwise each block is decoded into the thread's scratch and only judged, and an LZ4 block is
+// judged by its XXH64 alone (ROOT verifies that hash over the compressed bytes before it
+// decodes them; a block whose hash holds is the one its writer wrote).
+void decodeInto(const uint8_t* payload, size_t n, uint64_t objlen, bool keep, DecodedFrames& d) {
   auto failed = [&](const char* why) {
     d.check = FrameCheck::kFailed;
     d.why = why;
     d.out.clear();
-    return std::move(d);
   };
   auto unsupported = [&](const char* why) {
     d.check = FrameCheck::kNotCheckable;
     d.why = why;
     d.out.clear();
-    return std::move(d);
   };
   // objlen is attacker-influenceable: cap the upfront reservation (growth past
   // it amortizes per block) so a hostile value cannot force a giant allocation.
-  d.out.reserve(std::min<uint64_t>(objlen, 64ull << 20));
+  if (keep)
+    d.out.reserve(std::min<uint64_t>(objlen, 64ull << 20));
+  Decoders& dec = decoders();
   bool everyBlockChecked = true;
+  uint64_t total = 0; // what the blocks gave so far
   size_t p = 0;
-  while (d.out.size() < objlen) {
+  while (total < objlen) {
     if (p > n || n - p < 9)
       return failed("compression block header past the payload");
     const std::string codec = blockCodec(payload + p, n - p);
@@ -685,44 +841,77 @@ DecodedFrames decodeFrames(const uint8_t* payload, size_t n, uint64_t objlen) {
     if (usize == 0)
       return failed("empty compression block");
     const uint64_t availIn = n - p - 9;
-    const uint64_t wantOut = objlen - d.out.size();
+    const uint64_t wantOut = objlen - total;
     // ROOT decodes each block with the sizes its header states and stops once
     // the object is complete, so a LAST block whose header claims more input or
     // more output than there is still reads correctly in ROOT; its own check
-    // decides. Smaller values, or larger ones in a block that is not the last,
-    // fail in ROOT too. LZ4 is the exception: its hash covers exactly the
-    // compressed size the header states.
+    // decides. A block whose header claims more output than it gives reads
+    // correctly too (ROOT goes on from what it gave, below); one that does not
+    // fit the output its header states fails in ROOT, as here. A block that
+    // is not the last and claims more input than there is fails as well. LZ4
+    // is the exception: its hash covers exactly the compressed size the header
+    // states.
     if (csize > availIn || usize > wantOut) {
-      if (usize < wantOut)
+      if (csize > availIn && usize < wantOut)
         return failed("compression block runs past the payload");
       if (csize > availIn && codec == "lz4")
         return failed("lz4 block runs past the payload");
       csize = std::min(csize, availIn);
-      usize = wantOut;
+      usize = std::min(usize, wantOut);
       d.headerTolerated = true;
     }
     const uint8_t* blob = payload + p + 9;
-    const size_t pre = d.out.size();
-    d.out.resize(pre + usize);
-    uint8_t* dst = d.out.data() + pre;
+    uint8_t* dst = nullptr;
+    size_t pre = 0;
+    if (keep) {
+      pre = d.out.size();
+      d.out.resize(pre + usize);
+      dst = d.out.data() + pre;
+    } else if (codec != "lz4") {
+      if (dec.scratch.size() < usize)
+        dec.scratch.resize(usize);
+      dst = dec.scratch.data();
+    }
+    uint64_t gave = 0;
     if (codec == "lzma") {
       // An xz stream names its check in the second byte of its stream flags;
-      // ROOT writes CRC32, and liblzma verifies whatever is named.
+      // ROOT writes CRC32, and liblzma verifies whatever is named. As ROOT:
+      // a stream decoder, one lzma_code with LZMA_FINISH, the stream's end.
       if (csize < 8)
         return failed("lzma block too short");
       if ((blob[7] & 0x0F) == 0)
         everyBlockChecked = false;
-      uint64_t memlim = UINT64_MAX;
-      size_t inPos = 0, outPos = 0;
-      if (lzma_stream_buffer_decode(&memlim, 0, nullptr, blob, &inPos, csize, dst, &outPos,
-                                    usize) != LZMA_OK ||
-          outPos != usize)
+      if (lzma_stream_decoder(&dec.xz, UINT64_MAX, 0) != LZMA_OK)
         return failed("lzma block failed its check or did not decode");
+      dec.xz.next_in = blob;
+      dec.xz.avail_in = csize;
+      dec.xz.next_out = dst;
+      dec.xz.avail_out = usize;
+      if (lzma_code(&dec.xz, LZMA_FINISH) != LZMA_STREAM_END)
+        return failed("lzma block failed its check or did not decode");
+      gave = usize - dec.xz.avail_out;
     } else if (codec == "zlib") {
-      // The zlib wrapper ends with an adler32 that uncompress() verifies.
-      uLongf dl = usize;
-      if (::uncompress(dst, &dl, blob, csize) != Z_OK || dl != usize)
+      // The zlib wrapper ends with an adler32 that inflate verifies. As ROOT:
+      // inflate with Z_FINISH until the stream's end.
+      if (!dec.zInit) {
+        dec.z.zalloc = zAlloc;
+        dec.z.zfree = zFree;
+        dec.z.opaque = nullptr;
+        if (inflateInit(&dec.z) != Z_OK)
+          return failed("zlib block failed its check or did not decode");
+        dec.zInit = true;
+      } else if (inflateReset(&dec.z) != Z_OK) {
         return failed("zlib block failed its check or did not decode");
+      }
+      dec.z.next_in = const_cast<Bytef*>(blob);
+      dec.z.avail_in = static_cast<uInt>(csize);
+      dec.z.next_out = dst;
+      dec.z.avail_out = static_cast<uInt>(usize);
+      int err;
+      while ((err = inflate(&dec.z, Z_FINISH)) != Z_STREAM_END)
+        if (err != Z_OK)
+          return failed("zlib block failed its check or did not decode");
+      gave = usize - dec.z.avail_out;
     } else if (codec == "zstd") {
       // Frame header: 4-byte magic, then the descriptor whose bit 2 says a
       // content checksum follows the frame (ZSTD verifies it when present).
@@ -730,10 +919,18 @@ DecodedFrames decodeFrames(const uint8_t* payload, size_t n, uint64_t objlen) {
         return failed("zstd block too short");
       if ((blob[4] & 0x04) == 0)
         everyBlockChecked = false;
-      if (ZSTD_decompress(dst, usize, blob, csize) != usize)
+      if (!dec.zs) {
+        dec.zs = ZSTD_createDCtx();
+        g_decoderAllocs.fetch_add(1,
+                                  std::memory_order_relaxed); // its own allocations, counted once
+        if (!dec.zs)
+          return failed("zstd block did not decode");
+      }
+      const size_t r = ZSTD_decompressDCtx(dec.zs, dst, usize, blob, csize);
+      if (ZSTD_isError(r))
         return failed("zstd block did not decode");
+      gave = r;
     } else { // lz4
-#ifdef UCACHE_HAVE_LZ4
       // ROOT's LZ4 block: an 8-byte XXH64 (big-endian) of the compressed bytes
       // that follow it, then the LZ4 data.
       if (csize < 8)
@@ -743,19 +940,43 @@ DecodedFrames decodeFrames(const uint8_t* payload, size_t n, uint64_t objlen) {
         want = (want << 8) | blob[b];
       if (xxh64(blob + 8, csize - 8, 0) != want)
         return failed("lz4 block failed its check");
-      if (LZ4_decompress_safe(reinterpret_cast<const char*>(blob + 8), reinterpret_cast<char*>(dst),
-                              static_cast<int>(csize - 8),
-                              static_cast<int>(usize)) != static_cast<int>(usize))
-        return failed("lz4 block did not decode");
+      if (!keep) {
+        gave = usize; // judged by its hash; its size as its header states it
+      } else {
+#ifdef UCACHE_HAVE_LZ4
+        const int r = LZ4_decompress_safe(reinterpret_cast<const char*>(blob + 8),
+                                          reinterpret_cast<char*>(dst), static_cast<int>(csize - 8),
+                                          static_cast<int>(usize));
+        if (r <= 0)
+          return failed("lz4 block did not decode");
+        gave = static_cast<uint64_t>(r);
 #else
-      return unsupported("lz4 block, and this build has no lz4");
+        return unsupported("lz4 block, and this build has no lz4");
 #endif
+      }
     }
+    if (gave == 0)
+      return failed("compression block gave nothing");
+    if (keep)
+      d.out.resize(pre + gave);
+    total += gave;
     p += 9 + csize;
   }
   d.check = everyBlockChecked ? FrameCheck::kPassed : FrameCheck::kNotCheckable;
   if (!everyBlockChecked)
     d.why = "a block carries no check";
+}
+} // namespace
+
+DecodedFrames decodeFrames(const uint8_t* payload, size_t n, uint64_t objlen) {
+  DecodedFrames d;
+  decodeInto(payload, n, objlen, true, d);
+  return d;
+}
+
+DecodedFrames verifyFrames(const uint8_t* payload, size_t n, uint64_t objlen) {
+  DecodedFrames d;
+  decodeInto(payload, n, objlen, false, d);
   return d;
 }
 
