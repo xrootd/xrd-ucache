@@ -404,20 +404,14 @@ enum class DataCheck : uint8_t { kNone, kDecode };
 DataCheck dataCheckOf(const uint8_t* pay, uint64_t n) {
   if (n < 9)
     return DataCheck::kDecode; // no block header: the decoder fails it at once
-  const uint8_t a = pay[0], b = pay[1];
-  if ((a == 'Z' && b == 'L') || (a == 'X' && b == 'Z'))
+  const uint8_t a = pay[0], b = pay[1], m = pay[2];
+  // LZ4: judged by its hash, in any build (verifyFrames).
+  if ((a == 'Z' && b == 'L') || (a == 'X' && b == 'Z') || (a == 'L' && b == '4'))
     return DataCheck::kDecode;
-  if (a == 'L' && b == '4') {
-#ifdef UCACHE_HAVE_LZ4
-    return DataCheck::kDecode;
-#else
-    return DataCheck::kNone;
-#endif
-  }
-  if (a == 'Z' && b == 'S')
-    return n >= 14 && (pay[13] & 0x04) ? DataCheck::kDecode : DataCheck::kNone;
+  if (a == 'Z' && b == 'S') // judged when it carries a content checksum, or ROOT refuses its header
+    return m != 1 || (n >= 14 && (pay[13] & 0x04)) ? DataCheck::kDecode : DataCheck::kNone;
   if (a == 'C' && b == 'S')
-    return DataCheck::kNone;
+    return m == 8 ? DataCheck::kNone : DataCheck::kDecode;
   return DataCheck::kDecode;
 }
 
@@ -670,6 +664,7 @@ void FetchVerdict::merge(FetchVerdict&& o) {
     faults.push_back(std::move(f));
   passed += o.passed;
   none += o.none;
+  unjudged += o.unjudged;
 }
 
 MisplacedKeys FetchVerdict::against(const std::vector<std::pair<uint64_t, uint64_t>>& reader,
@@ -754,14 +749,31 @@ namespace {
 std::atomic<uint64_t> g_decoderAllocs{0};
 std::atomic<uint64_t> g_decoderLargeAllocs{
     0}; // 1 MiB or more: an LZMA dictionary, a zlib window is 32 KiB
+std::atomic<int64_t> g_decoderLargeLive{0}; // large allocations not yet freed
+// Each allocation carries its size in front, so a free knows whether it was a large one.
+constexpr size_t kAllocHead = 16;
 void* countedAlloc(void*, size_t nmemb, size_t size) {
+  const size_t n = nmemb * size;
   g_decoderAllocs.fetch_add(1, std::memory_order_relaxed);
-  if (nmemb * size >= (1u << 20))
+  if (n >= (1u << 20)) {
     g_decoderLargeAllocs.fetch_add(1, std::memory_order_relaxed);
-  return std::malloc(nmemb * size);
+    g_decoderLargeLive.fetch_add(1, std::memory_order_relaxed);
+  }
+  auto* base = static_cast<unsigned char*>(std::malloc(n + kAllocHead));
+  if (!base)
+    return nullptr;
+  std::memcpy(base, &n, sizeof n);
+  return base + kAllocHead;
 }
 void countedFree(void*, void* ptr) {
-  std::free(ptr);
+  if (!ptr)
+    return;
+  auto* base = static_cast<unsigned char*>(ptr) - kAllocHead;
+  size_t n = 0;
+  std::memcpy(&n, base, sizeof n);
+  if (n >= (1u << 20))
+    g_decoderLargeLive.fetch_sub(1, std::memory_order_relaxed);
+  std::free(base);
 }
 void* zAlloc(void* o, uInt items, uInt size) {
   return countedAlloc(o, items, size);
@@ -789,6 +801,7 @@ Decoders& decoders() {
   thread_local Decoders d;
   return d;
 }
+thread_local bool t_keepDecoders = false;
 } // namespace
 
 uint64_t decoderAllocations() {
@@ -796,6 +809,12 @@ uint64_t decoderAllocations() {
 }
 uint64_t decoderLargeAllocations() {
   return g_decoderLargeAllocs.load(std::memory_order_relaxed);
+}
+int64_t decoderLargeLive() {
+  return g_decoderLargeLive.load(std::memory_order_relaxed);
+}
+void keepDecodersOnThisThread() {
+  t_keepDecoders = true;
 }
 
 namespace {
@@ -821,7 +840,10 @@ void decodeInto(const uint8_t* payload, size_t n, uint64_t objlen, bool keep, De
   // it amortizes per block) so a hostile value cannot force a giant allocation.
   if (keep)
     d.out.reserve(std::min<uint64_t>(objlen, 64ull << 20));
-  Decoders& dec = decoders();
+  // Decoders kept for the thread's life only where the thread asked for it (the decode pool's);
+  // elsewhere set up for this object and freed with it, as liblzma's one-shot decoder did.
+  Decoders local;
+  Decoders& dec = t_keepDecoders ? decoders() : local;
   bool everyBlockChecked = true;
   uint64_t total = 0; // what the blocks gave so far
   size_t p = 0;
@@ -830,12 +852,17 @@ void decodeInto(const uint8_t* payload, size_t n, uint64_t objlen, bool keep, De
       return failed("compression block header past the payload");
     const std::string codec = blockCodec(payload + p, n - p);
     if (codec.empty()) {
-      // ROOT's old algorithm (CS) is legitimate and not decoded here; any
+      // ROOT's old algorithm (CS, its third byte 8) is legitimate and not decoded here; any
       // other tag is one ROOT itself does not know, so the bytes are damaged.
-      if (payload[p] == 'C' && payload[p + 1] == 'S')
+      if (payload[p] == 'C' && payload[p + 1] == 'S' && payload[p + 2] == 8)
         return unsupported("compression block of ROOT's old algorithm");
       return failed("unknown compression block");
     }
+    // The third byte, as ROOT holds it (R__unzip's is_valid_header: ZL 8, XZ 0, ZS 1;
+    // R__unzipLZ4: the LZ4 major version, 1): ROOT decodes nothing from a block whose third byte
+    // is another.
+    if (payload[p + 2] != (codec == "zlib" ? 8 : codec == "lzma" ? 0 : 1))
+      return failed("compression block header ROOT does not decode");
     uint64_t csize = payload[p + 3] | payload[p + 4] << 8 | payload[p + 5] << 16;
     uint64_t usize = payload[p + 6] | payload[p + 7] << 8 | payload[p + 8] << 16;
     if (usize == 0)

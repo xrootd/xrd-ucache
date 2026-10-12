@@ -72,9 +72,10 @@ struct DecodedFrames {
 };
 
 // Decode a ROOT multi-block compression container (XZ/ZL/ZS/L4) of an object
-// `objlen` bytes long, checking each block as ROOT would: a block may give fewer
-// bytes than its header states (ROOT goes on from what it gave), never more and
-// never none, and the blocks together must give exactly `objlen`. Never throws.
+// `objlen` bytes long, checking each block as ROOT would: its header's third byte
+// as ROOT holds it, a block may give fewer bytes than its header states (ROOT goes
+// on from what it gave), never more and never none, and the blocks together must
+// give exactly `objlen`. May throw std::bad_alloc (its buffers); nothing else.
 DecodedFrames decodeFrames(const uint8_t* payload, size_t n, uint64_t objlen);
 
 // The same check without keeping the object: each block decoded into a per-thread scratch buffer
@@ -84,11 +85,17 @@ DecodedFrames decodeFrames(const uint8_t* payload, size_t n, uint64_t objlen);
 DecodedFrames verifyFrames(const uint8_t* payload, size_t n, uint64_t objlen);
 // Allocations the decoders of decodeFrames and verifyFrames made, process-wide, and those of 1 MiB
 // or more (an LZMA stream's dictionary: 64 MiB for ROOT's LZMA level 9, allocated by liblzma at
-// each set-up). Their state is kept per thread and reused from one block to the next: a thread
-// allocates its dictionary once, and again only when a stream asks for another size; liblzma still
-// makes a few small allocations per stream.
+// each set-up). On a thread that keeps its decoders (keepDecodersOnThisThread) their state is
+// reused from one block to the next: it allocates its dictionary once, and again only when a
+// stream asks for another size; liblzma still makes a few small allocations per stream.
 uint64_t decoderAllocations();
 uint64_t decoderLargeAllocations();
+// Large allocations not yet freed.
+int64_t decoderLargeLive();
+// From now on this thread keeps its decoders' state from one block to the next, for its life
+// (the decode pool's threads: FetchCheck.h). Every other thread sets decoders up for each
+// object and frees them with it: a thread that converts or decompresses keeps no dictionary.
+void keepDecodersOnThisThread();
 
 // The same, for callers that only need the bytes: exactly `objlen` bytes, or
 // empty when the object failed its check or cannot be decoded here.
@@ -305,6 +312,7 @@ struct FetchFault {
 struct FetchVerdict {
   std::vector<FetchFault> faults;
   uint32_t passed = 0; // baskets whose compressed data was decoded and its own checksum held
+  uint32_t unjudged = 0; // jobs that could not judge their part (out of memory): no claim there
   uint32_t none = 0;   // baskets wholly in the bytes whose data carries no checksum (stored as
                        // they are, ZSTD without one, ROOT's old algorithm) or could not be judged
   // The parts of `spans` (sorted, merged) inside the fetched bytes [spanOff, spanOff + n), as
