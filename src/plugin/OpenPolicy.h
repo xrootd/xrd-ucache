@@ -673,6 +673,12 @@ int missRelayTimeoutS(int code, int readerTimeoutS, int requestTimeoutS, int ela
 // whole seconds, so at least 1 s while any is left; -1 when none is left, and the read then fails
 // with an expiry, as it would have without the cache.
 int parkedRefetchTimeoutS(int readerTimeoutS, int requestTimeoutS, int64_t elapsedUs);
+// When a read parked behind another read's fetch is looked at again if that fetch has not ended
+// (its insurance timer), in milliseconds, `elapsedUs` after the read was made: 10 s, or just past
+// the end of its own time (readBudgetS, plus 20 ms) when that comes first, so a read whose own time
+// runs out while it waits ends with an expiry then, as a plain client's read would, not up to 10 s
+// late.
+uint64_t parkedInsuranceMs(int readerTimeoutS, int requestTimeoutS, int64_t elapsedUs);
 // Whether a read parked behind another read's fetch of its span takes that fetch's failure
 // `code` as its own answer: the fetch ran out of time at its server (fetchRanOutOfTime), the
 // parked read's handle does not move its reads to another site (`moves`), the fetch failed at

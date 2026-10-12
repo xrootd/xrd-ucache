@@ -54,7 +54,8 @@ namespace ucache {
 
 class ColdFill; // ColdRun.h
 namespace transpose {
-struct ColdMap; // StoreMaps.h
+struct ColdMap;      // StoreMaps.h
+struct FetchVerdict; // TreeMeta.h
 }
 using ColdMap = transpose::ColdMap;
 class ReadRule; // ReadRule.h
@@ -528,6 +529,21 @@ void dropEntryOfBadCopy(HandleState& st, const std::shared_ptr<FileEntry>& entry
                         const std::string& server) noexcept;
 // The same, with the handle's own entry.
 void dropEntryOfBadCopy(HandleState& st, const std::string& server) noexcept;
+// check_origin_integrity for the fetches of a file that has a replica (the slot run, ColdRun.cc):
+// the handle's file map, made now when it has none (the byte path's parse, through the byte cache
+// first, with the client's request timeout; it blocks this thread, as max_read_fraction's parse
+// does); null when the setting is off or no map can be made (then nothing is checked).
+std::shared_ptr<const KeyMap> originCheckMapFor(const std::shared_ptr<HandleState>& st,
+                                                const std::shared_ptr<FileEntry>& entry);
+// The verdict's passed, none and unjudged counts, to the store's counters (the byte path's).
+void countOriginChecks(HandleState& st, const transpose::FetchVerdict& v);
+// A fetch's basket that failed the byte path's check: said, counted (`n` baskets), recorded, and
+// the entry dropped if it holds bytes of that copy, as the byte path does; the status the
+// reader gets ("failed its check (why) ... not served").
+XrdCl::XRootDStatus originCheckRefused(HandleState& st, ServerTally* tally, const char* op,
+                                       uint64_t pos, uint32_t n, uint64_t spanOff,
+                                       uint64_t spanLen, const std::string& server,
+                                       const std::string& why);
 
 // Process-wide config/store accessors (UCacheFactory.cc).
 const Config& globalConfig();

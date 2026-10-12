@@ -1130,6 +1130,13 @@ int parkedRefetchTimeoutS(int readerTimeoutS, int requestTimeoutS, int64_t elaps
   return static_cast<int>((leftUs + 999999) / 1000000);
 }
 
+uint64_t parkedInsuranceMs(int readerTimeoutS, int requestTimeoutS, int64_t elapsedUs) {
+  const int64_t leftUs = int64_t{readBudgetS(readerTimeoutS, requestTimeoutS)} * 1000000 -
+                         std::max<int64_t>(elapsedUs, 0);
+  const uint64_t ms = static_cast<uint64_t>(std::max<int64_t>(leftUs, 0) / 1000) + 20;
+  return std::min<uint64_t>(ms, 10000);
+}
+
 bool parkedGetsOwnersError(int code, bool moves, const std::string& fetchServer,
                            const std::string& ownServer, int64_t failedAtS, int64_t ownExpiryS) {
   if (!fetchRanOutOfTime(code) || moves || ownServer.empty() || failedAtS <= 0)

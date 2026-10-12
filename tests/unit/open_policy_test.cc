@@ -507,6 +507,19 @@ TEST(OpenPolicy, ParkedRefetchTimeout) {
   EXPECT_EQ(parkedRefetchTimeoutS(0, 0, 0), kReadDeadlineS) << "no request timeout known";
 }
 
+// The insurance timer of a parked read: 10 s, or just past the end of its own time when sooner.
+TEST(OpenPolicy, ParkedInsurance) {
+  constexpr int64_t S = 1000000;
+  EXPECT_EQ(parkedInsuranceMs(0, RT, 0), 10000u) << "the client's 1800 s: the 10 s insurance";
+  EXPECT_EQ(parkedInsuranceMs(5, RT, 0), 5020u) << "5 s of its own: just past them";
+  EXPECT_EQ(parkedInsuranceMs(5, RT, 2 * S), 3020u);
+  EXPECT_EQ(parkedInsuranceMs(5, RT, 5 * S), 20u) << "spent: at once, after 20 ms";
+  EXPECT_EQ(parkedInsuranceMs(5, RT, 9 * S), 20u);
+  EXPECT_EQ(parkedInsuranceMs(30, RT, 25 * S), 5020u);
+  EXPECT_EQ(parkedInsuranceMs(0, 8, 0), 8020u) << "a client's request timeout of 8 s";
+  EXPECT_EQ(parkedInsuranceMs(0, 12, 0), 10000u);
+}
+
 // A read parked behind a fetch that ran out of time at the server its handle reads, on a handle
 // whose reads do not move, takes that error when its own time had run out by the moment the
 // failure was seen (the client's own rule: a request's expiry is time(0) plus its timeout, in

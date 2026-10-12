@@ -3184,6 +3184,14 @@ static void withKeyMap(const std::shared_ptr<HandleState>& st,
   }
   go(m, fetchVerdict(*m, server, pieces));
 }
+std::shared_ptr<const KeyMap> originCheckMapFor(const std::shared_ptr<HandleState>& st,
+                                                const std::shared_ptr<FileEntry>& entry) {
+  if (!globalConfig().checkOriginIntegrity || !st || !entry)
+    return nullptr;
+  armKeyCheck(st, entry, 0);
+  return keySeeksOf(*st);
+}
+void countOriginChecks(HandleState& st, const transpose::FetchVerdict& v) { countChecks(st, v); }
 #else
 static std::shared_ptr<ReadRule> directRule(const std::shared_ptr<HandleState>&,
                                             const std::shared_ptr<FileEntry>&,
@@ -4360,6 +4368,17 @@ void persistPagesReserved(const std::shared_ptr<HandleState>& st,
   return refused;
 }
 
+// The wall-clock second (time(0)) at which the client saw a request's failure, as a handler of
+// its answer can tell: the second now, or the one before when now is within 50 ms past a second's
+// start (the client's timer check that ended the request may have run before that boundary, and
+// the handler only just after it). The earlier second is the cautious one: a read parked on the
+// fetch takes its error only when its own expiry is at or before it (parkedGetsOwnersError).
+int64_t failureSecond() {
+  struct timespec ts {};
+  ::clock_gettime(CLOCK_REALTIME, &ts);
+  return static_cast<int64_t>(ts.tv_sec) - (ts.tv_nsec < 50000000 ? 1 : 0);
+}
+
 // Single-Read miss: rounded wire read, user completion first, async persist.
 class MissReadHandler : public ResponseHandler {
  public:
@@ -4432,7 +4451,7 @@ class MissReadHandler : public ResponseHandler {
         if (s && !s->IsOK()) {
           o.code = s->code;
           o.server = answeredBy(*st_, h.get());
-          o.failedAtS = static_cast<int64_t>(::time(nullptr)); // as the client counts expiry
+          o.failedAtS = failureSecond(); // as the client counts expiry
         }
         entry_->endFetch(wireOff_, gateLen_, o);
       }
@@ -4653,8 +4672,11 @@ void redispatchRead(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> 
   auto [ws, we] = roundChunk(*entry, offset, size);
   auto again = parkedRead(st, entry, offset, size, buffer, handler, readerT, startUs);
   if (!entry->beginFetch(ws, we - ws, again)) {
-    Executor::instance().postAfter(10000, [again] { again(FileEntry::FetchOutcome()); });
-    return; // missed-endFetch insurance, above
+    Executor::instance().postAfter(
+        parkedInsuranceMs(readerT, currentRequestTimeoutS(),
+                          static_cast<int64_t>(nowUs() - std::min(startUs, nowUs()))),
+        [again] { again(FileEntry::FetchOutcome()); });
+    return; // missed-endFetch insurance, and the end of its own time: parkedInsuranceMs
   }
   // Its own fetch, with what is left of its time (an armed handle's reads have their own
   // limits, from the reader's own timeout: originTimeout).
@@ -5076,6 +5098,16 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
 }
 
 } // namespace
+
+#ifdef UCACHE_HAVE_COLDRUN
+XRootDStatus originCheckRefused(HandleState& st, ServerTally* tally, const char* op, uint64_t pos,
+                                uint32_t n, uint64_t spanOff, uint64_t spanLen,
+                                const std::string& server, const std::string& why) {
+  std::unique_ptr<XRootDStatus> r(
+      originCheckFailed(st, tally, op, pos, n, spanOff, spanLen, server, why));
+  return *r;
+}
+#endif
 
 //---------------------------------------------------------------- plugin ---
 
@@ -6184,9 +6216,10 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
     auto redispatch = parkedRead(st_, entry, offset, size, buffer, handler,
                                  static_cast<int>(timeout), nowUs());
     if (!entry->beginFetch(ws, we - ws, redispatch)) {
-      Executor::instance().postAfter(10000,
-                                     [redispatch] { redispatch(FileEntry::FetchOutcome()); });
-      return XRootDStatus(); // missed-endFetch insurance, above
+      Executor::instance().postAfter(
+          parkedInsuranceMs(static_cast<int>(timeout), currentRequestTimeoutS(), 0),
+          [redispatch] { redispatch(FileEntry::FetchOutcome()); });
+      return XRootDStatus(); // missed-endFetch insurance, and the end of its own time
     }
   }
   auto wireBuf = std::make_shared<std::vector<char>>(we - ws);

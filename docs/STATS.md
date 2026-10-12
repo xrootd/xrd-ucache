@@ -326,20 +326,32 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   is corrupted" and the log names the file, the position, the codec and the
   server; or that carry no checksum this build can check (ZSTD as ROOT writes it, baskets
   stored uncompressed, a block this build cannot decode), which nothing can check.
-  `origin_checks_not_examined` counts the baskets of a converted branch that a first pass
-  did not decode, so that their own checksum, which they may carry, was not checked: a
-  basket whose own codec is not in `recompress_codecs` though its branch's is (a file merged
-  from inputs written with different codecs keeps each input's baskets as they were), or
-  whose block tag the conversion does not know; one whose blocks name more than one codec;
-  and one that cannot be read as a basket record, or does not fit its slot. Such a basket is
-  kept and served as stored, as without the cache (shown only when not 0). A basket left
-  unconverted whose data carries no check at all (stored uncompressed, an object of no
-  length, its first block ZSTD without a content checksum or ROOT's old algorithm) counts
-  under `origin_checks_none`, as on the byte path below. A branch whose own codec is not in
-  `recompress_codecs` is not converted at all: in a file that has a replica its baskets are
-  fetched as original bytes, which are not checked, even with `check_origin_integrity` on,
-  and are not counted here. Only what a first pass converts is checked by checksum; other
-  bytes are not counted here except as follows.
+  `origin_checks_not_examined` counts, with `recompress = on` and `check_origin_integrity`
+  off, the baskets of a converted branch that a first pass did not decode, so that their own
+  checksum, which they may carry, was not checked: a basket whose own codec is not in
+  `recompress_codecs` though its branch's is (a file merged from inputs written with
+  different codecs keeps each input's baskets as they were), or whose block tag the
+  conversion does not know; one whose blocks name more than one codec; and one that cannot
+  be read as a basket record, or does not fit its slot. Such a basket is kept and served as
+  stored, as without the cache (shown only when not 0). With `check_origin_integrity` on
+  every such basket is checked by the byte path's rule below and counted there, so the
+  counter stays 0. A basket left unconverted whose data carries no check at all (stored
+  uncompressed, an object of no length, its first block ZSTD without a content checksum or
+  ROOT's old algorithm) counts under `origin_checks_none`, as on the byte path below. A branch
+  whose own codec is not in `recompress_codecs` is not converted at all: in a file that has
+  a replica its baskets are fetched as original bytes, checked (and counted) only with
+  `check_origin_integrity` on, below. With `check_origin_integrity` off, only what a first
+  pass converts is checked by checksum; other bytes are not counted here except as follows.
+  With `check_origin_integrity` on, these counters count every basket of a fetch from the
+  origin, by one rule, whatever `recompress` says and whatever the codec: zlib and LZMA blocks,
+  and ZSTD blocks written with a content checksum, are decompressed and checked; an LZ4 block is
+  checked by its XXH64 over the compressed bytes, never decompressed; ZSTD written without a
+  checksum (as ROOT writes it), ROOT's old algorithm and baskets stored uncompressed are not
+  decompressed at all (nothing could be checked), and count under `origin_checks_none`. In a file
+  that has a replica (`recompress = on`) that covers the original bytes a read fetches outside the
+  converted baskets (a branch of a codec not converted among them) and a converted branch's
+  basket the conversion leaves as stored; a basket the conversion decodes is checked once, by its
+  conversion.
   With `check_origin_integrity` on, these counters also count the byte path: the baskets of a
   fetch from the origin (a byte-cache miss, a read the cache relays to the origin for a handle
   that holds the file's map, read-ahead, the bytes the checks at open keep) that lie wholly in

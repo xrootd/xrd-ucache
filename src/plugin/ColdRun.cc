@@ -166,6 +166,12 @@ class ColdFill : public tp::StoreMaps, public std::enable_shared_from_this<ColdF
   // job with neither that fills the unfilled slots of a store made earlier keeps such a block as
   // stored and serves it, and the reader's own decoder finds the damage, as without the cache.
   bool checkConverted = false;
+  // check_origin_integrity on (forced by adaptive_federation): every basket wholly in a fetch from
+  // the origin is checked by the byte path's rule, whatever recompress says and whatever its codec:
+  // the original bytes outside the converted baskets (checkOriginalPieces), and a basket of a
+  // converted branch the conversion did not decode (convertOne). A converted basket is decoded once,
+  // by its conversion.
+  bool checkAll = false;
   // max_read_fraction: null when no rule applies. Once it says direct, what
   // this process converts is served and never kept, and nothing it fetches
   // goes to the byte cache but the file's own records.
@@ -358,6 +364,9 @@ class ColdFill : public tp::StoreMaps, public std::enable_shared_from_this<ColdF
   // Original bytes worth keeping in the byte cache, of the page-aligned range
   // [rs, re): every page not wholly inside a relocated basket.
   std::vector<std::pair<uint64_t, uint64_t>> storableRuns(uint64_t rs, uint64_t re, uint64_t ps);
+  // [rs, re) less the original ranges of relocated baskets (relocatedOrig): the bytes of a fetch's
+  // original pieces whose baskets no conversion decodes. All of it when relocatedOrig is not built.
+  std::vector<std::pair<uint64_t, uint64_t>> notRelocated(uint64_t rs, uint64_t re);
 
   void queueCommit();
   void commit();
@@ -607,6 +616,7 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   cf->entry = entry;
   cf->keepOriginals = cfg.recompressKeepOriginals;
   cf->checkConverted = cfg.recompress || cfg.checkOriginIntegrity;
+  cf->checkAll = cfg.checkOriginIntegrity;
   cf->inUseSeconds = cfg.inUseSeconds;
   cf->fsync = cfg.fsync != FsyncMode::kOff;
   cf->rule = ReadRule::forFile(key.key, size);
@@ -851,6 +861,9 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   // the same bytes, so the read is not asked again (another source is a matter
   // for adaptive_federation).
   std::atomic<bool> checkFailed{false};
+  // check_origin_integrity: the file map the original pieces' bytes are checked against (null: not
+  // checked), made before the fetch is issued (originCheckMapFor), on the issuing thread.
+  std::shared_ptr<const KeyMap> checkMap;
   std::mutex emu;
   XRootDStatus err;
 
@@ -1361,6 +1374,30 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     c.kind = tp::ConvertedBasket::kOriginal;
     c.record.assign(rec, rec + recLen);
   }
+  // check_origin_integrity: a basket the conversion did not decode (its own codec not converted, a
+  // block tag it does not know, blocks of more than one codec, not a basket record) is judged as
+  // the byte path judges a fetched basket (transpose::checkFetched, by the same rule: nothing
+  // without a checksum is decompressed, LZ4 only hashed): its key, and its data by its own checksum.
+  if (cf.checkAll && c.check == tp::ConvertedBasket::kNotExamined) {
+    const tp::FetchVerdict v = tp::checkFetched(std::vector<uint64_t>{slot.origSeek},
+                                                std::vector<int32_t>{static_cast<int32_t>(recLen)},
+                                                slot.origSeek, rec, recLen, /*data=*/true);
+    if (!v.faults.empty()) {
+      const tp::FetchFault& f = v.faults.front();
+      const std::string why = f.kind == tp::FetchFault::kData     ? "its data fails its own check: " + f.why
+                              : f.kind == tp::FetchFault::kLength ? "key length differs from the tree's record"
+                                                                  : "key position differs from the tree's record";
+      failOriginCheck(req, slot.origSeek, recLen,
+                      c.codec.empty() ? std::string("a basket") : "a basket (" + c.codec + ")",
+                      why.c_str(), fromCache, rStart, rounded->size(), c.codec, from);
+      req->done();
+      return;
+    }
+    if (v.passed)
+      c.check = tp::ConvertedBasket::kPassed;
+    else if (v.none)
+      c.check = tp::ConvertedBasket::kNotCheckable;
+  }
   // The basket's own checksum, checked by its decode: a basket that fails is never converted
   // (convertBasket keeps it as its original record). With recompress = on, or
   // check_origin_integrity on, it is never kept or served either, and the read fails with that
@@ -1472,6 +1509,89 @@ withoutData(const std::vector<std::pair<uint64_t, uint64_t>>& runs, const ReadRu
   return out;
 }
 
+// A part's original piece, as fetched: its item and its page-rounded bytes.
+struct OrigFetched {
+  PartItem it;
+  std::shared_ptr<std::vector<char>> buf;
+};
+
+// The original bytes a part fetched, to the reader's buffers; with `keep`, the byte cache keeps
+// them -- except pages wholly inside a relocated basket, which a reader of this layout never needs
+// (a copy tool reading everything would otherwise store every basket a second time).
+void serveOriginalPieces(const std::shared_ptr<ColdRequest>& req,
+                         const std::vector<OrigFetched>& origs, bool keep) {
+  auto& st = req->st;
+  for (const auto& o : origs) {
+    const auto& p = req->origPieces[o.it.index];
+    std::memcpy(p.dest, o.buf->data() + (p.off - o.it.rs), p.len);
+    if (!keep)
+      continue;
+    auto runs = req->cf->storableRuns(o.it.rs, o.it.re, req->entry->pageSize());
+    if (req->cf->direct())
+      runs = withoutData(runs, *req->cf->rule, req->entry->pageSize());
+    if (!runs.empty()) {
+      st->beginPersist();
+      auto entry = req->entry;
+      const uint64_t rs = o.it.rs;
+      auto buf = o.buf;
+      Executor::instance().post([st, entry, buf, rs, runs] {
+        for (const auto& [a, b] : runs)
+          entry->writePages(a, b - a, buf->data() + (a - rs));
+        entry->flushMeta(false);
+        st->endPersist();
+      });
+    }
+  }
+}
+
+// check_origin_integrity for the original bytes a part fetched (the bytes outside the baskets the
+// layout converts: an unconverted branch's baskets among them), as the byte path checks a miss's
+// fetch: each basket's key, and the data of each basket wholly in the bytes by its own checksum,
+// by the same rule (transpose::checkFetched: zlib, LZMA and ZSTD with a content checksum decoded;
+// LZ4 judged by its XXH64 over the compressed bytes, never decompressed; ZSTD without one, ROOT's
+// old algorithm and stored data not decoded, counted as carrying no check). Only the baskets of the
+// bytes no conversion decodes are decoded (`reach`: the fetched bytes less the relocated baskets'
+// ranges): a converted basket is decoded once, by its conversion. A basket the reader's own bytes
+// reach that fails fails the request with the byte path's error ("failed its check ... not
+// served"), counted and recorded, nothing of these bytes is served or kept, and the entry is
+// dropped if it holds bytes of that copy (originCheckRefused); a failure only in a piece's rounded
+// edge is served and nothing of it kept. Decoding runs on the decode pool when there is any
+// (fetchVerdictAsync), never on this (the client's) thread; the request is held until it ends.
+void checkOriginalPieces(const std::shared_ptr<ColdRequest>& req, std::vector<OrigFetched> origs,
+                         const std::string& server, uint64_t spanOff, uint64_t spanLen) {
+  const std::shared_ptr<const KeyMap> m = req->checkMap;
+  std::vector<FetchPiece> pieces;
+  std::vector<std::pair<uint64_t, uint64_t>> reader;
+  auto reach = std::make_shared<std::vector<std::pair<uint64_t, uint64_t>>>();
+  for (const auto& o : origs) {
+    pieces.push_back(FetchPiece{o.it.rs, o.buf->data(), o.it.re - o.it.rs});
+    const auto& p = req->origPieces[o.it.index];
+    reader.emplace_back(p.off, p.off + p.len);
+    for (const auto& r : req->cf->notRelocated(o.it.rs, o.it.re))
+      reach->push_back(r);
+  }
+  req->outstanding.fetch_add(1, std::memory_order_relaxed); // released by `then`
+  auto held = std::make_shared<std::vector<OrigFetched>>(std::move(origs));
+  auto then = [req, held, reader, server, spanOff, spanLen](transpose::FetchVerdict v) {
+    countOriginChecks(*req->st, v);
+    std::string why;
+    const auto mk = v.against(reader, &why);
+    if (mk.count) {
+      req->checkFailed.store(true);
+      req->fail(originCheckRefused(*req->st, &req->entry->obs().servers, "first_pass", mk.first,
+                                   mk.count, spanOff, spanLen, server, why));
+    } else {
+      serveOriginalPieces(req, *held, !(mk.outside || v.unjudged));
+    }
+    req->done();
+  };
+  std::shared_ptr<const std::vector<std::pair<uint64_t, uint64_t>>> r = reach;
+  if (fetchNeedsWork(*m, server, pieces))
+    fetchVerdictAsync(m, server, std::move(pieces), r, then);
+  else
+    then(fetchVerdict(*m, server, std::move(pieces), r.get()));
+}
+
 class PartHandler : public ResponseHandler {
  public:
   // `f`: the file the read is issued on, whose server it is counted against.
@@ -1524,6 +1644,7 @@ class PartHandler : public ResponseHandler {
                           bytes, rt, true, wireTraceFields(server, inflight_.t0, inflight_.nc));
     }
     req_->cf->wireBytes.fetch_add(bytes, std::memory_order_relaxed);
+    std::vector<OrigFetched> origs; // the original pieces' bytes, served (and checked) below
     for (const auto& it : items_) {
       auto buf = std::make_shared<std::vector<char>>(it.re - it.rs);
       if (!gather(it.rs, it.re - it.rs, buf->data())) {
@@ -1542,27 +1663,15 @@ class PartHandler : public ResponseHandler {
               convertOne(req, idx, buf, rs, recOff, recLen, /*fromCache=*/false, server);
             });
       } else {
-        const auto& p = req_->origPieces[it.index];
-        std::memcpy(p.dest, buf->data() + (p.off - it.rs), p.len);
-        // Original bytes the reader asked for: the byte cache keeps them --
-        // except pages wholly inside a relocated basket, which a reader of
-        // this layout never needs (a copy tool reading everything would
-        // otherwise store every basket a second time).
-        auto runs = req_->cf->storableRuns(it.rs, it.re, req_->entry->pageSize());
-        if (req_->cf->direct())
-          runs = withoutData(runs, *req_->cf->rule, req_->entry->pageSize());
-        if (!runs.empty()) {
-          st->beginPersist();
-          auto entry = req_->entry;
-          const uint64_t rs = it.rs;
-          Executor::instance().post([st, entry, buf, rs, runs] {
-            for (const auto& [a, b] : runs)
-              entry->writePages(a, b - a, buf->data() + (a - rs));
-            entry->flushMeta(false);
-            st->endPersist();
-          });
-        }
+        origs.push_back(OrigFetched{it, std::move(buf)});
       }
+    }
+    if (!origs.empty()) {
+      if (req_->checkMap)
+        checkOriginalPieces(req_, std::move(origs), server, wire_.empty() ? 0 : wire_.front().off,
+                            bytes);
+      else
+        serveOriginalPieces(req_, origs, true);
     }
     req_->done();
     delete this;
@@ -2058,6 +2167,10 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
   // range: known before any of what is fetched arrives, on this thread.
   if (!req->claimed.empty() || !req->origPieces.empty())
     cf.ensureRelocatedOrig();
+  // check_origin_integrity: the map the original pieces are checked against, before anything is
+  // fetched (it may read the file's records), on this thread.
+  if (cf.checkAll && !req->origPieces.empty() && !req->checkMap)
+    req->checkMap = originCheckMapFor(req->st, req->entry);
 
   // What to fetch: claimed baskets the byte cache does not hold, and original
   // bytes it did not have. A claimed basket already in the byte cache (a
@@ -2435,6 +2548,31 @@ void ColdFill::ensureRelocatedOrig() {
   merged->shrink_to_fit();
   std::lock_guard<std::mutex> g(mu);
   relocatedOrig = std::move(merged);
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> ColdFill::notRelocated(uint64_t rs, uint64_t re) {
+  std::shared_ptr<const std::vector<std::pair<uint64_t, uint64_t>>> rel;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    rel = relocatedOrig;
+  }
+  std::vector<std::pair<uint64_t, uint64_t>> out;
+  uint64_t at = rs;
+  if (rel)
+    for (const auto& [a, b] : *rel) {
+      if (b <= at)
+        continue;
+      if (a >= re)
+        break;
+      if (a > at)
+        out.emplace_back(at, a);
+      at = std::max(at, b);
+      if (at >= re)
+        break;
+    }
+  if (at < re)
+    out.emplace_back(at, re);
+  return out;
 }
 
 std::vector<std::pair<uint64_t, uint64_t>> ColdFill::storableRuns(uint64_t rs, uint64_t re,
