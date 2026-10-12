@@ -14,7 +14,11 @@ namespace ucache {
 namespace tp = transpose;
 
 Executor& decodePool() {
-  static Executor* pool = new Executor(std::max(1u, usableCpus())); // leaked, as the executor
+  // One thread per usable CPU, at most kMaxDecodeThreads: each thread keeps its decoders' state,
+  // an LZMA dictionary of 64 MiB of address space among them (ROOT's LZMA level 9), and a reader
+  // run under a limit on its address space must not lose it to them.
+  static Executor* pool = new Executor(
+      std::max(1u, std::min(usableCpus(), kMaxDecodeThreads))); // leaked, as the executor
   return *pool;
 }
 

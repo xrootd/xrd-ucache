@@ -4,7 +4,8 @@
 // and the caller's continuation runs once, on the thread that finished the last job.
 //
 // The decode pool is not the executor that serves hits and writes pages: a fetch's decoding never
-// holds back another handle's hit. It has one thread per CPU this process may use. Memory in
+// holds back another handle's hit. It has one thread per CPU this process may use, at most 16:
+// with 64 threads, a reader limited to 8 GiB of address space (a gate's) ran out of it. Memory in
 // flight: what each decode thread keeps (its decoders' state, an LZMA dictionary among them, and
 // a scratch buffer of at most one block's 16 MiB; transpose::verifyFrames), and the bytes joined
 // for baskets that a cut between two pieces of one fetch divides (one basket per cut); the
@@ -26,7 +27,9 @@ namespace ucache {
 
 class Executor;
 
-// The decode pool (process-wide, built at first use, one thread per usable CPU).
+// The decode pool (process-wide, built at first use): one thread per usable CPU, at most
+// kMaxDecodeThreads.
+constexpr unsigned kMaxDecodeThreads = 16;
 Executor& decodePool();
 
 struct FetchCheckOptions {
