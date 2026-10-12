@@ -209,7 +209,8 @@ void keyPositionFuzz(uint64_t iters, uint64_t seed) {
       const uint64_t cut = rng() % n;
       std::unique_ptr<uint8_t[]> a1(cut ? new uint8_t[cut] : nullptr);
       std::unique_ptr<uint8_t[]> a2(new uint8_t[n - cut]);
-      std::memcpy(a1.get(), p.get(), cut);
+      if (cut)
+        std::memcpy(a1.get(), p.get(), cut);
       std::memcpy(a2.get(), p.get() + cut, n - cut);
       const std::vector<BytePiece> two{
           {spanOff, reinterpret_cast<const char*>(a1.get()), cut},
