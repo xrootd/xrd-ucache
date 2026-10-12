@@ -43,7 +43,8 @@ using Ranges = std::vector<std::pair<uint64_t, uint64_t>>;
 // (faults by position), on the pool thread that finished the last job, or at once on this thread
 // when there is no job. `keep` holds `seeks`, `lengths` and `damaged` alive (the file map);
 // `reach`, when set, limits decoding to the baskets it reaches (FetchJudge). A job that cannot be
-// posted runs on this thread. Test hook: UCACHE_TEST_DECODE_DELAY_MS holds each job that long.
+// posted runs on this thread. Test hooks: UCACHE_TEST_DECODE_DELAY_MS holds each job that long;
+// UCACHE_TEST_DECODE_THROW makes each job throw, as one out of memory (its part not judged).
 void checkPiecesOn(Executor& pool, std::shared_ptr<const void> keep,
                    const std::vector<uint64_t>& seeks, const std::vector<int32_t>& lengths,
                    std::vector<transpose::BytePiece> pieces, bool data, const Ranges* damaged,

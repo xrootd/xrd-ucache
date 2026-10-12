@@ -3140,6 +3140,7 @@ static void countChecks(HandleState& st, const transpose::FetchVerdict& v) {
   if (st.store) {
     st.store->stats().originChecksPassed.fetch_add(v.passed, std::memory_order_relaxed);
     st.store->stats().originChecksNone.fetch_add(v.none, std::memory_order_relaxed);
+    st.store->stats().originChecksUnjudged.fetch_add(v.unjudged, std::memory_order_relaxed);
   }
 }
 // check_origin_integrity, for the answer of a fetch from the origin: `go` is called once, with the
@@ -4500,7 +4501,7 @@ class MissReadHandler : public ResponseHandler {
         delete this;
         return;
       }
-      keepNone = mk.outside;
+      keepNone = mk.outside || v.unjudged; // a part not judged is served, never kept
     }
 #else
     (void)m;
@@ -4761,7 +4762,7 @@ class MissVReadHandler : public ResponseHandler {
         delete this;
         return;
       }
-      keepNone = bad.outside;
+      keepNone = bad.outside || v.unjudged; // a part not judged is served, never kept
     }
 #else
     (void)m;

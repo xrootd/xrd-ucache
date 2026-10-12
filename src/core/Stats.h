@@ -159,6 +159,8 @@ struct Stats {
   std::atomic<uint64_t> originChecksPassed{0};
   std::atomic<uint64_t> originChecksFailed{0};
   std::atomic<uint64_t> originChecksNone{0};
+  // parts of a fetch the check could not judge (a decode job out of memory): served, never kept
+  std::atomic<uint64_t> originChecksUnjudged{0};
   std::atomic<uint64_t> coldReplicaConvertUs{0};        // time spent converting, summed over threads
   std::atomic<uint64_t> coldReplicaDeclined{0};  // replicas not published (no room, or failed)
   std::atomic<uint64_t> coldReplicaSkipped{0};   // files whose own content declined the first pass
@@ -302,11 +304,10 @@ struct StatsTotals {
            coldReplicaFiles = 0, coldReplicaInBytes = 0, coldReplicaOutBytes = 0,
            coldReplicaBaskets = 0, coldReplicaBasketsKept = 0, coldReplicaConvertUs = 0,
            originChecksPassed = 0, originChecksFailed = 0, originChecksNone = 0,
-           coldReplicaDeclined = 0, coldReplicaSkipped = 0, slotMapsMade = 0, slotMapOpens = 0,
-           slotMapFull = 0,
-           replicaReadBytes = 0, relayBytes = 0,
-           readvChunks = 0, readvCalls = 0, readvMixed = 0, flushRuns = 0, flushRunBytes = 0,
-           bufferStalls = 0, bufferStallUs = 0;
+           originChecksUnjudged = 0, coldReplicaDeclined = 0, coldReplicaSkipped = 0,
+           slotMapsMade = 0, slotMapOpens = 0, slotMapFull = 0, replicaReadBytes = 0,
+           relayBytes = 0, readvChunks = 0, readvCalls = 0, readvMixed = 0, flushRuns = 0,
+           flushRunBytes = 0, bufferStalls = 0, bufferStallUs = 0;
   uint64_t originOpenAttempts = 0, originOpenFailures = 0, recordsDropped = 0;
   uint64_t openFailovers = 0, opensRecovered = 0, opensFailedEverywhere = 0,
            openDeadlineExpiries = 0, failoverLocates = 0, offlineCopiesSkipped = 0,

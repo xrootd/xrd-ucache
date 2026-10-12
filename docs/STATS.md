@@ -333,7 +333,10 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   the fetched bytes, whose key passes and whose length the file map gives:
   `origin_checks_passed` those whose own checksum held (ZLIB and LZMA, decoded; LZ4, its
   XXH64), `origin_checks_none` those that carry none (stored uncompressed, ZSTD without a
-  content checksum, ROOT's old algorithm). `origin_checks_failed` counts the baskets of such a fetch that the reader asked for
+  content checksum, ROOT's old algorithm). `origin_checks_unjudged` counts the parts of such a
+  fetch the check could not judge (a decoding job that ran out of memory): their bytes are
+  served, as without the check, but nothing of that fetch is kept, and read-ahead stages none of
+  it (shown only when not 0). `origin_checks_failed` counts the baskets of such a fetch that the reader asked for
   whose key does not say they sit where the tree's record puts them, whose length differs from
   the one that record gives them where it changes ROOT's reading (the file map), or whose data
   fails its own checksum or does not decode; and, as one each, the reads a copy answered of the

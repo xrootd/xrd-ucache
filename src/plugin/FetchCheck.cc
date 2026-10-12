@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <new>
 #include <thread>
 
 namespace ucache {
@@ -23,6 +24,10 @@ Executor& decodePool() {
 }
 
 namespace {
+bool decodeThrows() {
+  static const bool on = std::getenv("UCACHE_TEST_DECODE_THROW") != nullptr;
+  return on;
+}
 long decodeDelayMs() {
   static const long ms = [] {
     const char* v = std::getenv("UCACHE_TEST_DECODE_DELAY_MS");
@@ -54,6 +59,8 @@ void runJob(const std::shared_ptr<Join>& j, size_t i) noexcept {
       j->onJob();
     if (const long ms = decodeDelayMs(); ms > 0)
       std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    if (decodeThrows())
+      throw std::bad_alloc(); // test hook: a job out of memory
     j->parts[i] = tp::runCheckJob(*j->seeks, *j->lengths, j->jobs[i], j->data, j->reach.get());
   } catch (...) {
     j->parts[i] = tp::FetchVerdict();

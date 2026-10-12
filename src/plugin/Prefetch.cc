@@ -791,8 +791,10 @@ struct Shard {
          stats_->originChecksPassed.fetch_add(v.passed, std::memory_order_relaxed);
          stats_->originChecksNone.fetch_add(v.none, std::memory_order_relaxed);
          stats_->originChecksFailed.fetch_add(v.faults.size(), std::memory_order_relaxed);
+         stats_->originChecksUnjudged.fetch_add(v.unjudged, std::memory_order_relaxed);
        }
-       if (!v.faults.empty()) {
+       // A part the check could not judge stages nothing either: read-ahead keeps only what passed.
+       if (!v.faults.empty() || v.unjudged) {
          UCACHE_DEBUG("read-ahead of %s from %s: %zu basket(s) failed their check; nothing staged",
                       entry_->key().key.c_str(), server.c_str(), v.faults.size());
          delete this;

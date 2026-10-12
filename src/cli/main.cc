@@ -386,10 +386,13 @@ void printStats(const StatsTotals& t) {
   row("open_retries_exhausted", t.openRetriesExhausted);
   row("validations_failed", t.validationsFailed);
   row("size_disagreements", t.sizeDisagreements);
-  if (t.originChecksPassed || t.originChecksFailed || t.originChecksNone) {
+  if (t.originChecksPassed || t.originChecksFailed || t.originChecksNone ||
+      t.originChecksUnjudged) {
     row("origin_checks_passed", t.originChecksPassed);
     row("origin_checks_failed", t.originChecksFailed);
     row("origin_checks_none", t.originChecksNone);
+    if (t.originChecksUnjudged)
+      row("origin_checks_unjudged", t.originChecksUnjudged);
   }
   // Origin opens and failures: shown when there were any (a warm run has none).
   const uint64_t failures = t.originFailures[0] + t.originFailures[1] + t.originFailures[2] +
