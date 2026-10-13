@@ -686,6 +686,34 @@ SiteFailure siteFailure(const AttemptView& w, const XRootDStatus& s, const std::
 // kSiteNamesMax servers are kept. The table is never destroyed (detached threads may use it), and
 // is made anew in a forked child, where a parent's thread may have held its lock.
 constexpr int kSiteNameQueryS = 5;
+// Test hook UCACHE_TEST_SITENAME_DELAY=host:port=ms[,host:port=ms...] (inert unless set, read at
+// load): the site-name query of each server named is made that long after it is asked, so that a
+// test can have one server's name known and another's not yet.
+uint64_t siteNameDelayMs(const std::string& server) {
+  static const auto* delays = [] {
+    auto* m = new std::map<std::string, uint64_t>; // never destroyed: detached threads read it
+    const char* v = ::getenv("UCACHE_TEST_SITENAME_DELAY");
+    std::string s = v ? v : "";
+    size_t at = 0;
+    while (at < s.size()) {
+      size_t end = s.find(',', at);
+      if (end == std::string::npos)
+        end = s.size();
+      const std::string item = s.substr(at, end - at);
+      const size_t eq = item.rfind('=');
+      if (eq != std::string::npos && eq > 0) {
+        std::string key = item.substr(0, eq);
+        for (char& c : key)
+          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        (*m)[key] = std::strtoull(item.c_str() + eq + 1, nullptr, 10);
+      }
+      at = end + 1;
+    }
+    return m;
+  }();
+  const auto it = delays->find(server);
+  return it == delays->end() ? 0 : it->second;
+}
 constexpr int kSiteNameRetryS = 300;
 constexpr size_t kSiteNamesMax = 4096;
 struct SiteNameOp {
@@ -804,7 +832,7 @@ void askSiteName(const std::shared_ptr<CacheStore>& store, const std::string& se
   if (store)
     store->stats().siteNameQueries.fetch_add(1, std::memory_order_relaxed);
   try {
-    Executor::instance().post([op, key, store] {
+    Executor::instance().postAfter(siteNameDelayMs(key), [op, key, store] {
       try {
         XrdCl::FileSystem* fs = siteNameFs(key);
         auto* h = new SiteNameHandler(op, key, store);
