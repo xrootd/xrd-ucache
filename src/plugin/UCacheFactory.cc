@@ -420,6 +420,7 @@ void initGlobals() {
     scheduleCheckpoint();
   ::atexit([] {
     gExiting.store(true, std::memory_order_release); // first: no open is issued from here on
+    waitForSourceWrites(1000); // a mark made just before the end is in the last stats
     if (gStore && *gStore)
       (*gStore)->dumpStats(/*finalDump=*/true); // + Layer-2 records of live entries
     Log::flushHeldBack();

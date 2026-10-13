@@ -612,6 +612,11 @@ int currentRequestTimeoutS();
 // started): an open trying other sites issues nothing more and ends with its
 // last error.
 bool processExiting();
+// The exit handler's wait, before the last stats: the writes of the source memory (a server's mark
+// or its clearing, a copy's fault) already posted to the executor end first, at most `ms`, so that
+// one made just before the process ends is counted and recorded. None waits in a forked child for
+// a parent's write. Called from the exit handler only.
+void waitForSourceWrites(int ms);
 // A forked child's first cache work: re-arms what lived only in the parent's
 // timer queue (the periodic checkpoint). Cheap when there is nothing to do.
 void resumeAfterFork();

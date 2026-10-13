@@ -486,6 +486,8 @@ more servers), and the copies proven missing (by in-use record). A mark only
 puts copies last in the regional redirector's list: a job is never refused a
 copy for it. To forget every server mark, remove `<dir>/sources`; a copy's mark
 goes with its file's in-use record (`<dir>/inuse/...`, FORMAT.md).
+A mark is written off the job's threads; a process that ends while one is being
+written waits for it, at most a second, so that it is kept and counted.
 
 ## uCache read the file at another site
 

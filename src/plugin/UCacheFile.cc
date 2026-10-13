@@ -852,6 +852,40 @@ uint64_t marksNowS() {
 }
 // A stall counts only while another site answers normally: at the stall, or within this long after.
 constexpr uint64_t kStallWitnessUs = 60ull * 1000000;
+// The source-memory writes posted to the executor and not yet done, of the fork generation that
+// posted them (a parent's never run in a child): waitForSourceWrites waits for them at exit.
+// Constant-initialized, never destroyed.
+std::atomic<int> gSourceWrites{0};
+std::atomic<uint64_t> gSourceWritesGen{0};
+// UCACHE_TEST_SOURCE_WRITE_DELAY_MS=N (inert unless set): each source-memory write waits N ms on
+// the executor before it is made, for tests of the exit's wait for them.
+long sourceWriteDelayMs() {
+  static const long ms = [] {
+    const char* v = std::getenv("UCACHE_TEST_SOURCE_WRITE_DELAY_MS");
+    return v ? std::max(0L, std::atol(v)) : 0L;
+  }();
+  return ms;
+}
+void postSourceWrite(std::function<void()> fn) { // throws as Executor::post does
+  struct Done {
+    ~Done() { gSourceWrites.fetch_sub(1, std::memory_order_acq_rel); }
+  };
+  const uint64_t gen = Executor::forkGeneration();
+  if (gSourceWritesGen.exchange(gen, std::memory_order_acq_rel) != gen)
+    gSourceWrites.store(0, std::memory_order_release); // a forked child: the parent's never end here
+  gSourceWrites.fetch_add(1, std::memory_order_acq_rel);
+  try {
+    Executor::instance().post([fn = std::move(fn)] {
+      Done done;
+      if (const long d = sourceWriteDelayMs(); d > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(d));
+      fn();
+    });
+  } catch (...) {
+    gSourceWrites.fetch_sub(1, std::memory_order_acq_rel);
+    throw;
+  }
+}
 struct PendingStall {
   SiteFailure f; // the server, its site name and domain
   std::string file, why;
@@ -888,7 +922,7 @@ void writeSiteMark(const std::shared_ptr<CacheStore>& store, const SiteFailure& 
   const std::string server = f.server, site = f.site, name = f.siteName,
                     domain = domainOfFailure(f);
   try {
-    Executor::instance().post([store, server, site, name, domain, file, why] {
+    postSourceWrite([store, server, site, name, domain, file, why] {
       SourceMark m;
       const std::string path = sourcesPath(store->config().cacheDir);
       if (!markSource(RealIO::instance(), path, server, name, domain, marksNowS(), &m))
@@ -1007,7 +1041,7 @@ void noteSourceAnswer(HandleState& st, const std::string& server, bool opened) n
     const std::shared_ptr<CacheStore> store = st.store;
     const std::string file = recordFile(st.url);
     try {
-      Executor::instance().post([store, server, site, file] {
+      postSourceWrite([store, server, site, file] {
         std::vector<SourceMark> marks;
         const std::string path = sourcesPath(store->config().cacheDir);
         if (!loadSources(RealIO::instance(), path, marks))
@@ -1039,7 +1073,7 @@ void noteSourceAnswer(HandleState& st, const std::string& server, bool opened) n
     const std::shared_ptr<CacheStore> store = st.store;
     const std::string file = recordFile(st.url);
     try {
-      Executor::instance().post([store, server, site, file] {
+      postSourceWrite([store, server, site, file] {
         bool was = false;
         if (clearSource(RealIO::instance(), sourcesPath(store->config().cacheDir), server,
                         marksNowS(), &was) &&
@@ -1053,6 +1087,12 @@ void noteSourceAnswer(HandleState& st, const std::string& server, bool opened) n
     }
   }
 } catch (...) {
+}
+void waitForSourceWritesHere(int ms) {
+  if (gSourceWritesGen.load(std::memory_order_acquire) != Executor::forkGeneration())
+    return; // a parent's writes: they never run here
+  for (int waited = 0; waited < ms && gSourceWrites.load(std::memory_order_acquire) > 0; waited += 10)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 // The marks of the cache's sources, read now (and kept as the process's snapshot, which an open's
 // success looks in), and the live copy faults of the handle's file, as one question for
@@ -1105,7 +1145,7 @@ void noteCopyFault(HandleState& st, const SiteFailure& f) noexcept try {
   fault.server = f.server;
   fault.site = f.site;
   fault.reason = "enoent";
-  Executor::instance().post([store, path, file, fault]() mutable {
+  postSourceWrite([store, path, file, fault]() mutable {
     fault.lastS = marksNowS();
     if (!InUseRecord::noteFault(RealIO::instance(), path, fault, store->config().inUseSeconds))
       return;
@@ -7578,5 +7618,7 @@ bool UCacheFile::GetProperty(const std::string& name, std::string& value) const 
   }
   return false;
 }
+
+void waitForSourceWrites(int ms) { waitForSourceWritesHere(ms); }
 
 } // namespace ucache
