@@ -15,6 +15,7 @@
 #include <utility>
 #include <zlib.h>
 #include <zstd.h>
+#include <zstd_errors.h>
 #ifdef UCACHE_HAVE_LZ4
 #include <lz4.h>
 #endif
@@ -781,7 +782,10 @@ std::atomic<uint64_t> g_decoderLargeAllocs{
 std::atomic<int64_t> g_decoderLargeLive{0}; // large allocations not yet freed
 // Each allocation carries its size in front, so a free knows whether it was a large one.
 constexpr size_t kAllocHead = 16;
+thread_local int t_noMemory = 0; // DecoderNoMemory scopes alive on this thread
 void* countedAlloc(void*, size_t nmemb, size_t size) {
+  if (t_noMemory > 0)
+    return nullptr; // test hook (DecoderNoMemory): as for want of memory
   const size_t n = nmemb * size;
   g_decoderAllocs.fetch_add(1, std::memory_order_relaxed);
   if (n >= (1u << 20)) {
@@ -845,6 +849,12 @@ int64_t decoderLargeLive() {
 void keepDecodersOnThisThread() {
   t_keepDecoders = true;
 }
+DecoderNoMemory::DecoderNoMemory() {
+  ++t_noMemory;
+}
+DecoderNoMemory::~DecoderNoMemory() {
+  --t_noMemory;
+}
 
 namespace {
 // The blocks of a compressed object, each decoded as ROOT decodes it (R__unzip's ZLIB, LZMA,
@@ -864,6 +874,14 @@ void decodeInto(const uint8_t* payload, size_t n, uint64_t objlen, bool keep, De
     d.check = FrameCheck::kNotCheckable;
     d.why = why;
     d.out.clear();
+  };
+  // A decoder that could not do its work for reasons of this process (decodeFrames): for want of
+  // memory a local failure the caller handles (std::bad_alloc), never a failed check; otherwise no
+  // claim.
+  auto notHere = [&](bool noMemory, const char* why) {
+    if (noMemory)
+      throw std::bad_alloc();
+    unsupported(why);
   };
   // objlen is attacker-influenceable: cap the upfront reservation (growth past
   // it amortizes per block) so a hostile value cannot force a giant allocation.
@@ -937,14 +955,19 @@ void decodeInto(const uint8_t* payload, size_t n, uint64_t objlen, bool keep, De
         return failed("lzma block too short");
       if ((blob[7] & 0x0F) == 0)
         everyBlockChecked = false;
-      if (lzma_stream_decoder(&dec.xz, UINT64_MAX, 0) != LZMA_OK)
-        return failed("lzma block failed its check or did not decode");
+      // Setting a stream decoder up reads no input: only memory or this build can fail it.
+      if (const lzma_ret ir = lzma_stream_decoder(&dec.xz, UINT64_MAX, 0); ir != LZMA_OK)
+        return notHere(ir == LZMA_MEM_ERROR || ir == LZMA_MEMLIMIT_ERROR,
+                     "lzma decoder could not be set up");
       dec.xz.next_in = blob;
       dec.xz.avail_in = csize;
       dec.xz.next_out = dst;
       dec.xz.avail_out = usize;
-      if (lzma_code(&dec.xz, LZMA_FINISH) != LZMA_STREAM_END)
+      if (const lzma_ret r = lzma_code(&dec.xz, LZMA_FINISH); r != LZMA_STREAM_END) {
+        if (r == LZMA_MEM_ERROR || r == LZMA_MEMLIMIT_ERROR || r == LZMA_PROG_ERROR)
+          return notHere(r != LZMA_PROG_ERROR, "lzma decoder failed for this process");
         return failed("lzma block failed its check or did not decode");
+      }
       gave = usize - dec.xz.avail_out;
     } else if (codec == "zlib") {
       // The zlib wrapper ends with an adler32 that inflate verifies. As ROOT:
@@ -953,11 +976,12 @@ void decodeInto(const uint8_t* payload, size_t n, uint64_t objlen, bool keep, De
         dec.z.zalloc = zAlloc;
         dec.z.zfree = zFree;
         dec.z.opaque = nullptr;
-        if (inflateInit(&dec.z) != Z_OK)
-          return failed("zlib block failed its check or did not decode");
+        // Reads no input: only memory or this build can fail it.
+        if (const int ir = inflateInit(&dec.z); ir != Z_OK)
+          return notHere(ir == Z_MEM_ERROR, "zlib decoder could not be set up");
         dec.zInit = true;
       } else if (inflateReset(&dec.z) != Z_OK) {
-        return failed("zlib block failed its check or did not decode");
+        return notHere(false, "zlib decoder could not be reset");
       }
       dec.z.next_in = const_cast<Bytef*>(blob);
       dec.z.avail_in = static_cast<uInt>(csize);
@@ -965,8 +989,11 @@ void decodeInto(const uint8_t* payload, size_t n, uint64_t objlen, bool keep, De
       dec.z.avail_out = static_cast<uInt>(usize);
       int err;
       while ((err = inflate(&dec.z, Z_FINISH)) != Z_STREAM_END)
-        if (err != Z_OK)
+        if (err != Z_OK) {
+          if (err == Z_MEM_ERROR || err == Z_STREAM_ERROR) // its window, or its own state
+            return notHere(err == Z_MEM_ERROR, "zlib decoder failed for this process");
           return failed("zlib block failed its check or did not decode");
+        }
       gave = usize - dec.z.avail_out;
     } else if (codec == "zstd") {
       // Frame header: 4-byte magic, then the descriptor whose bit 2 says a
@@ -976,15 +1003,18 @@ void decodeInto(const uint8_t* payload, size_t n, uint64_t objlen, bool keep, De
       if ((blob[4] & 0x04) == 0)
         everyBlockChecked = false;
       if (!dec.zs) {
-        dec.zs = ZSTD_createDCtx();
+        dec.zs = t_noMemory > 0 ? nullptr : ZSTD_createDCtx(); // the test hook: none made
+        if (!dec.zs)
+          return notHere(true, "zstd decoder could not be set up");
         g_decoderAllocs.fetch_add(1,
                                   std::memory_order_relaxed); // its own allocations, counted once
-        if (!dec.zs)
-          return failed("zstd block did not decode");
       }
       const size_t r = ZSTD_decompressDCtx(dec.zs, dst, usize, blob, csize);
-      if (ZSTD_isError(r))
+      if (ZSTD_isError(r)) {
+        if (ZSTD_getErrorCode(r) == ZSTD_error_memory_allocation)
+          return notHere(true, "zstd decoder failed for this process");
         return failed("zstd block did not decode");
+      }
       gave = r;
     } else { // lz4
       // ROOT's LZ4 block: an 8-byte XXH64 (big-endian) of the compressed bytes

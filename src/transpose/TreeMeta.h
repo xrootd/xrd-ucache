@@ -75,7 +75,11 @@ struct DecodedFrames {
 // `objlen` bytes long, checking each block as ROOT would: its header's third byte
 // as ROOT holds it, a block may give fewer bytes than its header states (ROOT goes
 // on from what it gave), never more and never none, and the blocks together must
-// give exactly `objlen`. May throw std::bad_alloc (its buffers); nothing else.
+// give exactly `objlen`. A decoder that could not do its work for reasons of this process, not
+// of the bytes, is never a failed check: for want of memory (its buffers, or a codec library's
+// own: LZMA_MEM_ERROR, Z_MEM_ERROR, a ZSTD context not made or ZSTD's memory_allocation)
+// std::bad_alloc is thrown, which the callers take as a local failure (no claim on the copy);
+// a decoder that could not be set up otherwise gives kNotCheckable. Nothing else is thrown.
 DecodedFrames decodeFrames(const uint8_t* payload, size_t n, uint64_t objlen);
 
 // The same check without keeping the object: each block decoded into a per-thread scratch buffer
@@ -83,6 +87,15 @@ DecodedFrames decodeFrames(const uint8_t* payload, size_t n, uint64_t objlen);
 // before it decodes; this needs no lz4 in the build). `out` stays empty. For checks that only
 // judge.
 DecodedFrames verifyFrames(const uint8_t* payload, size_t n, uint64_t objlen);
+// Test hook (inert unless used): while one lives on a thread, every allocation the decoders of
+// decodeFrames and verifyFrames make on that thread fails, as for want of memory (LZMA and ZLIB
+// through their allocator; no ZSTD context is made). LZ4 allocates nothing.
+struct DecoderNoMemory {
+  DecoderNoMemory();
+  ~DecoderNoMemory();
+  DecoderNoMemory(const DecoderNoMemory&) = delete;
+  DecoderNoMemory& operator=(const DecoderNoMemory&) = delete;
+};
 // Allocations the decoders of decodeFrames and verifyFrames made, process-wide, and those of 1 MiB
 // or more (an LZMA stream's dictionary: 64 MiB for ROOT's LZMA level 9, allocated by liblzma at
 // each set-up). On a thread that keeps its decoders (keepDecodersOnThisThread) their state is

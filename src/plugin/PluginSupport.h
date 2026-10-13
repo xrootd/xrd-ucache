@@ -39,6 +39,9 @@ bool onClientCallback();
 // instead of the reads failing. slotFetchFaultFire: readFaultFire for the slot run's fetches,
 // false with that kind.
 bool convertFaultFire();
+// Test hook (UCACHE_TEST_READ_FAIL_KIND=decodenomem): the slot run's conversion about to start is
+// made with its decoders' allocations failing (transpose::DecoderNoMemory). UCacheFile.cc.
+bool decodeNoMemFire();
 bool slotFetchFaultFire();
 // Test-only (UCACHE_TEST_READ_FAIL_KIND=splitmove, with UCACHE_TEST_READ_FAIL_N=1): the slot run
 // cuts its fetches into parts of at most 8 baskets; between the first and the second part of the

@@ -108,6 +108,38 @@ uint32_t getSize(const std::vector<uint8_t>& b, size_t at) {
 DecodedFrames decode(const std::vector<uint8_t>& b, uint64_t objlen) {
   return decodeFrames(b.data(), b.size(), objlen);
 }
+} // namespace
+
+// A decoder that cannot get memory is a local failure (std::bad_alloc, which the callers take as
+// no claim on the copy), never a failed check, for each codec that allocates; once memory is back
+// the same block decodes and passes. LZ4 allocates nothing and is judged as ever.
+TEST(FrameCheck, ADecoderOutOfMemoryIsNoFailedCheck) {
+  const struct {
+    const char* codec;
+    const uint8_t* p;
+    size_t n;
+    uint64_t objlen;
+  } blocks[] = {{"lzma", kLzmaPayload, sizeof kLzmaPayload, kLzmaObjlen},
+                {"zlib", kZlibPayload, sizeof kZlibPayload, kZlibObjlen},
+                {"zstd", kZstdPayload, sizeof kZstdPayload, kZstdObjlen}};
+  for (const auto& b : blocks) {
+    {
+      DecoderNoMemory none;
+      EXPECT_THROW(decodeFrames(b.p, b.n, b.objlen), std::bad_alloc) << b.codec;
+      EXPECT_THROW(verifyFrames(b.p, b.n, b.objlen), std::bad_alloc) << b.codec;
+      EXPECT_THROW(decompressFrames(b.p, b.n, b.objlen), std::bad_alloc) << b.codec;
+    }
+    // ROOT's ZSTD block carries no content checksum: not checkable, but decoded
+    const DecodedFrames d = decodeFrames(b.p, b.n, b.objlen);
+    EXPECT_NE(d.check, FrameCheck::kFailed) << b.codec;
+    EXPECT_EQ(d.out.size(), b.objlen) << b.codec;
+    EXPECT_EQ(verifyFrames(b.p, b.n, b.objlen).check, d.check) << b.codec;
+  }
+  DecoderNoMemory none;
+  EXPECT_EQ(verifyFrames(kLz4Payload, sizeof kLz4Payload, kLz4Objlen).check, FrameCheck::kPassed);
+}
+
+namespace {
 
 // A ROOT block around `blob`: tag, a method byte, then the two sizes.
 // Its third byte as ROOT writes it: ZL and CS 8 (Z_DEFLATED), XZ 0, ZS 1, L4 the LZ4 major

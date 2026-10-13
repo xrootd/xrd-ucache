@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <optional>
 #include <chrono>
 #include <condition_variable>
 #include <future>
@@ -1348,6 +1349,9 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
                 XrdCl::File* on = nullptr) try {
   if (convertFaultFire()) // test hook: the conversion throws, as for want of memory
     throw std::bad_alloc();
+  std::optional<tp::DecoderNoMemory> noMemory; // test hook: its decoders get no memory
+  if (decodeNoMemFire())
+    noMemory.emplace();
   ColdFill& cf = *req->cf;
   const tp::FillSlot& slot = cf.slot(i);
   const auto* rec = reinterpret_cast<const uint8_t*>(rounded->data() + recOff);

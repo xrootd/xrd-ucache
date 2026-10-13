@@ -181,8 +181,10 @@ bool headerFaultFires() {
 // the first one started, so that a copy cut short answers it short on the File the handle left);
 // every other one a connection error posted 1000 ms late (two reads issued together both meet the
 // copy before either answer comes). convert: the slot run's conversions instead (convertFaultFire).
+// decodenomem: the slot run's conversions, each struck one made with every allocation of its
+// decoders failing, as for want of memory (decodeNoMemFire, transpose::DecoderNoMemory).
 enum class FaultKind : uint8_t {
-  kMiss, kRelay, kRefuse, kFinal, kLate, kAgain, kLeftData, kConvert, kSplitMove
+  kMiss, kRelay, kRefuse, kFinal, kLate, kAgain, kLeftData, kConvert, kSplitMove, kDecodeNoMem
 };
 static const FaultKind gFaultKind = [] {
   const char* v = ::getenv("UCACHE_TEST_READ_FAIL_KIND");
@@ -195,14 +197,18 @@ static const FaultKind gFaultKind = [] {
          : k == "leftdata" ? FaultKind::kLeftData
          : k == "convert"  ? FaultKind::kConvert
          : k == "splitmove" ? FaultKind::kSplitMove
+         : k == "decodenomem" ? FaultKind::kDecodeNoMem
                            : FaultKind::kMiss;
 }();
 bool convertFaultFire() {
   return gFaultKind == FaultKind::kConvert && readFaultFire();
 }
+bool decodeNoMemFire() {
+  return gFaultKind == FaultKind::kDecodeNoMem && readFaultFire();
+}
 bool slotFetchFaultFire() {
   return gFaultKind != FaultKind::kConvert && gFaultKind != FaultKind::kSplitMove &&
-         readFaultFire();
+         gFaultKind != FaultKind::kDecodeNoMem && readFaultFire();
 }
 static std::atomic<bool> gSplitMoveArmed{false};
 bool splitMoveKind() {
@@ -252,7 +258,7 @@ static bool injectReadFault(bool relaySite, ResponseHandler* h, XRootDStatus& s,
       againSite   ? k == FaultKind::kAgain
       : relaySite ? k == FaultKind::kRelay || k == FaultKind::kRefuse || k == FaultKind::kAgain
                   : k != FaultKind::kRelay && k != FaultKind::kAgain && k != FaultKind::kConvert &&
-                        k != FaultKind::kSplitMove;
+                        k != FaultKind::kSplitMove && k != FaultKind::kDecodeNoMem;
   if (!here || !readFaultFire())
     return false;
   s = XRootDStatus();
