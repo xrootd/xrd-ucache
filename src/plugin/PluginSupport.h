@@ -28,6 +28,14 @@ bool readFaultFire();
 // false with that kind.
 bool convertFaultFire();
 bool slotFetchFaultFire();
+// Test-only (UCACHE_TEST_READ_FAIL_KIND=splitmove, with UCACHE_TEST_READ_FAIL_N=1): the slot run
+// cuts its fetches into parts of at most 8 baskets; between the first and the second part of the
+// first request that has more than one, the handle is moved to another copy, as another request's
+// failure would move it (splitMoveFire, once), and the next part issued then fails with a
+// connection error (splitMoveFailNext), on the File it was issued on.
+bool splitMoveKind();
+bool splitMoveFire();
+bool splitMoveFailNext();
 
 // The tier a request needed (ReaderWait::Tier), noted on the reader's handler
 // when the read's entry point wrapped it to measure the reader's wait; any

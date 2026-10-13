@@ -141,7 +141,9 @@ TEST(OpenPolicy, ServersOfOneSiteNameAreOneSite) {
   AfterFailure last = AfterFailure::kRetry;
   for (const char* s : {"127.0.0.1:1101", "127.0.0.1:1102", "127.0.0.2:1103"}) {
     SiteFailure f = stalled(s);
-    f.site = siteIdentity(f.server, false, nameOf(f.server));
+    f.siteName = nameOf(f.server);
+    f.domain = f.server;
+    f.site = siteIdentity(f.server, false, f.siteName);
     setSiteNames(failed, nameOf);
     last = afterFailure(failed, f, 2, false);
   }
@@ -181,8 +183,73 @@ TEST(OpenPolicy, ServersOfOneSiteNameAreOneSite) {
   EXPECT_EQ(late.front().site, "127.0.0.1:1102");
   setSiteNames(late, nameOf);
   EXPECT_EQ(late.front().site, "T1_ONE");
-  EXPECT_TRUE(failedBefore(late, {"127.0.0.1:1101", "T1_ONE", "", ""}));
+  SiteFailure other = stalled("127.0.0.1:1101");
+  other.siteName = "T1_ONE";
+  EXPECT_TRUE(failedBefore(late, other));
   EXPECT_EQ(serverOf(Location{"2001:DB8::7", 1094, false, false}), "[2001:db8::7]:1094");
+}
+
+// Mixed identities: a server whose name is known and one whose name is not known yet are compared by
+// their domains (as before site names); two named servers by their names, also within one domain;
+// two unnamed by their domains.
+TEST(OpenPolicy, ASiteByNamesWhenBothAreKnownElseByDomains) {
+  const auto at = [](const std::string& server, bool answered, const std::string& name) {
+    SiteFailure f;
+    f.server = server;
+    f.siteName = name;
+    f.domain = siteIdentity(server, answered, "");
+    f.site = name.empty() ? f.domain : name;
+    f.error = "e";
+    return f;
+  };
+  const SiteFailure aNamed = at("cmsxrd1.fnal.gov:1094", true, "T1_US_FNAL");
+  const SiteFailure bUnnamed = at("cmsxrd2.fnal.gov:1094", true, "");
+  const SiteFailure bNamed = at("cmsxrd2.fnal.gov:1094", true, "T1_US_FNAL");
+  const SiteFailure cOther = at("t3.fnal.gov:1094", true, "T3_US_FNALLPC");
+  const SiteFailure aUnnamed = at("cmsxrd1.fnal.gov:1094", true, "");
+  EXPECT_TRUE(sameSite(aNamed, bUnnamed)) << "named and not yet named, one domain: one site";
+  EXPECT_TRUE(sameSite(aNamed, bNamed));
+  EXPECT_FALSE(sameSite(aNamed, cOther)) << "two names in one domain: two sites";
+  EXPECT_TRUE(sameSite(aUnnamed, bUnnamed)) << "neither named: by domain";
+  EXPECT_FALSE(sameSite(aNamed, at("x.cern.ch:1094", true, ""))) << "another domain";
+  // afterFailure: the second server of the domain is a repeat of the site (the regional's list
+  // next), and the sites counted are one: the bound of 2 is not reached.
+  std::vector<SiteFailure> failed;
+  EXPECT_EQ(afterFailure(failed, aNamed, 2, false), AfterFailure::kRetry);
+  EXPECT_EQ(afterFailure(failed, bUnnamed, 2, false), AfterFailure::kRepeat);
+  std::vector<SiteFailure> two;
+  EXPECT_EQ(afterFailure(two, aNamed, 2, false), AfterFailure::kRetry);
+  EXPECT_EQ(afterFailure(two, cOther, 2, false), AfterFailure::kStop) << "two named sites";
+  // failedBefore: the same.
+  EXPECT_TRUE(failedBefore({aNamed}, bUnnamed));
+  EXPECT_TRUE(failedBefore({bUnnamed}, aNamed));
+  EXPECT_FALSE(failedBefore({aNamed}, cOther));
+  // An address: by domain its own server alone; by names, of the site of its name.
+  const SiteFailure l1 = at("127.0.0.1:1101", true, ""), l2 = at("127.0.0.1:1102", true, "");
+  EXPECT_FALSE(failedBefore({l1}, l2));
+  EXPECT_TRUE(failedBefore({at("127.0.0.1:1101", true, "T2_S1")}, at("127.0.0.1:1102", true, "T2_S1")));
+  // A listed copy: named, against a failure whose name is not known yet, by domain; an address
+  // only by names.
+  EXPECT_TRUE(atFailedSite(bUnnamed, "cmsxrd1.fnal.gov", "T1_US_FNAL"));
+  EXPECT_TRUE(atFailedSite(aNamed, "cmsxrd2.fnal.gov", ""));
+  EXPECT_FALSE(atFailedSite(aNamed, "t3.fnal.gov", "T3_US_FNALLPC"));
+  EXPECT_FALSE(atFailedSite(l1, "127.0.0.1", ""));
+  EXPECT_TRUE(atFailedSite(at("127.0.0.1:1101", true, "T2_S1"), "127.0.0.1", "T2_S1"));
+  // A stalled server (never answered) of a named site's domain: its host's domain is where its
+  // siblings are, as before.
+  EXPECT_TRUE(atFailedSite(at("cmsxrd3.fnal.gov:1094", false, ""),
+                           "cmsxrd1.fnal.gov", "T1_US_FNAL"));
+  Location l;
+  l.host = "cmsxrd1.fnal.gov";
+  l.port = 1094;
+  const std::function<std::string(const std::string&)> named = [](const std::string& s) {
+    return s == "cmsxrd1.fnal.gov:1094" ? std::string("T1_US_FNAL") : std::string();
+  };
+  Location t3 = l;
+  t3.host = "t3.cern.ch";
+  const auto order = orderLocations({l, t3}, {}, {bUnnamed}, named);
+  ASSERT_EQ(order.size(), 1u);
+  EXPECT_EQ(order.front().host, "t3.cern.ch") << "the named copy of the failed domain is left out";
 }
 
 TEST(OpenPolicy, FailureClasses) {

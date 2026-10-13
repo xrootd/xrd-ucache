@@ -274,7 +274,8 @@ ones included, so a run with caching disabled shows its origin failures too.
   The next open of the file fills a new entry (TROUBLESHOOTING.md).
 - `site_name_queries`, `site_names_missing` — with `adaptive_federation =
   on`: servers asked for the name of their site (their `all.sitename`, as the
-  server's configuration value `sitename`; USER_GUIDE.md), once per server and
+  server's configuration value `sitename`; USER_GUIDE.md: a server that answered
+  an open, and a listed copy when its turn comes), once per server and
   process (again 5 minutes after a query that got no answer), and the asks
   that gave no name (none configured, an error, or no answer within 5 s):
   such a server's site is its domain.

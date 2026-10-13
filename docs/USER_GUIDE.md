@@ -976,14 +976,18 @@ at such places are left, they are tried too, the oldest failure first. A site is
 the name its servers give for it (their `all.sitename`, which a server tells when
 asked for its configuration value `sitename`, as CMSSW's XRootD adaptor asks
 it): uCache asks each server that answered an open, and each copy the regional
-redirector lists, once per process and off the client's own threads (a few
-hundred bytes each), and nothing waits for the answer but a listed copy's turn,
-which waits for its name at most as long as its stat took. A server whose name
-is not known (not asked yet, none configured, no answer) is of the site of its
-domain, as before; one known by an address, or one that never answered, is its
-own site. So the servers of one site count as one of the 4 sites wherever they
-failed, and a copy at a site that failed is left to the end though it is named
-by an address (`site_name_queries`, `site_names_missing`, STATS.md).
+redirector lists when its turn comes (beside the question of its state, so a
+copy never asked its state is never asked its name), once per process and off
+the client's own threads (a few hundred bytes each), and nothing waits for the
+answer but a listed copy's turn, which waits for its name at most as long as its
+stat took. Two servers are of one site when both names are known and agree; while
+either name is not known (not asked yet, none configured, no answer), when their
+domains agree, as before site names (a server known by an address, or one that
+never answered, being its own site by domain). Two servers of one domain that give
+different names are two sites. So the servers of one site count as one of the 4
+sites wherever they failed, and a copy at a site that failed is left to the end
+though it is named by an address (`site_name_queries`, `site_names_missing`,
+STATS.md).
 A job's own `tried=` list is kept ahead of uCache's names. An open
 that uCache makes of the origin holds one of its worker threads while it tries
 sites, so with a stalled site and every worker so held, the next step of a

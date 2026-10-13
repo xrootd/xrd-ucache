@@ -32,6 +32,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <future>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1778,7 +1779,7 @@ void issuePart(const std::shared_ptr<ColdRequest>& req, std::vector<PartItem> it
   }
   auto* h = new PartHandler(req, f, std::move(items), std::move(wire));
   XRootDStatus s;
-  if (slotFetchFaultFire()) // test hook: the origin's vector read dies mid-stream
+  if (slotFetchFaultFire() || splitMoveFailNext()) // test hook: the origin's vector read dies mid-stream
     Executor::instance().post([h] {
       h->HandleResponseWithHosts(new XRootDStatus(XrdCl::stError, XrdCl::errConnectionError),
                                  nullptr, nullptr);
@@ -2277,10 +2278,20 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
   // next item does not share a page with the part so far.
   std::vector<PartItem> part;
   uint64_t partBytes = 0, partEnd = 0;
+  const size_t maxItems = splitMoveKind() ? 8 : kPartItems; // a test's parts (PluginSupport.h)
+  int issued = 0;
   for (const auto& it : items) {
     // Cut by bytes, and by element count: a vector read carries at most 1024.
-    if (!part.empty() && (partBytes >= kPartBytes || part.size() >= kPartItems) &&
+    if (!part.empty() && (partBytes >= kPartBytes || part.size() >= maxItems) &&
         it.rs >= partEnd) {
+      if (issued++ == 1 && splitMoveFire()) { // test hook: another request's move lands here
+        XrdCl::File* first = req->st->inner.load();
+        auto moved = std::make_shared<std::promise<bool>>();
+        if (moveSlotRequest(req->st, first,
+                            XRootDStatus(XrdCl::stError, XrdCl::errSocketTimeout), false, 0,
+                            req->t0, [moved](bool m, const XRootDStatus&) { moved->set_value(m); }))
+          moved->get_future().wait_for(std::chrono::seconds(60));
+      }
       issuePart(req, std::move(part));
       part.clear();
       partBytes = 0;

@@ -536,7 +536,7 @@ static_assert(kCandidateStatS < kOpenDeadlineS, "a copy's answer must not take a
 // One site an open failed at, as the final error and the next attempt see it.
 struct SiteFailure {
   std::string server; // host:port
-  std::string site;
+  std::string site;   // as said: the site name when known, else `domain`
   std::string name;  // what tried= may carry for it (exclusionName), "" for none
   std::string error; // the error's text
   // The copy is refused for what it is: its open succeeded and it is an empty or cut ROOT file,
@@ -544,7 +544,22 @@ struct SiteFailure {
   // sequence, nor by the handle whose read found it, and the error that ends it is of class data.
   bool bad = false;
   long long size = -1; // the size the copy reported at its open; -1 when it is not known
+  // The two identities of its site (sameSite): the name the server gave ("" while none is known),
+  // and its domain as before site names (siteIdentity with no name: the domain of a server that
+  // answered, else the server itself; "" here means `site` holds it).
+  std::string siteName = std::string();
+  std::string domain = std::string();
 };
+// Whether two failures are at one site: by their names when both servers gave one (two servers of
+// one domain that give different names are two sites), else by their domains (siteIdentity
+// without names), so that a server whose name is not known yet is of its named neighbours' site as
+// it was before site names.
+bool sameSite(const SiteFailure& a, const SiteFailure& b);
+// Whether a listed copy (its host, the name its server gave, "" for none) is
+// at the site of the failure `x`, as orderLocations decides it: by names when both are known; else,
+// for a copy named by a host name, when its domain is x's domain or the domain of x's host; never
+// for a copy named by an address (it stands for its server alone).
+bool atFailedSite(const SiteFailure& x, const std::string& host, const std::string& name);
 // Whether `failed` lists `server` (host:port, in any case) as a copy refused for what it is.
 bool refusedBefore(const std::vector<SiteFailure>& failed, const std::string& server);
 // A read of a handle failed at the copy `f` (its server, site and size; `f.bad` when the read
@@ -603,8 +618,9 @@ std::vector<Location> orderLocations(
 // The server (host:port) a Location is, named as the client names it: an IPv6 address in
 // brackets, lower-cased.
 std::string serverOf(const Location& l);
-// Puts in place of each site of `failed` the name its server gave (`nameOf`, "" for none
-// known), so that the servers of one site count as one wherever they failed.
+// Gives each failure of `failed` the name its server gave (`nameOf`, "" for none known), its
+// domain kept beside it (sameSite), so that the servers of one site count as one wherever they
+// failed.
 void setSiteNames(std::vector<SiteFailure>& failed,
                   const std::function<std::string(const std::string&)>& nameOf);
 // The names of `failed` a retry's tried= carries, oldest first.

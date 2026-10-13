@@ -961,19 +961,40 @@ bool listOpenFailure(std::vector<SiteFailure>& failed, const SiteFailure& f) {
   return false;
 }
 
+namespace {
+const std::string& domainOf(const SiteFailure& x) { return x.domain.empty() ? x.site : x.domain; }
+} // namespace
+
+bool sameSite(const SiteFailure& a, const SiteFailure& b) {
+  if (!a.siteName.empty() && !b.siteName.empty())
+    return a.siteName == b.siteName;
+  return !domainOf(a).empty() && domainOf(a) == domainOf(b);
+}
+
+bool atFailedSite(const SiteFailure& x, const std::string& host, const std::string& name) {
+  if (!x.siteName.empty() && !name.empty())
+    return x.siteName == name;
+  if (isIpv4(host) || isIpv6(host))
+    return false;
+  const std::string d = siteOf(host);
+  const std::string& fs = x.server;
+  return domainOf(x) == d || siteOf(fs.substr(0, fs.rfind(':'))) == d;
+}
+
 AfterFailure afterFailure(std::vector<SiteFailure>& failed, const SiteFailure& f, int maxSites,
                           bool spent) {
-  bool sameSite = false;
+  bool same = false;
   for (const SiteFailure& x : failed)
-    sameSite = sameSite || x.site == f.site;
+    same = same || sameSite(x, f);
   const bool seen = listOpenFailure(failed, f);
-  std::vector<std::string> sites;
+  // The sites counted: one failure stands for each site, those of one site counted once.
+  std::vector<const SiteFailure*> sites;
   for (const SiteFailure& x : failed)
-    if (std::find(sites.begin(), sites.end(), x.site) == sites.end())
-      sites.push_back(x.site);
+    if (std::none_of(sites.begin(), sites.end(), [&](const SiteFailure* s) { return sameSite(*s, x); }))
+      sites.push_back(&x);
   if (static_cast<int>(sites.size()) >= maxSites || spent)
     return AfterFailure::kStop;
-  return seen || sameSite ? AfterFailure::kRepeat : AfterFailure::kRetry;
+  return seen || same ? AfterFailure::kRepeat : AfterFailure::kRetry;
 }
 
 Location locationOf(const std::string& address, bool manager, bool pending) {
@@ -1011,8 +1032,12 @@ void setSiteNames(std::vector<SiteFailure>& failed,
     return;
   for (SiteFailure& x : failed) {
     std::string n = nameOf(x.server);
-    if (!n.empty())
-      x.site = std::move(n);
+    if (n.empty())
+      continue;
+    if (x.domain.empty())
+      x.domain = x.siteName.empty() ? x.site : x.domain;
+    x.siteName = n;
+    x.site = std::move(n);
   }
 }
 
@@ -1037,20 +1062,13 @@ std::vector<Location> orderLocations(const std::vector<Location>& listed,
                                std::to_string(l.port);
     if (std::find(tried.begin(), tried.end(), host) != tried.end())
       continue;
-    const bool literal = isIpv4(host) || isIpv6(host);
     size_t age = failed.size();
-    // A copy whose server gave its site's name is of the site of that name, an address too.
+    // A copy whose server gave its site's name is of the site of that name, an address too, where
+    // the failed server's name is known; else by domains (atFailedSite).
     const std::string named = nameOf ? nameOf(server) : std::string();
-    const std::string site = named.empty() ? siteOf(host) : named;
-    for (size_t i = 0; i < failed.size() && age == failed.size(); ++i) {
-      // A server that never answered is its own site (host:port), but the
-      // domain of its name is where its siblings are.
-      const std::string& fs = failed[i].server;
-      if (lower(fs) == server || (!named.empty() && failed[i].site == named) ||
-          (named.empty() && !literal &&
-           (failed[i].site == site || siteOf(fs.substr(0, fs.rfind(':'))) == site)))
+    for (size_t i = 0; i < failed.size() && age == failed.size(); ++i)
+      if (lower(failed[i].server) == server || atFailedSite(failed[i], host, named))
         age = i;
-    }
     const bool refused = std::any_of(failed.begin(), failed.end(), [&](const SiteFailure& x) {
       return x.bad && lower(x.server) == server;
     });
@@ -1109,9 +1127,12 @@ void noteReadFailure(std::vector<SiteFailure>& failed, SiteFailure f, size_t kee
 
 bool failedBefore(const std::vector<SiteFailure>& failed, const SiteFailure& f) {
   const std::string host = f.server.substr(0, f.server.rfind(':'));
-  for (const SiteFailure& x : failed)
-    if (x.server == f.server || (x.site == f.site && f.site != host))
+  for (const SiteFailure& x : failed) {
+    const bool named = !x.siteName.empty() && !f.siteName.empty();
+    // By domain, an address is its own server alone (its "domain" is itself).
+    if (x.server == f.server || (sameSite(x, f) && (named || domainOf(f) != host)))
       return true;
+  }
   return false;
 }
 

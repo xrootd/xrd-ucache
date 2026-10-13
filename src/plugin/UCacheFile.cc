@@ -164,7 +164,9 @@ bool headerFaultFires() {
 // the first one started, so that a copy cut short answers it short on the File the handle left);
 // every other one a connection error posted 1000 ms late (two reads issued together both meet the
 // copy before either answer comes). convert: the slot run's conversions instead (convertFaultFire).
-enum class FaultKind : uint8_t { kMiss, kRelay, kRefuse, kFinal, kLate, kAgain, kLeftData, kConvert };
+enum class FaultKind : uint8_t {
+  kMiss, kRelay, kRefuse, kFinal, kLate, kAgain, kLeftData, kConvert, kSplitMove
+};
 static const FaultKind gFaultKind = [] {
   const char* v = ::getenv("UCACHE_TEST_READ_FAIL_KIND");
   const std::string k = v ? v : "";
@@ -175,13 +177,28 @@ static const FaultKind gFaultKind = [] {
          : k == "again"    ? FaultKind::kAgain
          : k == "leftdata" ? FaultKind::kLeftData
          : k == "convert"  ? FaultKind::kConvert
+         : k == "splitmove" ? FaultKind::kSplitMove
                            : FaultKind::kMiss;
 }();
 bool convertFaultFire() {
   return gFaultKind == FaultKind::kConvert && readFaultFire();
 }
 bool slotFetchFaultFire() {
-  return gFaultKind != FaultKind::kConvert && readFaultFire();
+  return gFaultKind != FaultKind::kConvert && gFaultKind != FaultKind::kSplitMove &&
+         readFaultFire();
+}
+static std::atomic<bool> gSplitMoveArmed{false};
+bool splitMoveKind() {
+  return gFaultKind == FaultKind::kSplitMove;
+}
+bool splitMoveFire() {
+  if (gFaultKind != FaultKind::kSplitMove || !readFaultFire())
+    return false;
+  gSplitMoveArmed.store(true);
+  return true;
+}
+bool splitMoveFailNext() {
+  return gFaultKind == FaultKind::kSplitMove && gSplitMoveArmed.exchange(false);
 }
 static std::atomic<int> gReadFaultsFired{0}; // of kLeftData: which fault this is
 // A handler that delivers the answer it gets 2500 ms late (leftdata's second fault).
@@ -215,7 +232,8 @@ static bool injectReadFault(bool relaySite, ResponseHandler* h, XRootDStatus& s,
   const bool here =
       againSite   ? k == FaultKind::kAgain
       : relaySite ? k == FaultKind::kRelay || k == FaultKind::kRefuse || k == FaultKind::kAgain
-                  : k != FaultKind::kRelay && k != FaultKind::kAgain && k != FaultKind::kConvert;
+                  : k != FaultKind::kRelay && k != FaultKind::kAgain && k != FaultKind::kConvert &&
+                        k != FaultKind::kSplitMove;
   if (!here || !readFaultFire())
     return false;
   s = XRootDStatus();
@@ -915,14 +933,16 @@ SiteFailure siteFailure(const AttemptView& w, const XRootDStatus& s, const std::
     const Hop& h = w.hops[static_cast<size_t>(i)];
     f.server = h.host + ":" + std::to_string(h.port);
     // The name the server gave, once known (even when it did not answer this time), else its
-    // domain when it answered, else itself.
-    f.site = siteIdentity(f.server, h.flags != 0, knownSiteName(f.server));
+    // domain when it answered, else itself; the name and the domain kept apart (sameSite).
+    f.siteName = knownSiteName(f.server);
+    f.domain = siteIdentity(f.server, h.flags != 0, std::string());
+    f.site = f.siteName.empty() ? f.domain : f.siteName;
     f.name = exclusionName(w.hops, i);
   } else {
-    f.server = f.site = sentTo.empty() ? std::string("the origin") : sentTo;
-    const std::string n = sentTo.empty() ? std::string() : knownSiteName(sentTo);
-    if (!n.empty())
-      f.site = n;
+    f.server = f.site = f.domain = sentTo.empty() ? std::string("the origin") : sentTo;
+    f.siteName = sentTo.empty() ? std::string() : knownSiteName(sentTo);
+    if (!f.siteName.empty())
+      f.site = f.siteName;
   }
   f.error = s.ToString();
   f.size = w.size; // known for a copy that opened
@@ -1440,11 +1460,9 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     for (const Location& l : locateCopies(st, q, XrdCl::URL(base).GetPath()))
       if (!cached || hostPassesLists(cfg.allowHosts, cfg.denyHosts, l.host))
         listed.push_back(l);
-    // Each listed copy is asked for its site name now, while the others are looked at: one whose
-    // name is known already is left to the end when its site failed (orderLocations); one whose
-    // name comes with its answer is when its turn comes (below).
-    for (const Location& l : listed)
-      askSiteName(st.store, serverOf(l));
+    // A listed copy whose name is known already is left to the end when its site failed
+    // (orderLocations); one whose name is not is asked for it at its turn, beside its stat, and left
+    // to the end then (below). A copy never asked its state is never asked its name.
     setSiteNames(q.failed, siteNames());
     q.cands = orderLocations(listed, triedHosts(base), q.failed, siteNames());
   }
@@ -1459,6 +1477,7 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     std::unique_ptr<AnyObject> resp;
     const int t = std::min<int>(q.timeout(), kCandidateStatS);
     const uint64_t asked = nowUs();
+    askSiteName(st.store, server); // beside its stat (a server asked already is not asked again)
     (void)fsCall(
         server, t, 2 * q.trS,
         [&](XrdCl::FileSystem& fs, ResponseHandler* h) {
@@ -1475,8 +1494,9 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
       const int64_t tookMs = static_cast<int64_t>((nowUs() - asked) / 1000);
       const std::string named = awaitSiteName(server, std::max<int64_t>(tookMs, 100));
       setSiteNames(q.failed, siteNames());
-      if (!named.empty() && std::any_of(q.failed.begin(), q.failed.end(),
-                                        [&](const SiteFailure& x) { return x.site == named; })) {
+      if (!named.empty() && std::any_of(q.failed.begin(), q.failed.end(), [&](const SiteFailure& x) {
+            return atFailedSite(x, c.host, named);
+          })) {
         q.deferred.push_back(c);
         continue;
       }
@@ -1501,7 +1521,9 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     }
     SiteFailure f;
     f.server = server;
-    f.site = siteIdentity(server, false, knownSiteName(server));
+    f.siteName = knownSiteName(server);
+    f.domain = server; // it did not answer
+    f.site = f.siteName.empty() ? f.domain : f.siteName;
     f.error = s.ToString();
     setSiteNames(q.failed, siteNames());
     if (afterFailure(q.failed, f, failoverMaxSites(), q.stopped()) == AfterFailure::kStop) {
@@ -3077,7 +3099,9 @@ bool HandleState::ensureInnerOpen() {
         last.server = !reached.empty() ? reached
                       : !server.empty() ? server
                                         : std::string("the origin");
-        last.site = siteIdentity(last.server, true, knownSiteName(last.server));
+        last.siteName = knownSiteName(last.server);
+        last.domain = siteIdentity(last.server, true, std::string());
+        last.site = last.siteName.empty() ? last.domain : last.siteName;
         last.error = "it serves " + std::to_string(si->GetSize()) + " bytes, the cached file has " +
                      std::to_string(want);
         last.size = static_cast<long long>(si->GetSize());
@@ -3817,10 +3841,15 @@ static void noteReadFailureLocked(HandleState& st, XrdCl::File* on, const XRootD
   SiteFailure f = sourceOfLocked(st, on);
   if (f.server.empty())
     return;
-  // The site is the name the server gave, once known (asked when its open answered).
+  // The site is the name the server gave, once known (asked when its open answered); the
+  // domain siteFailure gave it stays beside it.
   const std::string named = knownSiteName(f.server);
-  if (!named.empty())
+  if (!named.empty()) {
+    if (f.domain.empty() && f.siteName.empty())
+      f.domain = f.site;
+    f.siteName = named;
     f.site = named;
+  }
   f.error = s.code == XrdCl::errDataError && !s.GetErrorMessage().empty() ? s.GetErrorMessage()
                                                                           : s.ToString();
   f.bad = s.code == XrdCl::errDataError;
