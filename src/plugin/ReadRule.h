@@ -126,11 +126,13 @@ bool readRuleDirect(const std::string& key);
 // walk does not support makes no claim (an empty map), as before. A bad map
 // is parsed again when `current` (the server the handle reads from now) is
 // another (the handle moved), at most once a second. `fmServer`: with `fm`,
-// the server its records were read from.
+// the server its records were read from. `startUs`: when the request that needs the map began (0:
+// now): a move of the parse's reads counts its time from there (adaptive_federation).
 std::shared_ptr<const KeyMap>
 keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEntry>& entry,
             XrdTimeout timeout, const transpose::FileMeta* fm = nullptr,
-            const std::string& fmServer = std::string(), const std::string* current = nullptr);
+            const std::string& fmServer = std::string(), const std::string* current = nullptr,
+            uint64_t startUs = 0);
 // check_origin_integrity: a piece of bytes fetched from the origin (an answer's buffer, an element
 // of a vector read), at `off` in the file.
 using FetchPiece = transpose::BytePiece;

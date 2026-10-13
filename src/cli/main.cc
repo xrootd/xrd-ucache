@@ -423,6 +423,7 @@ void printStats(const StatsTotals& t) {
     row("bad_entries_dropped", t.badEntriesDropped);
     row("site_name_queries", t.siteNameQueries);
     row("site_names_missing", t.siteNamesMissing);
+    row("requests_parked_for_parse", t.requestsParkedForParse);
   }
 
   // The derived workflow picture — the divisions a human would do.

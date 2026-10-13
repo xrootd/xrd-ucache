@@ -523,11 +523,20 @@ read. So do the reads with which a file shown in uCache's own layout (`recompres
 up at its first use: the layout is then made from the new copy. A failure of uCache's own (not
 the copy's) does not move.
 
-What does not move: those reads when the job makes them from inside its own completion handler
-(a read issued from the handler of another): that thread is the XRootD client's, which must
-never wait for a move, so they fail there as before; and the reads of the records a file in
-uCache's own layout makes for `max_read_fraction` on uCache's own threads, which change only
-whether the file is cached or read directly, never the bytes the job gets. On a file whose reads
+A request the job makes from inside its own completion handler (a read issued from the handler
+of another), before the file is set up or its records read, is not served on that thread: the
+thread is the XRootD client's, which must never wait for a move (the move's own open is answered
+on such a thread), so the request is made again on a thread of uCache's own, where the records are
+read and a move waited for (`requests_parked_for_parse`, STATS.md). A job that makes a
+synchronous call from inside a completion handler holds a client thread itself; with
+`XRD_WORKERTHREADS=1` nothing, uCache's move included, can be answered until that call times out.
+
+What does not move: the reads of the records made on uCache's own threads that serve hits and
+read ahead (a request issued again there after read-ahead waited), and those a file in uCache's
+own layout makes for `max_read_fraction`; neither changes the bytes the job gets (the second only
+whether the file is cached or read directly), and such a thread never waits for a move. While
+the first request that decides `max_read_fraction` reads the records (and waits for a move of
+those reads), the file's other first requests wait for its decision, as they did for the reads. On a file whose reads
 move, the client's own recovery is off, so a connection lost during those reads fails them: the
 file's reads are then served unchecked, and nothing of them kept, until a read a second later
 or more reads the records again.

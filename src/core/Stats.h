@@ -131,6 +131,9 @@ struct Stats {
   // (none configured, an error, no answer in time): those servers' site is their domain.
   std::atomic<uint64_t> siteNameQueries{0};
   std::atomic<uint64_t> siteNamesMissing{0};
+  // Requests made where no move may be waited for (a client callback thread), before their handle
+  // had the file's map, made again on the open-wait pool (adaptive_federation).
+  std::atomic<uint64_t> requestsParkedForParse{0};
   // Replica tier (docs/STATS.md):
   // Of earlier releases' compact replicas, no longer made or served: always 0.
   std::atomic<uint64_t> replicaOpens{0};
@@ -319,7 +322,7 @@ struct StatsTotals {
   uint64_t openFailovers = 0, opensRecovered = 0, opensFailedEverywhere = 0,
            openDeadlineExpiries = 0, failoverLocates = 0, offlineCopiesSkipped = 0,
            openCheckBytesKept = 0, badEntriesDropped = 0, siteNameQueries = 0,
-           siteNamesMissing = 0;
+           siteNamesMissing = 0, requestsParkedForParse = 0;
   uint64_t originFailures[6] = {}; // client, site, notfound, data, expired, other
   // Histogram bucket sums (log2 µs), for CLI percentile rendering:
   std::vector<uint64_t> histHitRead, histOriginRt, histOpen, histReplicaRead, histFlushWrite,

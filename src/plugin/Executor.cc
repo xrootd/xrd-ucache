@@ -17,6 +17,8 @@ uint64_t nowNs() {
 }
 
 std::atomic<uint64_t> g_gen{0};
+// The pool core the calling thread works for (null for a thread of no pool).
+thread_local const void* tCore = nullptr;
 // Serializes building a core. Replaced, not unlocked, in a forked child: a
 // parent thread may have held it at the fork. Leaked. Constant-initialized and
 // made at first use: the plugin can be called from XrdCl's static
@@ -69,6 +71,7 @@ struct Executor::Core {
   }
 
   void loop() {
+    tCore = this;
     for (;;) {
       Task task;
       {
@@ -156,6 +159,8 @@ Executor::Core* Executor::core() {
 }
 
 void Executor::post(std::function<void()> task) { core()->post(std::move(task)); }
+
+bool Executor::runsThisThread() { return tCore != nullptr && tCore == core(); }
 
 void Executor::postAfter(uint64_t delayMs, std::function<void()> task) {
   if (delayMs == 0) {

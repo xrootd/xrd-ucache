@@ -113,6 +113,8 @@ ClientCallback::ClientCallback() { ++tClientCallbacks; }
 ClientCallback::~ClientCallback() { --tClientCallbacks; }
 bool onClientCallback() { return tClientCallbacks > 0; }
 
+// UCACHE_TEST_READ_FAIL_AFTER=K (inert unless set): the first K reads that would be struck are
+// let through first.
 bool readFaultFire() {
   static std::atomic<int> budget{[] {
     const char* v = ::getenv("UCACHE_TEST_READ_FAIL_N");
@@ -120,6 +122,13 @@ bool readFaultFire() {
   }()};
   if (budget.load(std::memory_order_relaxed) <= 0)
     return false; // production fast path: one relaxed load
+  static std::atomic<int> spared{[] {
+    const char* v = ::getenv("UCACHE_TEST_READ_FAIL_AFTER");
+    return v ? ::atoi(v) : 0;
+  }()};
+  if (spared.load(std::memory_order_relaxed) > 0 &&
+      spared.fetch_sub(1, std::memory_order_relaxed) > 0)
+    return false;
   return budget.fetch_sub(1, std::memory_order_relaxed) > 0;
 }
 
@@ -3425,7 +3434,8 @@ static std::shared_ptr<const KeyMap> keySeeksOf(HandleState& st) {
 // A handle's map is kept, unless it showed its copy bad and the handle reads from another copy
 // now (it moved): then the map is made again, from what that copy holds.
 static void armKeyCheck(const std::shared_ptr<HandleState>& st,
-                        const std::shared_ptr<FileEntry>& entry, XrdTimeout timeout) {
+                        const std::shared_ptr<FileEntry>& entry, XrdTimeout timeout,
+                        uint64_t startUs = 0) {
   if (!globalConfig().checkOriginIntegrity)
     return;
   const auto had = keySeeksOf(*st);
@@ -3434,7 +3444,7 @@ static void armKeyCheck(const std::shared_ptr<HandleState>& st,
     return;
   std::shared_ptr<const KeyMap> seeks;
   try {
-    seeks = keySeeksFor(st, entry, timeout, nullptr, std::string(), &current);
+    seeks = keySeeksFor(st, entry, timeout, nullptr, std::string(), &current, startUs);
   } catch (...) {
     return; // a parse that threw (no memory): no map, the miss goes unchecked, as after a failed
             // read
@@ -3515,7 +3525,7 @@ static std::shared_ptr<ReadRule> directRule(const std::shared_ptr<HandleState>&,
 }
 static bool ruleReadsData(const std::shared_ptr<ReadRule>&, uint64_t, uint64_t) { return false; }
 static void armKeyCheck(const std::shared_ptr<HandleState>&, const std::shared_ptr<FileEntry>&,
-                        XrdTimeout) {}
+                        XrdTimeout, uint64_t = 0) {}
 #endif
 
 static void noteAppRead(const std::shared_ptr<HandleState>& st,
@@ -3970,13 +3980,21 @@ bool moveSlotRequest(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
 
 static XRootDStatus* shortAnswer(HandleState& st, ServerTally* tally, const char* op, uint64_t off,
                                  uint64_t len, uint64_t got, const std::string& server);
+// Whether the calling thread may wait for a move: the reader's own (one no pool of uCache's runs),
+// or the open-wait pool's, which makes requests again and may block (releaseOpenWaiters); never a
+// client callback thread, nor the pools that serve hits, run moves or give reads their answers.
+bool mayWaitForMove() {
+  return !onClientCallback() && !Executor::instance().runsThisThread() &&
+         !moveExecutor().runsThisThread() && !deliverExecutor().runsThisThread();
+}
+
 bool parseReadMoves(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
                     const XRootDStatus& s, uint64_t off, uint64_t len, uint64_t got,
                     const std::string& server, ServerTally* tally, uint64_t startUs) try {
   // Never on a client callback thread (a read a reader issued from inside its own completion):
   // the move's answers come on those threads. The parse fails there, as it did before reads of the
   // records moved.
-  if (!st || !on || processExiting() || onClientCallback() ||
+  if (!st || !on || processExiting() || onClientCallback() || !mayWaitForMove() ||
       !(st->moveOnReads.load(std::memory_order_relaxed) ||
         st->moveSlotReads.load(std::memory_order_relaxed) ||
         st->setupMoves.load(std::memory_order_relaxed)))
@@ -5019,12 +5037,13 @@ class MissReadHandler : public ResponseHandler {
 // wire-read fault: the injected completion is posted to the executor, standing
 // in for the XrdCl callback thread, so the handler runs its real error path.
 XRootDStatus issueWireRead(const std::shared_ptr<HandleState>& st, XrdCl::File* f, uint64_t off,
-                           uint64_t len, void* buf, MissReadHandler* mh, int readerT) {
+                           uint64_t len, void* buf, MissReadHandler* mh, int readerT,
+                           uint64_t startUs = 0) {
   XRootDStatus s;
   bool late = false;
   if (!injectReadFault(false, mh, s, false, &late)) {
     ResponseHandler* rh = late ? new LateAnswer(mh) : static_cast<ResponseHandler*>(mh);
-    s = f->Read(off, len, buf, rh, st->originTimeout(readerT));
+    s = f->Read(off, len, buf, rh, st->originTimeout(readerT, startUs));
     if (!s.IsOK() && rh != mh)
       delete rh;
   }
@@ -6385,6 +6404,13 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
         return o->Stat(force, h, timeout);
       }))
     return XRootDStatus();
+  // ... and one made where no move may be waited for, before its handle is set up or has the
+  // file's map, is made again where one may (adaptive_federation on).
+  if (parkForParse(
+          handler,
+          [force, timeout](UCacheFile* o, ResponseHandler* h) { return o->Stat(force, h, timeout); },
+          /*needsMap=*/false))
+    return XRootDStatus();
   st_->opsSeen.store(true, std::memory_order_relaxed); // a reader that stats first is no copy by read
   struct SizeShown { // every answer below gives a relocated handle's shown size
     UCacheFile* f;
@@ -6483,6 +6509,12 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
   st_->syncFork();
   // Made while the reader's open is in flight (adaptive_federation on): parked until its answer.
   if (parkForOpen(handler, [offset, size, buffer, timeout](UCacheFile* o, ResponseHandler* h) {
+        return o->readServe(offset, size, buffer, h, timeout);
+      }))
+    return XRootDStatus();
+  // ... and one made where no move may be waited for, before its handle is set up or has the
+  // file's map, is made again where one may (adaptive_federation on).
+  if (parkForParse(handler, [offset, size, buffer, timeout](UCacheFile* o, ResponseHandler* h) {
         return o->readServe(offset, size, buffer, h, timeout);
       }))
     return XRootDStatus();
@@ -6619,7 +6651,10 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
           0, offset, size);
     }
   }
-  armKeyCheck(st_, entry, timeout);
+  // One time for the request, the map's parse (and a move of its reads) included: its start is
+  // taken before the parse (adaptive_federation: the read's deadline counts from it).
+  const uint64_t missT0 = nowUs();
+  armKeyCheck(st_, entry, timeout, missT0);
 
   // MISS from the caller's thread: rounded wire read. Dedup: an identical
   // rounded miss already in flight (another handle/thread — RDF-IMT re-reads
@@ -6629,7 +6664,7 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
   auto [ws, we] = roundChunk(*entry, offset, size);
   {
     auto redispatch = parkedRead(st_, entry, offset, size, buffer, handler,
-                                 static_cast<int>(timeout), nowUs());
+                                 static_cast<int>(timeout), missT0);
     if (!entry->beginFetch(ws, we - ws, redispatch)) {
       Executor::instance().postAfter(
           parkedInsuranceMs(static_cast<int>(timeout), currentRequestTimeoutS(), 0),
@@ -6640,8 +6675,8 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
   auto wireBuf = std::make_shared<std::vector<char>>(we - ws);
   if (XrdCl::File* f = st_->acquireInner()) {
     auto* mh = new MissReadHandler(st_, f, entry, offset, size, buffer, handler, ws, wireBuf,
-                                   nowUs(), we - ws, timeout);
-    XRootDStatus s = issueWireRead(st_, f, ws, we - ws, wireBuf->data(), mh, timeout);
+                                   missT0, we - ws, timeout);
+    XRootDStatus s = issueWireRead(st_, f, ws, we - ws, wireBuf->data(), mh, timeout, missT0);
     if (!s.IsOK()) {
       delete mh;
       st_->releaseInner();
@@ -6678,6 +6713,12 @@ XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void
   st_->syncFork();
   // Made while the reader's open is in flight (adaptive_federation on): parked until its answer.
   if (parkForOpen(handler, [offset, size, buffer, timeout](UCacheFile* o, ResponseHandler* h) {
+        return o->pgReadServe(offset, size, buffer, h, timeout);
+      }))
+    return XRootDStatus();
+  // ... and one made where no move may be waited for, before its handle is set up or has the
+  // file's map, is made again where one may (adaptive_federation on).
+  if (parkForParse(handler, [offset, size, buffer, timeout](UCacheFile* o, ResponseHandler* h) {
         return o->pgReadServe(offset, size, buffer, h, timeout);
       }))
     return XRootDStatus();
@@ -6912,6 +6953,12 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
         return o->vectorReadServe(chunks, buffer, h, timeout);
       }))
     return XRootDStatus();
+  // ... and one made where no move may be waited for, before its handle is set up or has the
+  // file's map, is made again where one may (adaptive_federation on).
+  if (parkForParse(handler, [chunks, buffer, timeout](UCacheFile* o, ResponseHandler* h) {
+        return o->vectorReadServe(chunks, buffer, h, timeout);
+      }))
+    return XRootDStatus();
   st_->opsSeen.store(true, std::memory_order_relaxed);
   auto entry = ensureEntry();
   if (!entry && st_->layoutLost.load(std::memory_order_acquire))
@@ -7046,6 +7093,29 @@ XrdCl::XRootDStatus UCacheFile::Truncate(uint64_t size, ResponseHandler* handler
   st_->syncFork();
   invalidateOnWrite();
   return st_->inner.load()->Truncate(size, handler, timeout);
+}
+
+bool UCacheFile::parkForParse(
+    ResponseHandler* handler,
+    std::function<XRootDStatus(UCacheFile*, ResponseHandler*)> redo, bool needsMap) {
+  if (!handler || passthroughOnly_ || !st_->store)
+    return false;
+  const Config& cfg = globalConfig();
+  if (!cfg.adaptiveFederation || mayWaitForMove())
+    return false;
+  {
+    std::lock_guard<std::mutex> g(st_->mu);
+    if (st_->closed || st_->readerOpenPending)
+      return false;
+    if (st_->setupDone && (!needsMap || st_->keySeeks || !cfg.checkOriginIntegrity || !st_->entry))
+      return false;
+  }
+  std::vector<HandleState::OpenWaiter> w;
+  w.push_back(HandleState::OpenWaiter{handler, std::move(redo)});
+  releaseOpenWaiters(st_, std::move(w), nullptr);
+  if (st_->store)
+    st_->store->stats().requestsParkedForParse.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 bool UCacheFile::parkForOpen(

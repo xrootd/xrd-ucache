@@ -93,7 +93,7 @@ the consumers together.
  "open_failovers": 0, "opens_recovered": 0, "opens_failed_everywhere": 0,
  "open_deadline_expiries": 0, "failover_locates": 0, "offline_copies_skipped": 0,
  "open_check_bytes_kept": 0, "bad_entries_dropped": 0,
- "site_name_queries": 0, "site_names_missing": 0,
+ "site_name_queries": 0, "site_names_missing": 0, "requests_parked_for_parse": 0,
  "entries": [{"key": "root://host:1094/path", "file_size": 0,
               "cached_bytes": 0, "page_size": 4096}],
  "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ... adaptive_federation=off"}
@@ -272,6 +272,10 @@ ones included, so a run with caching disabled shows its origin failures too.
   on), an entry holding bytes this process fetched from a copy that a check
   then found bad, at a read or at an open that refused the copy.
   The next open of the file fills a new entry (TROUBLESHOOTING.md).
+- `requests_parked_for_parse` — with `adaptive_federation = on`, requests made where no move may
+  be waited for (a client callback thread: a read issued from inside a completion handler) before
+  their file was set up or had its map, made again on a thread of uCache's own
+  (TROUBLESHOOTING.md).
 - `site_name_queries`, `site_names_missing` — with `adaptive_federation =
   on`: servers asked for the name of their site (their `all.sitename`, as the
   server's configuration value `sitename`; USER_GUIDE.md: a server that answered

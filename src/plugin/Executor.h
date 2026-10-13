@@ -46,6 +46,9 @@ class Executor {
   static Executor& instance(unsigned threads = 0);
   // The number of worker threads this executor runs.
   unsigned threads() const { return threads_; }
+  // Whether the calling thread is one of this executor's workers (of the current fork
+  // generation's pool).
+  bool runsThisThread();
   // Account the tasks this executor runs in `s` (its pool_* counters and the
   // queue-wait histogram) from now on; null stops. `s` must outlive the
   // executor (the store's counters are leaked with it).

@@ -128,7 +128,7 @@ KeyMap keyMapOf(const tp::FileMeta& fm, uint64_t fileSize, const std::string& se
 std::shared_ptr<const KeyMap>
 keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEntry>& entry,
             XrdTimeout timeout, const tp::FileMeta* fm, const std::string& fmServer,
-            const std::string* current) {
+            const std::string* current, uint64_t startUs) {
   std::unique_lock<std::mutex> g(tablesMu());
   std::shared_ptr<KeySeekTable> t;
   for (const auto& x : tables())
@@ -169,6 +169,7 @@ keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEn
     src.entry = entry;
     src.timeout = timeout;
     src.mayMove = st != nullptr; // the parse runs on the reader's thread (armKeyCheck)
+    src.startUs = startUs;       // the request's time, the parse's included
     own = parseRecords(src, static_cast<int64_t>(entry->fileSize()));
     g.lock();
     if (src.readFailed) {
@@ -312,7 +313,10 @@ ReadRule::State ReadRule::observe(const std::vector<std::pair<uint64_t, uint64_t
   // Waited for, not skipped: the requests of one fill arrive together, and a
   // request not seen would leave its branches out of the share. The holder
   // parses once (the file's records, normally in the byte cache already) and
-  // is otherwise a few lookups.
+  // is otherwise a few lookups. With adaptive_federation on, a read of the
+  // parse that fails at its copy may move the handle (parseReadMoves) while
+  // mu_ is held: the file's other first requests wait for that too, as for the
+  // parse's reads; the move takes no lock of the rule's.
   std::lock_guard<std::mutex> g(mu_);
   s = state();
   if (s != kUndecided)

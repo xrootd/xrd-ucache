@@ -479,6 +479,16 @@ class UCacheFile : public XrdCl::FilePlugIn {
   // `handler` is answered, exactly once, after the open's answer. False (nothing parked) otherwise.
   bool parkForOpen(XrdCl::ResponseHandler* handler,
                    std::function<XrdCl::XRootDStatus(UCacheFile*, XrdCl::ResponseHandler*)> redo);
+  // With adaptive_federation on: a request made with a handler on a thread that may not wait for a
+  // move (a client callback thread: a read a reader issues from inside its own completion; or one
+  // of uCache's pools that serve hits, run moves or give answers), while the handle is not set up
+  // yet or holds no map of the file, is made again on the open-wait pool (releaseOpenWaiters),
+  // where the setup's and the map's reads of the file's records may wait for a move: such a
+  // thread never runs them. True when parked (the request is answered later, exactly once).
+  // `needsMap`: false for a request that never makes the map (Stat): parked only before the set-up.
+  bool parkForParse(XrdCl::ResponseHandler* handler,
+                    std::function<XrdCl::XRootDStatus(UCacheFile*, XrdCl::ResponseHandler*)> redo,
+                    bool needsMap = true);
   // Lazily create the cache entry on the caller's thread (first read), doing
   // a synchronous inner Stat. Returns the entry, or nullptr for
   // pass-through (write-open, disabled, denied host, Stat failure, closed).

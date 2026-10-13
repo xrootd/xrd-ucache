@@ -1882,11 +1882,19 @@ int runCut(const char* url, const char* local, const std::string& which) {
     std::printf("%s: SETUP: open failed\n", mode);
     return 2;
   }
-  if (const char* cmd = ::getenv("UCACHE_CUT_CMD"))
-    if (std::system((std::string(cmd) + " " + landed.substr(landed.rfind(':') + 1)).c_str()) != 0) {
-      std::printf("%s: SETUP: %s failed\n", mode, cmd);
-      return 2;
-    }
+  const auto cut = [&] {
+    if (const char* cmd = ::getenv("UCACHE_CUT_CMD"))
+      if (std::system((std::string(cmd) + " " + landed.substr(landed.rfind(':') + 1)).c_str()) !=
+          0) {
+        std::printf("%s: SETUP: %s failed\n", mode, cmd);
+        return false;
+      }
+    return true;
+  };
+  // leftdata cuts its copy only after a first read, whose miss makes the file's map from the whole
+  // copy (the map's parse reads the file's records, which lie past the cut).
+  if (which != "leftdata" && !cut())
+    return 2;
   std::string now = landed;
   std::vector<char> buf(65536, 0x5A);
   // A read of `n` bytes at `off`, exact, once; `what` says which.
@@ -1914,7 +1922,12 @@ int runCut(const char* url, const char* local, const std::string& which) {
     // left: X is then a copy the handle never opens again. Both are exact (the second is issued
     // again at Y). Then UCACHE_RESTORE_CMD (with X's port) makes X whole again, so that only its
     // mark can keep a move from it. A third Read fails at Y (a connection error): the move it makes
-    // stays at Y (an X marked only as a failure is taken again, as the oldest failure).
+    // stays at Y (an X marked only as a failure is taken again, as the oldest failure). First, a
+    // read whose miss makes the file's map from the whole copy (UCACHE_TEST_READ_FAIL_AFTER=1
+    // spares it), and only then the cut.
+    readExact(28672, 1024, "a first Read, before the cut, whose miss makes the file's map, is exact");
+    if (!cut())
+      return 2;
     std::thread t1([&] {
       readExact(8192, 4096, "a Read whose miss fails at X (a connection error) is exact");
     });
