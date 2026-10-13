@@ -94,6 +94,8 @@ the consumers together.
  "open_deadline_expiries": 0, "failover_locates": 0, "offline_copies_skipped": 0,
  "open_check_bytes_kept": 0, "bad_entries_dropped": 0,
  "site_name_queries": 0, "site_names_missing": 0, "requests_parked_for_parse": 0,
+ "site_faults_marked": 0, "site_marks_cleared": 0, "copy_faults_marked": 0,
+ "marked_copies_last": 0,
  "entries": [{"key": "root://host:1094/path", "file_size": 0,
               "cached_bytes": 0, "page_size": 4096}],
  "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ... adaptive_federation=off"}
@@ -283,6 +285,13 @@ ones included, so a run with caching disabled shows its origin failures too.
   process (again 5 minutes after a query that got no answer), and the asks
   that gave no name (none configured, an error, or no answer within 5 s):
   such a server's site is its domain.
+- `site_faults_marked`, `site_marks_cleared`, `copy_faults_marked`,
+  `marked_copies_last` — with `adaptive_federation = on` (USER_GUIDE.md,
+  "Remembering sources that failed"): servers marked in `<dir>/sources` (a
+  stall while another site answered, or a fault of the server's own; each mark
+  written, a repeat included), marks cleared by a success, copies proven
+  missing (noted in the file's in-use record), and copies a regional
+  redirector listed that were put after the others for a mark.
 
 `run_settings`, on the counter line, is the settings that decide how the
 origin is reached, as the plugin found them at load, one string:

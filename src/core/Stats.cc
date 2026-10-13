@@ -192,6 +192,10 @@ std::string Stats::toJsonBody() const {
   f("site_name_queries", siteNameQueries);
   f("site_names_missing", siteNamesMissing);
   f("requests_parked_for_parse", requestsParkedForParse);
+  f("site_faults_marked", siteFaultsMarked);
+  f("site_marks_cleared", siteMarksCleared);
+  f("copy_faults_marked", copyFaultsMarked);
+  f("marked_copies_last", markedCopiesLast);
   os << "\"open_deadline_expiries\":" << openDeadlineExpiries.load(std::memory_order_relaxed);
   return os.str();
 }
@@ -335,6 +339,10 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.siteNameQueries += extractU64(last, "site_name_queries");
     t.siteNamesMissing += extractU64(last, "site_names_missing");
     t.requestsParkedForParse += extractU64(last, "requests_parked_for_parse");
+    t.siteFaultsMarked += extractU64(last, "site_faults_marked");
+    t.siteMarksCleared += extractU64(last, "site_marks_cleared");
+    t.copyFaultsMarked += extractU64(last, "copy_faults_marked");
+    t.markedCopiesLast += extractU64(last, "marked_copies_last");
   }
   ::closedir(d);
   return t;

@@ -6,6 +6,8 @@
 #include "Config.h"
 #include "IOBackend.h"
 #include "MetaFile.h"
+#include "InUse.h"
+#include "SourceMarks.h"
 #include "SlotStore.h"
 #include "ConfTemplate.h"
 #include "PluginFile.h"
@@ -85,6 +87,9 @@ void usage() {
       "  history [--top N] one row per run, newest first — whether the numbers\n"
       "                    are holding up across runs, versions and machines\n"
       "  status            cache location, budget, usage, and aggregated stats\n"
+      "  sources           the servers and copies this cache remembers as failed\n"
+      "                    (adaptive_federation): marked servers and sites, copies\n"
+      "                    proven missing; each is tried after the others\n"
       "  bench [PATH ...] [--size SZ] [--measurement-duration S] [--threads N]\n"
       "                    [--block KB] [--fill k=v,...] [--cache-path]\n"
       "                    [--cache-sample SZ] [--log FILE | --no-log] [--publish]\n"
@@ -412,7 +417,7 @@ void printStats(const StatsTotals& t) {
   }
   if (t.openFailovers || t.opensFailedEverywhere || t.openDeadlineExpiries || t.failoverLocates ||
       t.offlineCopiesSkipped || t.openCheckBytesKept || t.badEntriesDropped ||
-      t.siteNameQueries) {
+      t.siteNameQueries || t.siteFaultsMarked || t.copyFaultsMarked || t.markedCopiesLast) {
     row("open_failovers", t.openFailovers);
     row("opens_recovered", t.opensRecovered);
     row("opens_failed_everywhere", t.opensFailedEverywhere);
@@ -424,6 +429,10 @@ void printStats(const StatsTotals& t) {
     row("site_name_queries", t.siteNameQueries);
     row("site_names_missing", t.siteNamesMissing);
     row("requests_parked_for_parse", t.requestsParkedForParse);
+    row("site_faults_marked", t.siteFaultsMarked);
+    row("site_marks_cleared", t.siteMarksCleared);
+    row("copy_faults_marked", t.copyFaultsMarked);
+    row("marked_copies_last", t.markedCopiesLast);
   }
 
   // The derived workflow picture — the divisions a human would do.
@@ -1444,6 +1453,87 @@ double gbPerS(uint64_t bytes, uint64_t seconds) {
 static const char* const kPublishHint =
     "publish    : `ucache publish` — a report with recommendations from this history;\n"
     "             paths, hostnames and file names never leave the machine (docs/PUBLISH.md)";
+
+// `ucache sources`: the sources this cache's processes remember as failed (adaptive_federation):
+// the servers marked in <dir>/sources, the sites counted as marked, and the copies proven missing
+// in the files' in-use records. Pure file reads. UCACHE_TEST_CLOCK_OFFSET_S moves the clock, as
+// it does the plug-in's.
+std::string agoText(uint64_t nowS, uint64_t s) {
+  if (!s || s > nowS)
+    return "-";
+  const uint64_t d = nowS - s;
+  char buf[32];
+  if (d < 120)
+    std::snprintf(buf, sizeof buf, "%llus", static_cast<unsigned long long>(d));
+  else if (d < 7200)
+    std::snprintf(buf, sizeof buf, "%llum", static_cast<unsigned long long>(d / 60));
+  else if (d < 172800)
+    std::snprintf(buf, sizeof buf, "%lluh", static_cast<unsigned long long>(d / 3600));
+  else
+    std::snprintf(buf, sizeof buf, "%llud", static_cast<unsigned long long>(d / 86400));
+  return buf;
+}
+int cmdSources(const Config& cfg) {
+  const char* off = ::getenv("UCACHE_TEST_CLOCK_OFFSET_S");
+  const uint64_t nowS =
+      static_cast<uint64_t>(static_cast<int64_t>(::time(nullptr)) + (off ? ::atoll(off) : 0));
+  IOBackend& io = RealIO::instance();
+  std::vector<SourceMark> marks;
+  if (!loadSources(io, sourcesPath(cfg.cacheDir), marks)) {
+    std::fprintf(stderr, "ucache: cannot read %s\n", sourcesPath(cfg.cacheDir).c_str());
+    return 1;
+  }
+  std::printf("servers marked (a fault of their own, or a stall while other sites answered; "
+              "their copies are tried after the others):\n");
+  if (marks.empty())
+    std::printf("  none\n");
+  else
+    std::printf("  %-40s %-24s %-14s %6s %8s\n", "SERVER", "SITE", "STATE", "IN-ROW", "LAST");
+  std::vector<std::string> sites;
+  for (const auto& m : marks) {
+    char state[32];
+    if (markLive(m, nowS))
+      std::snprintf(state, sizeof state, "marked %llum",
+                    static_cast<unsigned long long>((m.untilS - nowS + 59) / 60));
+    else
+      std::snprintf(state, sizeof state, "ended");
+    std::printf("  %-40s %-24s %-14s %6u %8s\n", m.server.c_str(),
+                markSite(m).empty() ? "-" : markSite(m).c_str(), state, m.count,
+                agoText(nowS, m.lastS).c_str());
+    if (siteMarked(marks, m.siteName, m.domain, nowS) &&
+        std::find(sites.begin(), sites.end(), markSite(m)) == sites.end())
+      sites.push_back(markSite(m));
+  }
+  for (const auto& s : sites)
+    std::printf("  site %s is marked: two or more of its servers are\n", s.c_str());
+  // Copy faults: the live fault lines of the in-use records.
+  std::printf("copies proven missing (tried after the others for 7 days):\n");
+  size_t n = 0;
+  const std::string root = cfg.cacheDir + "/inuse";
+  std::vector<std::string> shards;
+  if (io.listDir(root, shards) == 0)
+    for (const auto& sh : shards) {
+      std::vector<std::string> names;
+      if (sh.size() != 2 || io.listDir(root + "/" + sh, names) != 0)
+        continue;
+      for (const auto& h : names) {
+        InUseRecord rec;
+        if (!InUseRecord::load(io, root + "/" + sh + "/" + h, rec))
+          continue;
+        for (const auto& f : rec.liveFaults(nowS)) {
+          if (!n++)
+            std::printf("  %-40s %-24s %6s %8s  %s\n", "SERVER", "SITE", "PROOFS", "LAST",
+                        "FILE (record)");
+          std::printf("  %-40s %-24s %6u %8s  %s\n", f.server.c_str(),
+                      f.site.empty() ? "-" : f.site.c_str(), f.count,
+                      agoText(nowS, f.lastS).c_str(), h.c_str());
+        }
+      }
+    }
+  if (!n)
+    std::printf("  none\n");
+  return 0;
+}
 
 int cmdHistory(const Config& cfg, int argc, char** argv) {
   size_t top = 20;
@@ -4488,6 +4578,8 @@ int main(int argc, char** argv) {
   }
   if (cmd == "history") // pure file reads, no store
     return cmdHistory(cfg, argc, argv);
+  if (cmd == "sources") // pure file reads, no store
+    return cmdSources(cfg);
   if (cmd == "publish") // pure file reads plus the network; no store
     return cmdPublish(cfg, argc, argv);
 

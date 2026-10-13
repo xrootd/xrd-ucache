@@ -184,3 +184,48 @@ TEST(InUse, ConcurrentNotesAreAllKept) {
   EXPECT_EQ(r.ranges.size(), 200u);
   EXPECT_EQ(r.highWater, 1995u);
 }
+
+// A copy fault (a copy proven missing) is noted in the file's record, holds for 7 days after its
+// last proof, keeps the record from the sweep while it holds, and survives a note that starts the
+// record over; it does not make the file's maps in use.
+TEST(InUse, CopyFaultsHoldSevenDaysAndKeepTheRecord) {
+  TempDir t;
+  RealIO io;
+  const std::string p = InUseRecord::path(t.path(), kHash);
+  InUseFault f;
+  f.server = "D1.Site.ORG:1094";
+  f.site = "T2 X";
+  f.lastS = 1000;
+  ASSERT_TRUE(InUseRecord::noteFault(io, p, f, 3600));
+  f.lastS = 2000;
+  ASSERT_TRUE(InUseRecord::noteFault(io, p, f, 3600)); // a second proof
+  InUseRecord r;
+  ASSERT_TRUE(InUseRecord::load(io, p, r));
+  ASSERT_EQ(r.faults.size(), 1u);
+  EXPECT_EQ(r.faults[0].server, "d1.site.org:1094");
+  EXPECT_EQ(r.faults[0].site, "T2 X");
+  EXPECT_EQ(r.faults[0].count, 2u);
+  EXPECT_EQ(r.faults[0].firstS, 1000u);
+  EXPECT_EQ(r.faults[0].lastS, 2000u);
+  EXPECT_EQ(r.faults[0].reason, "enoent");
+  EXPECT_EQ(r.liveFaults(2000 + kCopyFaultS - 1).size(), 1u);
+  EXPECT_TRUE(r.liveFaults(2000 + kCopyFaultS).empty()) << "7 days after the last proof";
+  EXPECT_TRUE(r.expired(3000, 3600)) << "a fault does not make the maps in use";
+  EXPECT_FALSE(r.removable(3000, 3600));
+  EXPECT_TRUE(r.removable(2000 + kCopyFaultS, 3600));
+  // A note that finds nothing else in use starts the record over, its live faults kept.
+  ASSERT_TRUE(InUseRecord::note(io, p, rng(7, 0, 100, 5000), nullptr, 3600));
+  ASSERT_TRUE(InUseRecord::load(io, p, r));
+  EXPECT_EQ(r.faults.size(), 1u);
+  EXPECT_EQ(r.ranges.size(), 1u);
+  // The sweep keeps a record whose fault holds, removes it once the fault has run out.
+  EXPECT_EQ(InUseRecord::sweep(io, t.path(), 5000 + 7200, 3600), 0);
+  struct ::stat st {};
+  EXPECT_EQ(::stat(p.c_str(), &st), 0);
+  EXPECT_EQ(InUseRecord::sweep(io, t.path(), 2000 + kCopyFaultS, 3600), 1);
+  EXPECT_NE(::stat(p.c_str(), &st), 0);
+  // A builds' reader of the line: one that does not parse is skipped.
+  const auto parsed = InUseRecord::parse("ucache-inuse 1\nfault T2 a:1 5 4 enoent 1\nfault x\n");
+  ASSERT_EQ(parsed.faults.size(), 1u);
+  EXPECT_EQ(parsed.serialize(), "ucache-inuse 1\nhigh 0\nfault T2 a:1 5 4 enoent 1\n");
+}

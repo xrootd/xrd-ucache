@@ -20,6 +20,8 @@
 #include "ReaderWait.h"
 #include "ReadRounding.h"
 #include "Trace.h"
+#include "InUse.h"
+#include "SourceMarks.h"
 #include "vendor/crc32c.h"
 
 #include <functional>
@@ -835,6 +837,294 @@ void siteNamesInit() {
   ::pthread_atfork(nullptr, nullptr, [] { siteNameTable() = SiteNameTable(); });
 }
 
+// ---- Remembering sources that failed (adaptive_federation) -------------------
+// Site-fault memory (SourceMarks.h): a server that stalled while other sites answered normally, or
+// that answered with a fault of its own, is marked in <cacheDir>/sources, shared by every process
+// of the cache; copy faults (InUse.h): a copy proven missing, in the file's in-use record. Both only
+// order the copies a regional redirector lists (orderLocations): a marked one is tried after every
+// other. Files are written on the executor, never on a client callback thread, and read on the
+// thread that looks at the list of copies (which blocks already). UCACHE_TEST_CLOCK_OFFSET_S (inert
+// unless set, read at load) moves the clock both read and write by, so that a test can see a mark
+// or a fault expire without waiting for it.
+const int gTestClockOffsetS = envAtLoad("UCACHE_TEST_CLOCK_OFFSET_S");
+uint64_t marksNowS() {
+  return static_cast<uint64_t>(static_cast<int64_t>(::time(nullptr)) + gTestClockOffsetS);
+}
+// A stall counts only while another site answers normally: at the stall, or within this long after.
+constexpr uint64_t kStallWitnessUs = 60ull * 1000000;
+struct PendingStall {
+  SiteFailure f; // the server, its site name and domain
+  std::string file, why;
+  uint64_t atUs = 0;
+  std::shared_ptr<CacheStore> store;
+};
+// A normal answer: the server's site name ("" for none known) and domain, and when (µs).
+struct SourceAnswer {
+  std::string siteName, domain;
+  uint64_t atUs = 0;
+};
+struct SourceMemory {
+  std::mutex* mu = new std::mutex;
+  std::vector<SourceMark>* snap = new std::vector<SourceMark>; // as last read or written here
+  std::map<std::string, SourceAnswer>* lastOk = new std::map<std::string, SourceAnswer>; // server
+  std::vector<PendingStall>* pending = new std::vector<PendingStall>;
+  uint64_t* loadedUs = new uint64_t(0); // when `snap` was last read from the file
+};
+// An open's success reads the file again when the process's view of it is older than this.
+constexpr uint64_t kSourcesReloadUs = 30ull * 1000000;
+SourceMemory& sourceMemory() {
+  static SourceMemory* m = new SourceMemory;
+  return *m;
+}
+std::string siteOfServer(const std::string& server, bool answered) {
+  return siteIdentity(server, answered, knownSiteName(server));
+}
+const std::string& domainOfFailure(const SiteFailure& f) { return f.domain.empty() ? f.site : f.domain; }
+// Writes the mark of the server of `f` on the executor: counted, said, recorded.
+void writeSiteMark(const std::shared_ptr<CacheStore>& store, const SiteFailure& f,
+                   const std::string& file, const std::string& why) {
+  if (!store || processExiting())
+    return;
+  const std::string server = f.server, site = f.site, name = f.siteName,
+                    domain = domainOfFailure(f);
+  try {
+    Executor::instance().post([store, server, site, name, domain, file, why] {
+      SourceMark m;
+      const std::string path = sourcesPath(store->config().cacheDir);
+      if (!markSource(RealIO::instance(), path, server, name, domain, marksNowS(), &m))
+        return;
+      {
+        SourceMemory mem = sourceMemory();
+        std::lock_guard<std::mutex> g(*mem.mu);
+        auto it = std::find_if(mem.snap->begin(), mem.snap->end(),
+                               [&](const SourceMark& x) { return x.server == m.server; });
+        if (it == mem.snap->end())
+          mem.snap->push_back(m);
+        else
+          *it = m;
+      }
+      store->stats().siteFaultsMarked.fetch_add(1, std::memory_order_relaxed);
+      const uint64_t minutes = (m.untilS - m.lastS + 59) / 60;
+      UCACHE_WARN("%s: the server %s (%s) %s: its copies are tried after the others for %llu min "
+                  "(failure %u in a row)",
+                  file.c_str(), server.c_str(), site.c_str(), why.c_str(),
+                  static_cast<unsigned long long>(minutes), m.count);
+      std::string line = "{\"kind\":\"site_fault\",\"v\":1,\"ts_ms\":" + std::to_string(wallMs());
+      line += ",\"file\":\"" + escapeForJson(file) + "\",\"site\":\"" + escapeForJson(site) +
+              "\",\"server\":\"" + escapeForJson(server) + "\",\"reason\":\"" + escapeForJson(why) +
+              "\",\"count\":" + std::to_string(m.count) + ",\"until_s\":" + std::to_string(m.untilS) +
+              "}\n";
+      store->enqueueRecord(std::move(line));
+    });
+  } catch (...) {
+  }
+}
+// The failure `f` of a request to a server (`kind`, siteFaultOf), of the request issued at
+// `startUs`: a fault of the server's own is marked at once; a stall is marked when another site
+// answered normally since the request was issued, or does so within kStallWitnessUs after.
+void noteSiteFault(HandleState& st, const SiteFailure& f, SiteFault kind, uint64_t startUs) noexcept
+    try {
+  if (kind == SiteFault::kNone || !st.store || !globalConfig().adaptiveFederation ||
+      f.server.empty() || f.server == "the origin")
+    return;
+  const std::string file = recordFile(st.url);
+  if (kind == SiteFault::kServer) {
+    writeSiteMark(st.store, f, file, "answered with a fault of its own");
+    return;
+  }
+  const uint64_t now = nowUs();
+  bool witnessed = false;
+  {
+    SourceMemory mem = sourceMemory();
+    std::lock_guard<std::mutex> g(*mem.mu);
+    for (const auto& [server, a] : *mem.lastOk)
+      witnessed = witnessed || (a.atUs >= startUs &&
+                                !sameSiteIds(a.siteName, a.domain, f.siteName, domainOfFailure(f)));
+    if (!witnessed) {
+      mem.pending->erase(std::remove_if(mem.pending->begin(), mem.pending->end(),
+                                        [now](const PendingStall& p) {
+                                          return p.atUs + kStallWitnessUs < now;
+                                        }),
+                         mem.pending->end());
+      if (mem.pending->size() < 1024)
+        mem.pending->push_back(PendingStall{f, file, "stalled while other sites answered", now,
+                                            st.store});
+    }
+  }
+  if (witnessed)
+    writeSiteMark(st.store, f, file, "stalled while other sites answered");
+} catch (...) {
+}
+// The server `server` answered normally (`opened`: an open of a file there succeeded): the stalls
+// of other sites waiting for a witness are marked; an open's success clears the server's mark.
+void noteSourceAnswer(HandleState& st, const std::string& server, bool opened) noexcept try {
+  if (!st.store || !globalConfig().adaptiveFederation || server.empty())
+    return;
+  const std::string site = siteOfServer(server, true);
+  const std::string name = knownSiteName(server), domain = siteIdentity(server, true, std::string());
+  const uint64_t now = nowUs();
+  std::vector<PendingStall> confirmed;
+  bool clear = false;
+  {
+    SourceMemory mem = sourceMemory();
+    std::lock_guard<std::mutex> g(*mem.mu);
+    (*mem.lastOk)[server] = SourceAnswer{name, domain, now};
+    for (auto it = mem.pending->begin(); it != mem.pending->end();) {
+      if (it->atUs + kStallWitnessUs < now) {
+        it = mem.pending->erase(it);
+      } else if (!sameSiteIds(it->f.siteName, domainOfFailure(it->f), name, domain)) {
+        confirmed.push_back(std::move(*it));
+        it = mem.pending->erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if (opened) {
+      std::string key = server;
+      for (char& c : key)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      for (auto it = mem.snap->begin(); it != mem.snap->end(); ++it)
+        if (it->server == key) {
+          clear = true;
+          mem.snap->erase(it);
+          break;
+        }
+    }
+  }
+  for (const auto& p : confirmed)
+    writeSiteMark(p.store, p.f, p.file, p.why);
+  // Another process may have marked it: the file is read again when the view is old, at most once
+  // in kSourcesReloadUs, on the executor, and the server's mark cleared if it holds one.
+  bool reload = false;
+  if (opened && !clear) {
+    SourceMemory mem = sourceMemory();
+    std::lock_guard<std::mutex> g(*mem.mu);
+    reload = *mem.loadedUs + kSourcesReloadUs < now;
+    if (reload)
+      *mem.loadedUs = now;
+  }
+  if (reload && !processExiting()) {
+    const std::shared_ptr<CacheStore> store = st.store;
+    const std::string file = recordFile(st.url);
+    try {
+      Executor::instance().post([store, server, site, file] {
+        std::vector<SourceMark> marks;
+        const std::string path = sourcesPath(store->config().cacheDir);
+        if (!loadSources(RealIO::instance(), path, marks))
+          return;
+        std::string key = server;
+        for (char& c : key)
+          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        const bool marked = std::any_of(marks.begin(), marks.end(),
+                                        [&](const SourceMark& m) { return m.server == key; });
+        {
+          SourceMemory mem = sourceMemory();
+          std::lock_guard<std::mutex> g(*mem.mu);
+          *mem.snap = marks;
+          mem.snap->erase(std::remove_if(mem.snap->begin(), mem.snap->end(),
+                                         [&](const SourceMark& m) { return m.server == key; }),
+                          mem.snap->end());
+        }
+        bool was = false;
+        if (marked && clearSource(RealIO::instance(), path, server, marksNowS(), &was) && was) {
+          store->stats().siteMarksCleared.fetch_add(1, std::memory_order_relaxed);
+          UCACHE_INFO("%s: the server %s (%s) answered: its mark is cleared", file.c_str(),
+                      server.c_str(), site.c_str());
+        }
+      });
+    } catch (...) {
+    }
+  }
+  if (clear && !processExiting()) {
+    const std::shared_ptr<CacheStore> store = st.store;
+    const std::string file = recordFile(st.url);
+    try {
+      Executor::instance().post([store, server, site, file] {
+        bool was = false;
+        if (clearSource(RealIO::instance(), sourcesPath(store->config().cacheDir), server,
+                        marksNowS(), &was) &&
+            was) {
+          store->stats().siteMarksCleared.fetch_add(1, std::memory_order_relaxed);
+          UCACHE_INFO("%s: the server %s (%s) answered: its mark is cleared", file.c_str(),
+                      server.c_str(), site.c_str());
+        }
+      });
+    } catch (...) {
+    }
+  }
+} catch (...) {
+}
+// The marks of the cache's sources, read now (and kept as the process's snapshot, which an open's
+// success looks in), and the live copy faults of the handle's file, as one question for
+// orderLocations: when a copy at `server` was last failed for a mark that holds, 0 for none.
+// Blocks (a read of two small files): never called on a client callback thread.
+std::function<uint64_t(const std::string&)> markedAtFor(HandleState& st) noexcept try {
+  if (!st.store)
+    return nullptr;
+  const std::string& dir = st.store->config().cacheDir;
+  std::vector<SourceMark> marks;
+  if (loadSources(RealIO::instance(), sourcesPath(dir), marks)) {
+    SourceMemory mem = sourceMemory();
+    std::lock_guard<std::mutex> g(*mem.mu);
+    *mem.snap = marks;
+    *mem.loadedUs = nowUs();
+  }
+  std::vector<InUseFault> faults;
+  if (const auto key = UrlKey::parse(st.url, globalConfig().keepCgi)) {
+    InUseRecord rec;
+    if (InUseRecord::load(RealIO::instance(), InUseRecord::path(dir, key->hashHex), rec))
+      faults = rec.liveFaults(marksNowS());
+  }
+  const uint64_t now = marksNowS();
+  return [marks = std::move(marks), faults = std::move(faults), now](const std::string& server) {
+    std::string key = server;
+    for (char& c : key)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    uint64_t t =
+        markedAtS(marks, key, knownSiteName(key), siteIdentity(key, true, std::string()), now);
+    for (const auto& f : faults)
+      if (f.server == key)
+        t = std::max(t, f.lastS);
+    return t;
+  };
+} catch (...) {
+  return nullptr;
+}
+// The copy at `f.server` of the handle's file was proven missing: noted in the file's in-use
+// record on the executor, counted, said, recorded.
+void noteCopyFault(HandleState& st, const SiteFailure& f) noexcept try {
+  if (!st.store || processExiting())
+    return;
+  const auto key = UrlKey::parse(st.url, globalConfig().keepCgi);
+  if (!key)
+    return;
+  const std::shared_ptr<CacheStore> store = st.store;
+  const std::string path = InUseRecord::path(store->config().cacheDir, key->hashHex);
+  const std::string file = recordFile(st.url);
+  InUseFault fault;
+  fault.server = f.server;
+  fault.site = f.site;
+  fault.reason = "enoent";
+  Executor::instance().post([store, path, file, fault]() mutable {
+    fault.lastS = marksNowS();
+    if (!InUseRecord::noteFault(RealIO::instance(), path, fault, store->config().inUseSeconds))
+      return;
+    store->stats().copyFaultsMarked.fetch_add(1, std::memory_order_relaxed);
+    UCACHE_WARN("%s: the copy at %s (%s) is missing though the regional redirector lists it: it "
+                "is tried after the others for 7 days",
+                file.c_str(), fault.server.c_str(), fault.site.c_str());
+    std::string line = "{\"kind\":\"copy_fault\",\"v\":1,\"ts_ms\":" + std::to_string(wallMs());
+    line += ",\"file\":\"" + escapeForJson(file) + "\",\"site\":\"" + escapeForJson(fault.site) +
+            "\",\"server\":\"" + escapeForJson(fault.server) + "\",\"reason\":\"enoent\"}\n";
+    store->enqueueRecord(std::move(line));
+  });
+} catch (...) {
+}
+void sourceMemoryInit() {
+  (void)sourceMemory();
+  ::pthread_atfork(nullptr, nullptr, [] { sourceMemory() = SourceMemory(); });
+}
+
 // Each origin open attempt the plugin watches ends here with XrdCl's status
 // and the hosts the open went through (null when none came with the answer):
 // it is counted and recorded, and a successful one tells the handle which
@@ -887,6 +1177,8 @@ void noteOriginOpenOrThrow(const OpenAttempt& a, const XRootDStatus* status, con
       if (hops[static_cast<size_t>(i)].flags)
         askSiteName(st.store, named);
       siteName = knownSiteName(named);
+      if (ok) // a normal answer: other sites' stalls are witnessed, the server's own mark cleared
+        noteSourceAnswer(st, named, /*opened=*/true);
     }
   }
   if (ok && !server.empty() && a.route != OpenRoute::kRead) { // a move's is adopted, or not
@@ -1214,6 +1506,15 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     // The sites that failed are named as their servers named them, once known: the servers of
     // one site count as one wherever they failed.
     setSiteNames(seq->failed, siteNames());
+    f.notFound = !ok && (s.code == XrdCl::errErrorResponse ? s.errNo == kXR_NotFound
+                                                           : s.code == XrdCl::errNotFound);
+    // Site-fault memory: a stall at uCache's own deadline (not a shorter one the job gave), or a
+    // fault of the server's own. The attempt ran at most the sequence's deadline.
+    if (!ok)
+      noteSiteFault(st, f,
+                    siteFaultOf(s.code, static_cast<int>(s.errNo),
+                                seq->deadlineS == openDeadlineS(0, gTestOpenDeadlineS)),
+                    nowUs() - uint64_t(std::max(seq->deadlineS, 1)) * 1000000);
     // A copy refused for what it is earlier in this sequence, or that a read of the handle found
     // bad (it answered with bad bytes), is never taken again, wherever the redirector or the list
     // of copies sends the open: it is refused again as it is, with no check made of it again
@@ -1487,7 +1788,24 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     // (orderLocations); one whose name is not is asked for it at its turn, beside its stat, and left
     // to the end then (below). A copy never asked its state is never asked its name.
     setSiteNames(q.failed, siteNames());
-    q.cands = orderLocations(listed, triedHosts(base), q.failed, siteNames());
+    // A copy proven missing: a server that said the file is not there, and that the regional,
+    // asked again (Refresh, after that NotFound), still lists as holding it.
+    if (q.lastNotFound)
+      for (const SiteFailure& x : q.failed) {
+        std::string key = x.server;
+        for (char& c : key)
+          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (x.notFound && std::any_of(listed.begin(), listed.end(), [&](const Location& l) {
+              return !l.pending && serverOf(l) == key;
+            }))
+          noteCopyFault(st, x);
+      }
+    const auto markedAt = markedAtFor(st);
+    q.cands = orderLocations(listed, triedHosts(base), q.failed, siteNames(), markedAt);
+    if (markedAt && st.store)
+      for (const Location& l : q.cands)
+        if (markedAt(serverOf(l)))
+          st.store->stats().markedCopiesLast.fetch_add(1, std::memory_order_relaxed);
   }
   const std::string file = recordFile(st.url);
   bool bounded = false;
@@ -1510,6 +1828,8 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     XrdCl::StatInfo* si = nullptr;
     if (s.IsOK() && resp)
       resp->Get(si);
+    if (si) // a normal answer: other sites' stalls are witnessed
+      noteSourceAnswer(st, server, /*opened=*/false);
     // A copy that answered and whose site name, asked beside its stat, is a site that failed is
     // left to the end, as orderLocations leaves one whose name was known: tried only when no copy
     // at another site is left. The name is waited for at most as long as the stat took.
@@ -1548,6 +1868,8 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     f.domain = server; // it did not answer
     f.site = f.siteName.empty() ? f.domain : f.siteName;
     f.error = s.ToString();
+    // The copy's state was asked with uCache's own time (kCandidateStatS).
+    noteSiteFault(st, f, siteFaultOf(s.code, static_cast<int>(s.errNo), /*ownTime=*/true), asked);
     setSiteNames(q.failed, siteNames());
     if (afterFailure(q.failed, f, failoverMaxSites(), q.stopped()) == AfterFailure::kStop) {
       bounded = true;
@@ -2552,6 +2874,7 @@ class RetryingOpenHandler : public ResponseHandler {
 
 void locateInit() {
   siteNamesInit();
+  sourceMemoryInit();
   (void)locateTable();
   ::pthread_atfork(nullptr, nullptr, [] { locateTable() = LocateTable(); });
 }
@@ -3898,6 +4221,10 @@ static void noteReadFailureLocked(HandleState& st, XrdCl::File* on, const XRootD
     f.siteName = named;
     f.site = named;
   }
+  // Site-fault memory: a connection gone quiet, or a fault of the server's own (a read's expiry is
+  // not marked: its time may be the job's own).
+  noteSiteFault(st, f, siteFaultOf(s.code, static_cast<int>(s.errNo), /*ownTime=*/false),
+                nowUs() - 60ull * 1000000);
   f.error = s.code == XrdCl::errDataError && !s.GetErrorMessage().empty() ? s.GetErrorMessage()
                                                                           : s.ToString();
   f.bad = s.code == XrdCl::errDataError;

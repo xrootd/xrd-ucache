@@ -321,6 +321,7 @@ ucache-inuse 1
 settings <layout version> <slot factor x100> <codecs, or ->
 high <highest address handed out>
 range <store id, 16 hex digits> <first address> <end address> <last use> <last held> <pid>
+fault <site> <server host:port> <last proof> <first proof> <reason> <proofs>
 ```
 
 - A `range` line names a map by its addresses: a mixed map's tree record, a
@@ -336,9 +337,43 @@ range <store id, 16 hex digits> <first address> <end address> <last use> <last h
   store rebuilt while the record is in use is laid out with them, whatever the
   rebuilding process's `recompress_codecs`, so the positions readers hold stay
   right.
+- A `fault` line (with `adaptive_federation = on`) is a copy of the file
+  proven bad at a server: reason `enoent`, the server said the file is not
+  there although the regional redirector, asked again, still listed it. Such a
+  copy is tried after every other copy of the file for 7 days after its last
+  proof (USER_GUIDE.md). A site with a space or a byte that is not printable is
+  percent-encoded (`-` for none). A fault that holds keeps the record from
+  being removed, but does not make the file's maps in use (it does not protect
+  the file from eviction). Builds before 1.5.0 skip these lines and may drop
+  them when they rewrite the record; the cost is one more failover, which notes
+  the copy again.
 - Written in place under an exclusive `flock`, never fsynced; a line that does
   not parse is skipped, and a first line other than `ucache-inuse 1` makes the
   file read as no record.
+
+## Sources that failed: `<dir>/sources`
+
+With `adaptive_federation = on`, the servers the cache's processes remember as
+failed (USER_GUIDE.md), one small text file per cache, shared by all its
+processes:
+
+```
+ucache-sources 1
+server <host:port> <site name, or -> <domain> <count> <first failure> <last failure> <marked until>
+```
+
+- One line per server: the name it gave for its site (`-` while none is known)
+  and its domain (the server itself for one that never answered), its failures
+  in a row since its last success (`count`), and wall-clock seconds. Its mark
+  holds until `marked until`: 10 minutes after the first failure of a row,
+  doubled at each further one, at most an hour. A success clears the line.
+- A name or domain with a space, a `%` or a byte that is not printable is
+  percent-encoded.
+- Written in place under an exclusive `flock`, read under a shared one, never
+  fsynced. A line that does not parse is skipped; a first line other than
+  `ucache-sources 1` makes the file read as no marks. A line whose mark ended a
+  day before is dropped at the next write; at most 4096 servers are kept.
+- `ucache sources` shows it, with the copy faults of the in-use records.
 
 ## Cache-freshness marker (optional): `<hash>.val`
 
@@ -485,3 +520,25 @@ site or refused:
 - `site` and `server`: where that copy is (`server` host:port, `site` its
   domain); `sizes`: the copy's size, then the size of the file uCache holds.
   The `size_disagreements` counter (STATS.md) counts these too.
+
+**`"kind":"site_fault"`, v1** — with `adaptive_federation = on`, one line each
+time a server is marked in `<dir>/sources`:
+
+```json
+{"kind":"site_fault","v":1,"ts_ms":0,"file":"root://h:1094/p","site":"T2_X",
+ "server":"d:1094","reason":"stalled while other sites answered","count":1,
+ "until_s":0}
+```
+
+- `reason`: `stalled while other sites answered`, or `answered with a fault of
+  its own`; `count`: its failures in a row; `until_s`: when its mark ends (wall
+  clock, seconds); `site`: the name the server gave, else its domain; `file`:
+  the file whose request failed there.
+
+**`"kind":"copy_fault"`, v1** — with `adaptive_federation = on`, one line each
+time a copy is proven missing:
+
+```json
+{"kind":"copy_fault","v":1,"ts_ms":0,"file":"root://h:1094/p","site":"T2_X",
+ "server":"d:1094","reason":"enoent"}
+```

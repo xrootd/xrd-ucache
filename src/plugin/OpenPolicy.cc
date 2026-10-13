@@ -134,6 +134,25 @@ std::string siteNameOfAnswer(const char* data, size_t len) {
   return name;
 }
 
+SiteFault siteFaultOf(int code, int errNo, bool ownTime) {
+  if (code == kErrSocketTimeout)
+    return SiteFault::kStall;
+  if (code == kErrOperationExpired)
+    return ownTime ? SiteFault::kStall : SiteFault::kNone;
+  if (code == kErrErrorResponse)
+    switch (errNo) {
+    case kXrFSError:
+    case kXrIOError:
+    case kXrServerError:
+    case kXrNoMemory:
+    case kXrOverloaded:
+      return SiteFault::kServer;
+    default:
+      return SiteFault::kNone;
+    }
+  return SiteFault::kNone;
+}
+
 std::string siteIdentity(const std::string& server, bool answered, const std::string& name) {
   if (!name.empty())
     return name;
@@ -1044,7 +1063,8 @@ void setSiteNames(std::vector<SiteFailure>& failed,
 std::vector<Location> orderLocations(const std::vector<Location>& listed,
                                      const std::vector<std::string>& readerTried,
                                      const std::vector<SiteFailure>& failed,
-                                     const std::function<std::string(const std::string&)>& nameOf) {
+                                     const std::function<std::string(const std::string&)>& nameOf,
+                                     const std::function<uint64_t(const std::string&)>& markedAt) {
   const auto lower = [](std::string s) {
     for (char& c : s)
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -1055,6 +1075,7 @@ std::vector<Location> orderLocations(const std::vector<Location>& listed,
     tried.push_back(lower(t.substr(0, t.find(':'))));
   std::vector<Location> online, pending;
   std::vector<std::pair<size_t, Location>> excluded; // with the position of its failure
+  std::vector<std::pair<uint64_t, Location>> marked;  // with the time of its last failure
   for (const Location& l : listed) {
     // A failed server is named as the client names it, an IPv6 address in brackets.
     const std::string host = lower(l.host),
@@ -1075,10 +1096,18 @@ std::vector<Location> orderLocations(const std::vector<Location>& listed,
     if (age < failed.size()) {
       if (!refused)
         excluded.emplace_back(age, l);
+    } else if (const uint64_t at = markedAt ? markedAt(server) : 0) {
+      marked.emplace_back(at, l);
     } else
       (l.pending ? pending : online).push_back(l);
   }
   online.insert(online.end(), pending.begin(), pending.end());
+  // Marked copies after every other, the oldest failure first (online before pending at one time).
+  std::stable_sort(marked.begin(), marked.end(), [](const auto& a, const auto& b) {
+    return a.first < b.first || (a.first == b.first && !a.second.pending && b.second.pending);
+  });
+  for (const auto& m : marked)
+    online.push_back(m.second);
   if (online.empty()) {
     std::stable_sort(excluded.begin(), excluded.end(),
                      [](const auto& a, const auto& b) { return a.first < b.first; });

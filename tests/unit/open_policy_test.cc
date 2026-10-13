@@ -252,6 +252,62 @@ TEST(OpenPolicy, ASiteByNamesWhenBothAreKnownElseByDomains) {
   EXPECT_EQ(order.front().host, "t3.cern.ch") << "the named copy of the failed domain is left out";
 }
 
+// What a failure says of the server: a stall at uCache's own time or a quiet connection, a fault
+// of its own; never authorization, TLS, resolution, connections, a missing file, bad bytes or the
+// job's own timeout.
+TEST(OpenPolicy, SiteFaultOfAFailure) {
+  EXPECT_EQ(siteFaultOf(kErrOperationExpired, 0, true), SiteFault::kStall);
+  EXPECT_EQ(siteFaultOf(kErrOperationExpired, 0, false), SiteFault::kNone) << "the job's own time";
+  EXPECT_EQ(siteFaultOf(kErrSocketTimeout, 0, false), SiteFault::kStall);
+  for (int e : {kXrFSError, kXrIOError, kXrServerError, kXrNoMemory, kXrOverloaded})
+    EXPECT_EQ(siteFaultOf(kErrErrorResponse, e, false), SiteFault::kServer) << e;
+  for (int e : {kXrNotAuthorized, kXrNotFound, kXrNoServer, kXrFileLocked})
+    EXPECT_EQ(siteFaultOf(kErrErrorResponse, e, true), SiteFault::kNone) << e;
+  for (int c : {kErrTlsError, kErrAuthFailed, kErrConnectionError, kErrSocketError,
+                kErrSocketDisconnected, kErrInvalidSession, kErrNotFound, kErrDataError, 101, 0})
+    EXPECT_EQ(siteFaultOf(c, 0, true), SiteFault::kNone) << c;
+}
+
+// Marked copies come after every other copy left, the oldest failure first; when every copy is
+// marked all are given, oldest first; a copy failed in this sequence still comes only when nothing
+// else is left.
+TEST(OpenPolicy, MarkedCopiesAreTriedLast) {
+  const auto loc = [](const char* h, bool pending = false) {
+    Location l;
+    l.host = h;
+    l.port = 1094;
+    l.pending = pending;
+    return l;
+  };
+  const std::map<std::string, uint64_t> at = {{"a.one.org:1094", 500}, {"b.two.org:1094", 300}};
+  const std::function<uint64_t(const std::string&)> markedAt = [&](const std::string& s) {
+    const auto it = at.find(s);
+    return it == at.end() ? uint64_t(0) : it->second;
+  };
+  const auto hosts = [](const std::vector<Location>& v) {
+    std::string out;
+    for (const auto& l : v)
+      out += l.host + " ";
+    return out;
+  };
+  const std::vector<Location> listed = {loc("a.one.org"), loc("b.two.org"), loc("c.three.org"),
+                                        loc("d.four.org", true)};
+  EXPECT_EQ(hosts(orderLocations(listed, {}, {}, nullptr, markedAt)),
+            "c.three.org d.four.org b.two.org a.one.org ")
+      << "unmarked online, unmarked pending, then marked, the oldest failure first";
+  EXPECT_EQ(hosts(orderLocations(listed, {}, {})), "a.one.org b.two.org c.three.org d.four.org ")
+      << "without marks, the list's order";
+  EXPECT_EQ(hosts(orderLocations({loc("a.one.org"), loc("b.two.org")}, {}, {}, nullptr, markedAt)),
+            "b.two.org a.one.org ")
+      << "every copy marked: all tried, the oldest failure first";
+  SiteFailure c;
+  c.server = "c.three.org:1094";
+  c.site = "three.org";
+  EXPECT_EQ(hosts(orderLocations({loc("a.one.org"), loc("c.three.org")}, {}, {c}, nullptr, markedAt)),
+            "a.one.org ")
+      << "a marked copy before one that failed in this sequence (given only when nothing is left)";
+}
+
 TEST(OpenPolicy, FailureClasses) {
   struct Row {
     int code;

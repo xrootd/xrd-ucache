@@ -549,6 +549,7 @@ struct SiteFailure {
   // answered, else the server itself; "" here means `site` holds it).
   std::string siteName = std::string();
   std::string domain = std::string();
+  bool notFound = false; // the server said the file is not there (a copy fault once proven)
 };
 // Whether two failures are at one site: by their names when both servers gave one (two servers of
 // one domain that give different names are two sites), else by their domains (siteIdentity
@@ -560,6 +561,18 @@ bool sameSite(const SiteFailure& a, const SiteFailure& b);
 // for a copy named by a host name, when its domain is x's domain or the domain of x's host; never
 // for a copy named by an address (it stands for its server alone).
 bool atFailedSite(const SiteFailure& x, const std::string& host, const std::string& name);
+
+// What a failure at a server says of the server itself (site-fault memory, adaptive_federation):
+//   kStall   it stalled: a request that ran out of uCache's own time there (an expiry, `ownTime`:
+//            the deadline was uCache's, not a shorter one the job gave), or a connection gone quiet
+//            past the client's stream timeout; marked only while other sites answer normally
+//   kServer  it answered with a fault of its own: its storage or file system, an internal error,
+//            no memory, overload
+//   kNone    anything else: never marked (authorization, TLS, a name that does not resolve, a
+//            connection that could not be made or was lost, a file not found, bad bytes, the
+//            job's own timeout, the client's own faults)
+enum class SiteFault : uint8_t { kNone, kStall, kServer };
+SiteFault siteFaultOf(int code, int errNo, bool ownTime);
 // Whether `failed` lists `server` (host:port, in any case) as a copy refused for what it is.
 bool refusedBefore(const std::vector<SiteFailure>& failed, const std::string& server);
 // A read of a handle failed at the copy `f` (its server, site and size; `f.bad` when the read
@@ -611,10 +624,15 @@ bool copyOffline(uint32_t statFlags, const std::string& server, const std::strin
 // `nameOf`, when given, says the site name a server (host:port, as `failed` names it) gave, ""
 // for none known: a copy whose server gave one is of a failed site when that name is the site
 // `failed` lists, an address too (`failed` holds the names its servers gave: setSiteNames).
+// `markedAt`, when given, says when a copy (its server as `failed` names servers) was last failed
+// for a mark that still holds (a site-fault mark of its server or site, or a copy fault of the
+// file), 0 for none: the marked copies come after every other one left, online or pending, the
+// oldest failure first; none is left out for a mark.
 std::vector<Location> orderLocations(
     const std::vector<Location>& listed, const std::vector<std::string>& readerTried,
     const std::vector<SiteFailure>& failed,
-    const std::function<std::string(const std::string&)>& nameOf = nullptr);
+    const std::function<std::string(const std::string&)>& nameOf = nullptr,
+    const std::function<uint64_t(const std::string&)>& markedAt = nullptr);
 // The server (host:port) a Location is, named as the client names it: an IPv6 address in
 // brackets, lower-cased.
 std::string serverOf(const Location& l);

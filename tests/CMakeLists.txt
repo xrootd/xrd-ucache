@@ -25,6 +25,7 @@ add_executable(ucache-unit-tests
   unit/stats_test.cc
   unit/readerwait_test.cc
   unit/inuse_test.cc
+  unit/source_marks_test.cc
   unit/cpucounters_test.cc
   unit/metafile_test.cc
   unit/fileentry_test.cc

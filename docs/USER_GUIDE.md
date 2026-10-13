@@ -1069,6 +1069,36 @@ memory, say) is no copy's: the request is served again at the same copy, as with
 switch off. A file read from a direct URL and a
 file the job copies are not changed. With the switch off nothing of this happens.
 
+**Remembering sources that failed (part of `adaptive_federation`).** With
+`adaptive_federation = on`, the processes of one cache remember the servers and
+copies that failed, so that the next open does not meet them first:
+
+- **A server** is marked when it stalled (an open that ran out of uCache's own
+  deadline there, a connection gone quiet past the client's stream timeout, a
+  listed copy that did not answer its state) while another site answered
+  normally at the same time or within a minute, or when it answered with a fault
+  of its own (its storage, its file system, an internal error, no memory,
+  overload). Never for authorization, TLS, a name that does not resolve, a
+  connection that could not be made or was lost, a file not found, bad bytes, or
+  a timeout the job gave (a read's own expiry is not marked: its time may be the
+  job's). A mark lasts 10 minutes, doubled at each further failure in a row, at
+  most an hour, and is cleared at the server's first successful open. A site is
+  marked while two or more of its servers are (sites as above: by the names
+  their servers give, else by domain).
+- **A copy** is marked for 7 days when it is proven missing: its server said the
+  file is not there although the regional redirector, asked again, still listed
+  it there. It is noted in the file's in-use record.
+
+Marks only order: a copy at a marked server or site, or a marked copy, is tried
+after every copy the regional redirector lists that is not, and when every copy
+is marked all are tried, the oldest failure first. Nothing is left out for a
+mark, the bounds of an open are unchanged, and a redirector's own choice is not
+overruled (the marks are not sent to it). Server marks live in `<dir>/sources`
+(FORMAT.md), shared by every process of the cache; `ucache sources` shows them
+and the copies marked (`site_faults_marked`, `site_marks_cleared`,
+`copy_faults_marked`, `marked_copies_last`, STATS.md). With the switch off
+nothing is marked or read.
+
 **Put the cache on local disk.** `dir` has **no default** — an unset cache
 location is a loud condition (`doctor` FAILs, the plugin passes through
 uncached), never a silent cache in your home directory, which on CERN

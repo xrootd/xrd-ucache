@@ -134,6 +134,13 @@ struct Stats {
   // Requests made where no move may be waited for (a client callback thread), before their handle
   // had the file's map, made again on the open-wait pool (adaptive_federation).
   std::atomic<uint64_t> requestsParkedForParse{0};
+  // Remembering sources that failed (adaptive_federation): servers marked for a fault of their own
+  // or a stall while other sites answered, marks cleared by a success, copies proven missing, and
+  // listed copies tried after the others for a mark.
+  std::atomic<uint64_t> siteFaultsMarked{0};
+  std::atomic<uint64_t> siteMarksCleared{0};
+  std::atomic<uint64_t> copyFaultsMarked{0};
+  std::atomic<uint64_t> markedCopiesLast{0};
   // Replica tier (docs/STATS.md):
   // Of earlier releases' compact replicas, no longer made or served: always 0.
   std::atomic<uint64_t> replicaOpens{0};
@@ -322,7 +329,8 @@ struct StatsTotals {
   uint64_t openFailovers = 0, opensRecovered = 0, opensFailedEverywhere = 0,
            openDeadlineExpiries = 0, failoverLocates = 0, offlineCopiesSkipped = 0,
            openCheckBytesKept = 0, badEntriesDropped = 0, siteNameQueries = 0,
-           siteNamesMissing = 0, requestsParkedForParse = 0;
+           siteNamesMissing = 0, requestsParkedForParse = 0, siteFaultsMarked = 0,
+           siteMarksCleared = 0, copyFaultsMarked = 0, markedCopiesLast = 0;
   uint64_t originFailures[6] = {}; // client, site, notfound, data, expired, other
   // Histogram bucket sums (log2 µs), for CLI percentile rendering:
   std::vector<uint64_t> histHitRead, histOriginRt, histOpen, histReplicaRead, histFlushWrite,

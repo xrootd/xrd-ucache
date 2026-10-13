@@ -9,6 +9,7 @@ add_library(ucache-core STATIC
   Config.cc
   FileEntry.cc
   InUse.cc
+  SourceMarks.cc
   IOBackend.cc
   Log.cc
   MetaFile.cc

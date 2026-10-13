@@ -1,6 +1,9 @@
 #include "InUse.h"
 
+#include "SourceMarks.h"
+
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
@@ -52,6 +55,9 @@ std::string InUseRecord::serialize() const {
                   r.storeId, r.lo, r.hi, r.lastS, r.holdS, r.pid);
     os << buf;
   }
+  for (const auto& f : faults)
+    os << "fault " << encodeSite(f.site) << ' ' << f.server << ' ' << f.lastS << ' ' << f.firstS
+       << ' ' << (f.reason.empty() ? std::string("-") : f.reason) << ' ' << f.count << '\n';
   return os.str();
 }
 
@@ -96,6 +102,15 @@ InUseRecord InUseRecord::parse(const std::string& text) {
       if (errno || !end || *end)
         continue;
       rec.ranges.push_back(r);
+    } else if (tag == "fault") {
+      InUseFault f;
+      std::string site;
+      if (!(ls >> site >> f.server >> f.lastS >> f.firstS >> f.reason >> f.count) || f.server.empty())
+        continue;
+      f.site = decodeSite(site);
+      for (char& c : f.server)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      rec.faults.push_back(std::move(f));
     }
   }
   return rec;
@@ -130,8 +145,11 @@ bool InUseRecord::note(IOBackend& io, const std::string& path, const InUseRange&
   if (ok) {
     InUseRecord rec = parse(text);
     const uint64_t now = std::max(r.lastS, r.holdS);
-    if (rec.expired(now, windowS))
-      rec = InUseRecord{}; // nothing in it is in use: as good as no record
+    if (rec.expired(now, windowS)) { // nothing in it is in use: as good as no record, but its faults
+      std::vector<InUseFault> faults = rec.liveFaults(now);
+      rec = InUseRecord{};
+      rec.faults = std::move(faults);
+    }
     std::vector<InUseRange> kept;
     bool usedIn = !r.lastS, heldIn = !(r.holdS && r.pid) || release;
     for (auto e : rec.ranges) {
@@ -175,6 +193,64 @@ bool InUseRecord::note(IOBackend& io, const std::string& path, const InUseRange&
   return ok;
 }
 
+bool InUseRecord::noteFault(IOBackend& io, const std::string& path, const InUseFault& f,
+                            uint64_t windowS) {
+  const auto slash = path.rfind('/');
+  if (slash != std::string::npos)
+    io.mkdirs(path.substr(0, slash), 0700);
+  const int fd = io.open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (fd < 0)
+    return false;
+  bool ok = io.flock(fd, LOCK_EX) == 0;
+  std::string text;
+  ok = ok && readAll(io, fd, text);
+  if (ok) {
+    InUseRecord rec = parse(text);
+    if (rec.expired(f.lastS, windowS)) { // as note() does: ranges no longer in use are dropped
+      std::vector<InUseFault> kept = rec.liveFaults(f.lastS);
+      rec = InUseRecord{};
+      rec.faults = std::move(kept);
+    } else {
+      rec.faults = rec.liveFaults(f.lastS);
+    }
+    std::string server = f.server;
+    for (char& c : server)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    auto it = std::find_if(rec.faults.begin(), rec.faults.end(), [&](const InUseFault& x) {
+      return x.server == server && x.reason == f.reason;
+    });
+    if (it == rec.faults.end()) {
+      InUseFault n = f;
+      n.server = server;
+      n.firstS = f.lastS;
+      n.count = 1;
+      rec.faults.push_back(std::move(n));
+    } else {
+      it->lastS = std::max(it->lastS, f.lastS);
+      it->site = f.site.empty() ? it->site : f.site;
+      ++it->count;
+    }
+    const std::string out = rec.serialize();
+    ok = io.pwriteFull(fd, out.data(), out.size(), 0) == static_cast<int64_t>(out.size()) &&
+         io.ftruncate(fd, out.size()) == 0;
+  }
+  io.flock(fd, LOCK_UN);
+  io.close(fd);
+  return ok;
+}
+
+std::vector<InUseFault> InUseRecord::liveFaults(uint64_t nowS, uint64_t faultS) const {
+  std::vector<InUseFault> out;
+  for (const auto& f : faults)
+    if (f.lastS + faultS > nowS)
+      out.push_back(f);
+  return out;
+}
+
+bool InUseRecord::removable(uint64_t nowS, uint64_t windowS, uint64_t faultS) const {
+  return expired(nowS, windowS) && liveFaults(nowS, faultS).empty();
+}
+
 uint64_t InUseRecord::lastUseS() const {
   uint64_t t = 0;
   for (const auto& r : ranges)
@@ -211,7 +287,7 @@ bool InUseRecord::expired(uint64_t nowS, uint64_t windowS) const {
 }
 
 int InUseRecord::sweep(IOBackend& io, const std::string& cacheDir, uint64_t nowS,
-                       uint64_t windowS) {
+                       uint64_t windowS, uint64_t faultS) {
   const std::string root = cacheDir + "/inuse";
   std::vector<std::string> shards;
   if (io.listDir(root, shards) != 0)
@@ -229,7 +305,7 @@ int InUseRecord::sweep(IOBackend& io, const std::string& cacheDir, uint64_t nowS
         continue;
       if (io.flock(fd, LOCK_EX | LOCK_NB) == 0) {
         std::string text;
-        if (readAll(io, fd, text) && parse(text).expired(nowS, windowS) &&
+        if (readAll(io, fd, text) && parse(text).removable(nowS, windowS, faultS) &&
             io.unlink(p) == 0)
           ++removed;
         io.flock(fd, LOCK_UN);

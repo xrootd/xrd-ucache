@@ -468,6 +468,25 @@ it), and eviction removes it as any other. An entry made only by jobs run with
 `revalidate_seconds = 0` has no record of when it was confirmed (no marker is written), and
 the error gives no advice for it.
 
+## A server or a copy is tried last (`ucache sources`)
+
+With `adaptive_federation = on`, the log says when a server is marked or a
+copy is proven missing:
+
+- `<file>: the server <host:port> (<site>) stalled while other sites answered:
+  its copies are tried after the others for <n> min (failure <k> in a row)`, or
+  `... answered with a fault of its own: ...`;
+- `<file>: the server <host:port> (<site>) answered: its mark is cleared`;
+- `<file>: the copy at <host:port> (<site>) is missing though the regional
+  redirector lists it: it is tried after the others for 7 days`.
+
+`ucache sources` lists the servers marked (their site, `marked <n>m` or
+`ended`, the failures in a row, the last one's age), the sites marked (two or
+more servers), and the copies proven missing (by in-use record). A mark only
+puts copies last in the regional redirector's list: a job is never refused a
+copy for it. To forget every server mark, remove `<dir>/sources`; a copy's mark
+goes with its file's in-use record (`<dir>/inuse/...`, FORMAT.md).
+
 ## uCache read the file at another site
 
 With `adaptive_federation = on`, a read that fails at the server a file was
