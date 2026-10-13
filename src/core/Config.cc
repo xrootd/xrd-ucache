@@ -1,5 +1,7 @@
 #include "Config.h"
 
+#include "EntryNames.h"
+
 #include "Log.h"
 
 #include <climits>
@@ -515,6 +517,13 @@ std::string Config::setNote(const std::string& key, const std::string& value) co
                  "age out (a pinned one keeps its pin, and the new entry is pinned too)"
                : "  files are keyed by their URL";
   return "";
+}
+
+std::optional<UrlKey> Config::entryKey(const std::string& url) const {
+  auto k = keys.key(url);
+  if (!k)
+    return k;
+  return resolveEntry(*k, cacheDir);
 }
 
 std::string Config::valueOf(const std::string& key) const {

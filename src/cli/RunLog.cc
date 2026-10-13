@@ -449,7 +449,7 @@ std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiv
     // (written before run_settings existed, or a run killed before its counter
     // line) -- names the host the file was asked of, the host of its URL.
     // A record keyed by a logical name (lfn:) has no host in its key: it names its data server,
-    // whatever the switch said.
+    // whatever adaptive_federation said.
     const bool byServer = federationRun(r.runSettings);
     for (const auto& [k, f] : r.files) {
       const bool named = k.compare(0, 4, "lfn:") == 0 && f.urlHost.empty();

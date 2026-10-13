@@ -267,13 +267,6 @@ std::optional<UrlKey> KeyRules::urlKey(const std::string& url) const {
   return UrlKey::parse(url, keepCgi_);
 }
 
-std::string KeyRules::logicalName(const std::string& url) const {
-  if (prefixes_.empty())
-    return std::string();
-  const auto p = urlParts(url, {});
-  return p ? logicalNameOf(prefixes_, p->path) : std::string();
-}
-
 uint64_t KeyRules::nextId() {
   static std::atomic<uint64_t> next{1};
   return next.fetch_add(1, std::memory_order_relaxed);

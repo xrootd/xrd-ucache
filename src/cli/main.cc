@@ -4,6 +4,7 @@
 // `ucache set/unset/settings`) < UCACHE_* env.
 #include "CacheStore.h"
 #include "Config.h"
+#include "EntryNames.h"
 #include "IOBackend.h"
 #include "MetaFile.h"
 #include "InUse.h"
@@ -125,8 +126,9 @@ void usage() {
       "                    one owner page: an owner id plus a salt that never leaves\n"
       "                    this machine. Show it, install one from another machine,\n"
       "                    or start over\n"
-      "  ls [--sort age|size]  list cached entries (size, cached, coverage,\n"
-      "                    last-used age, replica, pinned); default sort = size\n"
+      "  ls [--sort age|size] [-l]  list cached entries (size, cached, coverage,\n"
+      "                    last-used age, replica, pinned); default sort = size;\n"
+      "                    -l: each entry's other names (the URLs that reached it)\n"
       "  stats [--reset | --files [--top N]]\n"
       "                    aggregate stats/*.jsonl across all processes, plus the\n"
       "                    derived workflow picture (tiers, opens/file, re-read\n"
@@ -629,6 +631,11 @@ int cmdStatsFiles(const Config& cfg, size_t topN) {
                   human(a.served).c_str(), (unsigned long long)a.opens,
                   (unsigned long long)a.diskReads, seq, rr, human(a.replica).c_str(),
                   human(a.wire).c_str(), tail.c_str());
+      // The URLs the file's entry was reached through (EntryNames.h), when it has names.
+      if (const auto ek = cfg.entryKey(key))
+        for (const auto& u : entryNames(cfg.cacheDir, ek->hashHex).urls)
+          std::printf("  %-10s %-6s %-9s %-5s %-7s %-10s %-10s   url %s\n", "", "", "", "", "", "",
+                      "", u.c_str());
       ++shown;
     } else {
       restServed += a.served;
@@ -2465,61 +2472,32 @@ int cmdStatus(CacheStore& store, IOBackend& io) {
   // Status is a fast command; the codec comparison is left to `doctor`.
   if (std::string why = recompressStall(cfg, io, replicaN, /*deep=*/false); !why.empty())
     std::printf("recompress: %s\n", why.c_str());
-  // Entries the cache's settings no longer read: with logical_name_prefixes set, those keyed by a
-  // URL whose path now has a logical name; with it off, those keyed by a logical name (made while
-  // it was set). Said only when there are some.
-  {
-    size_t n = 0, pinnedN = 0;
-    uint64_t bytes = 0;
-    for (const auto& e : entries) {
-      const bool other = cfg.keys.logical() ? cfg.keys.mapStored(e.key) != e.key
-                                            : e.key.compare(0, 4, "lfn:") == 0;
-      if (other) {
-        ++n;
-        pinnedN += e.pinned;
-        bytes += e.cachedBytes + e.replicaBytes;
-      }
-    }
-    const std::string pins =
-        pinnedN ? " (" + std::to_string(pinnedN) +
-                      " pinned: a pin is never taken away; `ucache unpin <key>` lets one age out)"
-                : std::string();
-    if (n && cfg.keys.logical())
-      std::printf("by URL    : %zu entr%s (%s) keyed by a URL whose path now has a logical name; "
-                  "logical_name_prefixes keys the file by that name, so these are no longer read "
-                  "and age out%s; `ucache rm <key>` removes one (`ucache ls` prints the keys)\n",
-                  n, n == 1 ? "y" : "ies", human(bytes).c_str(), pins.c_str());
-    else if (n)
-      std::printf("by name   : %zu entr%s (%s) keyed by a logical name (lfn:...), made while "
-                  "logical_name_prefixes was set; jobs without it do not read them, and they age out%s; "
-                  "`ucache rm <key>` removes one (`ucache ls` prints the keys)\n",
-                  n, n == 1 ? "y" : "ies", human(bytes).c_str(), pins.c_str());
-  }
   printStats(aggregateStats(cfg.cacheDir + "/stats"));
   return 0;
 }
 
-// The entries a name given to a command names: the key the settings give it
-// (by logical name, with logical_name_prefixes set and a path that holds one),
-// and, when that is a logical name made from a URL, the URL's own key (an entry
-// made without the prefixes, or before the name was used). A key
-// exactly as `ucache ls` prints it names that entry alone: a key by URL whose
-// path now has a logical name is how an entry left from before is removed
-// without the file's entry by name. Empty for a name that is not a URL or key.
+// The entries a name given to a command names: the entry the cache holds the file in, found
+// through its names (EntryNames.h: a URL or a logical name of an entry gives that entry), and, when
+// the URL has an entry of its own beside it (cached before the prefixes were set, while another URL
+// of the file became the name's entry), that one too. A key exactly as `ucache ls` prints a URL's
+// own entry names that entry alone. Empty for a name that is not a URL or key.
 std::vector<UrlKey> namedKeys(const Config& cfg, const std::string& name) {
   std::vector<UrlKey> out;
   auto k = cfg.keys.key(name);
   if (!k)
     return out;
-  if (k->logical() && !k->urlHash.empty()) {
-    const UrlKey byUrl = UrlKey::ofEntry(k->urlKey, k->urlHash);
-    if (name == k->urlKey)
-      return {byUrl};
-    out.push_back(*k);
-    out.push_back(byUrl);
-    return out;
-  }
-  out.push_back(*k);
+  auto exists = [&cfg](const UrlKey& u) {
+    struct ::stat st;
+    return ::stat(u.metaPath(cfg.cacheDir).c_str(), &st) == 0;
+  };
+  const bool named = k->logical() && !k->urlHash.empty();
+  const UrlKey own = named ? UrlKey::ofEntry(k->urlKey, k->urlHash) : *k;
+  if (named && name == k->urlKey && exists(own))
+    return {own};
+  const UrlKey entry = resolveEntry(*k, cfg.cacheDir);
+  out.push_back(entry);
+  if (named && entry.hashHex != own.hashHex && exists(own))
+    out.push_back(own);
   return out;
 }
 // Of namedKeys, the first whose entry is in the cache (its sidecar exists), else
@@ -2528,19 +2506,17 @@ std::optional<UrlKey> cachedKey(const Config& cfg, const std::string& name) {
   const auto keys = namedKeys(cfg, name);
   if (keys.empty())
     return std::nullopt;
-  for (auto k : keys) {
+  for (const auto& k : keys) {
     struct ::stat st;
-    if (::stat(k.metaPath(cfg.cacheDir).c_str(), &st) == 0) {
-      k.urlKey.clear(); // the entry itself: opening it (verify) moves no pin of the URL's entry
-      k.urlHash.clear();
+    if (::stat(k.metaPath(cfg.cacheDir).c_str(), &st) == 0)
       return k;
-    }
   }
   return keys.front();
 }
 
 int cmdLs(CacheStore& store, int argc, char** argv) {
   std::string sortBy = "size"; // default: largest first (as before)
+  bool longForm = false;       // -l: each entry's names (EntryNames.h) under it
   for (int i = 2; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--sort" || a.rfind("--sort=", 0) == 0) {
@@ -2550,6 +2526,8 @@ int cmdLs(CacheStore& store, int argc, char** argv) {
         return 2;
       }
       sortBy = v;
+    } else if (a == "-l" || a == "--names") {
+      longForm = true;
     } else {
       std::fprintf(stderr, "ls: unknown option '%s'\n", a.c_str());
       return 2;
@@ -2570,12 +2548,21 @@ int cmdLs(CacheStore& store, int argc, char** argv) {
   std::printf("%-9s %-9s %-6s %-6s %-9s %-4s  %s\n", "SIZE", "CACHED", "COV%", "LAST", "RECOMP",
               "PIN", "KEY");
   bool anyReplica = false;
+  const std::string& dir = store.config().cacheDir;
   for (const auto& e : entries) {
+    // An entry with a logical name is shown by it: the core name, which groups its URLs.
+    const EntryNameList names = entryNames(dir, e.hashHex);
     std::printf("%-9s %-9s %5.1f%% %-6s %-9s %-4s  %s\n", human(e.fileSize).c_str(),
                 human(e.cachedBytes).c_str(), e.coverage * 100.0,
                 humanAge(e.atime, now).c_str(),
                 e.replicaBytes ? human(e.replicaBytes).c_str() : "-", e.pinned ? "yes" : "",
-                e.key.c_str());
+                names.lfn.empty() ? e.key.c_str() : names.lfn.c_str());
+    if (longForm) {
+      if (!names.lfn.empty() && names.lfn != e.key)
+        std::printf("%-56s  stored as %s\n", "", e.key.c_str());
+      for (const auto& u : names.urls)
+        std::printf("%-56s  url %s\n", "", u.c_str());
+    }
     anyReplica = anyReplica || e.replicaBytes;
   }
   std::printf("(%zu entries)\n", entries.size());
@@ -3233,6 +3220,7 @@ int cmdRm(CacheStore& store, const Config& cfg, int argc, char** argv) {
     bool removed = false;
     for (const auto& key : keys)
       if (store.removeEntry(key)) {
+        dropEntryNames(cfg.cacheDir, key.hashHex); // its list of names (its aliases stay)
         std::printf("removed %s\n", key.key.c_str());
         removed = true;
       }
@@ -3651,10 +3639,10 @@ int cmdSettings(const Config& cfg) {
     std::printf("current  : %s%s\n", sp.c_str(),
                 ::stat(sp.c_str(), &st) == 0 ? "" : " (nothing set — values from defaults/env)");
   }
-  std::printf("\n%-22s %-38s %s\n", "key", "value", "source");
+  std::printf("\n%-22s %-28s %s\n", "key", "value", "source");
   for (const auto& k : Config::knownKeys()) {
     auto it = cfg.sources.find(k.key);
-    std::printf("%-22s %-38s %s\n", k.key, cfg.valueOf(k.key).c_str(),
+    std::printf("%-22s %-28s %s\n", k.key, cfg.valueOf(k.key).c_str(),
                 it == cfg.sources.end() ? "default" : it->second.c_str());
   }
   std::printf("\ncurrent values: `ucache set <key> <value>` / `ucache unset <key>` "
@@ -3713,6 +3701,16 @@ int cmdSet(const Config& cfg, const char* key, const char* value) {
                 "with `ucache recompress`\n");
   if (const std::string note = cfg.setNote(k, v); !note.empty())
     std::printf("%s\n", note.c_str());
+  // The entries already cached get their logical names now, so that every URL of a file finds its
+  // entry from the first job on (EntryNames.h nameCachedEntries).
+  if (k == "logical_name_prefixes") {
+    const KeyRules rules(cfg.keepCgi, /*logical=*/true, v);
+    if (rules.logical()) {
+      const long n = nameCachedEntries(cfg.cacheDir, rules);
+      if (n >= 0)
+        std::printf("  %ld cached entr%s named by these prefixes\n", n, n == 1 ? "y" : "ies");
+    }
+  }
   return 0;
 }
 
@@ -4266,6 +4264,16 @@ int cmdDoctor(const Config& cfg) {
                 cfg.logicalNamePrefixes.c_str(), cfg.keys.prefixesError().c_str());
     ++problems;
   }
+  // The prefixes are meant for the cache (its state file, read by every job): set in a conf only,
+  // a job run with another conf keys the files another way. Each still finds an entry by its URL
+  // (EntryNames.h), but a file the other job caches first is cached twice.
+  if (const auto it = cfg.sources.find("logical_name_prefixes");
+      it != cfg.sources.end() && it->second == "conf")
+    std::printf("  [NOTE] logical_name_prefixes = %s is set in the conf, not for the cache: a job "
+                "run with another conf\n"
+                "         keys files another way; set it for the cache with `ucache set "
+                "logical_name_prefixes '<prefix> ...'`\n",
+                cfg.logicalNamePrefixes.c_str());
   const PluginPick pick = pickPlugin(conf);
   problems += soProbe(pick) + activationProbe();
   problems += handshakeProbe(pick);
@@ -4385,7 +4393,7 @@ int cmdTest(CacheStore& store, const Config& cfg, int argc, char** argv) {
     return 2;
   }
   const std::string url = argv[2];
-  auto key = cfg.keys.key(url); // SAME normalization as the plugin
+  auto key = cfg.entryKey(url); // SAME normalization as the plugin, through the entry's names
   const auto byUrl = cfg.keys.urlKey(url); // the server, for the conf's binding
   if (!key || !byUrl || byUrl->logical()) {
     std::fprintf(stderr, "test: not a valid root:// URL: %s\n", url.c_str());

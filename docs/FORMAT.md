@@ -20,6 +20,8 @@ $UCACHE_DIR/                         (0700)
   sources                            # servers that failed (adaptive_federation; below)
   sources.lock                       # flock held while `sources` is written
   sources.new                        # transient during its rewrite
+  names/<hh>/<sha256(name)>.to       # an entry's other name (logical_name_prefixes; below)
+  names/<hh>/<sha256(key)>.names     # the names of an entry (below)
   LOCK                               # cache-wide flock for eviction
   objects.cleared.<pid>-<ms>/        # an objects/ tree `ucache clear` set aside,
                                      #  deleted in the background
@@ -29,13 +31,43 @@ $UCACHE_DIR/                         (0700)
 `<hh>` = first two hex chars of the sha256. The key is the normalized URL;
 CGI/opaque parameters are stripped before hashing so tokens never
 reach disk, in keys or file names. With `logical_name_prefixes` set, a file whose
-path holds one of them is keyed `lfn:<logical name>` instead
+path holds one of them has a logical name, `lfn:<logical name>`
 (`lfn:/store/mc/...`, kept CGI after it as after a URL's path), whatever server its
-URL names; nothing else about the entry, its sidecar, slot store or in-use record
-changes. An entry's name on disk is the hash of the key it was made under, and is
-never derived again from the key stored in its sidecar: a cache can hold entries
-under both kinds of key at once (made before and after the prefixes were set),
-each its own.
+URL names, and its entry has several names (the logical name and each URL that
+reached it). An entry's name on disk is the hash of the key it was made under (a
+URL's, for an entry cached before the prefixes were set; the logical name's, for one
+made after), and is never derived again from the key stored in its sidecar; its
+other names point to it (below). Nothing else about the entry, its sidecar, slot
+store or in-use record changes.
+
+## Names of an entry: `<dir>/names/`
+
+Written only by the plug-in, only once a logical name was given (a cache that never
+had `logical_name_prefixes` set has no such directory, and nothing below is read):
+
+```
+<dir>/names/<hh>/<namehash>.to       an alias: "ucache-alias 1 <entryhash> <entry key>\n"
+<dir>/names/<hh>/<entryhash>.names   the entry's names: "lfn <key>" and "url <key>" lines
+<dir>/names/named-<hash>             the entries cached before were named for the prefixes of
+                                     this hash (run_settings' logical_names=on/<hash>): the count
+<dir>/names/naming.lock              flock held while they are named (one process at a time)
+```
+
+- `<namehash>` is the SHA-256 of a name (`lfn:/...` or a URL key). An alias says
+  which entry the name is: it is made whole (written apart, then linked in) and never
+  changed; when two processes name one file at once, the first link wins and the
+  other reads it. It outlives its entry: the next fill through the name makes the
+  entry again under the same hash. A torn temporary file is debris.
+- A name's entry: an entry under its own hash first, else its alias; a URL with a
+  logical name whose name has neither, and whose own entry exists (cached before the
+  prefixes were set), makes that entry the name's (USER_GUIDE.md, "Keys by logical
+  name").
+- The entries already cached are named once per list of prefixes, the most recently
+  used first, by `ucache set logical_name_prefixes` or in the background by the
+  plug-in's first process with them; `named-<hash>` is written at the end.
+- `.names` is appended one line at a time (a torn last line is skipped) and read as
+  the logical name and the newest 8 distinct URLs; written again compacted when it
+  grows past twice that. `ucache rm` removes it; aliases stay.
 
 ## .meta layout (all integers little-endian; no implicit struct packing)
 

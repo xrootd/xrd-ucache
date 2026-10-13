@@ -1,7 +1,7 @@
 // Keys by logical name (logical_name_prefixes set): how a key
 // is derived from a URL, what the switch off leaves alone, the prefixes' checks,
-// the readouts' mapping of stored keys, the freshness check of such an entry, and
-// the move of a pin from an entry keyed by URL to the file's entry by name.
+// the readouts' mapping of stored keys and the freshness check of such an entry (the entry's
+// names: entry_names_test.cc).
 #include "CacheStore.h"
 #include "Config.h"
 #include "MetaFile.h"
@@ -113,7 +113,6 @@ TEST(LogicalNames, TheDefaultPrefixesNameTheRestOfThePath) {
   for (const auto& r : rows) {
     const std::string name = std::string("/store/") + r.g1 + "/" + r.g2;
     EXPECT_EQ(d.key(r.url)->key, "lfn:" + name) << r.url;
-    EXPECT_EQ(d.logicalName(r.url), name) << r.url;
   }
   for (const char* u : {"root://h//store/user/me/c.root", "root://h//x/store/mcextra/a.root",
                         "root://h//x/mystore/mc/a.root", "root://h//store/mc"}) {
@@ -293,40 +292,6 @@ TEST(LogicalNames, FreshnessOfAnEntryByName) {
     ASSERT_TRUE(u);
     EXPECT_EQ(u->cachedBytes(), 0u);
   }
-}
-
-// A pinned entry keyed by the URL before the switch: the file's entry by name is
-// pinned too when it is made from the same URL, and the entry by URL keeps its
-// pin (the cache never takes a pin away). An unpinned one is left as it is.
-TEST(LogicalNames, APinIsCopiedToTheEntryByName) {
-  TempDir td;
-  RealIO io;
-  Config cfg;
-  cfg.cacheDir = td.path();
-  const std::string url = "root://site.example//store/mc/a.root";
-  const auto byUrl = *UrlKey::parse(url);
-  const auto byName = *cms().key(url);
-  const auto other = *cms().key("root://site.example//store/mc/b.root");
-  {
-    CacheStore store(io, cfg);
-    store.disableStatsDump();
-    ASSERT_TRUE(store.open(byUrl, 50000));
-    ASSERT_TRUE(store.open(*UrlKey::parse("root://site.example//store/mc/b.root"), 50000));
-    ASSERT_TRUE(store.setPinnedByKey(byUrl, true));
-  }
-  CacheStore store(io, cfg);
-  store.disableStatsDump();
-  auto e = store.open(byName, 50000);
-  ASSERT_TRUE(e);
-  EXPECT_TRUE(e->pinned());
-  auto m = MetaFile::loadSummary(io, byUrl.metaPath(cfg.cacheDir));
-  ASSERT_TRUE(m);
-  EXPECT_TRUE(m->flags & MetaData::kFlagPinned);
-  auto o = store.open(other, 50000);
-  ASSERT_TRUE(o);
-  EXPECT_FALSE(o->pinned());
-  // A key given as "lfn:" has no URL to carry a pin from.
-  EXPECT_TRUE(UrlKey::parse("lfn:/store/mc/c.root")->urlHash.empty());
 }
 
 // The readouts: a baseline recorded by URL and a run keyed by name are one file

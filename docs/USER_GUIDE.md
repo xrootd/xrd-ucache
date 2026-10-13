@@ -1081,11 +1081,11 @@ file by its logical name (CMS: `/store/...`), and the same file is reached throu
 many URLs: a regional or the global redirector, a site's server, a site's own
 prefix (`root://eoscms.cern.ch//eos/cms/store/mc/...`). With
 `logical_name_prefixes` set (it is off by default, and does not depend on
-`adaptive_federation`), a file whose URL's path holds one of the prefixes is cached
-under `lfn:` and its logical name
-(`lfn:/store/mc/...`), whatever server the URL names: one entry, read once from the
-origin, then served to every URL of it: the name is the entry, and each URL that
-reaches it is another way to the same entry. Only the key changes: where an open or
+`adaptive_federation`), a file whose URL's path holds one of the prefixes has a
+logical name (`lfn:/store/mc/...`), whatever server the URL names, and its cache entry
+has several names: the logical name, which is the entry's core name and groups the
+others, and each URL that reached it. One entry, read once from the origin, then
+served to every URL of it. Only the cache's names change: where an open or
 a read goes, and what it does when a server fails, is as for any other file of
 that URL (a direct URL stays a direct URL; no redirector is added to it). The
 prefixes are looked for in the path
@@ -1101,8 +1101,9 @@ printable, with no empty, `.` or `..` part; `ucache set` refuses a list that is
 not, and one in the conf or the state file keys every file by its URL, said once in
 each job's log, and fails `ucache doctor`. Parameters
 kept by `keep_cgi` follow the name as they follow a URL's path. `ucache ls` prints
-such keys as they are, and every command takes them back
-(`ucache pin lfn:/store/mc/...`).
+an entry by its logical name, `ucache ls -l` lists its URLs under it (the newest 8;
+every URL that reached it stays a name of it), and every command takes any of its
+names (`ucache pin lfn:/store/mc/...`, or a URL).
 
 - **The assumption.** A path that holds a prefix names the same unchanging bytes
   on every server. CMS's official data is written once under a name that is never
@@ -1113,7 +1114,9 @@ such keys as they are, and every command takes them back
   then keyed by the official name and, inside the window, served the official
   file's bytes (or serves its own to a later job that asks for the official one).
   A cache that holds such copies sets `logical_name_prefixes = off` (every file
-  keyed by its URL), or a list that none of its users' paths holds.
+  keyed by its URL), or a list that none of its users' paths holds, and `ucache rm`s
+  the entry: with the prefixes off a URL still reaches the entry it was a name of
+  while that entry exists, and its own key is its own again once it is removed.
 - **Copies of another size.** One name reached through several sites can meet a
   copy that is not the file: cut short, or another version. The rules that keep a
   file's bytes from two copies apart hold as they do for one URL: an entry is never
@@ -1125,22 +1128,33 @@ such keys as they are, and every command takes them back
 - **Freshness.** With `validate = size+mtime` a file keyed by its logical name is
   checked on its size alone: a modification time belongs to one site's copy, and a
   change of site would start the entry again.
-- **Entries cached before.** Entries keyed by a URL whose path now has a logical
-  name are no longer used once the prefixes are set: the file is fetched once more, into
-  its entry by name, and the old entry ages out like any entry nobody reads.
-  `ucache status` counts them (`by URL`). A pinned one is copied: the entry by name
-  is pinned the first time a job opens the file through that URL, and the old entry
-  keeps its pin (a pin is never taken away; `ucache unpin <its key>` lets it go). A
-  pin on another URL of the same file is copied when a job opens that URL.
-  `ucache rm <url>` removes the file's entry by name and the URL's own entry;
-  `ucache rm <key>`, with the key exactly as `ucache ls` prints it, removes that
-  entry alone (CACHE_MANAGEMENT.md). With the prefixes off again, `status` counts
-  the entries by name (`by name`) the other way round: nothing reads them, and they
-  age out (`ucache rm lfn:/...` removes one).
-- **One setting for the cache.** The prefixes are read from the conf or the state
-  file, never from a job's environment, so every job of a cache keys a file one way.
-  Readers that hand positions in a file to workers in other processes
-  (uproot.dask) rely on it: set the prefixes for the cache (`ucache set`).
+- **Turning it on keeps the cache warm.** When the prefixes are set, the entries
+  already cached get their logical names: at once with `ucache set` (it says how
+  many), else once, in the background, by the first job with them. An entry cached by
+  a URL keeps its data, its pin, its replica and its records; nothing is fetched again
+  or copied, and every other URL of the file then reaches that entry (its copy's size
+  must be the entry's, as for any copy). A job that opens a file before its entry was
+  named names it itself. When two URLs of one file were cached as two entries before,
+  the one named first (by the naming, the most recently used) becomes the file's
+  entry, and the other URL becomes a name of it; that URL's own old entry is not read
+  while the prefixes are set and ages out like any entry nobody reads (a pinned one
+  stays until `ucache unpin <its key as ls prints it>`). Bytes of two entries are
+  never mixed.
+- **Turning it off keeps every entry reachable.** With the prefixes off again, each
+  entry is still found through each URL that reached it, while it exists; only the
+  logical name is no longer used.
+- **One setting for the cache.** Set the prefixes for the cache with `ucache set`
+  (its state file, which every job of the cache reads); never from a job's
+  environment. A value set in one job's conf only makes that job key files by name
+  while others do not: each still finds an entry through its URL, but a file the
+  other job caches first is cached twice. `ucache doctor` says so when the value
+  comes from the conf. Readers that hand positions in a file to workers in other
+  processes (uproot.dask) rely on one setting.
+- **Removing, pinning, verifying.** `ucache rm`, `pin`, `unpin`, `verify`,
+  `branches` and `untranspose` act on the file's entry whichever of its names they
+  are given; `rm <url>` also removes that URL's own old entry if one is left beside
+  it. The aliases (names) stay after `rm`: the next job to read the file through any
+  of them caches it again as one entry.
 - **The readouts.** With the prefixes set in the settings a command reads (`ucache
   history`, `stats --files`, `summary`, `publish`), or when any run of the records
   keyed files by the cache's prefixes (its `run_settings` say `logical_names=on/`
@@ -1328,9 +1342,9 @@ below and the dedicated guide in `docs/CACHE_MANAGEMENT.md`.
 | `ucache summary [--detail] [--json]` | **overall performance across every recorded run, and the time the cache has saved (or cost) you, measured against a no-cache baseline** — record one by running your job once with `UCACHE_DISABLE=1`. Refused with a reason rather than qualified when the comparison would not be sound. `--detail` adds the last run: tier split, delivered rate, per-tier read counts and sizes, replica coverage |
 | `ucache history [--top N] [--json]` | an **ALL** row aggregating every recorded run, then one row per run, newest first — whether the numbers are holding up across runs, versions and machines |
 | `ucache status`    | cache location, budget, usage, aggregate stats |
-| `ucache ls [--sort age\|size]` | list cached entries (size, cached, coverage, last-used age, replica, pinned) |
+| `ucache ls [--sort age\|size] [-l]` | list cached entries (size, cached, coverage, last-used age, replica, pinned); `-l` lists each entry's other names (the URLs that reached an entry with a logical name) |
 | `ucache stats`     | aggregate `stats/*.jsonl` across all processes, plus the derived **workflow picture**: opens per distinct file, bytes served per tier (direct / fill / RAM / disk / replica), disk-read count + mean size + sequential share, re-read factor, fill flush shape, and p50/p95/p99 latencies |
-| `ucache stats --files [--top N]` | per-file records (one per file per process), costliest first: which files were re-opened, re-read, served from which tier |
+| `ucache stats --files [--top N]` | per-file records (one per file per process), costliest first: which files were re-opened, re-read, served from which tier; under a file with a logical name, the URLs its entry was reached through |
 | `ucache stats --reset` | start a fresh counter window for measuring **one** run against a specific cache state (run it between jobs — it warns if a file looks live). The counter and per-file records MOVE to `stats/history`, where `summary` and `history` keep reading them: deleting them would delete any measured no-cache baseline, which is the one thing later runs are compared against. Traces are deleted (bulky, per-op, no run-level meaning). The cache contents are untouched |
 | `ucache bench --threads N [PATH …] [--size SZ] [--measurement-duration S] [--block KB] [--fill writers=N,block=SZ] [--sweep] [--cache-path [--cache-sample SZ]] [--log FILE\|--no-log]` | storage self-test of the cache dir (or of candidate dirs, to pick one). Three groups: **standard** measures at pinned block sizes and queue depths 1/16/32, comparable to a datasheet; **pattern** measures at your job's concurrency — each serving tier's read shape, and random reads under writeback; and, with `--cache-path`, the same storage **through uCache's own fill and read code** rather than an imitation of it. Plus fsync, create/unlink. `--threads` is **required and never guessed** — it is what your analyses run at, not the core count. `--measurement-duration` is the window of ONE measurement (the build stage gets 3×; the plan and estimated total print up front). Appends every run, with the machine, load and block device behind the path, to `./ucache-bench.txt`. `--publish` also sends the record — path and mount point replaced by salted hashes, hostname blanked — and prints the report URL (`docs/PUBLISH.md`). **Full guide: `docs/BENCH.md`** |
 | `ucache netbench <root://…> [--streams N,…] [--block KB] [--seconds S] [--publish]` | origin random-read baseline at 1/16/64 streams: what the network side delivers, for a fair cache-vs-origin comparison. `--publish` sends the record (hostname blanked, URL reduced to its domain) for a report |

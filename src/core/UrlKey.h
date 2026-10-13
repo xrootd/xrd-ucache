@@ -84,12 +84,8 @@ class KeyRules {
   // A key stored in a record, as these rules key it now: a URL key whose path
   // has a logical name becomes "lfn:<name>"; any other key is returned as it is.
   std::string mapStored(const std::string& storedKey) const;
-  // The logical name of `url`'s path under the prefixes, whatever the switch
-  // says, or "" when it has none.
-  std::string logicalName(const std::string& url) const;
-
   bool logical() const { return logical_; }
-  // These rules with logical names on whatever the switch said (the readouts of records that were
+  // These rules with logical names on whatever `logical` said (the readouts of records that were
   // keyed by name); as they are when the prefixes are off or not valid.
   KeyRules withNames() const {
     KeyRules k = *this;

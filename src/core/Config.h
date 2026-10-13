@@ -223,6 +223,10 @@ struct Config {
   // fails. Held normalized (normalizedPrefixes) once loaded. See UrlKey.h
   // KeyRules for how the name is taken from the path.
   std::string logicalNamePrefixes = kDefaultLogicalNamePrefixes;
+  // The entry the file read through `url` is held in (EntryNames.h): `keys.key(url)` resolved
+  // through the cache's names, so every name of one entry (its logical name, each URL that reached
+  // it) gives that entry. nullopt for a URL that is not one. Blocks on small local file reads.
+  std::optional<UrlKey> entryKey(const std::string& url) const;
   // `mixed_maps`: a TTree file with a slot store is shown, at each open, the
   // newest MIXED map -- the baskets converted by then stated at their real
   // length, the rest at their slot's -- so a later pass reads what the store
@@ -239,7 +243,7 @@ struct Config {
   std::string trace;    // UCACHE_TRACE ("io" | "off"/"")
   int traceSample = 64; // UCACHE_TRACE_SAMPLE
   std::vector<std::string> keepCgi;       // UCACHE_KEEP_CGI comma list
-  // The rules every caller keys a file by (keep_cgi, and with adaptive_federation on the
+  // The rules every caller keys a file by (keep_cgi, and with logical_name_prefixes set the
   // logical names), built from the fields above once every layer is applied.
   KeyRules keys;
   std::vector<std::string> allowHosts;    // UCACHE_ALLOW glob list (empty = all)

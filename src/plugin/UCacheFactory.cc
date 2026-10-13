@@ -15,6 +15,7 @@
 #include "ClientSettings.h"
 #include "CopyDetect.h"
 #include "CpuCounters.h"
+#include "EntryNames.h"
 #include "Executor.h"
 #include "Log.h"
 #include "UCacheFile.h"
@@ -393,6 +394,7 @@ void initGlobals() {
   // Before any plugin thread exists, so that no fork can find one unprepared.
   ::pthread_atfork(forkPrepare, forkParent, forkChild);
   locateInit();
+  setEntryNamesWritable(true); // the plug-in gives names to the entries it opens (EntryNames.h)
   // Leaked intentionally: destruction order against XrdCl teardown and the
   // executor threads is unknowable; the final stats dump happens via atexit.
   gConfig = new Config(Config::fromEnv(gPluginConf));
@@ -422,6 +424,16 @@ void initGlobals() {
     Executor::instance().setStats(&(*gStore)->stats());
   if (*gStore && gConfig->metaFlushSeconds > 0)
     scheduleCheckpoint();
+  // With logical names set, the entries cached before get their names once per cache and list of
+  // prefixes, in the background (an open meanwhile names its own URL's entry as it goes).
+  if (*gStore && gConfig->keys.logical()) {
+    const std::string dir = gConfig->cacheDir;
+    const KeyRules rules = gConfig->keys;
+    try {
+      Executor::instance().post([dir, rules] { (void)nameCachedEntries(dir, rules); });
+    } catch (...) {
+    }
+  }
   ::atexit([] {
     gExiting.store(true, std::memory_order_release); // first: no open is issued from here on
     waitForSourceWrites(1000); // a mark made just before the end is in the last stats

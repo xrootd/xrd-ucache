@@ -912,14 +912,14 @@ version-coupled state, not a shared scratch area; separate directories cost
 only disk. `ucache status` (`earlier` line) and `ucache doctor` say how many
 such replicas are left.
 
-## A file is fetched again after `logical_name_prefixes` was set
+## A file is cached twice under two names
 
-Expected once per file whose path has a logical name: it is now cached under that
-name (`lfn:/store/...`), and the entry it had under its URL is no
-longer read. `ucache status` counts those entries on its `by URL` line; they age
-out, or `ucache rm <key>` removes one (the key as `ucache ls` prints it). A
-pinned one keeps its pin, and the new entry is pinned too when a job opens the file
-through that URL; `ucache unpin <key>` lets the old one go.
+Two jobs whose confs set `logical_name_prefixes` differently (one with, one
+without) each key the file their way; a file the other job cached first is cached
+again. Set the prefixes for the cache with `ucache set logical_name_prefixes ...`
+(`ucache doctor` notes a value that comes from a conf). Two URLs of one file cached
+as two entries before the prefixes were set are one entry from then on: the second
+URL's old entry ages out (USER_GUIDE.md, "Keys by logical name").
 
 ## A job was served another file's bytes under a `/store/` path
 

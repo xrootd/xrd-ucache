@@ -99,12 +99,13 @@ SIZE      CACHED    COV%   LAST   RECOMP    PIN   KEY
 - **RECOMP** — size of a decompress-once (recompressed) replica if one
   exists (see `docs/USER_GUIDE.md`), else `-`.
 - **PIN** — `yes` if protected from eviction (§4).
-- **KEY** — what the entry is cached under: the file's URL, normalized (scheme,
-  server and port, path, without the query), or, with `logical_name_prefixes` set
-  and a path that holds one of them, `lfn:` and the file's logical name
-  (`lfn:/store/mc/...`): one entry for every URL of the file (USER_GUIDE.md, "Keys
-  by logical name"). Every command that takes a URL takes a key exactly as `ls`
-  prints it, and then acts on that entry alone.
+- **KEY** — the entry's name: the file's URL, normalized (scheme, server and
+  port, path, without the query), or, for an entry with a logical name
+  (`logical_name_prefixes` set and a path that holds one of them), `lfn:` and that
+  name (`lfn:/store/mc/...`): one entry for every URL of the file (USER_GUIDE.md,
+  "Keys by logical name"). `ls -l` lists under it the URLs the entry was reached
+  through (the newest 8), and, when the entry was cached by a URL before it had the
+  name, the key it is stored under. Every command takes any of those names.
 
 By default `ls` is sorted largest-first. To hunt for stale data, sort by age:
 
@@ -342,13 +343,11 @@ Drops those entries entirely — page cache **and** any replica. Use this
 when you know exactly which datasets you are done with. It reports `not cached`
 (and exits non-zero) for a URL that has nothing to remove.
 
-With `logical_name_prefixes` set, a URL whose path has a logical name names two
-entries: the file's entry by name (`lfn:...`) and the URL's own, made before the
-prefixes were set; `rm <url>` removes both, and says each. To remove only one,
-give its key as `ucache ls` prints it (`ucache rm lfn:/store/mc/...`, or
-`ucache rm root://host:1094/store/mc/...` for an entry by URL left from before:
-`ucache status` counts those on its `by URL` line). Such entries are no longer
-read and age out by themselves.
+With `logical_name_prefixes` set, `rm` of any name of an entry (its logical name,
+or a URL that reached it) removes the entry, and `rm <url>` also removes that URL's
+own old entry when one was left beside it (two URLs of one file cached as two
+entries before the prefixes were set: USER_GUIDE.md). Such a left entry, given by
+its key exactly as `ucache ls` prints it, is removed alone.
 
 ### Protect data you do not want cleaned up
 
@@ -360,17 +359,10 @@ ucache unpin root://host//path/to/hot.root     # allow eviction again
 Pin your active dataset before an aggressive cleanup so shrinking the cache
 never touches it.
 
-With `logical_name_prefixes` set, `pin <url>` pins the file's entry by logical name
-when it is cached, else the URL's own entry; `unpin <url>` unpins both. A pinned
-entry by URL made before the prefixes were set keeps its pin, and when a job opens
-the file through that URL, the file's entry by name is pinned too (the
-plug-in says so at `info`). The cache never takes a pin away: to let the old entry
-age out, `ucache unpin <its key as ls prints it>`.
-
-Entries by name (`lfn:...`) are read only while `logical_name_prefixes` names
-them. With it off again, `ucache status` counts them on its `by name` line; they age out like any entry
-nobody reads, and `ucache rm lfn:/store/...` removes one (`ucache unpin` first
-releases a pinned one to eviction).
+With `logical_name_prefixes` set, `pin` and `unpin` of any name of an entry act on
+the entry; a pin set before the prefixes stays the entry's, whichever name it is
+then reached by. `unpin <url>` also unpins that URL's own old entry when one is
+left beside it.
 
 ### Wipe everything
 

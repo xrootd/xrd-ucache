@@ -430,11 +430,6 @@ class CacheStore {
   std::set<std::string> removing_;
   std::condition_variable dropCv_;
   static constexpr int kOpenDropRetries = 16;
-  // A file keyed by its logical name (UrlKey::logical) opened from a URL whose
-  // own entry, keyed by that URL before, is pinned: `entry` is pinned too (the
-  // entry by URL keeps its pin). Asked once per URL key per process.
-  void carryPin(const UrlKey& key, FileEntry& entry);
-  std::set<std::string> pinChecked_; // under regMu_
   // At the final stats dump: the files of every dropped entry still registered (its removal not
   // run yet) are removed.
   void removePendingDrops();
