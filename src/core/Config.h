@@ -12,6 +12,8 @@
 // Thread-safety: immutable after construction; safe to share by const ref.
 #pragma once
 
+#include "UrlKey.h"
+
 #include <cstdint>
 #include <map>
 #include <string>
@@ -209,6 +211,18 @@ struct Config {
   // check_origin_integrity is forced on. Off by default: the client's settings
   // are left as they are.
   bool adaptiveFederation = false;               // UCACHE_ADAPTIVE_FEDERATION
+  // `logical_name_prefixes` (no environment variable: it is a property of the
+  // cache, and two processes keying one URL two ways would make two entries of
+  // one file): a space-separated list, "off" by default (keys by URL). Set, a URL
+  // whose normalized path holds one of them is keyed by its logical name,
+  // "lfn:/store/...", so one file reached through any site or redirector is one
+  // cache entry: the name is the entry, each URL that reached it an alias.
+  // The assumption it makes: a path that holds one names the same unchanging
+  // bytes on every server. Independent of adaptive_federation. A list
+  // that is not valid is warned about once, keys stay by URL, and `doctor`
+  // fails. Held normalized (normalizedPrefixes) once loaded. See UrlKey.h
+  // KeyRules for how the name is taken from the path.
+  std::string logicalNamePrefixes = kDefaultLogicalNamePrefixes;
   // `mixed_maps`: a TTree file with a slot store is shown, at each open, the
   // newest MIXED map -- the baskets converted by then stated at their real
   // length, the rest at their slot's -- so a later pass reads what the store
@@ -225,6 +239,9 @@ struct Config {
   std::string trace;    // UCACHE_TRACE ("io" | "off"/"")
   int traceSample = 64; // UCACHE_TRACE_SAMPLE
   std::vector<std::string> keepCgi;       // UCACHE_KEEP_CGI comma list
+  // The rules every caller keys a file by (keep_cgi, and with adaptive_federation on the
+  // logical names), built from the fields above once every layer is applied.
+  KeyRules keys;
   std::vector<std::string> allowHosts;    // UCACHE_ALLOW glob list (empty = all)
   std::vector<std::string> denyHosts;     // UCACHE_DENY glob list
 
@@ -254,7 +271,8 @@ struct Config {
   // XrdCl would process, discovered via the standard search order).
   static Config fromEnv(const std::string& pluginConfPath);
 
-  // The settings vocabulary: canonical key name + its UCACHE_* env twin.
+  // The settings vocabulary: canonical key name + its UCACHE_* env twin (null
+  // for a key the environment cannot set: logical_name_prefixes).
   struct KeyInfo {
     const char* key;
     const char* envName;
@@ -280,6 +298,13 @@ struct Config {
   // settings in force before it ("" = nothing to add): a value another setting
   // overrides, or what a switch changes beyond its own name.
   std::string setNote(const std::string& key, const std::string& value) const;
+  // The freshness check an entry of `key` gets: `validate`, except that an
+  // entry keyed by logical name is checked on its size where validate =
+  // size+mtime (a modification time belongs to one site's copy, and would
+  // start the entry again at every change of site).
+  ValidateMode validateFor(const UrlKey& key) const {
+    return validate == ValidateMode::kSizeMtime && key.logical() ? ValidateMode::kSize : validate;
+  }
   // Serialized current value of a known key (for `ucache settings`).
   std::string valueOf(const std::string& key) const;
   // The CLI-managed current-values file.

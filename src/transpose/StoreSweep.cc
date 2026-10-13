@@ -146,7 +146,7 @@ SweepResult sweepFile(CacheStore& cs, const Config& cfg, IOBackend& io, const Ur
   // more: the store replaces it.
   res.droppedEarlier = CacheStore::dropEarlierReplica(io, dir, key.hashHex);
   if (store && !adoptable(store->header(), size, cm->originMtime, cm->cksumKind, cm->originCksum,
-                          cfg.validate)) {
+                          cfg.validateFor(key))) {
     // Made by an earlier uCache, or for another version of the file.
     if (!store->dropIfCurrent())
       return fail(O::kIncomplete, "its store is being replaced");
@@ -234,7 +234,7 @@ SweepResult sweepFile(CacheStore& cs, const Config& cfg, IOBackend& io, const Ur
       if (store->header().declined)
         return fail(O::kDeclined, "declined when it was first read");
       if (!adoptable(store->header(), size, cm->originMtime, cm->cksumKind, cm->originCksum,
-                     cfg.validate))
+                     cfg.validateFor(key)))
         return fail(O::kIncomplete, "its store is being replaced");
     }
   }

@@ -318,6 +318,10 @@ std::string runSettings(const Config& cfg) {
   }
   out += " adaptive_federation=";
   out += cfg.adaptiveFederation ? "on" : "off";
+  // With logical_name_prefixes set: files are keyed by logical name, and a hash of the prefixes that
+  // name them (two runs keyed by different prefixes key one file two ways). No token when unset.
+  if (cfg.keys.logical())
+    out += " logical_names=on/" + cfg.keys.prefixesHash();
   return out;
 }
 

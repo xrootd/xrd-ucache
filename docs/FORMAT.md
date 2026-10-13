@@ -28,7 +28,14 @@ $UCACHE_DIR/                         (0700)
 
 `<hh>` = first two hex chars of the sha256. The key is the normalized URL;
 CGI/opaque parameters are stripped before hashing so tokens never
-reach disk, in keys or file names.
+reach disk, in keys or file names. With `logical_name_prefixes` set, a file whose
+path holds one of them is keyed `lfn:<logical name>` instead
+(`lfn:/store/mc/...`, kept CGI after it as after a URL's path), whatever server its
+URL names; nothing else about the entry, its sidecar, slot store or in-use record
+changes. An entry's name on disk is the hash of the key it was made under, and is
+never derived again from the key stored in its sidecar: a cache can hold entries
+under both kinds of key at once (made before and after the prefixes were set),
+each its own.
 
 ## .meta layout (all integers little-endian; no implicit struct packing)
 
@@ -411,7 +418,9 @@ other `*.jsonl` in `stats/` as a counter file. The lines are queued in memory
 that ends without either loses those queued since its last checkpoint, as it
 loses its counters. The last line can be torn by a crash; readers skip a line
 that does not end in `}`. A message never carries a URL's query (`?…`), which
-can hold an access token, and `file` is the cache key, which has none.
+can hold an access token, and `file` is the cache key, which has none (with
+`logical_name_prefixes` set, `lfn:` and the logical name for a path that has one:
+STATS.md).
 
 **`"kind":"open"`, v1** — one line per origin open attempt the plugin watched:
 

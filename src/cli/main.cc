@@ -561,6 +561,11 @@ int cmdStatsFiles(const Config& cfg, size_t topN) {
   };
   std::map<std::string, Agg> byKey;
   const std::string sdir = cfg.cacheDir + "/stats";
+  // Keys are read as files are keyed now: by name when this command's settings say so or the
+  // records' own runs keyed files by these prefixes (RunLog.h loadRuns); as written otherwise,
+  // and for the records of a run keyed by other prefixes.
+  const bool byName = cfg.keys.logical() || recordsKeyedByName(sdir, cfg.keys.prefixesHash());
+  const KeyRules names = byName ? cfg.keys.withNames() : cfg.keys;
   DIR* d = ::opendir(sdir.c_str());
   if (d) {
     while (dirent* e = ::readdir(d)) {
@@ -568,6 +573,8 @@ int cmdStatsFiles(const Config& cfg, size_t topN) {
       if (n.size() < 12 || n.compare(n.size() - 12, 12, ".files.jsonl") != 0)
         continue;
       std::ifstream in(sdir + "/" + n);
+      const std::string h = nameHashOf(runSettingsOf(sdir + "/" + n.substr(0, n.size() - 12) + ".jsonl"));
+      const KeyRules& rules = h.empty() || h == cfg.keys.prefixesHash() ? names : cfg.keys;
       std::string line;
       while (std::getline(in, line)) {
         auto kp = line.find("\"key\":\"");
@@ -577,7 +584,7 @@ int cmdStatsFiles(const Config& cfg, size_t topN) {
         auto ke = line.find('"', kp);
         if (ke == std::string::npos)
           continue;
-        Agg& a = byKey[line.substr(kp, ke - kp)];
+        Agg& a = byKey[rules.mapStored(line.substr(kp, ke - kp))]; // as the file is keyed now
         a.opens += fieldU64(line, "opens");
         a.served += fieldU64(line, "served_bytes");
         a.ram += fieldU64(line, "ram_bytes");
@@ -1548,7 +1555,7 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
       return 2;
     }
   }
-  const auto runs = withoutTrivial(loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history"));
+  const auto runs = withoutTrivial(loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history", &cfg.keys));
   if (asJson) {
     std::puts(historyJson(runs, top, /*redacted=*/false, /*oldestFirst=*/false).c_str());
     return 0;
@@ -1781,7 +1788,7 @@ int cmdPublish(const Config& cfg, int argc, char** argv) {
 
   // What there is to send, decided BEFORE anything is created on disk: a
   // refusal for want of data must not leave a fresh identity behind.
-  const auto runs = withoutTrivial(loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history"));
+  const auto runs = withoutTrivial(loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history", &cfg.keys));
   const auto store = loadRecords();
   std::vector<std::pair<const Json*, bool>> benchRecords; // record, is this very disk
   std::vector<const Json*> netRecords;
@@ -1953,7 +1960,7 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
     }
   }
   const auto runs =
-      withoutTrivial(loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history"));
+      withoutTrivial(loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history", &cfg.keys));
   auto entries = store.listEntries(/*disk=*/true);
   uint64_t used = 0, replicaTotal = 0, replicaN = 0, byteDisk = 0, replicaDisk = 0;
   for (const auto& e : entries) {
@@ -2458,8 +2465,78 @@ int cmdStatus(CacheStore& store, IOBackend& io) {
   // Status is a fast command; the codec comparison is left to `doctor`.
   if (std::string why = recompressStall(cfg, io, replicaN, /*deep=*/false); !why.empty())
     std::printf("recompress: %s\n", why.c_str());
+  // Entries the cache's settings no longer read: with logical_name_prefixes set, those keyed by a
+  // URL whose path now has a logical name; with it off, those keyed by a logical name (made while
+  // it was set). Said only when there are some.
+  {
+    size_t n = 0, pinnedN = 0;
+    uint64_t bytes = 0;
+    for (const auto& e : entries) {
+      const bool other = cfg.keys.logical() ? cfg.keys.mapStored(e.key) != e.key
+                                            : e.key.compare(0, 4, "lfn:") == 0;
+      if (other) {
+        ++n;
+        pinnedN += e.pinned;
+        bytes += e.cachedBytes + e.replicaBytes;
+      }
+    }
+    const std::string pins =
+        pinnedN ? " (" + std::to_string(pinnedN) +
+                      " pinned: a pin is never taken away; `ucache unpin <key>` lets one age out)"
+                : std::string();
+    if (n && cfg.keys.logical())
+      std::printf("by URL    : %zu entr%s (%s) keyed by a URL whose path now has a logical name; "
+                  "logical_name_prefixes keys the file by that name, so these are no longer read "
+                  "and age out%s; `ucache rm <key>` removes one (`ucache ls` prints the keys)\n",
+                  n, n == 1 ? "y" : "ies", human(bytes).c_str(), pins.c_str());
+    else if (n)
+      std::printf("by name   : %zu entr%s (%s) keyed by a logical name (lfn:...), made while "
+                  "logical_name_prefixes was set; jobs without it do not read them, and they age out%s; "
+                  "`ucache rm <key>` removes one (`ucache ls` prints the keys)\n",
+                  n, n == 1 ? "y" : "ies", human(bytes).c_str(), pins.c_str());
+  }
   printStats(aggregateStats(cfg.cacheDir + "/stats"));
   return 0;
+}
+
+// The entries a name given to a command names: the key the settings give it
+// (by logical name, with logical_name_prefixes set and a path that holds one),
+// and, when that is a logical name made from a URL, the URL's own key (an entry
+// made without the prefixes, or before the name was used). A key
+// exactly as `ucache ls` prints it names that entry alone: a key by URL whose
+// path now has a logical name is how an entry left from before is removed
+// without the file's entry by name. Empty for a name that is not a URL or key.
+std::vector<UrlKey> namedKeys(const Config& cfg, const std::string& name) {
+  std::vector<UrlKey> out;
+  auto k = cfg.keys.key(name);
+  if (!k)
+    return out;
+  if (k->logical() && !k->urlHash.empty()) {
+    const UrlKey byUrl = UrlKey::ofEntry(k->urlKey, k->urlHash);
+    if (name == k->urlKey)
+      return {byUrl};
+    out.push_back(*k);
+    out.push_back(byUrl);
+    return out;
+  }
+  out.push_back(*k);
+  return out;
+}
+// Of namedKeys, the first whose entry is in the cache (its sidecar exists), else
+// the first; nullopt for a name that is not a URL or key.
+std::optional<UrlKey> cachedKey(const Config& cfg, const std::string& name) {
+  const auto keys = namedKeys(cfg, name);
+  if (keys.empty())
+    return std::nullopt;
+  for (auto k : keys) {
+    struct ::stat st;
+    if (::stat(k.metaPath(cfg.cacheDir).c_str(), &st) == 0) {
+      k.urlKey.clear(); // the entry itself: opening it (verify) moves no pin of the URL's entry
+      k.urlHash.clear();
+      return k;
+    }
+  }
+  return keys.front();
 }
 
 int cmdLs(CacheStore& store, int argc, char** argv) {
@@ -2639,8 +2716,8 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
     if (e.cachedBytes == 0 && e.replicaBytes == 0) {
       ++preSkipped;
       if (e.earlierReplicaBytes)
-        if (auto key = UrlKey::parse(e.key, cfg.keepCgi))
-          earlier += CacheStore::dropEarlierReplica(io, key->objectDir(cfg.cacheDir), key->hashHex);
+        earlier += CacheStore::dropEarlierReplica(
+            io, UrlKey::ofEntry(e.key, e.hashHex).objectDir(cfg.cacheDir), e.hashHex);
     } else {
       work.push_back(e);
     }
@@ -2725,14 +2802,9 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
         std::fprintf(stderr, "\rrecompress: %zu/%zu — %d recompressed, %d nothing to do, %d failed",
                      nDone, work.size(), done.load(), skipped.load(), failed.load());
       const auto& e = work[i];
-      auto key = UrlKey::parse(e.key, cfg.keepCgi);
-      if (!key) {
-        std::lock_guard<std::mutex> g(outMu);
-        std::fprintf(stderr, "recompress: build failed: not a usable cache key: %s\n",
-                     e.key.c_str());
-        ++failed;
-        continue;
-      }
+      // The entry's identity is its object name, never its key's text parsed again: the
+      // settings may key that text another way now (a logical name).
+      const std::optional<UrlKey> key = UrlKey::ofEntry(e.key, e.hashHex);
       // Capacity budget: what this pass writes must fit in the headroom above
       // the eviction floor. The pass may not be the thing that pushes a volume
       // into eviction, and cannot know up front what it will cost — so it
@@ -2968,7 +3040,7 @@ int cmdBranches(const Config& cfg, IOBackend& io, const char* url) {
   std::fputs("branches: built without the native transposer (codec libs missing)\n", stderr);
   return 2;
 #else
-  auto key = UrlKey::parse(url, cfg.keepCgi);
+  auto key = cachedKey(cfg, url);
   if (!key) {
     std::fprintf(stderr, "%s: not a valid URL\n", url);
     return 2;
@@ -3044,7 +3116,7 @@ int cmdBranches(const Config& cfg, IOBackend& io, const char* url) {
 }
 
 int cmdUntranspose(CacheStore& store, const Config& cfg, IOBackend& io, const char* url) {
-  auto key = UrlKey::parse(url, cfg.keepCgi); // SAME normalization as the plugin
+  auto key = cachedKey(cfg, url); // SAME normalization as the plugin
   if (!key) {
     std::fprintf(stderr, "%s: not a valid URL\n", url);
     return 2;
@@ -3152,15 +3224,19 @@ int cmdRm(CacheStore& store, const Config& cfg, int argc, char** argv) {
   }
   int missing = 0, bad = 0;
   for (int i = 2; i < argc; ++i) {
-    auto key = UrlKey::parse(argv[i], cfg.keepCgi); // SAME normalization as the plugin
-    if (!key) {
+    const auto keys = namedKeys(cfg, argv[i]); // SAME normalization as the plugin
+    if (keys.empty()) {
       std::fprintf(stderr, "%s: not a valid URL\n", argv[i]);
       ++bad;
       continue;
     }
-    if (store.removeEntry(*key)) {
-      std::printf("removed %s\n", key->key.c_str());
-    } else {
+    bool removed = false;
+    for (const auto& key : keys)
+      if (store.removeEntry(key)) {
+        std::printf("removed %s\n", key.key.c_str());
+        removed = true;
+      }
+    if (!removed) {
       std::fprintf(stderr, "%s: not cached\n", argv[i]);
       ++missing;
     }
@@ -3285,21 +3361,32 @@ int cmdClear(CacheStore& store, int argc, char** argv) {
 }
 
 int cmdPin(CacheStore& store, const Config& cfg, const char* url, bool pin) {
-  auto key = UrlKey::parse(url, cfg.keepCgi); // SAME normalization as the plugin
-  if (!key) {
+  // SAME normalization as the plugin. A pin goes on the first of the file's entries that is
+  // cached (by logical name, else by URL: the entry by name is pinned too at the next open); an unpin takes it
+  // off each of them, so that none is left pinned.
+  const auto keys = namedKeys(cfg, url);
+  if (keys.empty()) {
     std::fprintf(stderr, "%s: not a valid URL\n", url);
     return 2;
   }
-  if (!store.setPinnedByKey(*key, pin)) {
+  bool done = false;
+  for (const auto& key : keys) {
+    if (pin && done)
+      break;
+    if (store.setPinnedByKey(key, pin)) {
+      std::printf("%s %s\n", pin ? "pinned" : "unpinned", key.key.c_str());
+      done = true;
+    }
+  }
+  if (!done) {
     std::fprintf(stderr, "%s: not cached (nothing to %s)\n", url, pin ? "pin" : "unpin");
     return 1;
   }
-  std::printf("%s %s\n", pin ? "pinned" : "unpinned", key->key.c_str());
   return 0;
 }
 
 int cmdVerify(CacheStore& store, const Config& cfg, IOBackend& io, const char* url) {
-  auto key = UrlKey::parse(url, cfg.keepCgi);
+  auto key = cachedKey(cfg, url);
   if (!key) {
     std::fprintf(stderr, "%s: not a valid URL\n", url);
     return 2;
@@ -3564,10 +3651,10 @@ int cmdSettings(const Config& cfg) {
     std::printf("current  : %s%s\n", sp.c_str(),
                 ::stat(sp.c_str(), &st) == 0 ? "" : " (nothing set — values from defaults/env)");
   }
-  std::printf("\n%-22s %-28s %s\n", "key", "value", "source");
+  std::printf("\n%-22s %-38s %s\n", "key", "value", "source");
   for (const auto& k : Config::knownKeys()) {
     auto it = cfg.sources.find(k.key);
-    std::printf("%-22s %-28s %s\n", k.key, cfg.valueOf(k.key).c_str(),
+    std::printf("%-22s %-38s %s\n", k.key, cfg.valueOf(k.key).c_str(),
                 it == cfg.sources.end() ? "default" : it->second.c_str());
   }
   std::printf("\ncurrent values: `ucache set <key> <value>` / `ucache unset <key>` "
@@ -3595,6 +3682,13 @@ int cmdSet(const Config& cfg, const char* key, const char* value) {
                "or UCACHE_DIR first\n",
                stderr);
     return 2;
+  }
+  if (k == "logical_name_prefixes") {
+    std::string why;
+    if (!logicalNamePrefixesValid(value, &why)) {
+      std::fprintf(stderr, "set: logical_name_prefixes '%s' is not valid: %s\n", value, why.c_str());
+      return 2;
+    }
   }
   mkdirs(cfg.cacheDir);
   const std::string sp = Config::statePath(cfg.cacheDir);
@@ -4164,6 +4258,14 @@ int cmdDoctor(const Config& cfg) {
     problems += fsProbe(cfg.cacheDir, cfg.pageSize, unit);
     problems += cacheSpaceProbe(cfg.cacheDir, unit);
   }
+  // The prefixes of logical names are the cache's: a list that is not valid keys
+  // every file by its URL, whatever adaptive_federation says.
+  if (!cfg.keys.prefixesValid()) {
+    std::printf("  [FAIL] logical_name_prefixes '%s' is not valid (%s): files are keyed by their "
+                "URL; `ucache set logical_name_prefixes '<prefix> ...'` (or off)\n",
+                cfg.logicalNamePrefixes.c_str(), cfg.keys.prefixesError().c_str());
+    ++problems;
+  }
   const PluginPick pick = pickPlugin(conf);
   problems += soProbe(pick) + activationProbe();
   problems += handshakeProbe(pick);
@@ -4185,6 +4287,11 @@ int cmdDoctor(const Config& cfg) {
                 "         removes a file's replica while no job is reading it\n");
   if (cfg.adaptiveFederation)
     federationNote(cfg);
+  if (cfg.keys.logical())
+    std::printf("  [NOTE] logical_name_prefixes = %s: a file whose path holds one of them is cached\n"
+                "         under its logical name (one entry through any site or redirector),\n"
+                "         assuming the path names the same unchanging bytes on every server\n",
+                cfg.logicalNamePrefixes.c_str());
   if (!cfg.cacheDir.empty())
     if (const size_t n = countEarlierReplicas(cfg.cacheDir))
       std::printf("  [NOTE] %zu replica%s an earlier uCache made %s in the cache. This one does not\n"
@@ -4278,8 +4385,9 @@ int cmdTest(CacheStore& store, const Config& cfg, int argc, char** argv) {
     return 2;
   }
   const std::string url = argv[2];
-  auto key = UrlKey::parse(url, cfg.keepCgi); // SAME normalization as the plugin
-  if (!key) {
+  auto key = cfg.keys.key(url); // SAME normalization as the plugin
+  const auto byUrl = cfg.keys.urlKey(url); // the server, for the conf's binding
+  if (!key || !byUrl || byUrl->logical()) {
     std::fprintf(stderr, "test: not a valid root:// URL: %s\n", url.c_str());
     return 2;
   }
@@ -4300,7 +4408,7 @@ int cmdTest(CacheStore& store, const Config& cfg, int argc, char** argv) {
   // Binding sanity: warn up front if the conf can't intercept this URL.
   // key->key is "scheme://host:port/path" — extract host:port.
   const std::string binding = xp.empty() ? confKey(conf, "url") : "*";
-  std::string hostport = key->key;
+  std::string hostport = byUrl->key;
   if (auto ss = hostport.find("://"); ss != std::string::npos)
     hostport = hostport.substr(ss + 3);
   hostport = hostport.substr(0, hostport.find('/'));

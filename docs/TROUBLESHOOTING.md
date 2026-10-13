@@ -35,7 +35,10 @@ second. If not:
    data host explicitly.
 4. **Host mismatch.** The cache key includes host:port. If you read via a
    federation redirector on the cold pass and a direct site URL on the warm pass
-   (or vice versa), they are different keys. Read via a consistent URL.
+   (or vice versa), they are different keys, unless the path has a logical name
+   and `logical_name_prefixes` is set: then every URL of the file is one key,
+   `lfn:/store/...` (USER_GUIDE.md, "Keys by logical name"). Otherwise read via
+   a consistent URL.
 5. **Caching disabled.** `UCACHE_DISABLE=1`, `disable = true` in the conf, or
    `ucache disable` was run. Re-enable with `ucache enable`.
 6. **You tested with `xrdcp`.** A copy never uses the cache, by design: `xrdcp`,
@@ -151,7 +154,10 @@ a validated entry is served without contacting the origin, so a file
 window expires. Physics data is normally write-once, which is why the default
 trusts the cache. When you know a file changed:
 
-- `ucache rm <url>` — drop that entry; the next open re-fetches.
+- `ucache rm <url>` — drop that entry; the next open re-fetches. With
+  `logical_name_prefixes` set and a path with a logical name, the entry is the
+  file's for every URL that names it, and `rm` drops it (and the URL's own
+  entry, if one is left from before).
 - `UCACHE_REVALIDATE_S=0 <your job>` — force origin re-checks for one run.
 - `revalidate_seconds = 0` in your `ucache.conf` — always re-check (the
   pre-0.9.1 behavior; adds a remote open+stat to every open).
@@ -194,6 +200,13 @@ A copy tool that uses XRootD's copy engine and still is not counted in
 `copier_handles` is worth reporting, with its name and the client version.
 
 ## `doctor` reports a problem
+
+- **`[FAIL] logical_name_prefixes ... is not valid`** — the list in the conf or
+  the state file has an entry that does not begin and end with `/`, holds a space
+  or a byte that is not printable, or an empty, `.` or `..` part, or is too long
+  (USER_GUIDE.md, "Keys by logical name"). Files are keyed by their URL until it
+  is fixed: `ucache set logical_name_prefixes '/store/data/ /store/mc/'` (which
+  refuses a bad list), or `off`. Every job says it once in its log.
 
 - **`[FAIL] plugin not loadable`** — the `.so` can't be `dlopen`ed. Usually a
   missing/incompatible `libXrdCl` (wrong XRootD version) or a moved install.
@@ -898,6 +911,25 @@ Point one version at a cache directory at a time. A cache directory is
 version-coupled state, not a shared scratch area; separate directories cost
 only disk. `ucache status` (`earlier` line) and `ucache doctor` say how many
 such replicas are left.
+
+## A file is fetched again after `logical_name_prefixes` was set
+
+Expected once per file whose path has a logical name: it is now cached under that
+name (`lfn:/store/...`), and the entry it had under its URL is no
+longer read. `ucache status` counts those entries on its `by URL` line; they age
+out, or `ucache rm <key>` removes one (the key as `ucache ls` prints it). A
+pinned one keeps its pin, and the new entry is pinned too when a job opens the file
+through that URL; `ucache unpin <key>` lets the old one go.
+
+## A job was served another file's bytes under a `/store/` path
+
+With `logical_name_prefixes = /store/data/ /store/mc/ /store/hidata/`, any path
+that contains `/store/data/`, `/store/mc/` or `/store/hidata/` is keyed by the name
+from there on, a user's copy that keeps CMS's layout included (`/eos/user/x/me/store/mc/...`):
+it and the official file are one entry, and inside the freshness window either is
+served the bytes of whichever was cached first. Set `logical_name_prefixes = off`
+for such a cache (or a list that none of its users' paths holds), and `ucache rm`
+the entry.
 
 ## Pinned data got evicted / a pin didn't take
 

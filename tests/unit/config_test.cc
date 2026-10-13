@@ -21,7 +21,8 @@ struct EnvGuard {
   ~EnvGuard() { clear(); }
   static void clear() {
     for (const auto& k : Config::knownKeys())
-      ::unsetenv(k.envName);
+      if (k.envName)
+        ::unsetenv(k.envName);
     for (const auto& r : Config::retiredKeys())
       if (r.envName)
         ::unsetenv(r.envName);

@@ -13,6 +13,8 @@
 // Thread-safety: none required; plain readers used by one CLI process.
 #pragma once
 
+#include "UrlKey.h"
+
 #include <cstdint>
 #include <map>
 #include <string>
@@ -113,6 +115,9 @@ struct Run {
     // the newest record that names one; "" when none does (a warm run, or a
     // record from before the field existed).
     std::string dataServer;
+    // The host of the file's key as the newest record stored it, when that key is a URL: a record
+    // by URL read as a logical name (KeyRules::mapStored) keeps the origin its key named.
+    std::string urlHost;
     uint64_t tsMs = 0;       // newest record's epoch milliseconds, 0 if none
 
     // What the application read of this file, in ORIGINAL-file coordinates
@@ -352,8 +357,28 @@ struct Run {
 // COUNTER window by moving the records there rather than deleting them, so the
 // performance record outlives a measurement window -- losing months of history
 // to a command documented as "start a fresh measurement" would be a poor trade.
-std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiveDir = "");
+//
+// `keys`, when given, maps each per-file record's key as those rules key the
+// file now (KeyRules::mapStored), when they have logical names on, or when
+// any run of the records keyed files by these rules' prefixes (their hash, nameHashOf): a record
+// keyed by a URL whose path has a logical name is read as that name's, so a
+// baseline recorded before the switch, or through another site or redirector,
+// still matches the runs that key the file by its logical name, and `sig` and
+// the read signature are computed on the mapped keys. The origin of such a
+// record stays the host its key named. A run keyed by other prefixes is read
+// as written (said once on stderr).
+std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiveDir = "",
+                          const KeyRules* keys = nullptr);
 
+// The hash of the prefixes a run keyed files by (`logical_names=on/<hash>` in its `run_settings`),
+// or "" when it did not (or the string is empty).
+std::string nameHashOf(const std::string& runSettings);
+bool keyedByName(const std::string& runSettings);
+// The last `run_settings` of a counter file, or "".
+std::string runSettingsOf(const std::string& countersPath);
+// Whether any counter line of a stats directory says its run keyed files by the prefixes of hash
+// `prefixesHash` (`ucache stats --files`).
+bool recordsKeyedByName(const std::string& statsDir, const std::string& prefixesHash);
 // Whether a run's `run_settings` (docs/STATS.md) say adaptive_federation was
 // on. False for an empty string: a record written before the field existed.
 bool federationRun(const std::string& runSettings);

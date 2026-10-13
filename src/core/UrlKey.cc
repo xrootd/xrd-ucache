@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <fnmatch.h>
 #include <map>
 #include <sstream>
@@ -48,10 +49,83 @@ std::string normalizePath(const std::string& in) {
   return out.empty() ? "/" : out;
 }
 
+// Keep only whitelisted CGI keys, sorted for canonical form: "" or "?k=v&...".
+std::string keptCgi(const std::string& cgi, const std::vector<std::string>& keepCgi) {
+  std::string kept;
+  if (!keepCgi.empty() && !cgi.empty()) {
+    std::map<std::string, std::string> keptKv; // sorted by key
+    std::istringstream is(cgi);
+    std::string kv;
+    while (std::getline(is, kv, '&')) {
+      auto eq = kv.find('=');
+      std::string k = eq == std::string::npos ? kv : kv.substr(0, eq);
+      if (std::find(keepCgi.begin(), keepCgi.end(), k) != keepCgi.end())
+        keptKv[k] = eq == std::string::npos ? "" : kv.substr(eq + 1);
+    }
+    for (const auto& [k, v] : keptKv)
+      kept += (kept.empty() ? "?" : "&") + k + "=" + v;
+  }
+  return kept;
+}
+
+// The parts of a URL a key is made of.
+struct UrlParts {
+  std::string scheme, host, path, kept;
+  int port = 0;
+};
+std::optional<UrlParts> urlParts(const std::string& url, const std::vector<std::string>& keepCgi);
+
+constexpr const char* kLfnPrefix = "lfn:";
+
+// "lfn:/<path>[?query]": the key as it is, its path normalized. nullopt for
+// anything else.
+std::optional<UrlKey> parseLogical(const std::string& s, const std::vector<std::string>& keepCgi) {
+  if (s.compare(0, 4, kLfnPrefix) != 0 || s.size() < 5 || s[4] != '/')
+    return std::nullopt;
+  std::string rest = s.substr(4), cgi;
+  if (auto q = rest.find('?'); q != std::string::npos) {
+    cgi = rest.substr(q + 1);
+    rest = rest.substr(0, q);
+  }
+  UrlKey out;
+  out.scheme = "lfn";
+  out.key = std::string(kLfnPrefix) + normalizePath(rest) + keptCgi(cgi, keepCgi);
+  out.hashHex = sha256Hex(out.key);
+  return out;
+}
+
 } // namespace
 
 std::optional<UrlKey> UrlKey::parse(const std::string& url,
                                     const std::vector<std::string>& keepCgi) {
+  if (auto lfn = parseLogical(url, keepCgi))
+    return lfn;
+  const auto p = urlParts(url, keepCgi);
+  if (!p)
+    return std::nullopt;
+  UrlKey out;
+  out.scheme = p->scheme;
+  out.host = p->host;
+  out.key = p->scheme + "://" + p->host + ":" + std::to_string(p->port) + p->path + p->kept;
+  out.hashHex = sha256Hex(out.key);
+  return out;
+}
+
+UrlKey UrlKey::ofEntry(const std::string& key, const std::string& hashHex) {
+  UrlKey out;
+  if (auto k = parse(key)) // scheme and host, as far as the text gives them
+    out = *k;
+  out.key = key;
+  out.hashHex = hashHex; // the identity: never the hash of the text again
+  out.urlKey.clear();
+  out.urlHash.clear();
+  if (key.compare(0, 4, kLfnPrefix) == 0)
+    out.scheme = "lfn";
+  return out;
+}
+
+namespace {
+std::optional<UrlParts> urlParts(const std::string& url, const std::vector<std::string>& keepCgi) {
   auto schemeEnd = url.find("://");
   if (schemeEnd == std::string::npos || schemeEnd == 0)
     return std::nullopt;
@@ -92,31 +166,178 @@ std::optional<UrlKey> UrlKey::parse(const std::string& url,
     cgi = rest.substr(q + 1);
     rest = rest.substr(0, q);
   }
-  std::string path = normalizePath(rest);
-
-  // Keep only whitelisted CGI keys, sorted for canonical form.
-  std::string kept;
-  if (!keepCgi.empty() && !cgi.empty()) {
-    std::map<std::string, std::string> keptKv; // sorted by key
-    std::istringstream is(cgi);
-    std::string kv;
-    while (std::getline(is, kv, '&')) {
-      auto eq = kv.find('=');
-      std::string k = eq == std::string::npos ? kv : kv.substr(0, eq);
-      if (std::find(keepCgi.begin(), keepCgi.end(), k) != keepCgi.end())
-        keptKv[k] = eq == std::string::npos ? "" : kv.substr(eq + 1);
-    }
-    for (const auto& [k, v] : keptKv)
-      kept += (kept.empty() ? "?" : "&") + k + "=" + v;
-  }
-
-  UrlKey out;
+  UrlParts out;
   out.scheme = scheme;
   out.host = host;
-  out.key = scheme + "://" + host + ":" + std::to_string(port) + path + kept;
+  out.port = port;
+  out.path = normalizePath(rest);
+  out.kept = keptCgi(cgi, keepCgi);
+  return out;
+}
+} // namespace
+
+// ---- Keys by logical name ---------------------------------------------------
+
+namespace {
+bool prefixesOff(const std::string& value) {
+  return value.find_first_not_of(" \t") == std::string::npos || value == "off";
+}
+std::vector<std::string> splitPrefixes(const std::string& value) {
+  std::vector<std::string> out;
+  size_t i = 0;
+  while (i < value.size()) {
+    while (i < value.size() && (value[i] == ' ' || value[i] == '\t'))
+      ++i;
+    size_t j = i;
+    while (j < value.size() && value[j] != ' ' && value[j] != '\t')
+      ++j;
+    if (j > i)
+      out.push_back(value.substr(i, j - i));
+    i = j;
+  }
+  return out;
+}
+// Why `p` cannot be a prefix, "" when it can.
+std::string prefixFault(const std::string& p) {
+  if (p.size() > kMaxLogicalNamePrefixBytes)
+    return "'" + p.substr(0, 40) + "...' is longer than " +
+           std::to_string(kMaxLogicalNamePrefixBytes) + " bytes";
+  if (p.size() < 3 || p.front() != '/' || p.back() != '/')
+    return "'" + p + "' does not begin and end with \"/\" with a name between";
+  for (unsigned char c : p)
+    if (c < 0x21 || c > 0x7e)
+      return "'" + p + "' holds a byte that is not printable";
+  if (p.find("//") != std::string::npos || p.find("/./") != std::string::npos ||
+      p.find("/../") != std::string::npos)
+    return "'" + p + "' holds an empty, \".\" or \"..\" component, which a path never does";
+  return std::string();
+}
+} // namespace
+
+std::string logicalNameOf(const std::vector<std::string>& prefixes, const std::string& path) {
+  size_t from = std::string::npos;
+  for (const std::string& p : prefixes) {
+    const size_t at = path.find(p);
+    if (at < from)
+      from = at;
+  }
+  return from == std::string::npos ? std::string() : path.substr(from);
+}
+
+bool logicalNamePrefixesValid(const std::string& value, std::string* why) {
+  if (prefixesOff(value))
+    return true;
+  const std::vector<std::string> list = splitPrefixes(value);
+  std::string fault;
+  if (list.size() > kMaxLogicalNamePrefixes)
+    fault = std::to_string(list.size()) + " prefixes, more than " +
+            std::to_string(kMaxLogicalNamePrefixes);
+  for (const std::string& p : list)
+    if (fault.empty())
+      fault = prefixFault(p);
+  if (!fault.empty() && why)
+    *why = fault;
+  return fault.empty();
+}
+
+std::string normalizedPrefixes(const std::string& value) {
+  if (prefixesOff(value))
+    return "off";
+  std::string out;
+  for (const std::string& p : splitPrefixes(value))
+    out += (out.empty() ? "" : " ") + p;
+  return out;
+}
+
+KeyRules::KeyRules(std::vector<std::string> keepCgi, bool logical, const std::string& prefixes)
+    : keepCgi_(std::move(keepCgi)) {
+  if (prefixesOff(prefixes))
+    return;
+  std::string why;
+  if (!logicalNamePrefixesValid(prefixes, &why)) {
+    error_ = why;
+    return;
+  }
+  prefixes_ = splitPrefixes(prefixes);
+  prefixesHash_ = sha256Hex(normalizedPrefixes(prefixes)).substr(0, 8);
+  logical_ = logical;
+}
+
+std::optional<UrlKey> KeyRules::urlKey(const std::string& url) const {
+  return UrlKey::parse(url, keepCgi_);
+}
+
+std::string KeyRules::logicalName(const std::string& url) const {
+  if (prefixes_.empty())
+    return std::string();
+  const auto p = urlParts(url, {});
+  return p ? logicalNameOf(prefixes_, p->path) : std::string();
+}
+
+uint64_t KeyRules::nextId() {
+  static std::atomic<uint64_t> next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::optional<UrlKey> KeyRules::key(const std::string& url) const {
+  // The same URL is keyed again and again by one thread (a handle's records and reads): the last
+  // answer is kept per thread, for these rules (a regular expression is not free).
+  struct Last {
+    uint64_t id = 0;
+    std::string url;
+    std::optional<UrlKey> key;
+  };
+  // Never destroyed: a thread's exit (the main thread's at process exit, while the final records
+  // are written) must not leave a destroyed object behind for a later call.
+  thread_local Last* last = new Last;
+  if (last->id == id_ && last->url == url)
+    return last->key;
+  std::optional<UrlKey> k = derive(url);
+  last->id = id_;
+  last->url = url;
+  last->key = k;
+  return k;
+}
+
+std::optional<UrlKey> KeyRules::derive(const std::string& url) const {
+  if (auto lfn = parseLogical(url, keepCgi_))
+    return lfn;
+  const auto p = urlParts(url, keepCgi_);
+  if (!p)
+    return std::nullopt;
+  UrlKey out;
+  out.scheme = p->scheme;
+  out.host = p->host;
+  out.key = p->scheme + "://" + p->host + ":" + std::to_string(p->port) + p->path + p->kept;
+  out.hashHex = sha256Hex(out.key);
+  if (!logical_)
+    return out;
+  const std::string name = logicalNameOf(prefixes_, p->path);
+  if (name.empty())
+    return out;
+  out.urlKey = std::move(out.key);
+  out.urlHash = std::move(out.hashHex);
+  out.scheme = "lfn";
+  out.key = std::string(kLfnPrefix) + name + p->kept;
   out.hashHex = sha256Hex(out.key);
   return out;
 }
+
+std::string KeyRules::mapStored(const std::string& storedKey) const {
+  if (!logical_ || storedKey.compare(0, 4, kLfnPrefix) == 0)
+    return storedKey;
+  // A stored key is a URL key already (normalized, its kept CGI sorted): its
+  // own kept query goes on as it is.
+  const auto p = urlParts(storedKey, {});
+  if (!p)
+    return storedKey;
+  const std::string name = logicalNameOf(prefixes_, p->path);
+  if (name.empty())
+    return storedKey;
+  const auto q = storedKey.find('?');
+  return std::string(kLfnPrefix) + name + (q == std::string::npos ? "" : storedKey.substr(q));
+}
+
 
 std::string UrlKey::objectDir(const std::string& cacheDir) const {
   return cacheDir + "/objects/" + hashHex.substr(0, 2);

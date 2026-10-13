@@ -174,9 +174,10 @@ bool FileEntry::adoptable(const MetaData& m, const Config& cfg, const UrlKey& ke
                           uint32_t originCksum) {
   bool ok = m.key == key.key && m.fileSize == originSize && Config::validPageSize(m.pageSize) &&
             m.npages() == m.pageCrcs.size();
-  if (ok && cfg.validate == ValidateMode::kSizeMtime)
+  const ValidateMode validate = cfg.validateFor(key);
+  if (ok && validate == ValidateMode::kSizeMtime)
     ok = m.originMtime == originMtime;
-  if (ok && cfg.validate == ValidateMode::kCksum && cksumKind != MetaData::kCksumNone)
+  if (ok && validate == ValidateMode::kCksum && cksumKind != MetaData::kCksumNone)
     ok = m.cksumKind == cksumKind && m.originCksum == originCksum;
   return ok;
 }

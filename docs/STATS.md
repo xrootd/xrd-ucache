@@ -304,7 +304,13 @@ variable is set, `default` when the value is the client's built-in one, and
 application). With `adaptive_federation = on`, the first three say `ucache`
 when uCache set them (USER_GUIDE.md), `kept` when uCache kept the value of an
 `XRD_<NAME>` variable instead or the client refused uCache's write, and
-`client` when it kept a `client.conf` value. An application that changes a
+`client` when it kept a `client.conf` value. With `logical_name_prefixes` set
+(and valid), the string ends with `logical_names=on/<hash>`, whatever
+`adaptive_federation` says: files whose path holds one of the prefixes are keyed by
+their logical name; `<hash>` is the first 8 hex digits of the SHA-256 of
+`logical_name_prefixes` as `ucache settings` shows it, one space between prefixes,
+so two runs that keyed files two ways can be told apart. With it off there is no
+such token. An application that changes a
 value after the plugin has loaded is not seen. A token missing from the string
 means the build that wrote it did not have that setting; tokens may be added
 at the end.
@@ -658,6 +664,11 @@ reading was re-reading, and what the cache disk was asked to do.
    "data_server": "disk7.site.example", "data_servers": "disk7.site.example:1094=…"}
   ```
 
+  `key` is the file's cache key: its URL, normalized (no query), or, with
+  `logical_name_prefixes` set and a path that holds one of them, `lfn:` and
+  its logical name (`lfn:/store/mc/...`; USER_GUIDE.md, "Keys by logical name"), for
+  whatever URL the job opened.
+
   The same file holds lines of newer kinds, which carry `"kind"` and no
   `"key"`: one per origin open attempt (`"kind":"open"`) and one per failed
   origin request (`"kind":"origin_failure"`); [FORMAT.md](FORMAT.md) gives
@@ -716,7 +727,22 @@ reading was re-reading, and what the cache disk was asked to do.
   the reads went to, and `history --json` and `publish` show that server's
   domain under `origins` and `origins_rt`, not the redirector's. A run whose
   records do not say (written before `run_settings` existed, or a job killed
-  before it wrote a counter line) is taken as one with the switch off.
+  before it wrote a counter line) is taken as one with the switch off. A file
+  keyed by its logical name has no host in its key: its origin is `data_server`,
+  and a file of such a run that read nothing from the origin names none.
+
+  With `logical_name_prefixes` set in the settings the command reads (the conf or
+  the state file), or when any run of the records keyed files by these prefixes
+  (its counter line's `run_settings` say `logical_names=on/<hash>` with this list's
+  hash), `summary`, `history`, `stats --files` and
+  `publish` read a record's key as the file is keyed now, by the command's own
+  `logical_name_prefixes`: a key by URL whose path holds a prefix is read as
+  `lfn:` and the name, so the records of one file, written by URL before the
+  prefixes were set or through other servers, are one file; a run's `sig` (the hash of its set of
+  files) and the matching of a baseline's files are computed on those keys. Such a
+  record's origin is still the host its URL named. The records of a run keyed by
+  other prefixes (another hash) are read as written, and the command says on
+  stderr how many such runs there are. Otherwise the keys are read as written.
 
   **`orig_bytes` and `unique_bytes` are exact or absent**, never estimated:
   absent means unknown, and a file opened and not read has 0. How each route

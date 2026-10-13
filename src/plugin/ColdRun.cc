@@ -622,9 +622,10 @@ void noteDeclined(const std::shared_ptr<HandleState>& st, const UrlKey& key,
 
 // The replica tier's adoption rule (StoreLayout.h), under this process's
 // `validate` setting.
-bool adoptable(const SlotStoreHeader& h, uint64_t size, uint64_t originMtime, uint8_t cksumKind,
-               uint32_t originCksum) {
-  return tp::adoptable(h, size, originMtime, cksumKind, originCksum, globalConfig().validate);
+bool adoptable(const SlotStoreHeader& h, const UrlKey& key, uint64_t size, uint64_t originMtime,
+               uint8_t cksumKind, uint32_t originCksum) {
+  return tp::adoptable(h, size, originMtime, cksumKind, originCksum,
+                       globalConfig().validateFor(key));
 }
 
 // Set up the slot run of a file.
@@ -663,7 +664,7 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   // and the file served as stored, never replaced (it would replace ours back).
   if (store && store->header().layoutVersion > kLayoutVersion)
     return nullptr;
-  if (store && !adoptable(store->header(), size, originMtime, cksumKind, originCksum)) {
+  if (store && !adoptable(store->header(), key, size, originMtime, cksumKind, originCksum)) {
     const SlotStoreHeader& oh = store->header();
     if (oh.layoutVersion < (oh.declined ? kOldestDecision : kOldestServedLayout))
       UCACHE_INFO("slot store for %s was made by an earlier uCache; decided again",
@@ -768,7 +769,7 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
       return nullptr;
     }
     if (!created) { // someone else made it first: theirs is the layout
-      if (!adoptable(store->header(), size, originMtime, cksumKind, originCksum) ||
+      if (!adoptable(store->header(), key, size, originMtime, cksumKind, originCksum) ||
           (mode == AttachMode::kMatch && store->header().layoutHash != matchHash))
         return nullptr;
     }
@@ -2441,7 +2442,7 @@ void coldHeldOriginal(const UrlKey& key, const std::string& cacheDir, uint64_t s
   auto store = SlotStore::open(RealIO::instance(), key.objectDir(cacheDir), key.hashHex,
                                /*readOnly=*/true);
   if (!store || store->header().declined ||
-      !adoptable(store->header(), size, originMtime, cksumKind, originCksum))
+      !adoptable(store->header(), key, size, originMtime, cksumKind, originCksum))
     return;
   tp::StoredLayout lay;
   lay.slotFactor100 = store->header().slotFactor100;

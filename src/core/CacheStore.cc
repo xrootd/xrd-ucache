@@ -131,6 +131,7 @@ void CacheStore::afterForkChild() {
     std::deque<std::string> records;
     std::map<std::string, uint32_t> recordCaps;
     std::set<std::string> removing;
+    std::set<std::string> pinChecked;
   };
   auto* left = new LeftBehind; // leaked on purpose
   new (&relayFpMu_) std::mutex;
@@ -152,6 +153,7 @@ void CacheStore::afterForkChild() {
   new (&dropCv_) std::condition_variable;
   left->summaries.swap(entrySummaries_);
   left->seen.swap(seenKeys_);
+  left->pinChecked.swap(pinChecked_); // a parent thread may have been inserting into it
   left->sink = std::move(obsSink_);
   left->tracer = std::move(tracer_);
   new (&statsPath_) std::string; // the parent's (or half-written) name, left behind
@@ -363,9 +365,36 @@ std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSi
       }
     }
     entry->obs().opens.fetch_add(1, std::memory_order_relaxed);
+    carryPin(key, *entry);
     maybeEvict();
     return entry;
   }
+}
+
+void CacheStore::carryPin(const UrlKey& key, FileEntry& entry) {
+  if (!key.logical() || key.urlHash.empty())
+    return;
+  {
+    std::lock_guard<std::mutex> g(regMu_);
+    if (pinChecked_.count(key.urlHash))
+      return; // asked already in this process
+    if (pinChecked_.size() < kMaxFootprints) // past that, asked at each new entry, not remembered
+      pinChecked_.insert(key.urlHash);
+  }
+  // The entry the URL had before its path was named by its logical name: pinned, its pin is copied
+  // here. That entry keeps its own pin: a job without logical names still reads it, and a pin is never
+  // taken away by the cache (`ucache unpin <its key>` lets it go). Unpinned, it is left to age out.
+  const UrlKey before = UrlKey::ofEntry(key.urlKey, key.urlHash);
+  struct ::stat st;
+  if (io_.stat(before.metaPath(cfg_.cacheDir), &st) != 0)
+    return;
+  const auto m = MetaFile::loadSummary(io_, before.metaPath(cfg_.cacheDir));
+  if (!m || m->key != before.key || !(m->flags & MetaData::kFlagPinned) || entry.pinned())
+    return;
+  entry.setPinned(true);
+  UCACHE_INFO("%s: pinned, as %s is (that entry, keyed by URL, keeps its pin; jobs with "
+              "adaptive_federation on no longer read it)",
+              key.key.c_str(), before.key.c_str());
 }
 
 void CacheStore::notePersisted(uint64_t bytes, bool allowEvict) {
@@ -1236,7 +1265,7 @@ FileEntry::ScrubResult CacheStore::verify(const UrlKey& key, uint64_t originSize
 }
 
 ReadFootprint* CacheStore::footprintFor(const std::string& url) {
-  auto k = UrlKey::parse(url, cfg_.keepCgi);
+  auto k = cfg_.keys.key(url);
   const std::string& key = k ? k->key : url;
   std::lock_guard<std::mutex> g(relayFpMu_);
   auto it = relayFp_.find(key);
@@ -1312,7 +1341,7 @@ void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const ch
     return;
   // Normalized exactly like a cached entry's key, or the baseline record could
   // never match the warm runs it exists to be compared against.
-  auto key = UrlKey::parse(url, cfg_.keepCgi);
+  auto key = cfg_.keys.key(url);
   const uint64_t ms = nowMs();
   std::ostringstream os;
   os << "{\"ts\":" << ms / 1000 << ",\"ts_ms\":" << ms << ",\"key\":\""

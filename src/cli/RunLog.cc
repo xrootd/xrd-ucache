@@ -217,15 +217,20 @@ void loadCounters(const std::string& path, Run& r) {
   fieldHist(last, "hist_open_us", r.histOpen);
 }
 
-void loadFiles(const std::string& path, Run& r) {
+std::string hostOf(const std::string& url);
+void loadFiles(const std::string& path, Run& r, const KeyRules* keys) {
   std::ifstream in(path);
   std::string line;
   while (std::getline(in, line)) {
     if (line.empty() || line.back() != '}')
       continue;
-    const std::string key = fieldStr(line, "key");
+    std::string key = fieldStr(line, "key");
     if (key.empty())
       continue;
+    // The host of the key as stored: a key by URL read as a logical name keeps its origin.
+    const std::string storedHost = hostOf(key);
+    if (keys)
+      key = keys->mapStored(key);
     Run::FileRec& f = r.files[key];
     // One record per entry per process, but a re-opened entry can produce a
     // second: accumulate rather than overwrite, so nothing is silently lost.
@@ -297,6 +302,8 @@ void loadFiles(const std::string& path, Run& r) {
       f.mode = m;
     if (const std::string ds = fieldStr(line, "data_server"); !ds.empty())
       f.dataServer = ds;
+    if (!storedHost.empty())
+      f.urlHost = storedHost;
   }
 }
 
@@ -307,6 +314,49 @@ std::string signatureOf(const std::map<std::string, Run::FileRec>& files);
 std::string readSignatureOf(const std::map<std::string, Run::FileRec>& files);
 std::string hostOf(const std::string& url);
 } // namespace
+
+std::string nameHashOf(const std::string& runSettings) {
+  // Tokens are separated by single spaces (docs/STATS.md `run_settings`).
+  const std::string tok = " logical_names=on/";
+  const std::string rs = " " + runSettings;
+  const auto at = rs.find(tok);
+  if (at == std::string::npos)
+    return std::string();
+  const size_t from = at + tok.size();
+  return rs.substr(from, rs.find(' ', from) - from);
+}
+
+bool keyedByName(const std::string& runSettings) { return !nameHashOf(runSettings).empty(); }
+
+std::string runSettingsOf(const std::string& countersPath) {
+  std::ifstream in(countersPath);
+  std::string line, last;
+  while (std::getline(in, line))
+    if (const std::string rs = fieldStr(line, "run_settings"); !rs.empty())
+      last = rs;
+  return last;
+}
+
+bool recordsKeyedByName(const std::string& statsDir, const std::string& prefixesHash) {
+  DIR* d = ::opendir(statsDir.c_str());
+  if (!d)
+    return false;
+  bool found = false;
+  while (dirent* e = ::readdir(d)) {
+    const std::string n = e->d_name;
+    if (found || !endsWith(n, ".jsonl") || endsWith(n, ".files.jsonl") ||
+        endsWith(n, ".trace.jsonl"))
+      continue;
+    std::ifstream in(statsDir + "/" + n);
+    std::string line;
+    while (!found && std::getline(in, line)) {
+      const std::string h = nameHashOf(fieldStr(line, "run_settings"));
+      found = !h.empty() && h == prefixesHash;
+    }
+  }
+  ::closedir(d);
+  return found;
+}
 
 bool federationRun(const std::string& runSettings) {
   // Tokens are separated by single spaces (docs/STATS.md `run_settings`).
@@ -321,7 +371,8 @@ bool federationRun(const std::string& runSettings) {
   return false;
 }
 
-std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiveDir) {
+std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiveDir,
+                          const KeyRules* keys) {
   std::vector<Run> runs;
   std::vector<std::pair<std::string, std::string>> stems; // (dir, stem)
   std::set<std::string> seen; // a stem name is unique per process; never count it twice
@@ -341,13 +392,43 @@ std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiv
     }
     ::closedir(d);
   }
+  std::vector<Run> loaded;
   for (const auto& [dir, base] : stems) {
     Run r;
     if (!parseStem(base, r.host, r.pid, r.startS))
       continue; // not a name this writer produced; leave it alone
     r.stem = dir + "/" + base;
     loadCounters(r.stem + ".jsonl", r);
-    loadFiles(r.stem + ".files.jsonl", r);
+    loaded.push_back(std::move(r));
+  }
+  // The keys are read as the files are keyed by name when the command's own settings say so, or
+  // when any run of the records keyed files by these prefixes: with the command's own prefixes,
+  // which are the cache's.
+  // A run keyed by other prefixes (its hash is not this one's) is read as written: its names are
+  // not these prefixes', and its keys by URL would be named differently from its own.
+  KeyRules named;
+  const KeyRules* map = nullptr;
+  size_t otherPattern = 0;
+  if (keys) {
+    bool byName = keys->logical();
+    for (const Run& r : loaded) {
+      const std::string h = nameHashOf(r.runSettings);
+      byName = byName || (!h.empty() && h == keys->prefixesHash());
+      otherPattern += !h.empty() && h != keys->prefixesHash();
+    }
+    if (byName) {
+      named = keys->withNames();
+      map = &named;
+    }
+  }
+  if (map && otherPattern)
+    std::fprintf(stderr,
+                 "note: %zu run(s) keyed files by other logical_name_prefixes than these; "
+                 "their records are read as written\n",
+                 otherPattern);
+  for (Run& r : loaded) {
+    const std::string h = nameHashOf(r.runSettings);
+    loadFiles(r.stem + ".files.jsonl", r, !keys || h.empty() || h == keys->prefixesHash() ? map : nullptr);
     // A killed job leaves no cumulative line. Its per-file records still say
     // when it was last doing work, which is a better end than "unknown".
     for (const auto& [k, f] : r.files) {
@@ -367,9 +448,14 @@ std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiv
     // of. Every other run -- the switch off, or a record that does not say
     // (written before run_settings existed, or a run killed before its counter
     // line) -- names the host the file was asked of, the host of its URL.
+    // A record keyed by a logical name (lfn:) has no host in its key: it names its data server,
+    // whatever the switch said.
     const bool byServer = federationRun(r.runSettings);
     for (const auto& [k, f] : r.files) {
-      const std::string h = byServer && !f.dataServer.empty() ? f.dataServer : hostOf(k);
+      const bool named = k.compare(0, 4, "lfn:") == 0 && f.urlHost.empty();
+      const std::string h = (byServer || named) && !f.dataServer.empty() ? f.dataServer
+                            : !f.urlHost.empty()                   ? f.urlHost
+                                                                   : hostOf(k);
       if (h.empty())
         continue;
       ++r.originHosts[h];

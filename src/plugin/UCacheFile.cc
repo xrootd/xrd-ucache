@@ -564,7 +564,7 @@ std::string recordMsg(const XRootDStatus& s) {
 
 // The file a record names: its cache key, which carries no query.
 std::string recordFile(const std::string& url) {
-  const auto key = UrlKey::parse(url, globalConfig().keepCgi);
+  const auto key = globalConfig().keys.key(url);
   return key ? key->key : url.substr(0, url.find('?'));
 }
 
@@ -1218,7 +1218,7 @@ std::function<uint64_t(const std::string&)> markedAtFor(HandleState& st) noexcep
     *mem.loadedUs = nowUs();
   }
   std::vector<InUseFault> faults;
-  if (const auto key = UrlKey::parse(st.url, globalConfig().keepCgi)) {
+  if (const auto key = globalConfig().keys.key(st.url)) {
     InUseRecord rec;
     if (InUseRecord::load(RealIO::instance(), InUseRecord::path(dir, key->hashHex), rec))
       faults = rec.liveFaults(marksNowS());
@@ -1243,7 +1243,7 @@ std::function<uint64_t(const std::string&)> markedAtFor(HandleState& st) noexcep
 void noteCopyFault(HandleState& st, const SiteFailure& f) noexcept try {
   if (!st.store || processExiting())
     return;
-  const auto key = UrlKey::parse(st.url, globalConfig().keepCgi);
+  const auto key = globalConfig().keys.key(st.url);
   if (!key)
     return;
   const std::shared_ptr<CacheStore> store = st.store;
@@ -1478,7 +1478,7 @@ void noteBadCopy(HandleState& st, const std::string& server, const std::string& 
   // The copy was refused for what it is: an entry of the file this process holds (this handle's,
   // or another's: an open sets its own up only later) that took bytes from it is dropped.
   if (!e && st.store)
-    if (const auto key = UrlKey::parse(st.url, globalConfig().keepCgi))
+    if (const auto key = globalConfig().keys.key(st.url))
       e = st.store->liveEntry(*key);
   dropEntryOfBadCopy(st, e, server);
 } catch (...) {
@@ -1955,7 +1955,7 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     // regional lists; for a file it passes straight to the origin they do not, and its open's
     // failover and its reads' moves may take every copy listed. Where a redirector itself sends an
     // open is not filtered, for a cached file too.
-    const auto key = UrlKey::parse(st.url, cfg.keepCgi);
+    const auto key = cfg.keys.key(st.url);
     const bool cached = key && hostPassesLists(cfg.allowHosts, cfg.denyHosts, key->host);
     std::vector<Location> listed;
     for (const Location& l : locateCopies(st, q, XrdCl::URL(base).GetPath()))
@@ -2254,7 +2254,7 @@ void storeOpenBytesIn(HandleState& st, const std::shared_ptr<FileEntry>& entry,
 bool cachesFile(const HandleState& st, const Config& cfg) {
   if (!st.store)
     return false;
-  const auto key = UrlKey::parse(st.url, cfg.keepCgi);
+  const auto key = cfg.keys.key(st.url);
   return key && hostPassesLists(cfg.allowHosts, cfg.denyHosts, key->host);
 }
 
@@ -3244,7 +3244,7 @@ static uint64_t heldBytes(const UrlKey& key, const Config& cfg, const MetaData& 
 // callback thread.
 std::string staleEntryAdviceFor(const std::string& url) noexcept try {
   const Config& cfg = globalConfig();
-  const auto key = UrlKey::parse(url, cfg.keepCgi);
+  const auto key = cfg.keys.key(url);
   if (!key || cfg.cacheDir.empty() || !hostPassesLists(cfg.allowHosts, cfg.denyHosts, key->host))
     return std::string();
   struct ::stat vs;
@@ -3674,7 +3674,7 @@ bool HandleState::ensureInnerOpen() {
                /*closeOld=*/n == Next::kRefuse || lastOpen);
     // Named by its cache key, which carries no query (a query can carry an
     // access token). Other log lines that name the reader's URL print it whole.
-    const auto key = UrlKey::parse(url, cfg.keepCgi);
+    const auto key = cfg.keys.key(url);
     const std::string file = key ? key->key : url.substr(0, url.find('?'));
     // Once it failed over, or a bound stopped it: the error naming every copy tried, as the
     // read's (this handle's reader was shown the file when its own open was answered).
@@ -6204,7 +6204,7 @@ std::atomic<int> gOpenUCacheHandles{0};
 
 // Write the entry's .cost sidecar (tiny, advisory: tmp+rename).
 void writeCostSidecar(const std::string& url, const Config& cfg, uint64_t cpuUs, bool blended) {
-  auto key = UrlKey::parse(url, cfg.keepCgi);
+  auto key = cfg.keys.key(url);
   if (!key || cpuUs == 0)
     return;
   const std::string base = key->objectDir(cfg.cacheDir) + "/" + key->hashHex;
@@ -6299,10 +6299,15 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   }
   if (writey && st_->store) {
     // §4.4: write access invalidates any cached entry for this URL.
+    // A file keyed by its logical name: its entry by URL, made with the switch off, too.
     auto store = st_->store;
-    auto key = UrlKey::parse(url, cfg.keepCgi);
+    auto key = cfg.keys.key(url);
     if (key)
-      Executor::instance().post([store, key] { store->invalidate(*key); });
+      Executor::instance().post([store, key] {
+        store->invalidate(*key);
+        if (key->logical() && !key->urlHash.empty())
+          store->invalidate(UrlKey::ofEntry(key->urlKey, key->urlHash));
+      });
   }
   // Cache-freshness (UCACHE_REVALIDATE_S, default 7 days): if a
   // recent local entry is trusted, skip the remote open+stat entirely and
@@ -6311,7 +6316,7 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // depend on a flaky/loaded/WAN remote. UCACHE_REVALIDATE_S=0 (revalidate
   // every open) never enters here.
   if (!passthroughOnly_ && cfg.revalidateSeconds > 0) {
-    auto key = UrlKey::parse(url, cfg.keepCgi);
+    auto key = cfg.keys.key(url);
     if (key && cacheFresh(*key, cfg.cacheDir, cfg.revalidateSeconds) &&
         !dropCutWarmEntry(*key, url, cfg, *st_->store)) {
       {
@@ -6687,7 +6692,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
                                     // validation, layout choice) — the per-open
                                     // cost 65k opens multiply on a slow disk
   const Config& cfg = globalConfig();
-  auto key = UrlKey::parse(st_->url, cfg.keepCgi);
+  auto key = cfg.keys.key(st_->url);
   bool allowed = key && hostPassesLists(cfg.allowHosts, cfg.denyHosts, key->host);
   std::shared_ptr<FileEntry> entry;
   std::shared_ptr<ColdFill> cold;
@@ -7659,7 +7664,7 @@ void UCacheFile::invalidateOnWrite() {
 #endif
   if (st_->store) {
     auto store = st_->store;
-    auto key = UrlKey::parse(st_->url, globalConfig().keepCgi);
+    auto key = globalConfig().keys.key(st_->url);
     if (key)
       Executor::instance().post([store, key] { store->invalidate(*key); });
   }

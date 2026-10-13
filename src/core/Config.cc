@@ -218,6 +218,8 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.checkOriginIntegrity = truthy(v);
   else if (k == "adaptive_federation")
     c.adaptiveFederation = truthy(v);
+  else if (k == "logical_name_prefixes")
+    c.logicalNamePrefixes = falsy(v) ? std::string("off") : v; // checked once, at the end
   else if (k == "mixed_maps")
     c.mixedMaps = !falsy(v); // default on; see Config.h
   else if (k == "recompress_codecs")
@@ -293,6 +295,8 @@ void loadKeyValueFile(Config& c, const std::string& path, bool& explicitMax, con
 // as the files, so a value means the same thing wherever it is set.
 void applyEnvLayer(Config& c, bool& explicitMax) {
   for (const auto& spec : Config::knownKeys()) {
+    if (!spec.envName) // a property of the cache: no environment variable sets it
+      continue;
     const char* v = env(spec.envName);
     if (!v || !*v) // empty = unset (keep the file/state value)
       continue;
@@ -337,6 +341,22 @@ void clampAndFinish(Config& c, bool explicitMax) {
   if (c.adaptiveFederation && !c.checkOriginIntegrity) {
     c.checkOriginIntegrity = true;
     c.sources["check_origin_integrity"] = "forced by adaptive_federation";
+  }
+  // The key rules, from the final values. Logical names whenever
+  // logical_name_prefixes is set, whatever adaptive_federation says; a list that
+  // is not valid leaves keys by URL, warned once per process (the settings are
+  // loaded more than once).
+  c.keys = KeyRules(c.keepCgi, /*logical=*/true, c.logicalNamePrefixes);
+  if (c.keys.prefixesValid()) {
+    c.logicalNamePrefixes = normalizedPrefixes(c.logicalNamePrefixes);
+  } else {
+    static auto* mu = new std::mutex;
+    static auto* warned = new std::set<std::string>;
+    std::lock_guard<std::mutex> g(*mu);
+    if (warned->insert(c.logicalNamePrefixes).second)
+      UCACHE_WARN("logical_name_prefixes '%s' is not valid (%s); files are keyed by their URL — "
+                  "`ucache doctor` fails until it is fixed",
+                  c.logicalNamePrefixes.c_str(), c.keys.prefixesError().c_str());
   }
 }
 
@@ -425,6 +445,7 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"recompress_keep_originals", "UCACHE_RECOMPRESS_KEEP_ORIGINALS"},
       {"check_origin_integrity", "UCACHE_CHECK_ORIGIN_INTEGRITY"},
       {"adaptive_federation", "UCACHE_ADAPTIVE_FEDERATION"},
+      {"logical_name_prefixes", nullptr},
       {"mixed_maps", "UCACHE_MIXED_MAPS"},
       {"recompress_codecs", "UCACHE_RECOMPRESS_CODECS"},
       {"trace", "UCACHE_TRACE"},
@@ -487,6 +508,12 @@ std::string Config::setNote(const std::string& key, const std::string& value) co
            "a file opened through a redirector has the client's own read recovery turned off and a "
            "time limit of 5 minutes for each read, and a read that fails is made again at another site; "
            "check_origin_integrity is forced on";
+  if (key == "logical_name_prefixes")
+    return normalizedPrefixes(value) != "off" && logicalNamePrefixesValid(value)
+               ? "  a file whose path holds one of these prefixes is cached under its logical name: "
+                 "files cached before under such a URL are fetched again once and the old entries "
+                 "age out (a pinned one keeps its pin, and the new entry is pinned too)"
+               : "  files are keyed by their URL";
   return "";
 }
 
@@ -583,6 +610,8 @@ std::string Config::valueOf(const std::string& key) const {
     return onoff(checkOriginIntegrity);
   if (key == "adaptive_federation")
     return onoff(adaptiveFederation);
+  if (key == "logical_name_prefixes")
+    return logicalNamePrefixes;
   if (key == "mixed_maps")
     return onoff(mixedMaps);
   if (key == "recompress_codecs")
