@@ -42,6 +42,9 @@ bool convertFaultFire();
 // Test hook (UCACHE_TEST_READ_FAIL_KIND=decodenomem): the slot run's conversion about to start is
 // made with its decoders' allocations failing (transpose::DecoderNoMemory). UCacheFile.cc.
 bool decodeNoMemFire();
+// The same for the decode of a stored RNTuple page a request copies (UCACHE_TEST_READ_FAIL_KIND=
+// pagenomem).
+bool pageNoMemFire();
 bool slotFetchFaultFire();
 // Test-only (UCACHE_TEST_READ_FAIL_KIND=splitmove, with UCACHE_TEST_READ_FAIL_N=1): the slot run
 // cuts its fetches into parts of at most 8 baskets; between the first and the second part of the

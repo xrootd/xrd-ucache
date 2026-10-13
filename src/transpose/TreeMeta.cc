@@ -783,6 +783,11 @@ std::atomic<int64_t> g_decoderLargeLive{0}; // large allocations not yet freed
 // Each allocation carries its size in front, so a free knows whether it was a large one.
 constexpr size_t kAllocHead = 16;
 thread_local int t_noMemory = 0; // DecoderNoMemory scopes alive on this thread
+// The most an xz stream's decoder may use (liblzma's memlimit). ROOT's LZMA presets use
+// dictionaries of 64 MiB at most (level 9), so its decoder needs about that; a stream that asks for
+// more than this names a dictionary no ROOT writer makes: a failed check, never a want of memory
+// of this process (which, without a limit, a crafted header would make of any copy).
+constexpr uint64_t kLzmaMemlimit = 1ull << 30;
 void* countedAlloc(void*, size_t nmemb, size_t size) {
   if (t_noMemory > 0)
     return nullptr; // test hook (DecoderNoMemory): as for want of memory
@@ -956,16 +961,17 @@ void decodeInto(const uint8_t* payload, size_t n, uint64_t objlen, bool keep, De
       if ((blob[7] & 0x0F) == 0)
         everyBlockChecked = false;
       // Setting a stream decoder up reads no input: only memory or this build can fail it.
-      if (const lzma_ret ir = lzma_stream_decoder(&dec.xz, UINT64_MAX, 0); ir != LZMA_OK)
-        return notHere(ir == LZMA_MEM_ERROR || ir == LZMA_MEMLIMIT_ERROR,
-                     "lzma decoder could not be set up");
+      if (const lzma_ret ir = lzma_stream_decoder(&dec.xz, kLzmaMemlimit, 0); ir != LZMA_OK)
+        return notHere(ir == LZMA_MEM_ERROR, "lzma decoder could not be set up");
       dec.xz.next_in = blob;
       dec.xz.avail_in = csize;
       dec.xz.next_out = dst;
       dec.xz.avail_out = usize;
       if (const lzma_ret r = lzma_code(&dec.xz, LZMA_FINISH); r != LZMA_STREAM_END) {
-        if (r == LZMA_MEM_ERROR || r == LZMA_MEMLIMIT_ERROR || r == LZMA_PROG_ERROR)
-          return notHere(r != LZMA_PROG_ERROR, "lzma decoder failed for this process");
+        if (r == LZMA_MEM_ERROR || r == LZMA_PROG_ERROR)
+          return notHere(r == LZMA_MEM_ERROR, "lzma decoder failed for this process");
+        if (r == LZMA_MEMLIMIT_ERROR) // kLzmaMemlimit
+          return failed("lzma block names a dictionary larger than any ROOT writer makes");
         return failed("lzma block failed its check or did not decode");
       }
       gave = usize - dec.xz.avail_out;
@@ -1066,11 +1072,14 @@ DecodedFrames verifyFrames(const uint8_t* payload, size_t n, uint64_t objlen) {
   return d;
 }
 
-std::vector<uint8_t> decompressFrames(const uint8_t* payload, size_t n, uint64_t objlen) {
+std::vector<uint8_t> decompressFrames(const uint8_t* payload, size_t n,
+                                      uint64_t objlen) noexcept try {
   DecodedFrames d = decodeFrames(payload, n, objlen);
   if (d.check == FrameCheck::kFailed)
     return {};
   return std::move(d.out); // empty for a block this build cannot decode
+} catch (...) {           // for want of memory (decodeFrames throws nothing else): not here
+  return {};
 }
 
 namespace {
@@ -1411,7 +1420,14 @@ std::vector<uint8_t> readKeyPayloadFrom(Reader& r, const KeyInfo& k, bool* unrea
   if (k.objlen == k.nbytes - k.keylen) {
     out.assign(rec.begin() + k.keylen, rec.end());
   } else {
-    DecodedFrames d = decodeFrames(rec.data() + k.keylen, rec.size() - k.keylen, k.objlen);
+    DecodedFrames d;
+    try {
+      d = decodeFrames(rec.data() + k.keylen, rec.size() - k.keylen, k.objlen);
+    } catch (const std::bad_alloc&) { // a decoder's want of memory: this process's, not the copy's
+      if (unreadable)
+        *unreadable = true; // try again later
+      return {};
+    }
     if (d.check == FrameCheck::kFailed) {
       if (checkFailed)
         *checkFailed = true;

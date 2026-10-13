@@ -183,8 +183,10 @@ bool headerFaultFires() {
 // copy before either answer comes). convert: the slot run's conversions instead (convertFaultFire).
 // decodenomem: the slot run's conversions, each struck one made with every allocation of its
 // decoders failing, as for want of memory (decodeNoMemFire, transpose::DecoderNoMemory).
+// pagenomem: the same for the decodes of stored RNTuple pages a request copies (pageNoMemFire).
 enum class FaultKind : uint8_t {
-  kMiss, kRelay, kRefuse, kFinal, kLate, kAgain, kLeftData, kConvert, kSplitMove, kDecodeNoMem
+  kMiss, kRelay, kRefuse, kFinal, kLate, kAgain, kLeftData, kConvert, kSplitMove, kDecodeNoMem,
+  kPageNoMem
 };
 static const FaultKind gFaultKind = [] {
   const char* v = ::getenv("UCACHE_TEST_READ_FAIL_KIND");
@@ -198,6 +200,7 @@ static const FaultKind gFaultKind = [] {
          : k == "convert"  ? FaultKind::kConvert
          : k == "splitmove" ? FaultKind::kSplitMove
          : k == "decodenomem" ? FaultKind::kDecodeNoMem
+         : k == "pagenomem" ? FaultKind::kPageNoMem
                            : FaultKind::kMiss;
 }();
 bool convertFaultFire() {
@@ -206,9 +209,13 @@ bool convertFaultFire() {
 bool decodeNoMemFire() {
   return gFaultKind == FaultKind::kDecodeNoMem && readFaultFire();
 }
+bool pageNoMemFire() {
+  return gFaultKind == FaultKind::kPageNoMem && readFaultFire();
+}
 bool slotFetchFaultFire() {
   return gFaultKind != FaultKind::kConvert && gFaultKind != FaultKind::kSplitMove &&
-         gFaultKind != FaultKind::kDecodeNoMem && readFaultFire();
+         gFaultKind != FaultKind::kDecodeNoMem && gFaultKind != FaultKind::kPageNoMem &&
+         readFaultFire();
 }
 static std::atomic<bool> gSplitMoveArmed{false};
 bool splitMoveKind() {
@@ -258,7 +265,8 @@ static bool injectReadFault(bool relaySite, ResponseHandler* h, XRootDStatus& s,
       againSite   ? k == FaultKind::kAgain
       : relaySite ? k == FaultKind::kRelay || k == FaultKind::kRefuse || k == FaultKind::kAgain
                   : k != FaultKind::kRelay && k != FaultKind::kAgain && k != FaultKind::kConvert &&
-                        k != FaultKind::kSplitMove && k != FaultKind::kDecodeNoMem;
+                        k != FaultKind::kSplitMove && k != FaultKind::kDecodeNoMem &&
+                        k != FaultKind::kPageNoMem;
   if (!here || !readFaultFire())
     return false;
   s = XRootDStatus();

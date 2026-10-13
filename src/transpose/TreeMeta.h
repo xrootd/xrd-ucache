@@ -79,7 +79,9 @@ struct DecodedFrames {
 // of the bytes, is never a failed check: for want of memory (its buffers, or a codec library's
 // own: LZMA_MEM_ERROR, Z_MEM_ERROR, a ZSTD context not made or ZSTD's memory_allocation)
 // std::bad_alloc is thrown, which the callers take as a local failure (no claim on the copy);
-// a decoder that could not be set up otherwise gives kNotCheckable. Nothing else is thrown.
+// a decoder that could not be set up otherwise gives kNotCheckable. An xz stream whose decoder
+// would need more than 1 GiB (a dictionary no ROOT writer makes: its presets use 64 MiB at most)
+// fails its check. Nothing else is thrown.
 DecodedFrames decodeFrames(const uint8_t* payload, size_t n, uint64_t objlen);
 
 // The same check without keeping the object: each block decoded into a per-thread scratch buffer
@@ -111,8 +113,10 @@ int64_t decoderLargeLive();
 void keepDecodersOnThisThread();
 
 // The same, for callers that only need the bytes: exactly `objlen` bytes, or
-// empty when the object failed its check or cannot be decoded here.
-std::vector<uint8_t> decompressFrames(const uint8_t* payload, size_t n, uint64_t objlen);
+// empty when the object failed its check or cannot be decoded here, for want of memory included
+// (its callers read an empty result as "not here": the object is not used, never judged bad).
+// Never throws.
+std::vector<uint8_t> decompressFrames(const uint8_t* payload, size_t n, uint64_t objlen) noexcept;
 
 // The TBasket fields that follow the TKey part of a basket's key header.
 struct BasketHeader {

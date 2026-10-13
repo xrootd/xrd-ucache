@@ -127,7 +127,11 @@ TEST(FrameCheck, ADecoderOutOfMemoryIsNoFailedCheck) {
       DecoderNoMemory none;
       EXPECT_THROW(decodeFrames(b.p, b.n, b.objlen), std::bad_alloc) << b.codec;
       EXPECT_THROW(verifyFrames(b.p, b.n, b.objlen), std::bad_alloc) << b.codec;
-      EXPECT_THROW(decompressFrames(b.p, b.n, b.objlen), std::bad_alloc) << b.codec;
+      // decompressFrames' callers read {} as "not here" (a stored page decoded for a request is
+      // fetched again): it never throws
+      std::vector<uint8_t> got;
+      EXPECT_NO_THROW(got = decompressFrames(b.p, b.n, b.objlen)) << b.codec;
+      EXPECT_TRUE(got.empty()) << b.codec;
     }
     // ROOT's ZSTD block carries no content checksum: not checkable, but decoded
     const DecodedFrames d = decodeFrames(b.p, b.n, b.objlen);
@@ -137,6 +141,46 @@ TEST(FrameCheck, ADecoderOutOfMemoryIsNoFailedCheck) {
   }
   DecoderNoMemory none;
   EXPECT_EQ(verifyFrames(kLz4Payload, sizeof kLz4Payload, kLz4Objlen).check, FrameCheck::kPassed);
+}
+
+namespace {
+// ROOT's LZMA block with its xz block header's LZMA2 dictionary raised to `code` (the filter's
+// one property byte: 40 is 4 GiB - 1), the header's CRC32 made again: a valid stream naming a
+// dictionary no ROOT writer makes.
+std::vector<uint8_t> lzmaWithDictionary(uint8_t code) {
+  std::vector<uint8_t> b(kLzmaPayload, kLzmaPayload + sizeof kLzmaPayload);
+  const size_t xz = 9;                 // ROOT's block header, then the xz stream
+  const size_t bh = xz + 12;           // the xz stream header, then the first block's header
+  const size_t size = (b[bh] + 1) * 4; // its size byte
+  const uint8_t flags = b[bh + 1];
+  size_t p = bh + 2;
+  auto varint = [&] {
+    while (b[p++] & 0x80) {
+    }
+  };
+  if (flags & 0x40)
+    varint(); // compressed size
+  if (flags & 0x80)
+    varint(); // uncompressed size
+  EXPECT_EQ(b[p], 0x21) << "the LZMA2 filter";
+  EXPECT_EQ(b[p + 1], 1) << "one property byte";
+  b[p + 2] = code;
+  const uint32_t crc = static_cast<uint32_t>(crc32(0, b.data() + bh, static_cast<uInt>(size - 4)));
+  for (int i = 0; i < 4; ++i)
+    b[bh + size - 4 + i] = static_cast<uint8_t>(crc >> (8 * i));
+  return b;
+}
+} // namespace
+
+// An xz stream that names a dictionary larger than any ROOT writer makes (its decoder would need
+// more than 1 GiB, liblzma's memlimit) fails its check: never a want of memory of this process,
+// whatever the process's limits; the dictionary ROOT wrote decodes as ever.
+TEST(FrameCheck, AnLzmaDictionaryNoRootWriterMakesFailsItsCheck) {
+  EXPECT_EQ(decode(lzmaWithDictionary(40), kLzmaObjlen).check, FrameCheck::kFailed);
+  EXPECT_EQ(verifyFrames(lzmaWithDictionary(40).data(), lzmaWithDictionary(40).size(), kLzmaObjlen).check,
+            FrameCheck::kFailed);
+  const std::vector<uint8_t> asWritten(kLzmaPayload, kLzmaPayload + sizeof kLzmaPayload);
+  EXPECT_EQ(decode(asWritten, kLzmaObjlen).check, FrameCheck::kPassed);
 }
 
 namespace {

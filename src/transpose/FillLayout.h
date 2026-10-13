@@ -175,7 +175,10 @@ struct ConvertedBasket {
 // layout took for the branch. So a basket stored in another codec than its
 // branch's other baskets (a file merged from inputs written differently) is
 // converted when that codec is listed and kept as stored when it is not, and
-// a basket stored uncompressed is kept as stored.
+// a basket stored uncompressed is kept as stored. Throws std::bad_alloc for want of memory, a
+// decoder's included (TreeMeta.h decodeFrames): a failure of this process, which the caller
+// handles as one (the slot run serves the request again; the sweep keeps the basket as stored),
+// never a failed check.
 ConvertedBasket convertBasket(const uint8_t* record, size_t n, uint32_t slotLen,
                               const std::vector<std::string>& codecs);
 

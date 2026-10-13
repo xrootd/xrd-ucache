@@ -1043,7 +1043,12 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
     if (rec->size() != pageLen) {
       if (auto cs = globalStore())
         cs->stats().slotPagesDecoded.fetch_add(1, std::memory_order_relaxed);
-      raw = tp::decompressFrames(rec->data(), rec->size(), pageLen);
+      {
+        std::optional<tp::DecoderNoMemory> noMemory; // test hook: its decoder gets no memory
+        if (pageNoMemFire())
+          noMemory.emplace();
+        raw = tp::decompressFrames(rec->data(), rec->size(), pageLen); // {} for want of memory
+      }
       if (raw.size() != pageLen) {
         cf.forget(i);
         return false;

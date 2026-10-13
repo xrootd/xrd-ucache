@@ -71,8 +71,13 @@ int main(int argc, char** argv) {
         bytesUnchecked += payload;
         continue;
       }
-      const DecodedFrames d = decodeFrames(buf.data() + k->keylen, payload,
-                                           static_cast<uint64_t>(k->objlen));
+      DecodedFrames d;
+      try {
+        d = decodeFrames(buf.data() + k->keylen, payload, static_cast<uint64_t>(k->objlen));
+      } catch (const std::bad_alloc&) { // a decoder's want of memory: no verdict on the basket
+        d.check = FrameCheck::kNotCheckable;
+        d.why = "no memory to decode it";
+      }
       if (d.headerTolerated)
         ++tolerated;
       switch (d.check) {

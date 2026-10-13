@@ -341,7 +341,13 @@ SweepResult sweepFile(CacheStore& cs, const Config& cfg, IOBackend& io, const Ur
       r.kind = p.enc.size() == p.raw.size() ? SlotEntry::kRaw : SlotEntry::kZstd;
       r.bytes = std::move(p.enc);
     } else {
-      ConvertedBasket c = convertBasket(orig.data(), orig.size(), s.vLen, sm.codecs);
+      ConvertedBasket c;
+      try {
+        c = convertBasket(orig.data(), orig.size(), s.vLen, sm.codecs);
+      } catch (const std::bad_alloc&) { // want of memory, this process's: kept as stored
+        c = ConvertedBasket();
+        c.kind = ConvertedBasket::kOriginal;
+      }
       if (!c.error.empty())
         c.kind = ConvertedBasket::kOriginal; // the reader gets the origin's bytes, as it would have
       if (c.kind == ConvertedBasket::kOriginal) {
