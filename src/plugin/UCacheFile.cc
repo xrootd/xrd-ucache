@@ -5484,11 +5484,13 @@ class MissReadHandler : public ResponseHandler {
 #else
   void finish(Answer& a, uint64_t got, const std::string& server, const KeyMap* m) {
 #endif
+    bool keepNone = false;
+#ifdef UCACHE_HAVE_COLDRUN
     // check_origin_integrity on and no map (its parse failed, threw, or another handle's ended
     // without one): served unchecked, and nothing kept, so no later read takes unchecked bytes from
-    // the cache.
-    bool keepNone = !m && globalConfig().checkOriginIntegrity;
-#ifdef UCACHE_HAVE_COLDRUN
+    // the cache. (A build without the codec libraries makes no map and checks nothing: it keeps
+    // what it fetches, as without the setting.)
+    keepNone = !m && globalConfig().checkOriginIntegrity;
     if (m) {
       std::string why;
       countChecks(*st_, v);
@@ -5526,17 +5528,18 @@ class MissReadHandler : public ResponseHandler {
                           wireTraceFields(server, inflight_.t0, inflight_.nc));
     }
     st_->noteCacheOk();
-    // Reserve the persist slot BEFORE completing the user, so a Close on the
-    // just-woken app thread cannot race past a not-yet-counted persist.
-    st_->beginPersist();
-    complete(user_, okStatus(), chunkResponse(userOff_, userLen_, userBuf_));
-    // ...then persist full pages asynchronously (§5.2 step 4). Ownership of
-    // the wire buffer MOVES to the task: single owner, no cross-thread
-    // refcount teardown (keeps TSan exact and the lifetime obvious). Nothing
-    // of it is kept when its edge failed the check (parked readers then
+    // The persist is counted and posted BEFORE the user is completed, so a Close on the
+    // just-woken app thread cannot race past a not-yet-counted persist, and a Close or a destructor
+    // that waits for the persists (drainPersists) waits only for the executor's write, never for
+    // this completion (which a reader may hold up: Python's needs the lock the destroying thread
+    // holds). Ownership of the wire buffer MOVES to the task: single owner, no cross-thread
+    // refcount teardown (keeps TSan exact and the lifetime obvious); the user's bytes were copied
+    // out of it above. Nothing of it is kept when its edge failed the check (parked readers then
     // fetch for themselves).
+    st_->beginPersist();
     persistPagesReserved(st_, entry_, wireOff_, std::move(wireBuf_), keepNone ? 0 : got,
                          gateLen_);
+    complete(user_, okStatus(), chunkResponse(userOff_, userLen_, userBuf_));
     delete this;
   }
 
@@ -5838,8 +5841,9 @@ class MissVReadHandler : public ResponseHandler {
 #else
   void finish(Answer& a, uint64_t wireBytes, const std::string& server, const KeyMap* m) {
 #endif
-    bool keepNone = !m && globalConfig().checkOriginIntegrity; // as MissReadHandler::finish
+    bool keepNone = false;
 #ifdef UCACHE_HAVE_COLDRUN
+    keepNone = !m && globalConfig().checkOriginIntegrity; // as MissReadHandler::finish
     if (m) {
       countChecks(*st_, v);
       std::vector<std::pair<uint64_t, uint64_t>> asked;
@@ -5923,14 +5927,13 @@ class MissVReadHandler : public ResponseHandler {
       delete this;
       return;
     }
-    // Reserve all persist slots before completing the user (see MissRead).
+    // Persist each wire element's full pages asynchronously, posted before the user is completed
+    // (see MissReadHandler); buffer ownership moves to each task (single owner).
     for (size_t i = 0; i < wire_.size(); ++i)
       st_->beginPersist();
-    complete(user_, okStatus(), vreadResponse(userChunks_));
-    // Persist each wire element's full pages asynchronously; buffer
-    // ownership moves to each task (single owner — see MissReadHandler).
     for (auto& w : wire_)
       persistPagesReserved(st_, entry_, w.off, std::move(w.buf), w.len);
+    complete(user_, okStatus(), vreadResponse(userChunks_));
     delete this;
   }
 
@@ -5971,8 +5974,7 @@ class MissVReadHandler : public ResponseHandler {
     }
     for (size_t i = 0; i < keep.size(); ++i)
       st_->beginPersist();
-    complete(user_, okStatus(), vreadResponse(userChunks_));
-    for (auto& r : keep) {
+    for (auto& r : keep) { // posted before the user is completed (see MissReadHandler)
       auto st = st_;
       auto entry = entry_;
       Executor::instance().post([st, entry, r] {
@@ -5981,6 +5983,7 @@ class MissVReadHandler : public ResponseHandler {
         st->endPersist();
       });
     }
+    complete(user_, okStatus(), vreadResponse(userChunks_));
   }
 
   const WireElem* findWire(uint64_t off) const {

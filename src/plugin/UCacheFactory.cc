@@ -427,6 +427,11 @@ void initGlobals() {
   });
   UCACHE_INFO("xrd-ucache plugin initialized (dir=%s page=%u disable=%d)",
               gConfig->cacheDir.c_str(), gConfig->pageSize, gConfig->disable ? 1 : 0);
+#ifndef UCACHE_HAVE_COLDRUN
+  if (gConfig->checkOriginIntegrity)
+    UCACHE_INFO("check_origin_integrity is on, but this build has no codec libraries: nothing "
+                "fetched is checked, and what is fetched is kept as without the setting");
+#endif
 }
 } // namespace
 

@@ -669,7 +669,12 @@ entry:
   or its header or list of top-level objects not those of a whole ROOT file), after the
   entry had taken bytes from it. Those bytes may be damaged in ways
   no check sees (inside a ZSTD or uncompressed block), so none of them are kept. Until the
-  job opens the file again, its reads of it go to the origin.
+  job opens the file again, its reads of it go to the origin. With `recompress = on` the same
+  holds for the records of uCache's own layout: a request whose fetch failed at its copy keeps
+  nothing it converted from it, and once the entry is dropped every record the process holds of
+  the file is forgotten and fetched again. A read answered before the copy was found bad (a
+  request of its own, all of whose bytes passed their checks or carry none) got that copy's
+  bytes, as it would without uCache; so does a request already under way at that moment.
 
 `bad_entries_dropped` (STATS.md) counts both. Only the process that found the copy bad
 knows it: another job that has the file open at that moment goes on reading what its view

@@ -180,6 +180,22 @@ class ColdFill : public tp::StoreMaps, public std::enable_shared_from_this<ColdF
   std::shared_ptr<ReadRule> rule;
   bool direct() const { return rule && rule->direct(); }
   std::unique_ptr<std::atomic<uint8_t>[]> state; // per slot: kAbsent / kFetching / kReady
+  // The entry was dropped for a bad copy (FileEntry::dropped): every record this process holds of
+  // the file, converted from that copy or any other, and every committed one, is forgotten
+  // (forgetAllRecords); nothing more is committed. `copyGen` counts those forgettings: a record
+  // staged by a request issued before one is served to that request and kept for no other.
+  std::atomic<uint64_t> copyGen{0};
+  bool forgotten = false; // under mu
+  void forgetAllRecords();
+  // A request's staged records (slot, token) that are not to be kept: its fetch failed at its copy.
+  void forgetGroup(const std::vector<std::pair<uint32_t, uint64_t>>& group) {
+    std::lock_guard<std::mutex> g(mu);
+    for (const auto& [i, token] : group) {
+      auto it = info.find(i);
+      if (it != info.end() && it->second.held && it->second.token == token && !it->second.inStore)
+        forgetLocked(i);
+    }
+  }
   // Slot i's first committed record's length (a kept original's own length;
   // 0 when nothing is committed): what a mixed map states it at.
   uint32_t committedLenLocked(uint32_t i, const tp::FillSlot& s) const {
@@ -281,6 +297,8 @@ class ColdFill : public tp::StoreMaps, public std::enable_shared_from_this<ColdF
     }
     {
       std::lock_guard<std::mutex> g(mu);
+      if (forgotten)
+        return; // the store's records came from the copy found bad, or before it: none serves
       for (const auto& [e, h] : heads)
         noteMapLocked(*e, h);
       for (const auto& e : es) {
@@ -319,8 +337,10 @@ class ColdFill : public tp::StoreMaps, public std::enable_shared_from_this<ColdF
   // `keepIt` false (a file this process reads directly): served to whoever asked, never kept.
   // `group`: the caller is a request that will hand the record back with
   // appendGroup() when it finishes; set to the staging's token (0: not held).
+  // `gen`: the copyGen the staging request was issued under (kAnyGen: the current one).
+  static constexpr uint64_t kAnyGen = ~0ull;
   void stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool keepIt = true,
-             uint64_t* group = nullptr);
+             uint64_t* group = nullptr, uint64_t gen = kAnyGen);
   // A finished request's records (slot, token): to be committed together, in
   // slot order; a slot staged again since, or committed meanwhile, is skipped.
   void appendGroup(std::vector<std::pair<uint32_t, uint64_t>> group);
@@ -816,6 +836,7 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   bool mayPark = true; // may wait once for read-ahead already on the wire
   uint64_t t0 = 0;
   int readerT = 0; // the reader's own timeout of the request, 0 for none (coldServe)
+  uint64_t cfGen = 0; // the ColdFill's copyGen when this request was served (serveRequest)
   int retryS = 0;  // a request made again after a failure: its fetches' timeout (finish), 0: none
 
   // Filled in by classify(), consumed when every fetch it started is done.
@@ -1171,14 +1192,25 @@ void ColdRequest::finish() {
   // that stages nothing it finds ready, so records left here would never be
   // committed. Before the reader is answered, so a reader that closes on its
   // answer cannot outrun it (an append with no handle open queues a commit).
+  // Except when its fetch failed at its copy (a check its bytes failed, or the copy's own
+  // failure): what it converted from that copy is forgotten, never kept or served to another
+  // request, and the request made again (at another copy, when it moves) converts it anew.
   {
     std::vector<std::pair<uint32_t, uint64_t>> group;
     {
       std::lock_guard<std::mutex> g(emu);
       group.swap(staged);
     }
-    if (!group.empty())
-      cf->appendGroup(std::move(group));
+    const bool copyFailed =
+        failed.load() && (checkFailed.load() || failedOn.load() != nullptr);
+    if (entry && entry->dropped())
+      cf->forgetAllRecords();
+    if (!group.empty()) {
+      if (copyFailed)
+        cf->forgetGroup(group);
+      else
+        cf->appendGroup(std::move(group));
+    }
   }
   // Arrival (t0, kept across retries) to the answer handed to the reader.
   auto answered = [this] {
@@ -1287,7 +1319,9 @@ void ColdRequest::finish() {
   if (lost) {
     // A request that waited for another's fetch is served again as often as that one may be made
     // again (it moves up to kReadMaxAttempts times): each failure of the owner costs it an attempt.
-    if ((attempt < 2 || (lostByOther && attempt + 1 < kReadMaxAttempts)) && !fatal) {
+    if ((attempt < 2 || (lostByOther && attempt + 1 < kReadMaxAttempts &&
+                         st->moveSlotReads.load(std::memory_order_relaxed))) &&
+        !fatal) {
       again(false);
       return;
     }
@@ -1460,7 +1494,7 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     auto rec = std::make_shared<const std::vector<uint8_t>>(std::move(p.enc));
     req->hold(i, rec);
     uint64_t token = 0;
-    cf.stage(i, kind, std::move(rec), fromCache, /*keepIt=*/!direct, &token);
+    cf.stage(i, kind, std::move(rec), fromCache, /*keepIt=*/!direct, &token, req->cfGen);
     { // staged: the claim is no longer this request's to give back
       std::lock_guard<std::mutex> g(req->emu);
       req->converted.push_back(i);
@@ -1569,7 +1603,8 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
   // A kept original is not punched from the byte cache: it is the only copy.
   uint64_t token = 0;
   cf.stage(i, static_cast<uint8_t>(c.kind), std::move(held),
-           fromCache && c.kind != tp::ConvertedBasket::kOriginal, /*keepIt=*/!direct, &token);
+           fromCache && c.kind != tp::ConvertedBasket::kOriginal, /*keepIt=*/!direct, &token,
+           req->cfGen);
   { // staged: the claim is no longer this request's to give back
     std::lock_guard<std::mutex> g(req->emu);
     req->converted.push_back(i);
@@ -2174,6 +2209,12 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
 
 void serveRequest(const std::shared_ptr<ColdRequest>& req) {
   ColdFill& cf = *req->cf;
+  // The entry dropped for a bad copy: nothing this process holds of the file serves any more (it
+  // may hold records converted from that copy, each of which passed its own check or carries
+  // none); the request fetches what it needs from the handle's copy now.
+  if (cf.entry && cf.entry->dropped())
+    cf.forgetAllRecords();
+  req->cfGen = cf.copyGen.load(std::memory_order_acquire);
   std::vector<uint32_t> need;
   classify(req, need);
   // check_origin_integrity: the map the original pieces are checked against. While another
@@ -2454,6 +2495,30 @@ ColdFill::~ColdFill() {
       store->stats().coldReplicaDeclined.fetch_add(lost, std::memory_order_relaxed);
 }
 
+void ColdFill::forgetAllRecords() {
+  std::lock_guard<std::mutex> g(mu);
+  if (forgotten)
+    return;
+  forgotten = true;
+  storeGone.store(true, std::memory_order_release); // its files go with the entry's
+  copyGen.fetch_add(1, std::memory_order_acq_rel);
+  for (auto it = info.begin(); it != info.end();) {
+    releaseMemLocked(it->second);
+    uint8_t expect = kReady; // a claim under way stays its fetcher's (its staging is not kept)
+    state[it->first].compare_exchange_strong(expect, kAbsent, std::memory_order_acq_rel);
+    it = info.erase(it);
+  }
+  for (uint32_t i = 0; i < nSlots(); ++i) {
+    uint8_t expect = kReady;
+    state[i].compare_exchange_strong(expect, kAbsent, std::memory_order_acq_rel);
+  }
+  g_pendingTotal.fetch_sub(std::min(pendingBytes, g_pendingTotal.load()), std::memory_order_relaxed);
+  pendingBytes = 0;
+  pending.clear();
+  transient.clear();
+  heldList.clear();
+}
+
 void ColdFill::releaseMemLocked(Info& s) {
   if (s.transient && s.mem) {
     const uint64_t b = std::min<uint64_t>(transientBytes, s.mem->size());
@@ -2465,14 +2530,25 @@ void ColdFill::releaseMemLocked(Info& s) {
 }
 
 void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool keepIt,
-                     uint64_t* group) {
+                     uint64_t* group, uint64_t gen) {
   std::vector<Waiter> wake;
   bool kick = false;
   uint64_t lost = 0; // records no longer held anywhere: converted again if read
   if (group)
     *group = 0;
   {
-    std::lock_guard<std::mutex> g(mu);
+    std::unique_lock<std::mutex> g(mu);
+    if (gen != kAnyGen && gen != copyGen.load(std::memory_order_acquire)) {
+      // Fetched before the file's records were forgotten (a copy found bad): served to the request
+      // that holds it, kept for no one else; whoever waited for it fetches it again.
+      uint8_t expect = kFetching;
+      state[i].compare_exchange_strong(expect, kAbsent, std::memory_order_acq_rel);
+      takeWaitersLocked(i, wake);
+      g.unlock();
+      for (auto& w : wake)
+        w(false, nullptr);
+      return;
+    }
     Info& s = info[i];
     bool keep = true;
     if (!keepIt && !s.inStore) {

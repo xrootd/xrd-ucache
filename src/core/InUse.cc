@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <sstream>
 #include <sys/file.h>
+#include <unistd.h>
 
 namespace ucache {
 
@@ -201,7 +202,15 @@ bool InUseRecord::noteFault(IOBackend& io, const std::string& path, const InUseF
   const int fd = io.open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
   if (fd < 0)
     return false;
-  bool ok = io.flock(fd, LOCK_EX) == 0;
+  // Never blocked for long: this runs on the threads that serve the cache's hits, and the record
+  // is shared by every process of the cache (one stopped while it holds it). After about 100 ms the
+  // fault is not noted: a copy not noted costs one more failover, which notes it again.
+  bool ok = false;
+  for (int i = 0; i < 20 && !ok; ++i) {
+    ok = io.flock(fd, LOCK_EX | LOCK_NB) == 0;
+    if (!ok)
+      ::usleep(5000);
+  }
   std::string text;
   ok = ok && readAll(io, fd, text);
   if (ok) {
