@@ -684,10 +684,26 @@ struct SiteNameTable {
   std::mutex* mu = new std::mutex;
   std::map<std::string, std::shared_ptr<SiteNameOp>>* ops =
       new std::map<std::string, std::shared_ptr<SiteNameOp>>;
+  // One FileSystem per server asked, made on the executor at its first query, used again by a
+  // query made again, and never destroyed: a FileSystem's destructor takes a lock of the client's
+  // (its fork handler's), and on the executor, whose threads the client never joins, nothing
+  // orders that before the client's own teardown, which destroys the lock (the exit handler and
+  // the factory's deletion both run after it). At most kSiteNamesMax, as the table. Under mu.
+  std::map<std::string, XrdCl::FileSystem*>* fss = new std::map<std::string, XrdCl::FileSystem*>;
 };
 SiteNameTable& siteNameTable() {
   static SiteNameTable* t = new SiteNameTable;
   return *t;
+}
+// The FileSystem the queries of `server` use (SiteNameTable::fss): made at the first (throws for
+// want of memory). On the executor only.
+XrdCl::FileSystem* siteNameFs(const std::string& server) {
+  const SiteNameTable t = siteNameTable();
+  std::lock_guard<std::mutex> g(*t.mu);
+  XrdCl::FileSystem*& fs = (*t.fss)[server];
+  if (!fs)
+    fs = new XrdCl::FileSystem(XrdCl::URL("root://" + server), false); // left behind, never deleted
+  return fs;
 }
 std::string serverKey(std::string server) {
   for (char& c : server)
@@ -719,9 +735,9 @@ void endSiteName(const std::shared_ptr<SiteNameOp>& op, const std::string& serve
 }
 class SiteNameHandler : public ResponseHandler {
  public:
-  SiteNameHandler(std::shared_ptr<SiteNameOp> op, std::string server, XrdCl::FileSystem* fs,
+  SiteNameHandler(std::shared_ptr<SiteNameOp> op, std::string server,
                   std::shared_ptr<CacheStore> store)
-      : op_(std::move(op)), server_(std::move(server)), fs_(fs), store_(std::move(store)) {}
+      : op_(std::move(op)), server_(std::move(server)), store_(std::move(store)) {}
   void HandleResponse(XRootDStatus* status, AnyObject* response) override {
     ClientCallback inClientCallback; // PluginSupport.h
     std::unique_ptr<XRootDStatus> s(status);
@@ -738,19 +754,12 @@ class SiteNameHandler : public ResponseHandler {
     } catch (...) {
     }
     endSiteName(op_, server_, std::move(name), failed, store_);
-    // The FileSystem is destroyed on the executor, never here on a callback thread.
-    XrdCl::FileSystem* fs = fs_;
-    try {
-      Executor::instance().post([fs] { delete fs; });
-    } catch (...) { // for want of memory it is left behind
-    }
-    delete this;
+    delete this; // the FileSystem stays (SiteNameTable::fss)
   }
 
  private:
   std::shared_ptr<SiteNameOp> op_;
   std::string server_;
-  XrdCl::FileSystem* fs_;
   std::shared_ptr<CacheStore> store_;
 };
 // Asks the server `server` (host:port) for its site name, unless it was asked already (or its
@@ -781,14 +790,13 @@ void askSiteName(const std::shared_ptr<CacheStore>& store, const std::string& se
   try {
     Executor::instance().post([op, key, store] {
       try {
-        auto* fs = new XrdCl::FileSystem(XrdCl::URL("root://" + key), false);
-        auto* h = new SiteNameHandler(op, key, fs, store);
+        XrdCl::FileSystem* fs = siteNameFs(key);
+        auto* h = new SiteNameHandler(op, key, store);
         XrdCl::Buffer arg;
         arg.FromString("sitename");
         const XRootDStatus s = fs->Query(XrdCl::QueryCode::Config, arg, h, kSiteNameQueryS);
         if (!s.IsOK()) { // no answer will come
           delete h;
-          delete fs;
           endSiteName(op, key, std::string(), true, store);
         }
       } catch (...) {
