@@ -3458,7 +3458,7 @@ bool coldExactOriginRanges(ColdFill& cf, uint64_t off, uint64_t len,
 
 void coldServe(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
                std::shared_ptr<ColdFill> cf, ChunkList chunks, bool isVRead,
-               ResponseHandler* user) {
+               ResponseHandler* user, uint64_t startUs) {
   noteWaitTier(user, ReaderWait::kSlots);
   auto req = std::make_shared<ColdRequest>();
   req->st = std::move(st);
@@ -3467,7 +3467,7 @@ void coldServe(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry
   req->chunks = std::move(chunks);
   req->isVRead = isVRead;
   req->user = user;
-  req->t0 = nowUs();
+  req->t0 = startUs ? startUs : nowUs();
   serveRequest(req);
 }
 

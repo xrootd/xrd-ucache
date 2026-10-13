@@ -157,9 +157,11 @@ bool coldExactOriginRanges(ColdFill& cf, uint64_t off, uint64_t len,
 
 // Serve Read/VectorRead-shaped chunks, each already inside the virtual size.
 // Completes `user` exactly once: with the chunks (VectorReadInfo when isVRead,
-// ChunkInfo of the first chunk otherwise), or with the origin's error.
+// ChunkInfo of the first chunk otherwise), or with the origin's error. `startUs`: when the
+// request began (its time counts from there, the map's parse on the reader's thread included);
+// 0 for now.
 void coldServe(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
                std::shared_ptr<ColdFill> cf, XrdCl::ChunkList chunks, bool isVRead,
-               XrdCl::ResponseHandler* user);
+               XrdCl::ResponseHandler* user, uint64_t startUs = 0);
 
 } // namespace ucache

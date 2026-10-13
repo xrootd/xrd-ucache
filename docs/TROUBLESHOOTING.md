@@ -542,7 +542,9 @@ of that copy; the file is opened at another site by the same rules, and the reco
 there, on the job's own thread, so the reads that wait for them are checked once they are
 read. So do the reads with which a file shown in uCache's own layout (`recompress = on`) is set
 up at its first use: the layout is then made from the new copy. A failure of uCache's own (not
-the copy's) does not move.
+the copy's) does not move. The time those reads take, and a move of them, counts against the
+request that made them, a vector read or a read of uCache's own layout as a plain read: its
+fetch from the origin is then given what is left of its time.
 
 A request the job makes from inside its own completion handler (a read issued from the handler
 of another), before the file is set up or its records read, is not served on that thread: the

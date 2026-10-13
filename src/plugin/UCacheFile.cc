@@ -5868,10 +5868,15 @@ std::pair<uint64_t, uint64_t> roundChunk(const FileEntry& e, uint64_t off, uint6
 
 // Issues the wire VectorRead for the miss stage. Runs on the caller's thread
 // or an executor thread; touches inner only via acquire/release.
+// `startUs`: when the request began (its time counts from there, the map's parse included); 0
+// for now.
 void issueMissVRead(const std::shared_ptr<HandleState>& st,
                     const std::shared_ptr<FileEntry>& entry, ChunkList userChunks,
                     std::vector<size_t> missIdx, ResponseHandler* user,
-                    std::shared_ptr<ReadRule> direct = nullptr, int readerT = 0) {
+                    std::shared_ptr<ReadRule> direct = nullptr, int readerT = 0,
+                    uint64_t startUs = 0) {
+  if (!startUs)
+    startUs = nowUs();
   // Build rounded intervals in offset order, coalescing overlaps so the
   // origin never sees overlapping reads (§5.2 step 3). A file read directly
   // fetches its data exactly as asked: rounding is for pages to keep.
@@ -5917,10 +5922,10 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
     return;
   }
   auto* mh = new MissVReadHandler(st, f, entry, std::move(userChunks), std::move(missIdx),
-                                  std::move(wire), user, nowUs(), std::move(direct), readerT);
+                                  std::move(wire), user, startUs, std::move(direct), readerT);
   XRootDStatus s;
   if (!injectReadFault(false, mh, s)) // test hook: wire vector read dies mid-stream
-    s = f->VectorRead(wireChunks, nullptr, mh, st->originTimeout(readerT));
+    s = f->VectorRead(wireChunks, nullptr, mh, st->originTimeout(readerT, startUs));
   s = refusedLater(st, s, mh);
   if (!s.IsOK()) {
     delete mh;
@@ -6971,13 +6976,14 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
     // check_origin_integrity: the map, made on this (the reader's) thread with its timeout, as a
     // byte-cache miss makes it once per handle; a reader that makes its first read from inside a
     // client completion handler thus runs the parse's synchronous origin reads on that callback
-    // thread, as a miss does.
-    armKeyCheck(st_, entry, timeout);
+    // thread, as a miss does. One time for the request, the parse included (coldServe).
+    const uint64_t t0 = nowUs();
+    armKeyCheck(st_, entry, timeout, t0);
     auto st = st_;
     ChunkList one;
     one.emplace_back(offset, served, buffer);
-    Executor::instance().post([st, entry, cold, one = std::move(one), handler]() mutable {
-      coldServe(st, entry, cold, std::move(one), /*isVRead=*/false, handler);
+    Executor::instance().post([st, entry, cold, one = std::move(one), handler, t0]() mutable {
+      coldServe(st, entry, cold, std::move(one), /*isVRead=*/false, handler, t0);
     });
     return XRootDStatus();
   }
@@ -7200,12 +7206,13 @@ XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void
     pg->off = offset;
     pg->size = size;
     pg->buf = buffer;
-    armKeyCheck(st_, entry, timeout); // check_origin_integrity: the map, on this thread (as a miss)
+    const uint64_t t0 = nowUs(); // one time for the request, the map's parse included
+    armKeyCheck(st_, entry, timeout, t0); // check_origin_integrity: the map, on this thread (as a miss)
     auto st = st_;
     ChunkList one;
     one.emplace_back(offset, size, buffer);
-    Executor::instance().post([st, entry, cold, one = std::move(one), pg]() mutable {
-      coldServe(st, entry, cold, std::move(one), /*isVRead=*/false, pg);
+    Executor::instance().post([st, entry, cold, one = std::move(one), pg, t0]() mutable {
+      coldServe(st, entry, cold, std::move(one), /*isVRead=*/false, pg, t0);
     });
     return XRootDStatus();
   }
@@ -7223,9 +7230,13 @@ XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void
 // parks behind a fetch already in flight can re-enter it. `mayPark` is false on
 // that second pass: it has already been counted as a fill, and one wait is
 // enough -- whatever is still missing then goes to the origin.
+// `startUs`: when the request began (0: now); a request served again after it parked keeps it.
 static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
                                  const std::shared_ptr<FileEntry>& entry, ChunkList chunks,
-                                 ResponseHandler* handler, bool mayPark, int readerT = 0) {
+                                 ResponseHandler* handler, bool mayPark, int readerT = 0,
+                                 uint64_t startUs = 0) {
+  if (!startUs) // one time for the request, the map's parse (and a move of its reads) included
+    startUs = nowUs();
   // Atomic per-chunk classification (§5.2 step 1).
   std::vector<size_t> missIdx;
   for (size_t i = 0; i < chunks.size(); ++i)
@@ -7242,7 +7253,7 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
   // for; what it misses is fetched for this request only.
   std::shared_ptr<ReadRule> direct = missIdx.empty() ? nullptr : directRule(st, entry, chunks);
   if (!missIdx.empty())
-    armKeyCheck(st, entry, 0); // as the wire vector read below
+    armKeyCheck(st, entry, 0, startUs); // as the wire vector read below
 #ifdef UCACHE_HAVE_PREFETCH
   // Read-ahead learns from every fill and, once confirmed, fetches the next
   // one while the reader computes; posted to its own thread, never blocking.
@@ -7274,15 +7285,17 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
     for (size_t i : missIdx)
       missLen += chunks[i].length;
     auto redispatch = [st, entry, again = std::move(again), handler, fired, parkedAt, missOff,
-                       missLen, readerT]() mutable {
+                       missLen, readerT, startUs]() mutable {
       if (fired->exchange(true))
         return;
       if (st->store && st->store->stats().tracer)
         st->store->stats().tracer->rec("join", entry->key().key, missOff, missLen,
                                        nowUs() - parkedAt, /*sampled=*/false);
-      Executor::instance().post([st, entry, again = std::move(again), handler, readerT]() mutable {
-        servePlainVectorRead(st, entry, std::move(again), handler, /*mayPark=*/false, readerT);
-      });
+      Executor::instance().post(
+          [st, entry, again = std::move(again), handler, readerT, startUs]() mutable {
+            servePlainVectorRead(st, entry, std::move(again), handler, /*mayPark=*/false, readerT,
+                                 startUs);
+          });
     };
     if (entry->waitForInFlight(want, redispatch)) {
       Executor::instance().postAfter(10000, redispatch); // the same insurance the single-read path keeps
@@ -7298,7 +7311,8 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
 
   if (missIdx.size() == chunks.size()) {
     // All-miss: no disk stage; issue the wire read from this thread.
-    issueMissVRead(st, entry, chunks, std::move(missIdx), handler, std::move(direct), readerT);
+    issueMissVRead(st, entry, chunks, std::move(missIdx), handler, std::move(direct), readerT,
+                   startUs);
     return;
   }
 
@@ -7307,7 +7321,7 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
   ChunkList userChunks = chunks;
   Executor::instance().post(
       [st, entry, userChunks = std::move(userChunks), missIdx = std::move(missIdx), handler,
-       direct = std::move(direct), readerT]() mutable {
+       direct = std::move(direct), readerT, startUs]() mutable {
         uint64_t t0 = nowUs();
         uint64_t hitBytes = 0;
         std::vector<size_t> misses = std::move(missIdx);
@@ -7339,7 +7353,7 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
         }
         std::sort(misses.begin(), misses.end());
         issueMissVRead(st, entry, std::move(userChunks), std::move(misses), handler,
-                       std::move(direct), readerT);
+                       std::move(direct), readerT, startUs);
       });
   return;
 }
@@ -7414,13 +7428,14 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
         return XRootDStatus(XrdCl::stError, XrdCl::errInvalidArgs);
     if (!guardAllowsChunks(st_, entry->fileSize(), shownSize(), chunks))
       return refuseCopy(st_);
-    armKeyCheck(st_, entry, timeout); // check_origin_integrity: the map, on this thread (as a miss)
+    const uint64_t t0 = nowUs(); // one time for the request, the map's parse included
+    armKeyCheck(st_, entry, timeout, t0); // check_origin_integrity: the map, on this thread (as a miss)
     auto st = st_;
     noteVectorRequest(st_, chunks);
     ChunkList userChunks = chunks;
     Executor::instance().post(
-        [st, entry, cold, userChunks = std::move(userChunks), handler]() mutable {
-          coldServe(st, entry, cold, std::move(userChunks), /*isVRead=*/true, handler);
+        [st, entry, cold, userChunks = std::move(userChunks), handler, t0]() mutable {
+          coldServe(st, entry, cold, std::move(userChunks), /*isVRead=*/true, handler, t0);
         });
     return XRootDStatus();
   }
