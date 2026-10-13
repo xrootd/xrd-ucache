@@ -861,9 +861,13 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   // the same bytes, so the read is not asked again (another source is a matter
   // for adaptive_federation).
   std::atomic<bool> checkFailed{false};
-  // The File the request's first fetch from the origin was issued on (null: none issued): the
-  // copy a failure of the request is held against when it moves (moveSlotRequest).
-  std::atomic<XrdCl::File*> issuedOn{nullptr};
+  // The File the fetch whose failure failed the request was issued on (fail's `on`): the copy
+  // that failure is held against when the request moves (moveSlotRequest). Null when the failure
+  // is not a copy's: made here (a conversion that threw, a fetch's bytes that could not be
+  // gathered), bytes from the byte cache, no File to issue on, or a request the layout cannot
+  // serve; such a request does not move. A read the client refuses at once is its File's answer
+  // (a session lost since gives 109) and is held against it, as an answer is.
+  std::atomic<XrdCl::File*> failedOn{nullptr};
   // check_origin_integrity: the file map the original pieces' bytes are checked against (null: not
   // checked, and then not kept), taken before the fetch is issued (originCheckMapFor; the reader's
   // thread parsed; a request made during another handle's parse waits for it, serveRequest).
@@ -872,10 +876,14 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   std::mutex emu;
   XRootDStatus err;
 
-  void fail(const XRootDStatus& s) {
+  // The request fails with `s` (the first failure stands); `on`: the File of the fetch it is the
+  // copy's failure of, null for none (failedOn).
+  void fail(const XRootDStatus& s, XrdCl::File* on = nullptr) {
     std::lock_guard<std::mutex> g(emu);
-    if (!failed.exchange(true))
+    if (!failed.exchange(true)) {
       err = s;
+      failedOn.store(on);
+    }
   }
   // The last hold released finishes the request -- on the executor, whatever
   // thread let go (an XrdCl callback thread must not do disk reads).
@@ -1163,7 +1171,7 @@ void ColdRequest::finish() {
         s = err;
       }
       auto self = shared_from_this();
-      if (moveSlotRequest(st, issuedOn.load(), s, checkFailed.load(), attempt, t0,
+      if (moveSlotRequest(st, failedOn.load(), s, checkFailed.load(), attempt, t0,
                           [self, answered](bool moved, const XRootDStatus& e) {
                             if (moved) {
                               self->again(false);
@@ -1289,7 +1297,7 @@ void ColdRequest::finish() {
 void failOriginCheck(const std::shared_ptr<ColdRequest>& req, uint64_t pos, uint32_t len,
                      const std::string& what, const char* why, bool fromCache, uint64_t rStart,
                      uint64_t rLen, const std::string& codec = std::string(),
-                     const std::string& from = std::string()) {
+                     const std::string& from = std::string(), XrdCl::File* on = nullptr) {
   if (fromCache) {
     req->entry->releaseRanges({{rStart, rStart + rLen}});
     req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError));
@@ -1314,16 +1322,20 @@ void failOriginCheck(const std::shared_ptr<ColdRequest>& req, uint64_t pos, uint
                     codec);
   dropEntryOfBadCopy(*req->st, req->entry, from.empty() ? at : from);
   req->checkFailed.store(true);
-  req->fail(refused);
+  req->fail(refused, on);
 }
 
 // Convert one claimed basket and stage it. `rounded` holds the page-rounded
 // original range starting at `rStart`; the basket is [recOff, recOff+recLen)
 // inside it. `fromCache` = the original came from the byte cache (its copy
-// there is freed once the record is committed). Runs on the conversion pool.
+// there is freed once the record is committed). `from`, `on`: the server the original came from
+// and the File its fetch was issued on (null from the cache). Runs on the conversion pool.
 void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
                 std::shared_ptr<std::vector<char>> rounded, uint64_t rStart, uint64_t recOff,
-                uint32_t recLen, bool fromCache, const std::string& from = std::string()) try {
+                uint32_t recLen, bool fromCache, const std::string& from = std::string(),
+                XrdCl::File* on = nullptr) try {
+  if (convertFaultFire()) // test hook: the conversion throws, as for want of memory
+    throw std::bad_alloc();
   ColdFill& cf = *req->cf;
   const tp::FillSlot& slot = cf.slot(i);
   const auto* rec = reinterpret_cast<const uint8_t*>(rounded->data() + recOff);
@@ -1338,7 +1350,7 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
       // reader could no longer detect it. Fail the read, as ROOT would.
       if (cf.checkConverted) {
         failOriginCheck(req, slot.origSeek, recLen, "an RNTuple page", p.error.c_str(), fromCache,
-                        rStart, rounded->size(), std::string(), from);
+                        rStart, rounded->size(), std::string(), from, on);
       } else {
         UCACHE_WARN("slot run for %s: page at %llu: %s", cf.key.key.c_str(),
                     static_cast<unsigned long long>(slot.origSeek), p.error.c_str());
@@ -1420,7 +1432,7 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
                                                                   : "key position differs from the tree's record";
       failOriginCheck(req, slot.origSeek, recLen,
                       c.codec.empty() ? std::string("a basket") : "a basket (" + c.codec + ")",
-                      why.c_str(), fromCache, rStart, rounded->size(), c.codec, from);
+                      why.c_str(), fromCache, rStart, rounded->size(), c.codec, from, on);
       req->done();
       return;
     }
@@ -1436,7 +1448,7 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
   if (cf.checkConverted && c.check == tp::ConvertedBasket::kFailed) {
     failOriginCheck(req, slot.origSeek, recLen,
                     c.codec.empty() ? std::string("a basket") : "a basket (" + c.codec + ")",
-                    c.checkWhy, fromCache, rStart, rounded->size(), c.codec, from);
+                    c.checkWhy, fromCache, rStart, rounded->size(), c.codec, from, on);
     req->done();
     return;
   }
@@ -1504,7 +1516,7 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
   req->done();
 } catch (const std::exception& e) {
   UCACHE_WARN("slot run for %s: conversion failed (%s)", req->cf->key.key.c_str(), e.what());
-  req->fail(XRootDStatus(XrdCl::stError, XrdCl::errInternal));
+  req->fail(XRootDStatus(XrdCl::stError, XrdCl::errInternal)); // made here: does not move
   req->done();
 }
 
@@ -1589,7 +1601,8 @@ void serveOriginalPieces(const std::shared_ptr<ColdRequest>& req,
 // edge is served and nothing of it kept. Decoding runs on the decode pool when there is any
 // (fetchVerdictAsync), never on this (the client's) thread; the request is held until it ends.
 void checkOriginalPieces(const std::shared_ptr<ColdRequest>& req, std::vector<OrigFetched> origs,
-                         const std::string& server, uint64_t spanOff, uint64_t spanLen) {
+                         const std::string& server, uint64_t spanOff, uint64_t spanLen,
+                         XrdCl::File* on) {
   const std::shared_ptr<const KeyMap> m = req->checkMap;
   std::vector<FetchPiece> pieces;
   std::vector<std::pair<uint64_t, uint64_t>> reader;
@@ -1603,14 +1616,15 @@ void checkOriginalPieces(const std::shared_ptr<ColdRequest>& req, std::vector<Or
   }
   req->outstanding.fetch_add(1, std::memory_order_relaxed); // released by `then`
   auto held = std::make_shared<std::vector<OrigFetched>>(std::move(origs));
-  auto then = [req, held, reader, server, spanOff, spanLen](transpose::FetchVerdict v) {
+  auto then = [req, held, reader, server, spanOff, spanLen, on](transpose::FetchVerdict v) {
     countOriginChecks(*req->st, v);
     std::string why;
     const auto mk = v.against(reader, &why);
     if (mk.count) {
       req->checkFailed.store(true);
       req->fail(originCheckRefused(*req->st, &req->entry->obs().servers, "first_pass", mk.first,
-                                   mk.count, spanOff, spanLen, server, why));
+                                   mk.count, spanOff, spanLen, server, why),
+                on);
     } else {
       serveOriginalPieces(req, *held, !(mk.outside || v.unjudged));
     }
@@ -1628,7 +1642,7 @@ class PartHandler : public ResponseHandler {
   // `f`: the file the read is issued on, whose server it is counted against.
   PartHandler(std::shared_ptr<ColdRequest> req, XrdCl::File* f, std::vector<PartItem> items,
               std::vector<WireElem> wire)
-      : req_(std::move(req)), items_(std::move(items)), wire_(std::move(wire)),
+      : req_(std::move(req)), on_(f), items_(std::move(items)), wire_(std::move(wire)),
         t0_(nowUs()),
         inflight_(req_->st->store ? &req_->st->store->stats() : nullptr,
                   issueServer(*req_->st, f)) {}
@@ -1650,7 +1664,7 @@ class PartHandler : public ResponseHandler {
       noteOriginFailure(*req_->st, &req_->entry->obs().servers, "first_pass",
                         wire_.empty() ? 0 : wire_.front().off, asked, failed,
                         answeredBy(*req_->st, h.get()));
-      req_->fail(failed);
+      req_->fail(failed, on_);
       req_->done();
       delete this;
       return;
@@ -1678,7 +1692,7 @@ class PartHandler : public ResponseHandler {
     std::vector<OrigFetched> origs; // the original pieces' bytes, served (and checked) below
     for (const auto& it : items_) {
       auto buf = std::make_shared<std::vector<char>>(it.re - it.rs);
-      if (!gather(it.rs, it.re - it.rs, buf->data())) {
+      if (!gather(it.rs, it.re - it.rs, buf->data())) { // made here: the request does not move
         req_->fail(XRootDStatus(XrdCl::stError, XrdCl::errInternal));
         continue;
       }
@@ -1689,9 +1703,10 @@ class PartHandler : public ResponseHandler {
         const uint32_t recLen = static_cast<uint32_t>(it.len);
         const uint32_t idx = it.index;
         const uint64_t rs = it.rs;
+        XrdCl::File* on = on_;
         convertPool().post(
-            [req, idx, buf, rs, recOff, recLen, server] {
-              convertOne(req, idx, buf, rs, recOff, recLen, /*fromCache=*/false, server);
+            [req, idx, buf, rs, recOff, recLen, server, on] {
+              convertOne(req, idx, buf, rs, recOff, recLen, /*fromCache=*/false, server, on);
             });
       } else {
         origs.push_back(OrigFetched{it, std::move(buf)});
@@ -1700,7 +1715,7 @@ class PartHandler : public ResponseHandler {
     if (!origs.empty()) {
       if (req_->checkMap)
         checkOriginalPieces(req_, std::move(origs), server, wire_.empty() ? 0 : wire_.front().off,
-                            bytes);
+                            bytes, on_);
       else // not checked (the setting off, or no map could be made): kept only with the setting off
         serveOriginalPieces(req_, origs, !req_->cf->checkAll);
     }
@@ -1726,6 +1741,7 @@ class PartHandler : public ResponseHandler {
   }
 
   std::shared_ptr<ColdRequest> req_;
+  XrdCl::File* on_; // the File the read was issued on: a failure of it is held against its copy
   std::vector<PartItem> items_;
   std::vector<WireElem> wire_;
   uint64_t t0_;
@@ -1761,10 +1777,8 @@ void issuePart(const std::shared_ptr<ColdRequest>& req, std::vector<PartItem> it
     return;
   }
   auto* h = new PartHandler(req, f, std::move(items), std::move(wire));
-  XrdCl::File* none = nullptr;
-  req->issuedOn.compare_exchange_strong(none, f);
   XRootDStatus s;
-  if (readFaultFire()) // test hook: the origin's vector read dies mid-stream
+  if (slotFetchFaultFire()) // test hook: the origin's vector read dies mid-stream
     Executor::instance().post([h] {
       h->HandleResponseWithHosts(new XRootDStatus(XrdCl::stError, XrdCl::errConnectionError),
                                  nullptr, nullptr);
@@ -1782,7 +1796,7 @@ void issuePart(const std::shared_ptr<ColdRequest>& req, std::vector<PartItem> it
     noteOriginFailure(*req->st, &req->entry->obs().servers, "first_pass",
                       chunks.empty() ? 0 : chunks.front().offset, asked, s,
                       answeredBy(*req->st, nullptr));
-    req->fail(s);
+    req->fail(s, f); // the File's own answer (a session lost since: 109), judged by readStep
     req->done();
   }
 }

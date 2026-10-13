@@ -545,8 +545,9 @@ std::shared_ptr<const KeyMap> originCheckMapFor(const std::shared_ptr<HandleStat
                                                 const std::shared_ptr<FileEntry>& entry,
                                                 std::function<void()>* then, bool& parked);
 // adaptive_federation, a handle shown a slot layout (HandleState::moveSlotReads): a request of the
-// slot run whose fetch from the origin failed with `s` on the File `on` (`checkFailed`: its bytes
-// failed a check: a data failure of that copy) moves as a byte-path read does (the same move,
+// slot run whose fetch from the origin failed with `s` on the File `on`, the fetch's own (null: the
+// failure is no copy's, made in uCache itself, and the request does not move; `checkFailed`: its
+// bytes failed a check: a data failure of that copy) moves as a byte-path read does (the same move,
 // moveOn: the read deadline, tried=, the regional's list, the size the reader was shown, a copy
 // found bad never taken again), when it is one that moves (readStep, or checkFailed) and has
 // attempts (`attempt`, kReadMaxAttempts) and time left (counted from `startUs`). Returns false

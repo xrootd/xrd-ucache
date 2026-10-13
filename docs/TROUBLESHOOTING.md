@@ -512,6 +512,18 @@ take any copy the regional redirector lists.
 A file whose size uCache does not know is not moved: the client's own recovery of its
 reads stays on.
 
+What does not move: uCache's own reads of the file's records, made to know where each
+basket is for `check_origin_integrity` (and to find a direct file's baskets under
+`max_read_fraction`), are not made again at another copy. On a file whose reads move, the
+client's own recovery is off, so a connection lost during those reads (which the client
+would otherwise have recovered) fails them: the file's reads are then served unchecked, and
+nothing of them kept, until a read a second later or more reads the records again. This
+holds for a file shown in uCache's own layout and for one served as it is alike.
+
+A file shown in uCache's own layout (`recompress = on`) bounds its fetches by the read
+deadline (5 minutes, within the client's `RequestTimeout`), not by a timeout the job gave
+the read: a job's own shorter read timeout does not shorten them.
+
 A job's open that the cache entry answered within its freshness window opens the file at an
 origin only when a read needs it. When the entry is gone by the job's first read (evicted
 meanwhile), that read opens the file at an origin, with the failover of an open. If that open

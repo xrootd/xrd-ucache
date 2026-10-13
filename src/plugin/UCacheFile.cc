@@ -163,8 +163,8 @@ bool headerFaultFires() {
 // fault is no error: the read is sent as it is and its answer delivered 2500 ms late (after a move
 // the first one started, so that a copy cut short answers it short on the File the handle left);
 // every other one a connection error posted 1000 ms late (two reads issued together both meet the
-// copy before either answer comes).
-enum class FaultKind : uint8_t { kMiss, kRelay, kRefuse, kFinal, kLate, kAgain, kLeftData };
+// copy before either answer comes). convert: the slot run's conversions instead (convertFaultFire).
+enum class FaultKind : uint8_t { kMiss, kRelay, kRefuse, kFinal, kLate, kAgain, kLeftData, kConvert };
 static const FaultKind gFaultKind = [] {
   const char* v = ::getenv("UCACHE_TEST_READ_FAIL_KIND");
   const std::string k = v ? v : "";
@@ -174,8 +174,15 @@ static const FaultKind gFaultKind = [] {
          : k == "late"     ? FaultKind::kLate
          : k == "again"    ? FaultKind::kAgain
          : k == "leftdata" ? FaultKind::kLeftData
+         : k == "convert"  ? FaultKind::kConvert
                            : FaultKind::kMiss;
 }();
+bool convertFaultFire() {
+  return gFaultKind == FaultKind::kConvert && readFaultFire();
+}
+bool slotFetchFaultFire() {
+  return gFaultKind != FaultKind::kConvert && readFaultFire();
+}
 static std::atomic<int> gReadFaultsFired{0}; // of kLeftData: which fault this is
 // A handler that delivers the answer it gets 2500 ms late (leftdata's second fault).
 class LateAnswer : public ResponseHandler {
@@ -208,7 +215,7 @@ static bool injectReadFault(bool relaySite, ResponseHandler* h, XRootDStatus& s,
   const bool here =
       againSite   ? k == FaultKind::kAgain
       : relaySite ? k == FaultKind::kRelay || k == FaultKind::kRefuse || k == FaultKind::kAgain
-                  : k != FaultKind::kRelay && k != FaultKind::kAgain;
+                  : k != FaultKind::kRelay && k != FaultKind::kAgain && k != FaultKind::kConvert;
   if (!here || !readFaultFire())
     return false;
   s = XRootDStatus();

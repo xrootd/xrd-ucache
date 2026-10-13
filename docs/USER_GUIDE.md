@@ -1047,7 +1047,12 @@ the next read moves the file. A file shown in uCache's own layout (`recompress =
 moves the same way: the request that failed is served again from the start once the
 file is read from another copy, its fetches made there at the origin's offsets (the
 baskets it converts and the bytes it keeps as they are), checked as from any copy;
-the addresses the job was shown never change. A file read from a direct URL and a
+the addresses the job was shown never change. Each fetch is judged on its own: nothing
+of a fetch that failed is kept, while what the request's other fetches brought from the
+copy it left and that passed their checks stays (unless that copy is found bad: then the
+entry is dropped, as above). A failure made in uCache itself (a conversion that ran out of
+memory, say) is no copy's: the request is served again at the same copy, as with the
+switch off. A file read from a direct URL and a
 file the job copies are not changed. With the switch off nothing of this happens.
 
 **Put the cache on local disk.** `dir` has **no default** — an unset cache

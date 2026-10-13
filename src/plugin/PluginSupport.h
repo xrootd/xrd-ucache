@@ -22,6 +22,12 @@ XrdCl::AnyObject* vreadResponse(const XrdCl::ChunkList& chunks);
 // and first-pass fetches alike -- which then complete with errConnectionError
 // instead of being sent. One relaxed load when unset.
 bool readFaultFire();
+// Test-only (UCACHE_TEST_READ_FAIL_KIND=convert, with UCACHE_TEST_READ_FAIL_N): true for the
+// process's first N conversions of the slot run, each of which then throws as for want of memory,
+// instead of the reads failing. slotFetchFaultFire: readFaultFire for the slot run's fetches,
+// false with that kind.
+bool convertFaultFire();
+bool slotFetchFaultFire();
 
 // The tier a request needed (ReaderWait::Tier), noted on the reader's handler
 // when the read's entry point wrapped it to measure the reader's wait; any
