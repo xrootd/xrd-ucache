@@ -655,6 +655,17 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
     SetupSource src;
     src.st = st;
     src.entry = entry;
+    // The reader's thread: its reads of the records move when the handle's setup may move
+    // (HandleState::setupMoves), and the setup goes on at the new copy.
+    src.mayMove = true;
+    // Test hook (UCACHE_TEST_KEYMAP_DELAY_MS, as the map's parse): the setup held this long before
+    // its first read of the records, so that a test can stop the copy meanwhile.
+    static const long holdMs = [] {
+      const char* v = std::getenv("UCACHE_TEST_KEYMAP_DELAY_MS");
+      return v ? std::strtol(v, nullptr, 10) : 0L;
+    }();
+    if (holdMs > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
     cf->codecs = cfg.recompressCodecs;
     cf->slotFactor100 = kSlotFactor100;
     // Rebuilding the layout this process already showed (its store is gone):
@@ -1650,6 +1661,7 @@ class PartHandler : public ResponseHandler {
 
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     req_->st->releaseInner();
     inflight_.release();
     std::unique_ptr<XRootDStatus> s(status);

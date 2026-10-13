@@ -210,6 +210,10 @@ struct HandleState {
   // origin failed is served again from the start, at the origin's offsets, once the handle reads
   // from another copy (moveSlotRequest). The client's own recovery is off on its Files too.
   std::atomic<bool> moveSlotReads{false};
+  // adaptive_federation: the reads of the handle's setup (a replica's layout made from the file's
+  // records, at its first use) may move as its reads will once it is set up (armForSetup), though
+  // the handle is armed only at the end of the setup (applyReadPolicy).
+  std::atomic<bool> setupMoves{false};
   bool viaRedirector = false;
   // Under mu: the server and site the current File was opened at; where reads
   // of the handle failed, the 3 newest (the next open names them in tried= and
@@ -288,6 +292,10 @@ struct HandleState {
   int parkedReads = 0;
   bool wholeCopy = false; // under mu: set up as a copy (the first read took the whole file)
   void applyReadPolicy();
+  // Before the setup reads the file's records: when the handle will be armed (as applyReadPolicy
+  // decides, the setup aside; `copy`: a copy's handle never is), its setup's reads may move
+  // (setupMoves) and the client's own recovery is turned off on its File, as for an armed handle.
+  void armForSetup(bool copy);
   void unpark();
   // The timeout of an origin read of this handle (OpenPolicy.h readAttemptTimeoutS),
   // `startUs` after the request began (`again`: this is a later attempt); the

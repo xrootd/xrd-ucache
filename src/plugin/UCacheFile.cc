@@ -108,6 +108,11 @@ static_assert(XrdCl::DefaultStreamTimeout + XrdCl::DefaultTimeoutResolution < kR
 // after a healthy open, so the fail-open contract -- the reader still gets the
 // exact bytes -- can be tested deterministically. The relay pass-through and
 // every other inner operation are untouched. Sibling of UCACHE_TEST_OPEN_FAIL_N.
+static thread_local int tClientCallbacks = 0;
+ClientCallback::ClientCallback() { ++tClientCallbacks; }
+ClientCallback::~ClientCallback() { --tClientCallbacks; }
+bool onClientCallback() { return tClientCallbacks > 0; }
+
 bool readFaultFire() {
   static std::atomic<int> budget{[] {
     const char* v = ::getenv("UCACHE_TEST_READ_FAIL_N");
@@ -208,6 +213,7 @@ public:
   explicit LateAnswer(ResponseHandler* h) : h_(h) {}
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     ResponseHandler* h = h_;
     delete this;
     Executor::instance().postAfter(2500, [h, status, response, hostList] {
@@ -215,6 +221,7 @@ public:
     });
   }
   void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     HandleResponseWithHosts(status, response, nullptr);
   }
 
@@ -274,10 +281,12 @@ class WaitHandler : public ResponseHandler {
   }
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     ResponseHandler* real = finish(false);
     real->HandleResponseWithHosts(status, response, hostList);
   }
   void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     ResponseHandler* real = finish(false);
     real->HandleResponse(status, response);
   }
@@ -337,6 +346,7 @@ class DeferredAnswer : public ResponseHandler {
   explicit DeferredAnswer(ResponseHandler* real) : real_(real) {}
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     {
       std::lock_guard<std::mutex> g(mu_);
       if (inCall_) {
@@ -351,6 +361,7 @@ class DeferredAnswer : public ResponseHandler {
     delete this;
   }
   void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     HandleResponseWithHosts(status, response, nullptr);
   }
   // The request has left the plugin object, which returned `s`: an answer held meanwhile is handed
@@ -701,6 +712,7 @@ class SiteNameHandler : public ResponseHandler {
                   std::shared_ptr<CacheStore> store)
       : op_(std::move(op)), server_(std::move(server)), fs_(fs), store_(std::move(store)) {}
   void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     std::unique_ptr<XRootDStatus> s(status);
     std::unique_ptr<AnyObject> r(response);
     std::string name;
@@ -1316,6 +1328,7 @@ class FsHandler : public ResponseHandler {
  public:
   explicit FsHandler(std::shared_ptr<FsReply> r) : r_(std::move(r)) {}
   void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     std::unique_ptr<XRootDStatus> s(status);
     std::shared_ptr<FsReply> r = std::move(r_);
     delete this;
@@ -1585,12 +1598,14 @@ class ReaderOpenHandler : public ResponseHandler {
   }
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     noteOriginOpen(a_, status, hostList, nullptr);
     ResponseHandler* real = real_;
     delete this;
     real->HandleResponseWithHosts(status, response, hostList);
   }
   void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     noteOriginOpen(a_, status, nullptr, nullptr);
     ResponseHandler* real = real_;
     delete this;
@@ -1632,9 +1647,11 @@ class OpenWaitHandler : public ResponseHandler {
   explicit OpenWaitHandler(std::shared_ptr<OpenResult> r) : r_(std::move(r)) {}
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     finish(status, response, hostList);
   }
   void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     finish(status, response, nullptr);
   }
 
@@ -1920,10 +1937,12 @@ class RetryingOpenHandler : public ResponseHandler {
   }
 
   void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     HandleResponseWithHosts(status, response, nullptr); // a chained plugin's completion
   }
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     std::unique_ptr<XRootDStatus> s(status ? status
                                            : new XRootDStatus(XrdCl::stError, XrdCl::errInternal));
     std::unique_ptr<AnyObject> r(response);
@@ -1995,10 +2014,12 @@ class RetryingOpenHandler : public ResponseHandler {
                std::unique_ptr<AnyObject> r, std::unique_ptr<HostList> h, AttemptView w)
         : o(o), s(std::move(s)), r(std::move(r)), h(std::move(h)), w(std::move(w)) {}
     void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    ClientCallback inClientCallback; // PluginSupport.h
       HandleResponseWithHosts(status, response, nullptr);
     }
     void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                  HostList* hosts) override {
+    ClientCallback inClientCallback; // PluginSupport.h
       std::unique_ptr<HeaderRead> self(this);
       std::unique_ptr<XRootDStatus> rs(status ? status
                                               : new XRootDStatus(XrdCl::stError, XrdCl::errInternal));
@@ -3262,6 +3283,21 @@ void HandleState::applyReadPolicy() {
   recoveryOff(*f);
 }
 
+void HandleState::armForSetup(bool copy) {
+  if (!globalConfig().adaptiveFederation || copy)
+    return;
+  XrdCl::File* f = nullptr;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    if (moveOnReads || moveSlotReads || setupMoves || !innerValid ||
+        !armedForReads(true, reopenInChild, viaRedirector, false, sizeShownLocked() != 0))
+      return;
+    setupMoves = true;
+    f = inner.load();
+  }
+  recoveryOff(*f);
+}
+
 uint64_t HandleState::sizeShownLocked() const {
   uint64_t n = expectedOriginSize.load(std::memory_order_relaxed);
   if (!n && entry)
@@ -3937,9 +3973,13 @@ static XRootDStatus* shortAnswer(HandleState& st, ServerTally* tally, const char
 bool parseReadMoves(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
                     const XRootDStatus& s, uint64_t off, uint64_t len, uint64_t got,
                     const std::string& server, ServerTally* tally, uint64_t startUs) try {
-  if (!st || !on || processExiting() ||
+  // Never on a client callback thread (a read a reader issued from inside its own completion):
+  // the move's answers come on those threads. The parse fails there, as it did before reads of the
+  // records moved.
+  if (!st || !on || processExiting() || onClientCallback() ||
       !(st->moveOnReads.load(std::memory_order_relaxed) ||
-        st->moveSlotReads.load(std::memory_order_relaxed)))
+        st->moveSlotReads.load(std::memory_order_relaxed) ||
+        st->setupMoves.load(std::memory_order_relaxed)))
     return false;
   XRootDStatus why = s;
   if (s.IsOK()) { // a short answer: a failure of the copy only inside the confirmed size
@@ -3951,10 +3991,15 @@ bool parseReadMoves(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
   if (why.code != XrdCl::errDataError &&
       readStep(why.code, static_cast<int>(why.errNo)) != ReadStep::kMove)
     return false;
-  if (st->originTimeout(0, startUs, true) == 0)
+  // The parse's time: a read's budget, counted from its first read (for a handle not armed yet,
+  // whose own timeout says nothing of it, as for an armed one).
+  const auto leftS = [startUs] {
+    return readBudgetS(0, defaultRequestTimeoutS()) -
+           static_cast<int>((nowUs() - std::min(startUs, nowUs())) / 1000000);
+  };
+  const int capS = leftS();
+  if (capS <= 0)
     return false;
-  const int capS = readBudgetS(0, defaultRequestTimeoutS()) -
-                   static_cast<int>((nowUs() - std::min(startUs, nowUs())) / 1000000);
   auto moved = std::make_shared<std::promise<bool>>();
   auto done = moved->get_future();
   moveOn(st, on, why, capS, [st, moved](bool m, const std::string&) {
@@ -3965,7 +4010,7 @@ bool parseReadMoves(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
   // The move ends within its own bounds (the sequence's budget, capS); the wait is a backstop.
   if (done.wait_for(std::chrono::seconds(std::max(capS, 1) + 60)) != std::future_status::ready)
     return false;
-  return done.get() && !processExiting() && st->originTimeout(0, startUs, true) > 0;
+  return done.get() && !processExiting() && leftS() > 0;
 } catch (...) {
   return false;
 }
@@ -4271,6 +4316,7 @@ struct RelayHandler : XrdCl::ResponseHandler {
 #endif
   void HandleResponseWithHosts(XrdCl::XRootDStatus* s, XrdCl::AnyObject* r,
                                XrdCl::HostList* h) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     arrivedUs = nowUs();
 #ifdef UCACHE_HAVE_COLDRUN
     // check_origin_integrity: decoding (a basket's data) runs on the executor (withKeyMap).
@@ -4760,6 +4806,7 @@ class MissReadHandler : public ResponseHandler {
 
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     st_->releaseInner();
     // The origin read this handler was waiting for has landed. Give the guard
     // back HERE and not at destruction: a fail-open retry below issues a fresh
@@ -5124,6 +5171,7 @@ class MissVReadHandler : public ResponseHandler {
 
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
+    ClientCallback inClientCallback; // PluginSupport.h
     st_->releaseInner();
     // The origin read this handler was waiting for has landed. Give the guard
     // back HERE and not at destruction: a fail-open retry below issues a fresh
@@ -6135,9 +6183,11 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
       if (entry)
         dropEarlierReplica(*key, cfg);
 #ifdef UCACHE_HAVE_COLDRUN
-      if (entry && cfg.transpose && !keepOriginal)
+      if (entry && cfg.transpose && !keepOriginal) {
+        st_->armForSetup(copy); // the layout's reads of the records may move (adaptive_federation)
         chooseLayout(st_, entry, *key, cfg, si->GetModTime(), MetaData::kCksumNone, 0, cold,
                      forkLayout != ForkLayout::kNone);
+      }
       if (entry && cold)
         statClone->SetSize(coldVirtualSize(*cold));
 #endif
@@ -6236,6 +6286,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
   (void)attached;
 #endif
   st_->applyReadPolicy();
+  st_->setupMoves = false; // armed now, or not to be
   std::lock_guard<std::mutex> g(st_->mu);
   return st_->entry;
 }
@@ -6388,6 +6439,7 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
       ResponseHandler* user;
       uint64_t vsize;
       void HandleResponseWithHosts(XRootDStatus* s, AnyObject* r, HostList* h) override {
+    ClientCallback inClientCallback; // PluginSupport.h
         if (s && s->IsOK() && r) {
           XrdCl::StatInfo* si = nullptr;
           r->Get(si);
@@ -6673,6 +6725,7 @@ XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void
       uint32_t size;
       void* buf;
       void HandleResponseWithHosts(XRootDStatus* s, AnyObject* r, HostList* h) override {
+    ClientCallback inClientCallback; // PluginSupport.h
         std::unique_ptr<AnyObject> rr(r); // ChunkInfo response; rebuilt below
         std::unique_ptr<HostList> hh(h);
         if (s && s->IsOK()) {

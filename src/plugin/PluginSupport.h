@@ -22,6 +22,18 @@ XrdCl::AnyObject* vreadResponse(const XrdCl::ChunkList& chunks);
 // and first-pass fetches alike -- which then complete with errConnectionError
 // instead of being sent. One relaxed load when unset.
 bool readFaultFire();
+
+// A handler the XRootD client calls marks its thread while it runs (a ClientCallback for the call's
+// length), so that code a reader runs from inside its own completion (a read issued from its
+// handler) can tell that it is on a client callback thread, where nothing may wait for a move:
+// the client's few worker threads deliver every answer, the move's own among them.
+struct ClientCallback {
+  ClientCallback();
+  ~ClientCallback();
+  ClientCallback(const ClientCallback&) = delete;
+  ClientCallback& operator=(const ClientCallback&) = delete;
+};
+bool onClientCallback();
 // Test-only (UCACHE_TEST_READ_FAIL_KIND=convert, with UCACHE_TEST_READ_FAIL_N): true for the
 // process's first N conversions of the slot run, each of which then throws as for want of memory,
 // instead of the reads failing. slotFetchFaultFire: readFaultFire for the slot run's fetches,

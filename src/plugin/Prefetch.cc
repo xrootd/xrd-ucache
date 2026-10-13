@@ -6,6 +6,7 @@
 #include "FileEntry.h"
 #include "Log.h"
 #include "OriginInFlight.h"
+#include "PluginSupport.h"
 #include "ReadRounding.h"
 #include "ReadRule.h"
 #include "Trace.h"
@@ -722,6 +723,7 @@ struct Shard {
     }
     void HandleResponseWithHosts(XrdCl::XRootDStatus* status, XrdCl::AnyObject* response,
                                  XrdCl::HostList* hosts) override {
+    ClientCallback inClientCallback; // PluginSupport.h
       // Give the inner file back and let go of the handle in the same breath:
       // the plugin destructor waits for the former and must not find this
       // handler still holding the latter afterwards. The store outlives us.
