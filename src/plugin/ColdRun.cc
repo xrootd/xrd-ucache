@@ -932,10 +932,11 @@ void servePage(const uint8_t* page, uint32_t pageLen, uint64_t from, uint64_t le
 // Copy bytes [from, from+len) of slot i -- its record, then zeros -- to dest.
 // False when the slot's bytes are not to be had after all: the slot is then
 // absent again, and serving the request again fetches it -- unless `fatal`
-// is set, and the request fails.
+// is set, and the request fails. `noMemory`, when given, is set when that was
+// for want of memory (a stored page's decoder): this process's, not the copy's.
 bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
               uint64_t& recBytes, const ColdFill::Where* held, bool mapped, bool& fatal, uint64_t seekAs = 0, uint32_t expectLen = 0,
-              uint32_t expectCrc = 0) {
+              uint32_t expectCrc = 0, bool* noMemory = nullptr) {
   recBytes = 0;
   ColdFill::Where w;
   if (held) {
@@ -1043,14 +1044,25 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
     if (rec->size() != pageLen) {
       if (auto cs = globalStore())
         cs->stats().slotPagesDecoded.fetch_add(1, std::memory_order_relaxed);
-      {
-        std::optional<tp::DecoderNoMemory> noMemory; // test hook: its decoder gets no memory
+      bool short_of_memory = false;
+      try {
+        std::optional<tp::DecoderNoMemory> hook; // test hook: its decoder gets no memory
         if (pageNoMemFire())
-          noMemory.emplace();
-        raw = tp::decompressFrames(rec->data(), rec->size(), pageLen); // {} for want of memory
+          hook.emplace();
+        tp::DecodedFrames d = tp::decodeFrames(rec->data(), rec->size(), pageLen);
+        if (d.check != tp::FrameCheck::kFailed)
+          raw = std::move(d.out);
+      } catch (const std::bad_alloc&) { // never out of this task of the executor
+        raw.clear();
+        short_of_memory = true;
+        if (noMemory)
+          *noMemory = true;
       }
       if (raw.size() != pageLen) {
-        cf.forget(i);
+        // A record that cannot be decoded is forgotten (fetched again); one this process had no
+        // memory to decode is good and kept: the request served again decodes it again.
+        if (!short_of_memory)
+          cf.forget(i);
         return false;
       }
       page = raw.data();
@@ -1235,6 +1247,7 @@ void ColdRequest::finish() {
   // fetches them all at once. Stopping at the first let a request with several
   // damaged slots use up its retries one slot at a time and fail the read.
   bool fatal = false;
+  bool noMemory = false; // a stored page not decoded for want of memory (copySlot)
   if (!lost)
     for (const auto& p : slotPieces) {
       uint64_t rec = 0;
@@ -1245,7 +1258,7 @@ void ColdRequest::finish() {
       auto h = mine.find(p.slot);
       if (!copySlot(*cf, p.slot, p.from, p.len, p.dest, rec,
                     h == mine.end() ? nullptr : &h->second, st->coldMap != nullptr, fatal,
-                    p.seekAs, p.expectLen, p.expectCrc)) {
+                    p.seekAs, p.expectLen, p.expectCrc, &noMemory)) {
         lost = true; // a record failed its check, or a kept original is gone
         continue;
       }
@@ -1257,7 +1270,13 @@ void ColdRequest::finish() {
       return;
     }
     answered();
-    complete(user, new XRootDStatus(XrdCl::stError, XrdCl::errDataError), nullptr);
+    // Want of memory is this process's: said as such, never as damaged data.
+    complete(user,
+             noMemory ? new XRootDStatus(XrdCl::stError, XrdCl::errOSError, ENOMEM,
+                                         "uCache: a stored page could not be decoded for want of "
+                                         "memory (this process's, not the copy's)")
+                      : new XRootDStatus(XrdCl::stError, XrdCl::errDataError),
+             nullptr);
     return;
   }
   if (st->store) {

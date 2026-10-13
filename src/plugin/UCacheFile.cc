@@ -1005,16 +1005,13 @@ void writeSiteMark(const std::shared_ptr<CacheStore>& store, const SiteFailure& 
   } catch (...) {
   }
 }
-// The stream timeout in force is the job's own (streamTimeoutIsJobs): read once, as the client's
-// settings are at load (runSettings).
+// The stream timeout in force is the job's own (streamTimeoutIsJobs): read at each decision, so
+// that a job that changes it later is seen (a lookup in the client's settings).
 bool jobStreamTimeout() {
-  static const bool jobs = [] {
-    int v = XrdCl::DefaultStreamTimeout;
-    if (XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv())
-      env->GetInt("StreamTimeout", v);
-    return streamTimeoutIsJobs(v);
-  }();
-  return jobs;
+  int v = XrdCl::DefaultStreamTimeout;
+  if (XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv())
+    env->GetInt("StreamTimeout", v);
+  return streamTimeoutIsJobs(v);
 }
 // The failure `f` of a request to a server (`kind`, siteFaultOf), of the request issued at
 // `startUs`: a fault of the server's own is marked at once; a stall is marked when another site
