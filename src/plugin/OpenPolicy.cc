@@ -141,6 +141,10 @@ std::string siteNameOfAnswer(const char* data, size_t len) {
   return name;
 }
 
+bool slotLossIsWantOfMemory(bool dataFailure, bool noMemory) {
+  return noMemory && !dataFailure;
+}
+
 bool streamTimeoutIsJobs(int streamTimeoutS) {
   return streamTimeoutS > 0 && streamTimeoutS < kDefaultStreamTimeoutS;
 }

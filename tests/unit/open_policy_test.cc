@@ -272,6 +272,15 @@ TEST(OpenPolicy, TheLastHostIsMarked) {
   EXPECT_EQ(markedHop(readChain({}), {}), -1);
 }
 
+// A replica layout's request that could not have its slots fails for want of memory only when no
+// piece failed as data: a data failure is never hidden behind want of memory.
+TEST(OpenPolicy, ADataFailureComesBeforeWantOfMemory) {
+  EXPECT_TRUE(slotLossIsWantOfMemory(false, true));
+  EXPECT_FALSE(slotLossIsWantOfMemory(true, true)) << "one piece short of memory, another corrupt";
+  EXPECT_FALSE(slotLossIsWantOfMemory(true, false));
+  EXPECT_FALSE(slotLossIsWantOfMemory(false, false));
+}
+
 TEST(OpenPolicy, SiteFaultOfAFailure) {
   EXPECT_EQ(siteFaultOf(kErrOperationExpired, 0, true), SiteFault::kStall);
   EXPECT_EQ(siteFaultOf(kErrOperationExpired, 0, false), SiteFault::kNone) << "the job's own time";

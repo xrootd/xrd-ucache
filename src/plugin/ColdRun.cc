@@ -1247,7 +1247,8 @@ void ColdRequest::finish() {
   // fetches them all at once. Stopping at the first let a request with several
   // damaged slots use up its retries one slot at a time and fail the read.
   bool fatal = false;
-  bool noMemory = false; // a stored page not decoded for want of memory (copySlot)
+  bool noMemory = false;    // a stored page not decoded for want of memory (copySlot)
+  bool dataFailure = false; // a piece not had for another reason: a data failure
   if (!lost)
     for (const auto& p : slotPieces) {
       uint64_t rec = 0;
@@ -1256,10 +1257,12 @@ void ColdRequest::finish() {
         continue;
       }
       auto h = mine.find(p.slot);
+      bool pieceNoMemory = false;
       if (!copySlot(*cf, p.slot, p.from, p.len, p.dest, rec,
                     h == mine.end() ? nullptr : &h->second, st->coldMap != nullptr, fatal,
-                    p.seekAs, p.expectLen, p.expectCrc, &noMemory)) {
-        lost = true; // a record failed its check, or a kept original is gone
+                    p.seekAs, p.expectLen, p.expectCrc, &pieceNoMemory)) {
+        lost = true; // a record failed its check, or a kept original is gone, or no memory
+        (pieceNoMemory ? noMemory : dataFailure) = true;
         continue;
       }
       (std::binary_search(fetched.begin(), fetched.end(), p.slot) ? fillRec : replicaRec) += rec;
@@ -1270,9 +1273,10 @@ void ColdRequest::finish() {
       return;
     }
     answered();
-    // Want of memory is this process's: said as such, never as damaged data.
+    // Want of memory is this process's: said as such, never as damaged data, and never over a
+    // data failure of another piece (slotLossIsWantOfMemory).
     complete(user,
-             noMemory ? new XRootDStatus(XrdCl::stError, XrdCl::errOSError, ENOMEM,
+             slotLossIsWantOfMemory(dataFailure, noMemory) ? new XRootDStatus(XrdCl::stError, XrdCl::errOSError, ENOMEM,
                                          "uCache: a stored page could not be decoded for want of "
                                          "memory (this process's, not the copy's)")
                       : new XRootDStatus(XrdCl::stError, XrdCl::errDataError),

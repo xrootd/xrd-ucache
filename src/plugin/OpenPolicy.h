@@ -585,6 +585,11 @@ SiteFault siteFaultOf(int code, int errNo, bool ownTime, bool jobStream = false)
 // below the client's default (60 s), so a connection gone quiet past it says no more than the
 // job's own timeout does.
 bool streamTimeoutIsJobs(int streamTimeoutS);
+// A request of a replica layout whose slots could not all be had, at its last attempt: it fails
+// for want of memory (a local error, ENOMEM) only when some piece was not had for want of memory
+// and none failed as data (a record that failed its check or would not decode, a kept original
+// gone): a data failure takes precedence, so a bad record or copy is never hidden as memory.
+bool slotLossIsWantOfMemory(bool dataFailure, bool noMemory);
 constexpr int kDefaultStreamTimeoutS = 60; // the client's own (XrdCl::DefaultStreamTimeout)
 // Whether `failed` lists `server` (host:port, in any case) as a copy refused for what it is.
 bool refusedBefore(const std::vector<SiteFailure>& failed, const std::string& server);
