@@ -366,11 +366,15 @@ server <host:port> <site name, or -> <domain> <count> <first failure> <last fail
   and its domain (the server itself for one that never answered), its failures
   in a row since its last success (`count`), and wall-clock seconds. Its mark
   holds until `marked until`: 10 minutes after the first failure of a row,
-  doubled at each further one, at most an hour. A success clears the line.
+  doubled at each further one, at most an hour. A success clears the line. A
+  mark whose end lies more than an hour and a minute ahead (the clock went
+  back) is taken as ended: the clock never lengthens a mark.
 - A name or domain with a space, a `%` or a byte that is not printable is
   percent-encoded.
-- Written in place under an exclusive `flock`, read under a shared one, never
-  fsynced. A line that does not parse is skipped; a first line other than
+- Written whole to `<dir>/sources.new` and renamed over `<dir>/sources` under an
+  exclusive `flock` of `<dir>/sources.lock`, read without a lock (the rename
+  replaces it whole), never fsynced: a process that dies leaves the old version
+  or the new one. A line that does not parse is skipped; a first line other than
   `ucache-sources 1` makes the file read as no marks. A line whose mark ended a
   day before is dropped at the next write; at most 4096 servers are kept.
 - `ucache sources` shows it, with the copy faults of the in-use records.

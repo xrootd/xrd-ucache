@@ -141,9 +141,13 @@ std::string siteNameOfAnswer(const char* data, size_t len) {
   return name;
 }
 
-SiteFault siteFaultOf(int code, int errNo, bool ownTime) {
+bool streamTimeoutIsJobs(int streamTimeoutS) {
+  return streamTimeoutS > 0 && streamTimeoutS < kDefaultStreamTimeoutS;
+}
+
+SiteFault siteFaultOf(int code, int errNo, bool ownTime, bool jobStream) {
   if (code == kErrSocketTimeout)
-    return SiteFault::kStall;
+    return jobStream ? SiteFault::kNone : SiteFault::kStall;
   if (code == kErrOperationExpired)
     return ownTime ? SiteFault::kStall : SiteFault::kNone;
   if (code == kErrErrorResponse)

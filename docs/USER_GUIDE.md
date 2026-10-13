@@ -1074,8 +1074,9 @@ file the job copies are not changed. With the switch off nothing of this happens
 copies that failed, so that the next open does not meet them first:
 
 - **A server** is marked when it stalled (an open that ran out of uCache's own
-  deadline there, a connection gone quiet past the client's stream timeout, a
-  listed copy that did not answer its state) while another site answered
+  deadline there, a connection gone quiet past the client's stream timeout
+  unless the job set it below the client's 60 s, a listed copy that did not
+  answer its state) while another site answered
   normally at the same time or within a minute, or when it answered with a fault
   of its own (its storage, its file system, an internal error, no memory,
   overload). Never for authorization, TLS, a name that does not resolve, a

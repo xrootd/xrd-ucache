@@ -572,14 +572,20 @@ bool atFailedSite(const SiteFailure& x, const std::string& host, const std::stri
 // What a failure at a server says of the server itself (site-fault memory, adaptive_federation):
 //   kStall   it stalled: a request that ran out of uCache's own time there (an expiry, `ownTime`:
 //            the deadline was uCache's, not a shorter one the job gave), or a connection gone quiet
-//            past the client's stream timeout; marked only while other sites answer normally
+//            past the client's stream timeout (not when the job lowered it: jobStream);
+//            marked only while other sites answer normally
 //   kServer  it answered with a fault of its own: its storage or file system, an internal error,
 //            no memory, overload
 //   kNone    anything else: never marked (authorization, TLS, a name that does not resolve, a
 //            connection that could not be made or was lost, a file not found, bad bytes, the
 //            job's own timeout, the client's own faults)
 enum class SiteFault : uint8_t { kNone, kStall, kServer };
-SiteFault siteFaultOf(int code, int errNo, bool ownTime);
+SiteFault siteFaultOf(int code, int errNo, bool ownTime, bool jobStream = false);
+// The client's stream timeout in force (`streamTimeoutS`, its StreamTimeout) is the job's own: set
+// below the client's default (60 s), so a connection gone quiet past it says no more than the
+// job's own timeout does.
+bool streamTimeoutIsJobs(int streamTimeoutS);
+constexpr int kDefaultStreamTimeoutS = 60; // the client's own (XrdCl::DefaultStreamTimeout)
 // Whether `failed` lists `server` (host:port, in any case) as a copy refused for what it is.
 bool refusedBefore(const std::vector<SiteFailure>& failed, const std::string& server);
 // A read of a handle failed at the copy `f` (its server, site and size; `f.bad` when the read

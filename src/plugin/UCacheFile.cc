@@ -103,6 +103,8 @@ static_assert(kXR_isServer == xrdwire::kIsServer && kXR_isManager == xrdwire::kI
                   XrdCl::StatInfo::Offline == xrdwire::kStatOffline,
               "XRootD login or stat flags drifted from OpenPolicy.h");
 // A silent connection must be found by the client's own check before a read's limit.
+static_assert(XrdCl::DefaultStreamTimeout == kDefaultStreamTimeoutS,
+              "the client's default stream timeout drifted from OpenPolicy.h");
 static_assert(XrdCl::DefaultStreamTimeout + XrdCl::DefaultTimeoutResolution < kReadDeadlineS,
               "the client's stream timeout and its resolution must end before a read's limit");
 
@@ -975,6 +977,17 @@ void writeSiteMark(const std::shared_ptr<CacheStore>& store, const SiteFailure& 
   } catch (...) {
   }
 }
+// The stream timeout in force is the job's own (streamTimeoutIsJobs): read once, as the client's
+// settings are at load (runSettings).
+bool jobStreamTimeout() {
+  static const bool jobs = [] {
+    int v = XrdCl::DefaultStreamTimeout;
+    if (XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv())
+      env->GetInt("StreamTimeout", v);
+    return streamTimeoutIsJobs(v);
+  }();
+  return jobs;
+}
 // The failure `f` of a request to a server (`kind`, siteFaultOf), of the request issued at
 // `startUs`: a fault of the server's own is marked at once; a stall is marked when another site
 // answered normally since the request was issued, or does so within kStallWitnessUs after.
@@ -1593,7 +1606,8 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     if (!ok)
       noteSiteFault(st, markedFailure(w, f),
                     siteFaultOf(s.code, static_cast<int>(s.errNo),
-                                seq->deadlineS == openDeadlineS(0, gTestOpenDeadlineS)),
+                                seq->deadlineS == openDeadlineS(0, gTestOpenDeadlineS),
+                                jobStreamTimeout()),
                     nowUs() - uint64_t(std::max(seq->deadlineS, 1)) * 1000000);
     // A copy refused for what it is earlier in this sequence, or that a read of the handle found
     // bad (it answered with bad bytes), is never taken again, wherever the redirector or the list
@@ -1949,7 +1963,9 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     f.site = f.siteName.empty() ? f.domain : f.siteName;
     f.error = s.ToString();
     // The copy's state was asked with uCache's own time (kCandidateStatS).
-    noteSiteFault(st, f, siteFaultOf(s.code, static_cast<int>(s.errNo), /*ownTime=*/true), asked);
+    noteSiteFault(st, f,
+                  siteFaultOf(s.code, static_cast<int>(s.errNo), /*ownTime=*/true, jobStreamTimeout()),
+                  asked);
     setSiteNames(q.failed, siteNames());
     if (afterFailure(q.failed, f, failoverMaxSites(), q.stopped()) == AfterFailure::kStop) {
       bounded = true;
@@ -4303,7 +4319,8 @@ static void noteReadFailureLocked(HandleState& st, XrdCl::File* on, const XRootD
   }
   // Site-fault memory: a connection gone quiet, or a fault of the server's own (a read's expiry is
   // not marked: its time may be the job's own).
-  noteSiteFault(st, f, siteFaultOf(s.code, static_cast<int>(s.errNo), /*ownTime=*/false),
+  noteSiteFault(st, f,
+                siteFaultOf(s.code, static_cast<int>(s.errNo), /*ownTime=*/false, jobStreamTimeout()),
                 nowUs() - 60ull * 1000000);
   f.error = s.code == XrdCl::errDataError && !s.GetErrorMessage().empty() ? s.GetErrorMessage()
                                                                           : s.ToString();

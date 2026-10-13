@@ -7,6 +7,67 @@
 using namespace ucache;
 using test::TempDir;
 
+namespace {
+// A process that dies right after a write's data reached the disk: the step that would finish
+// the write (an ftruncate of a file rewritten in place, or the rename of a new one) never comes.
+class DiesAfterDataIO : public RealIO {
+ public:
+  bool armed = false;
+  int ftruncate(int fd, uint64_t length) override {
+    return armed ? -1 : RealIO::ftruncate(fd, length);
+  }
+  int rename(const std::string& from, const std::string& to) override {
+    return armed ? -1 : RealIO::rename(from, to);
+  }
+};
+std::string bytesOf(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+} // namespace
+
+// A write that dies before it is finished leaves the file as it was or as it was to be, byte for
+// byte: never the new version with the old one's tail (where a cleared mark could come back).
+TEST(SourceMarks, AWriteThatDiesLeavesOneWholeVersion) {
+  TempDir t;
+  DiesAfterDataIO io;
+  const std::string p = sourcesPath(t.path());
+  ASSERT_TRUE(markSource(io, p, "a.one.org:1094", "a site with a long name", "one.org", 1000));
+  ASSERT_TRUE(markSource(io, p, "b.two.org:1094", "B", "two.org", 1000));
+  ASSERT_TRUE(markSource(io, p, "c.three.org:1094", "C", "three.org", 1000));
+  const std::string before = bytesOf(p);
+  std::vector<SourceMark> m;
+  ASSERT_TRUE(loadSources(io, p, m));
+  std::vector<SourceMark> rest;
+  for (const auto& x : m)
+    if (x.server != "a.one.org:1094")
+      rest.push_back(x);
+  const std::string after = serializeSources(rest);
+  io.armed = true;
+  clearSource(io, p, "a.one.org:1094", 1100); // dies after its data
+  io.armed = false;
+  const std::string now = bytesOf(p);
+  EXPECT_TRUE(now == before || now == after) << "a mix of two versions:\n" << now;
+  ASSERT_TRUE(clearSource(io, p, "a.one.org:1094", 1100)); // made again, it holds
+  ASSERT_TRUE(loadSources(io, p, m));
+  EXPECT_EQ(m.size(), 2u);
+}
+
+// A clock that goes back never lengthens a mark: one whose end lies further ahead than an hour
+// (and a minute) is taken as ended.
+TEST(SourceMarks, AClockGoneBackNeverLengthensAMark) {
+  SourceMark m{"a:1", "A", "one.org", 4, 10000, 10000, 10000 + 3600};
+  EXPECT_TRUE(markLive(m, 10000)) << "an hour left: as long as a mark lasts";
+  EXPECT_TRUE(markLive(m, 10000 - 60)) << "within the slack";
+  EXPECT_FALSE(markLive(m, 10000 - 61)) << "the clock went back past it: ended";
+  EXPECT_FALSE(markLive(m, 10000 - 7200));
+  EXPECT_FALSE(markLive(m, 13600)) << "its end reached";
+  std::vector<SourceMark> two = {m, SourceMark{"b:1", "A", "one.org", 1, 10000, 10000, 10600}};
+  EXPECT_TRUE(siteMarked(two, "A", "one.org", 10000));
+  EXPECT_FALSE(siteMarked(two, "A", "one.org", 10000 - 7200)) << "the site's marks too";
+  EXPECT_EQ(markedAtS(two, "a:1", "A", "one.org", 10000 - 7200), 0u);
+}
+
 // 10 minutes, doubled at each repeat, at most an hour.
 TEST(SourceMarks, AMarkLastsTenMinutesDoubledToAnHour) {
   EXPECT_EQ(siteMarkSeconds(1), 600u);

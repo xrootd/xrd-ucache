@@ -188,6 +188,20 @@ TEST(InUse, ConcurrentNotesAreAllKept) {
 // A copy fault (a copy proven missing) is noted in the file's record, holds for 7 days after its
 // last proof, keeps the record from the sweep while it holds, and survives a note that starts the
 // record over; it does not make the file's maps in use.
+// A clock that goes back never lengthens a copy fault: a proof ahead of now by more than a minute
+// is not live.
+TEST(InUse, AClockGoneBackNeverLengthensACopyFault) {
+  InUseRecord rec;
+  InUseFault f;
+  f.server = "a:1";
+  f.lastS = 100000;
+  rec.faults.push_back(f);
+  EXPECT_EQ(rec.liveFaults(100000).size(), 1u);
+  EXPECT_EQ(rec.liveFaults(100000 - 60).size(), 1u) << "within the slack";
+  EXPECT_TRUE(rec.liveFaults(100000 - 61).empty()) << "the clock went back past the proof";
+  EXPECT_TRUE(rec.liveFaults(100000 + kCopyFaultS).empty()) << "its 7 days over";
+}
+
 TEST(InUse, CopyFaultsHoldSevenDaysAndKeepTheRecord) {
   TempDir t;
   RealIO io;

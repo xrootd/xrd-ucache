@@ -9,9 +9,10 @@
 // a copy at a marked server or site is tried after every copy that is not, and when every copy is
 // marked all are tried, the oldest failure first; nothing is ever left out for a mark.
 //
-// One small text file per cache, <cacheDir>/sources, written in place under an exclusive flock and
-// read under a shared one (as the in-use records are), never fsynced: a mark lost in a crash costs
-// one more failover, which marks again.
+// One small text file per cache, <cacheDir>/sources, written whole to <cacheDir>/sources.new and
+// renamed over it under an exclusive flock of <cacheDir>/sources.lock, read without a lock (the
+// rename replaces it whole), never fsynced: a process that dies leaves the old version or the new
+// one, and a mark lost in a crash of the machine costs one more failover, which marks again.
 //
 //   ucache-sources 1
 //   server <host:port> <site name> <domain> <count> <first failure> <last failure> <marked until>
@@ -41,6 +42,10 @@ inline constexpr uint64_t kSiteMarkBaseS = 600;   // 10 minutes
 inline constexpr uint64_t kSiteMarkMaxS = 3600;   // 1 hour
 inline constexpr uint64_t kSourceMarkForgetS = 86400;
 inline constexpr size_t kSourceMarksMax = 4096;
+// A clock that went back: a mark whose end lies further ahead than any mark lasts
+// (kSiteMarkMaxS), by more than this slack, is taken as ended (markLive), and a copy fault whose
+// proof lies ahead by more than it is no longer live (InUse). Never lengthened by the clock.
+inline constexpr uint64_t kMarkClockSlackS = 60;
 
 struct SourceMark {
   std::string server;   // host:port, lower-cased
@@ -76,6 +81,8 @@ bool markSource(IOBackend& io, const std::string& path, const std::string& serve
 bool clearSource(IOBackend& io, const std::string& path, const std::string& server,
                  uint64_t nowS, bool* cleared = nullptr);
 
+// Live: failed since its last success, its end not reached, and that end no further ahead than
+// a mark lasts (kSiteMarkMaxS, with kMarkClockSlackS): a clock that went back never lengthens it.
 bool markLive(const SourceMark& m, uint64_t nowS);
 // The site of a server (its site name, "" for none known, and its domain) is marked: two or more
 // of the servers of that site hold live marks. `newestS`, when given, gets their newest failure.

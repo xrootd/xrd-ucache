@@ -276,6 +276,12 @@ TEST(OpenPolicy, SiteFaultOfAFailure) {
   EXPECT_EQ(siteFaultOf(kErrOperationExpired, 0, true), SiteFault::kStall);
   EXPECT_EQ(siteFaultOf(kErrOperationExpired, 0, false), SiteFault::kNone) << "the job's own time";
   EXPECT_EQ(siteFaultOf(kErrSocketTimeout, 0, false), SiteFault::kStall);
+  EXPECT_EQ(siteFaultOf(kErrSocketTimeout, 0, false, /*jobStream=*/true), SiteFault::kNone)
+      << "a stream timeout the job lowered is the job's own";
+  EXPECT_TRUE(streamTimeoutIsJobs(5));
+  EXPECT_FALSE(streamTimeoutIsJobs(60)) << "the client's default";
+  EXPECT_FALSE(streamTimeoutIsJobs(120)) << "raised: a quiet connection still says the server stalled";
+  EXPECT_FALSE(streamTimeoutIsJobs(0));
   for (int e : {kXrFSError, kXrIOError, kXrServerError, kXrNoMemory, kXrOverloaded})
     EXPECT_EQ(siteFaultOf(kErrErrorResponse, e, false), SiteFault::kServer) << e;
   for (int e : {kXrNotAuthorized, kXrNotFound, kXrNoServer, kXrFileLocked})

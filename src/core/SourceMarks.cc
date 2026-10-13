@@ -33,19 +33,33 @@ std::string lower(std::string s) {
   return s;
 }
 
-// Under the file's exclusive lock: `edit` changes the marks read, which are then written back,
-// marks long ended dropped and at most kSourceMarksMax kept.
+// The marks at `path` as they stand: no file reads as none. False when one exists and cannot be
+// read.
+bool readSources(IOBackend& io, const std::string& path, std::string& text) {
+  text.clear();
+  const int fd = io.open(path, O_RDONLY | O_CLOEXEC, 0);
+  if (fd < 0)
+    return errno == ENOENT;
+  const bool ok = readAll(io, fd, text);
+  io.close(fd);
+  return ok;
+}
+
+// Under the exclusive lock of <path>.lock: `edit` changes the marks read, which are then written
+// whole to <path>.new and renamed over <path>, marks long ended dropped and at most
+// kSourceMarksMax kept. A process that dies at any point leaves the old version or the new one
+// whole, never one with another's tail; readers take no lock (a rename replaces the file whole).
 template <typename Edit>
 bool update(IOBackend& io, const std::string& path, uint64_t nowS, Edit edit) {
   const auto slash = path.rfind('/');
   if (slash != std::string::npos)
     io.mkdirs(path.substr(0, slash), 0700);
-  const int fd = io.open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-  if (fd < 0)
+  const int lfd = io.open(path + ".lock", O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (lfd < 0)
     return false;
-  bool ok = io.flock(fd, LOCK_EX) == 0;
+  bool ok = io.flock(lfd, LOCK_EX) == 0;
   std::string text;
-  ok = ok && readAll(io, fd, text);
+  ok = ok && readSources(io, path, text);
   if (ok) {
     std::vector<SourceMark> marks = parseSources(text);
     edit(marks);
@@ -60,11 +74,17 @@ bool update(IOBackend& io, const std::string& path, uint64_t nowS, Edit edit) {
       marks.resize(kSourceMarksMax);
     }
     const std::string out = serializeSources(marks);
-    ok = io.pwriteFull(fd, out.data(), out.size(), 0) == static_cast<int64_t>(out.size()) &&
-         io.ftruncate(fd, out.size()) == 0;
+    const std::string fresh = path + ".new";
+    const int fd = io.open(fresh, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    ok = fd >= 0;
+    if (ok) {
+      ok = io.pwriteFull(fd, out.data(), out.size(), 0) == static_cast<int64_t>(out.size());
+      io.close(fd);
+      ok = ok && io.rename(fresh, path) == 0;
+    }
   }
-  io.flock(fd, LOCK_UN);
-  io.close(fd);
+  io.flock(lfd, LOCK_UN);
+  io.close(lfd);
   return ok;
 }
 
@@ -158,14 +178,8 @@ std::string serializeSources(const std::vector<SourceMark>& marks) {
 
 bool loadSources(IOBackend& io, const std::string& path, std::vector<SourceMark>& out) {
   out.clear();
-  const int fd = io.open(path, O_RDONLY | O_CLOEXEC, 0);
-  if (fd < 0)
-    return errno == ENOENT;
-  io.flock(fd, LOCK_SH); // a writer rewrites in place: read a whole version
   std::string text;
-  const bool ok = readAll(io, fd, text);
-  io.flock(fd, LOCK_UN);
-  io.close(fd);
+  const bool ok = readSources(io, path, text); // a whole version: writers rename it in (update)
   if (ok)
     out = parseSources(text);
   return ok;
@@ -219,7 +233,9 @@ bool clearSource(IOBackend& io, const std::string& path, const std::string& serv
   return ok;
 }
 
-bool markLive(const SourceMark& m, uint64_t nowS) { return m.count > 0 && m.untilS > nowS; }
+bool markLive(const SourceMark& m, uint64_t nowS) {
+  return m.count > 0 && m.untilS > nowS && m.untilS - nowS <= kSiteMarkMaxS + kMarkClockSlackS;
+}
 
 bool siteMarked(const std::vector<SourceMark>& marks, const std::string& siteName,
                 const std::string& domain, uint64_t nowS, uint64_t* newestS) {

@@ -241,8 +241,10 @@ bool InUseRecord::noteFault(IOBackend& io, const std::string& path, const InUseF
 
 std::vector<InUseFault> InUseRecord::liveFaults(uint64_t nowS, uint64_t faultS) const {
   std::vector<InUseFault> out;
+  // A proof ahead of now by more than a minute (the clock went back) is not live: the clock never
+  // lengthens a fault (its 7 days count from a proof that has happened).
   for (const auto& f : faults)
-    if (f.lastS + faultS > nowS)
+    if (f.lastS + faultS > nowS && f.lastS <= nowS + 60)
       out.push_back(f);
   return out;
 }
