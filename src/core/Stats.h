@@ -127,6 +127,10 @@ struct Stats {
   // checks existed whose stored header states an end past its stored size, or an entry holding
   // bytes from a copy that a check then found bad.
   std::atomic<uint64_t> badEntriesDropped{0};
+  // Servers asked for the name of their site (adaptive_federation), and the asks that gave none
+  // (none configured, an error, no answer in time): those servers' site is their domain.
+  std::atomic<uint64_t> siteNameQueries{0};
+  std::atomic<uint64_t> siteNamesMissing{0};
   // Replica tier (docs/STATS.md):
   // Of earlier releases' compact replicas, no longer made or served: always 0.
   std::atomic<uint64_t> replicaOpens{0};
@@ -314,7 +318,8 @@ struct StatsTotals {
   uint64_t originOpenAttempts = 0, originOpenFailures = 0, recordsDropped = 0;
   uint64_t openFailovers = 0, opensRecovered = 0, opensFailedEverywhere = 0,
            openDeadlineExpiries = 0, failoverLocates = 0, offlineCopiesSkipped = 0,
-           openCheckBytesKept = 0, badEntriesDropped = 0;
+           openCheckBytesKept = 0, badEntriesDropped = 0, siteNameQueries = 0,
+           siteNamesMissing = 0;
   uint64_t originFailures[6] = {}; // client, site, notfound, data, expired, other
   // Histogram bucket sums (log2 µs), for CLI percentile rendering:
   std::vector<uint64_t> histHitRead, histOriginRt, histOpen, histReplicaRead, histFlushWrite,

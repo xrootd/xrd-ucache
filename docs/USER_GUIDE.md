@@ -970,10 +970,20 @@ not tried. Where a redirector itself sends an open is not filtered, for a cached
 file too: the server it sends the open to is tried whatever the lists say of its
 host. For a file whose reads uCache passes straight to the origin (the lists leave
 the host of the job's URL out) the lists say nothing of where it is read, and every
-copy listed may be tried. The
-copies listed are tried within the same bounds. A server that failed, and the
-other servers in the domain of its name, are left to the end: when only copies
-at such places are left, they are tried too, the oldest failure first.
+copy listed may be tried. The copies listed are tried within the same bounds. A server that failed, and the
+other servers of its site, are left to the end: when only copies
+at such places are left, they are tried too, the oldest failure first. A site is
+the name its servers give for it (their `all.sitename`, which a server tells when
+asked for its configuration value `sitename`, as CMSSW's XRootD adaptor asks
+it): uCache asks each server that answered an open, and each copy the regional
+redirector lists, once per process and off the client's own threads (a few
+hundred bytes each), and nothing waits for the answer but a listed copy's turn,
+which waits for its name at most as long as its stat took. A server whose name
+is not known (not asked yet, none configured, no answer) is of the site of its
+domain, as before; one known by an address, or one that never answered, is its
+own site. So the servers of one site count as one of the 4 sites wherever they
+failed, and a copy at a site that failed is left to the end though it is named
+by an address (`site_name_queries`, `site_names_missing`, STATS.md).
 A job's own `tried=` list is kept ahead of uCache's names. An open
 that uCache makes of the origin holds one of its worker threads while it tries
 sites, so with a stalled site and every worker so held, the next step of a

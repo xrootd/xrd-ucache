@@ -421,6 +421,13 @@ can hold an access token, and `file` is the cache key, which has none.
   `"budget_s"`, the time the open's attempts were allowed in all, in seconds.
   An open that ended because its handle was closed before a next attempt was
   issued has no such line.
+- With `adaptive_federation = on`, `"sitename"` at the end of the line: the
+  name the server that `site` is held against (the chain's effective server,
+  else its last host) gave for its site, when the name was known when the
+  line was written (it is asked once per server and process, after its first
+  answer, so the first line of a server has none; a server that does not
+  answer this attempt keeps the name it gave earlier). `site` stays the
+  domain.
 
 An open the client refuses at once, before it reaches any server (the open
 call itself returns the error, and no answer comes), has a line as well:

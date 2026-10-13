@@ -348,8 +348,9 @@ per-file record file has route `candidate` for these attempts). It does the
 same after a server that stalled past the open deadline, or whose connection
 timed out (the client's stream timeout), was lost or could not be made, so
 that the next attempt does not meet the same site again (the other server of
-the site, which stalls too); the copies at that server's domain are tried
-last. This holds for a failure of the checks' reads at open as well. A copy listed
+the site, which stalls too); the copies at that server's site are tried
+last: a site is the name its servers give for it (`all.sitename`), else their
+domain (USER_GUIDE.md). This holds for a failure of the checks' reads at open as well. A copy listed
 as on tape is skipped, with the log line `<file>: the copy at <host>:<port> is
 on tape (offline); not opened`. A copy of a file named `*.root` that holds no
 bytes is a bad copy: the open is made again at another site, with the log line

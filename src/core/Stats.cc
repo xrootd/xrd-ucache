@@ -189,6 +189,8 @@ std::string Stats::toJsonBody() const {
   f("offline_copies_skipped", offlineCopiesSkipped);
   f("open_check_bytes_kept", openCheckBytesKept);
   f("bad_entries_dropped", badEntriesDropped);
+  f("site_name_queries", siteNameQueries);
+  f("site_names_missing", siteNamesMissing);
   os << "\"open_deadline_expiries\":" << openDeadlineExpiries.load(std::memory_order_relaxed);
   return os.str();
 }
@@ -329,6 +331,8 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.offlineCopiesSkipped += extractU64(last, "offline_copies_skipped");
     t.openCheckBytesKept += extractU64(last, "open_check_bytes_kept");
     t.badEntriesDropped += extractU64(last, "bad_entries_dropped");
+    t.siteNameQueries += extractU64(last, "site_name_queries");
+    t.siteNamesMissing += extractU64(last, "site_names_missing");
   }
   ::closedir(d);
   return t;

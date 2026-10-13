@@ -114,6 +114,32 @@ std::string siteOf(const std::string& host) {
   return h.substr(dot + 1);
 }
 
+std::string siteNameOfAnswer(const char* data, size_t len) {
+  if (!data)
+    return std::string();
+  size_t end = 0;
+  while (end < len && data[end] != '\n' && data[end] != '\0')
+    ++end;
+  size_t b = 0;
+  while (b < end && (data[b] == ' ' || data[b] == '\t' || data[b] == '\r'))
+    ++b;
+  while (end > b && (data[end - 1] == ' ' || data[end - 1] == '\t' || data[end - 1] == '\r'))
+    --end;
+  const std::string name(data + b, end - b);
+  if (name.empty() || name.size() > kSiteNameMaxLen || name == "sitename")
+    return std::string();
+  for (const char c : name)
+    if (c <= ' ' || c > '~')
+      return std::string();
+  return name;
+}
+
+std::string siteIdentity(const std::string& server, bool answered, const std::string& name) {
+  if (!name.empty())
+    return name;
+  return answered ? siteOf(server.substr(0, server.rfind(':'))) : server;
+}
+
 FailureClass classifyFailure(int code, int errNo) {
   switch (code) {
   case 0:
@@ -971,9 +997,29 @@ bool copyOffline(uint32_t statFlags, const std::string& server, const std::strin
          (testOffline && testOffline->find("," + server + ",") != std::string::npos);
 }
 
+std::string serverOf(const Location& l) {
+  std::string host = l.host;
+  for (char& c : host)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return (host.find(':') == std::string::npos ? host : "[" + host + "]") + ":" +
+         std::to_string(l.port);
+}
+
+void setSiteNames(std::vector<SiteFailure>& failed,
+                  const std::function<std::string(const std::string&)>& nameOf) {
+  if (!nameOf)
+    return;
+  for (SiteFailure& x : failed) {
+    std::string n = nameOf(x.server);
+    if (!n.empty())
+      x.site = std::move(n);
+  }
+}
+
 std::vector<Location> orderLocations(const std::vector<Location>& listed,
                                      const std::vector<std::string>& readerTried,
-                                     const std::vector<SiteFailure>& failed) {
+                                     const std::vector<SiteFailure>& failed,
+                                     const std::function<std::string(const std::string&)>& nameOf) {
   const auto lower = [](std::string s) {
     for (char& c : s)
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -993,13 +1039,16 @@ std::vector<Location> orderLocations(const std::vector<Location>& listed,
       continue;
     const bool literal = isIpv4(host) || isIpv6(host);
     size_t age = failed.size();
-    const std::string site = siteOf(host);
+    // A copy whose server gave its site's name is of the site of that name, an address too.
+    const std::string named = nameOf ? nameOf(server) : std::string();
+    const std::string site = named.empty() ? siteOf(host) : named;
     for (size_t i = 0; i < failed.size() && age == failed.size(); ++i) {
       // A server that never answered is its own site (host:port), but the
       // domain of its name is where its siblings are.
       const std::string& fs = failed[i].server;
-      if (lower(fs) == server ||
-          (!literal && (failed[i].site == site || siteOf(fs.substr(0, fs.rfind(':'))) == site)))
+      if (lower(fs) == server || (!named.empty() && failed[i].site == named) ||
+          (named.empty() && !literal &&
+           (failed[i].site == site || siteOf(fs.substr(0, fs.rfind(':'))) == site)))
         age = i;
     }
     const bool refused = std::any_of(failed.begin(), failed.end(), [&](const SiteFailure& x) {

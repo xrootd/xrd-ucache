@@ -616,6 +616,185 @@ AttemptView viewOf(HandleState& st, const XRootDStatus& s, const HostList* hosts
 
 SiteFailure siteFailure(const AttemptView& w, const XRootDStatus& s, const std::string& sentTo);
 
+// ---- Site names (adaptive_federation) ---------------------------------------
+// The site a server is at, as the server names it (OpenPolicy.h siteNameOfAnswer): asked of it
+// once per process, by a query of its configuration value "sitename", as CMSSW's XRootD adaptor
+// asks it. Asked only with adaptive_federation on: of the server an open attempt reached when it
+// answered (siteFailure's server), and of each copy a regional redirector lists for a failover
+// (locateNext). Asks of one server are coalesced; a query is made on the executor, never on a
+// client callback thread (a FileSystem made or destroyed there can hang a fork), and nothing on
+// such a thread waits for it: a site is the server's domain until its name is known
+// (siteIdentity). A query that failed (an error, no answer in time) may be made again
+// kSiteNameRetryS later; an answer, a name or none, stands for the process. At most
+// kSiteNamesMax servers are kept. The table is never destroyed (detached threads may use it), and
+// is made anew in a forked child, where a parent's thread may have held its lock.
+constexpr int kSiteNameQueryS = 5;
+constexpr int kSiteNameRetryS = 300;
+constexpr size_t kSiteNamesMax = 4096;
+struct SiteNameOp {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool done = false;
+  bool failed = false; // no answer: an error, or none in time
+  std::string name;    // "" for none
+  uint64_t doneUs = 0;
+};
+struct SiteNameTable {
+  std::mutex* mu = new std::mutex;
+  std::map<std::string, std::shared_ptr<SiteNameOp>>* ops =
+      new std::map<std::string, std::shared_ptr<SiteNameOp>>;
+};
+SiteNameTable& siteNameTable() {
+  static SiteNameTable* t = new SiteNameTable;
+  return *t;
+}
+std::string serverKey(std::string server) {
+  for (char& c : server)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return server;
+}
+std::shared_ptr<SiteNameOp> siteNameOp(const std::string& server) {
+  const SiteNameTable t = siteNameTable();
+  std::lock_guard<std::mutex> g(*t.mu);
+  const auto it = t.ops->find(serverKey(server));
+  return it == t.ops->end() ? nullptr : it->second;
+}
+// The end of one query: its name ("" for none), or that it failed. Counted.
+void endSiteName(const std::shared_ptr<SiteNameOp>& op, const std::string& server, std::string name,
+                 bool failed, const std::shared_ptr<CacheStore>& store) {
+  if (name.empty() && store)
+    store->stats().siteNamesMissing.fetch_add(1, std::memory_order_relaxed);
+  if (!name.empty())
+    UCACHE_DEBUG("the server %s names its site %s", server.c_str(), name.c_str());
+  else
+    UCACHE_DEBUG("the server %s gave no site name (%s): its site is its domain", server.c_str(),
+                 failed ? "no answer" : "none configured");
+  std::lock_guard<std::mutex> g(op->mu);
+  op->name = std::move(name);
+  op->failed = failed;
+  op->doneUs = nowUs();
+  op->done = true;
+  op->cv.notify_all();
+}
+class SiteNameHandler : public ResponseHandler {
+ public:
+  SiteNameHandler(std::shared_ptr<SiteNameOp> op, std::string server, XrdCl::FileSystem* fs,
+                  std::shared_ptr<CacheStore> store)
+      : op_(std::move(op)), server_(std::move(server)), fs_(fs), store_(std::move(store)) {}
+  void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    std::unique_ptr<XRootDStatus> s(status);
+    std::unique_ptr<AnyObject> r(response);
+    std::string name;
+    bool failed = true;
+    try {
+      XrdCl::Buffer* b = nullptr;
+      if (s && s->IsOK() && r)
+        r->Get(b);
+      failed = !b;
+      if (b)
+        name = siteNameOfAnswer(b->GetBuffer(), b->GetSize());
+    } catch (...) {
+    }
+    endSiteName(op_, server_, std::move(name), failed, store_);
+    // The FileSystem is destroyed on the executor, never here on a callback thread.
+    XrdCl::FileSystem* fs = fs_;
+    try {
+      Executor::instance().post([fs] { delete fs; });
+    } catch (...) { // for want of memory it is left behind
+    }
+    delete this;
+  }
+
+ private:
+  std::shared_ptr<SiteNameOp> op_;
+  std::string server_;
+  XrdCl::FileSystem* fs_;
+  std::shared_ptr<CacheStore> store_;
+};
+// Asks the server `server` (host:port) for its site name, unless it was asked already (or its
+// query failed less than kSiteNameRetryS ago). Never blocks; throws nothing.
+void askSiteName(const std::shared_ptr<CacheStore>& store, const std::string& server) noexcept try {
+  if (!globalConfig().adaptiveFederation || server.empty() || server == "the origin" ||
+      processExiting())
+    return;
+  const std::string key = serverKey(server);
+  std::shared_ptr<SiteNameOp> op;
+  {
+    const SiteNameTable t = siteNameTable();
+    std::lock_guard<std::mutex> g(*t.mu);
+    auto it = t.ops->find(key);
+    if (it != t.ops->end()) {
+      std::lock_guard<std::mutex> g2(it->second->mu);
+      if (!it->second->done || !it->second->failed ||
+          nowUs() - it->second->doneUs < uint64_t(kSiteNameRetryS) * 1000000)
+        return;
+    } else if (t.ops->size() >= kSiteNamesMax) {
+      return;
+    }
+    op = std::make_shared<SiteNameOp>();
+    (*t.ops)[key] = op;
+  }
+  if (store)
+    store->stats().siteNameQueries.fetch_add(1, std::memory_order_relaxed);
+  try {
+    Executor::instance().post([op, key, store] {
+      try {
+        auto* fs = new XrdCl::FileSystem(XrdCl::URL("root://" + key), false);
+        auto* h = new SiteNameHandler(op, key, fs, store);
+        XrdCl::Buffer arg;
+        arg.FromString("sitename");
+        const XRootDStatus s = fs->Query(XrdCl::QueryCode::Config, arg, h, kSiteNameQueryS);
+        if (!s.IsOK()) { // no answer will come
+          delete h;
+          delete fs;
+          endSiteName(op, key, std::string(), true, store);
+        }
+      } catch (...) {
+        endSiteName(op, key, std::string(), true, store);
+      }
+    });
+  } catch (...) {
+    endSiteName(op, key, std::string(), true, store);
+  }
+} catch (...) {
+}
+// The site name the server `server` (host:port) gave, "" when none is known (not asked, asked
+// and not answered yet, or it gave none). With adaptive_federation off, always "".
+std::string knownSiteName(const std::string& server) noexcept try {
+  if (!globalConfig().adaptiveFederation)
+    return std::string();
+  const auto op = siteNameOp(server);
+  if (!op)
+    return std::string();
+  std::lock_guard<std::mutex> g(op->mu);
+  return op->done ? op->name : std::string();
+} catch (...) {
+  return std::string();
+}
+// knownSiteName, after waiting at most `ms` for a query of `server` in flight to end. Blocks:
+// never called on a client callback thread.
+std::string awaitSiteName(const std::string& server, int64_t ms) noexcept try {
+  const auto op = globalConfig().adaptiveFederation ? siteNameOp(server) : nullptr;
+  if (!op)
+    return std::string();
+  std::unique_lock<std::mutex> lk(op->mu);
+  if (ms > 0)
+    op->cv.wait_for(lk, std::chrono::milliseconds(ms), [&op] { return op->done; });
+  return op->done ? op->name : std::string();
+} catch (...) {
+  return std::string();
+}
+const std::function<std::string(const std::string&)>& siteNames() {
+  static const auto* f = new std::function<std::string(const std::string&)>(
+      [](const std::string& server) { return knownSiteName(server); });
+  return *f;
+}
+void siteNamesInit() {
+  (void)siteNameTable();
+  (void)siteNames();
+  ::pthread_atfork(nullptr, nullptr, [] { siteNameTable() = SiteNameTable(); });
+}
+
 // Each origin open attempt the plugin watches ends here with XrdCl's status
 // and the hosts the open went through (null when none came with the answer):
 // it is counted and recorded, and a successful one tells the handle which
@@ -656,6 +835,19 @@ void noteOriginOpenOrThrow(const OpenAttempt& a, const XRootDStatus* status, con
   } else if (!ok && !refusedAt.empty()) {
     server = refusedAt;
     host = server.substr(0, server.rfind(':'));
+  }
+  // With adaptive_federation on, the server the attempt is held against (siteFailure's), when it
+  // answered, is asked for its site name; the record carries the name once it is known.
+  std::string siteName;
+  if (globalConfig().adaptiveFederation) {
+    const int i = v.effective >= 0 ? v.effective : v.last;
+    if (i >= 0) { // asked only when it answered; a name known from an earlier answer is recorded
+      const std::string named = hops[static_cast<size_t>(i)].host + ":" +
+                                std::to_string(hops[static_cast<size_t>(i)].port);
+      if (hops[static_cast<size_t>(i)].flags)
+        askSiteName(st.store, named);
+      siteName = knownSiteName(named);
+    }
   }
   if (ok && !server.empty() && a.route != OpenRoute::kRead) { // a move's is adopted, or not
     std::lock_guard<std::mutex> g(st.mu);
@@ -698,6 +890,8 @@ void noteOriginOpenOrThrow(const OpenAttempt& a, const XRootDStatus* status, con
   if (a.outcome)
     line += std::string(",\"outcome\":\"") + a.outcome + "\",\"budget_s\":" +
             std::to_string(a.budgetS);
+  if (!siteName.empty())
+    line += ",\"sitename\":\"" + escapeForJson(siteName) + '"';
   line += "}\n";
   st.store->enqueueRecord(std::move(line));
 }
@@ -720,10 +914,15 @@ SiteFailure siteFailure(const AttemptView& w, const XRootDStatus& s, const std::
   if (i >= 0) {
     const Hop& h = w.hops[static_cast<size_t>(i)];
     f.server = h.host + ":" + std::to_string(h.port);
-    f.site = h.flags ? siteOf(h.host) : f.server;
+    // The name the server gave, once known (even when it did not answer this time), else its
+    // domain when it answered, else itself.
+    f.site = siteIdentity(f.server, h.flags != 0, knownSiteName(f.server));
     f.name = exclusionName(w.hops, i);
   } else {
     f.server = f.site = sentTo.empty() ? std::string("the origin") : sentTo;
+    const std::string n = sentTo.empty() ? std::string() : knownSiteName(sentTo);
+    if (!n.empty())
+      f.site = n;
   }
   f.error = s.ToString();
   f.size = w.size; // known for a copy that opened
@@ -859,7 +1058,8 @@ struct FailoverSeq {
       st.store->stats().opensRecovered.fetch_add(1, std::memory_order_relaxed);
     if (!read) // a move says where it went when it ends
       UCACHE_INFO("%s: opened at %s (%s) after %d failed attempt(s)", recordFile(st.url).c_str(),
-                  server.c_str(), siteOf(server.substr(0, server.rfind(':'))).c_str(), attempts - 1);
+                  server.c_str(), siteIdentity(server, true, knownSiteName(server)).c_str(),
+                  attempts - 1);
   } catch (...) {
   }
 
@@ -899,6 +1099,10 @@ struct FailoverSeq {
   bool lastNotFound = false, located = false, onCandidate = false;
   std::vector<Location> cands;
   size_t ci = 0;
+  // Listed copies left to the end because the site name they gave is a site that failed
+  // (locateNext), and whether they were put back on the list (`cands`), once nothing else was left.
+  std::vector<Location> deferred;
+  bool deferring = false;
 };
 
 // What follows one attempt of an open.
@@ -965,6 +1169,9 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     const bool sizeDiffers =
         ok && want && (w.size >= 0 ? static_cast<uint64_t>(w.size) != want : seq->read);
     SiteFailure f = siteFailure(w, s, hostPortOfUrl(sentUrl));
+    // The sites that failed are named as their servers named them, once known: the servers of
+    // one site count as one wherever they failed.
+    setSiteNames(seq->failed, siteNames());
     // A copy refused for what it is earlier in this sequence, or that a read of the handle found
     // bad (it answered with bad bytes), is never taken again, wherever the redirector or the list
     // of copies sends the open: it is refused again as it is, with no check made of it again
@@ -1233,9 +1440,16 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     for (const Location& l : locateCopies(st, q, XrdCl::URL(base).GetPath()))
       if (!cached || hostPassesLists(cfg.allowHosts, cfg.denyHosts, l.host))
         listed.push_back(l);
-    q.cands = orderLocations(listed, triedHosts(base), q.failed);
+    // Each listed copy is asked for its site name now, while the others are looked at: one whose
+    // name is known already is left to the end when its site failed (orderLocations); one whose
+    // name comes with its answer is when its turn comes (below).
+    for (const Location& l : listed)
+      askSiteName(st.store, serverOf(l));
+    setSiteNames(q.failed, siteNames());
+    q.cands = orderLocations(listed, triedHosts(base), q.failed, siteNames());
   }
   const std::string file = recordFile(st.url);
+  bool bounded = false;
   while (q.ci < q.cands.size() && !q.stopped()) {
     const Location c = q.cands[q.ci++];
     const std::string server = (c.host.find(':') == std::string::npos ? c.host : "[" + c.host + "]") +
@@ -1244,6 +1458,7 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     XRootDStatus s;
     std::unique_ptr<AnyObject> resp;
     const int t = std::min<int>(q.timeout(), kCandidateStatS);
+    const uint64_t asked = nowUs();
     (void)fsCall(
         server, t, 2 * q.trS,
         [&](XrdCl::FileSystem& fs, ResponseHandler* h) {
@@ -1253,6 +1468,19 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     XrdCl::StatInfo* si = nullptr;
     if (s.IsOK() && resp)
       resp->Get(si);
+    // A copy that answered and whose site name, asked beside its stat, is a site that failed is
+    // left to the end, as orderLocations leaves one whose name was known: tried only when no copy
+    // at another site is left. The name is waited for at most as long as the stat took.
+    if (si && !q.deferring) {
+      const int64_t tookMs = static_cast<int64_t>((nowUs() - asked) / 1000);
+      const std::string named = awaitSiteName(server, std::max<int64_t>(tookMs, 100));
+      setSiteNames(q.failed, siteNames());
+      if (!named.empty() && std::any_of(q.failed.begin(), q.failed.end(),
+                                        [&](const SiteFailure& x) { return x.site == named; })) {
+        q.deferred.push_back(c);
+        continue;
+      }
+    }
     if (si) {
       if (copyOffline(si->GetFlags(), server, gTestOfflineHosts)) {
         if (st.store)
@@ -1273,10 +1501,20 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     }
     SiteFailure f;
     f.server = server;
-    f.site = server;
+    f.site = siteIdentity(server, false, knownSiteName(server));
     f.error = s.ToString();
-    if (afterFailure(q.failed, f, failoverMaxSites(), q.stopped()) == AfterFailure::kStop)
+    setSiteNames(q.failed, siteNames());
+    if (afterFailure(q.failed, f, failoverMaxSites(), q.stopped()) == AfterFailure::kStop) {
+      bounded = true;
       break;
+    }
+  }
+  if (!bounded && q.ci == q.cands.size() && !q.deferred.empty() && !q.deferring && !q.stopped()) {
+    // Nothing at another site is left: the copies left to the end are tried, in the list's order.
+    q.deferring = true;
+    q.cands.insert(q.cands.end(), q.deferred.begin(), q.deferred.end());
+    q.deferred.clear();
+    return locateNext(st, q, base);
   }
   if (q.sawOffline && !q.lastResort && !processExiting()) {
     q.lastResort = true;
@@ -2260,6 +2498,7 @@ class RetryingOpenHandler : public ResponseHandler {
 } // namespace
 
 void locateInit() {
+  siteNamesInit();
   (void)locateTable();
   ::pthread_atfork(nullptr, nullptr, [] { locateTable() = LocateTable(); });
 }
@@ -2838,7 +3077,7 @@ bool HandleState::ensureInnerOpen() {
         last.server = !reached.empty() ? reached
                       : !server.empty() ? server
                                         : std::string("the origin");
-        last.site = siteOf(last.server.substr(0, last.server.rfind(':')));
+        last.site = siteIdentity(last.server, true, knownSiteName(last.server));
         last.error = "it serves " + std::to_string(si->GetSize()) + " bytes, the cached file has " +
                      std::to_string(want);
         last.size = static_cast<long long>(si->GetSize());
@@ -3414,6 +3653,7 @@ static bool moveInner(HandleState& st, std::vector<SiteFailure> failed, uint64_t
   seq.t0 = failUs;
   seq.read = true;
   seq.failed = std::move(failed);
+  setSiteNames(seq.failed, siteNames());
   seq.budget = std::min(seq.budget, std::max(capS, 1));
   const std::string base =
       st.innerOpened ? ownOpenUrl(st.url, failedHostsOf(st)) : mergeTried(st.url);
@@ -3577,6 +3817,10 @@ static void noteReadFailureLocked(HandleState& st, XrdCl::File* on, const XRootD
   SiteFailure f = sourceOfLocked(st, on);
   if (f.server.empty())
     return;
+  // The site is the name the server gave, once known (asked when its open answered).
+  const std::string named = knownSiteName(f.server);
+  if (!named.empty())
+    f.site = named;
   f.error = s.code == XrdCl::errDataError && !s.GetErrorMessage().empty() ? s.GetErrorMessage()
                                                                           : s.ToString();
   f.bad = s.code == XrdCl::errDataError;

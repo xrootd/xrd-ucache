@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -108,6 +109,19 @@ std::string chainText(const std::vector<Hop>& hops);
 // its first label, lower-cased ("cmsio10.rc.ufl.edu" -> "rc.ufl.edu"). A name
 // without a dot, and an IPv4 or IPv6 address, is its own site.
 std::string siteOf(const std::string& host);
+
+// Site names (adaptive_federation): a server says which site it belongs to when asked for its
+// configuration value "sitename" (the server's all.sitename), as CMSSW's XRootD adaptor asks.
+// The name from an answer's bytes (`data`, `len`): its first line, without surrounding blanks;
+// "" when it names none: empty, the word "sitename" itself (what a server with none
+// configured answers), longer than kSiteNameMaxLen, or holding a byte that is not a printable
+// character other than a space.
+inline constexpr size_t kSiteNameMaxLen = 64;
+std::string siteNameOfAnswer(const char* data, size_t len);
+// The site of the server `server` (host:port): `name`, the name it gave, when it gave one; else
+// its domain (siteOf) when it answered (`answered`), else the server itself, host:port (a server
+// that never answered cannot be told from its neighbours).
+std::string siteIdentity(const std::string& server, bool answered, const std::string& name);
 
 // A provisional class for a failed origin request, from its status code and
 // errNo alone. It is a first reading, not a verdict: what a failure means often
@@ -579,9 +593,20 @@ bool copyOffline(uint32_t statFlags, const std::string& server, const std::strin
 // except a server whose copy was refused for what it is (`bad`): that one is final.
 // `failed` names an IPv6 server in brackets ("[2001:db8::1]:1094"), as the client does;
 // a Location holds the bare address.
-std::vector<Location> orderLocations(const std::vector<Location>& listed,
-                                     const std::vector<std::string>& readerTried,
-                                     const std::vector<SiteFailure>& failed);
+// `nameOf`, when given, says the site name a server (host:port, as `failed` names it) gave, ""
+// for none known: a copy whose server gave one is of a failed site when that name is the site
+// `failed` lists, an address too (`failed` holds the names its servers gave: setSiteNames).
+std::vector<Location> orderLocations(
+    const std::vector<Location>& listed, const std::vector<std::string>& readerTried,
+    const std::vector<SiteFailure>& failed,
+    const std::function<std::string(const std::string&)>& nameOf = nullptr);
+// The server (host:port) a Location is, named as the client names it: an IPv6 address in
+// brackets, lower-cased.
+std::string serverOf(const Location& l);
+// Puts in place of each site of `failed` the name its server gave (`nameOf`, "" for none
+// known), so that the servers of one site count as one wherever they failed.
+void setSiteNames(std::vector<SiteFailure>& failed,
+                  const std::function<std::string(const std::string&)>& nameOf);
 // The names of `failed` a retry's tried= carries, oldest first.
 std::vector<std::string> exclusionNames(const std::vector<SiteFailure>& failed);
 // Whether `f` is a server `failed` lists, or a site it lists. Servers behind one

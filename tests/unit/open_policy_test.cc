@@ -6,6 +6,9 @@
 
 #include <gtest/gtest.h>
 
+#include <functional>
+#include <map>
+
 #include <climits>
 #include <cstring>
 #include <vector>
@@ -84,6 +87,102 @@ TEST(OpenPolicy, SiteOfAHost) {
   EXPECT_EQ(siteOf("2001:db8::7"), "2001:db8::7");
   EXPECT_EQ(siteOf("10.1.2"), "1.2"); // three numbers are a name, not an address
   EXPECT_EQ(siteOf(""), "");
+}
+
+// What a server answers when asked for its "sitename": the name, on its first line.
+TEST(OpenPolicy, SiteNameOfAnAnswer) {
+  const auto name = [](const std::string& a) { return siteNameOfAnswer(a.data(), a.size()); };
+  EXPECT_EQ(name("T2_S1\n\n"), "T2_S1"); // as an XRootD server answers it
+  EXPECT_EQ(name("T1_US_FNAL_Disk"), "T1_US_FNAL_Disk");
+  EXPECT_EQ(name("  T2_CH_CERN \r\n"), "T2_CH_CERN");
+  EXPECT_EQ(name(std::string("T3_X\0junk", 9)), "T3_X");
+  EXPECT_EQ(name("sitename\n"), "") << "a server with no all.sitename answers the key itself";
+  EXPECT_EQ(name(""), "");
+  EXPECT_EQ(name("\n"), "");
+  EXPECT_EQ(name("two words\n"), "") << "not a name";
+  EXPECT_EQ(name("bad\x01name"), "");
+  EXPECT_EQ(name(std::string(kSiteNameMaxLen, 'a')), std::string(kSiteNameMaxLen, 'a'));
+  EXPECT_EQ(name(std::string(kSiteNameMaxLen + 1, 'a')), "") << "too long";
+  EXPECT_EQ(siteNameOfAnswer(nullptr, 5), "");
+}
+
+// A server's site: the name it gave, else its domain when it answered, else itself.
+TEST(OpenPolicy, SiteIdentityPrefersTheName) {
+  EXPECT_EQ(siteIdentity("cmsxrootd1.fnal.gov:1094", true, "T1_US_FNAL"), "T1_US_FNAL");
+  EXPECT_EQ(siteIdentity("cmsxrootd1.fnal.gov:1094", false, "T1_US_FNAL"), "T1_US_FNAL")
+      << "a server that gave its name keeps it when it stalls later";
+  EXPECT_EQ(siteIdentity("cmsxrootd1.fnal.gov:1094", true, ""), "fnal.gov");
+  EXPECT_EQ(siteIdentity("cmsxrootd1.fnal.gov:1094", false, ""), "cmsxrootd1.fnal.gov:1094");
+  EXPECT_EQ(siteIdentity("127.0.0.1:1094", false, "T2_S1"), "T2_S1");
+}
+
+// Servers that gave one site name count as one site: four managers of one site stalling use one
+// of the bound of sites, not four, and a listed copy of that site is left to the end, an address
+// too.
+TEST(OpenPolicy, ServersOfOneSiteNameAreOneSite) {
+  const std::map<std::string, std::string> names = {{"127.0.0.1:1101", "T1_ONE"},
+                                                    {"127.0.0.1:1102", "T1_ONE"},
+                                                    {"127.0.0.2:1103", "T1_ONE"},
+                                                    {"m4.one.org:1094", "T1_ONE"},
+                                                    {"127.0.0.1:1105", "T2_TWO"}};
+  const std::function<std::string(const std::string&)> nameOf = [&](const std::string& s) {
+    const auto it = names.find(s);
+    return it == names.end() ? std::string() : it->second;
+  };
+  // Four servers of T1_ONE that did not answer (each its own host:port until named).
+  std::vector<SiteFailure> failed;
+  const auto stalled = [](const std::string& server) {
+    SiteFailure f;
+    f.server = server;
+    f.site = server;
+    f.error = "expired";
+    return f;
+  };
+  AfterFailure last = AfterFailure::kRetry;
+  for (const char* s : {"127.0.0.1:1101", "127.0.0.1:1102", "127.0.0.2:1103"}) {
+    SiteFailure f = stalled(s);
+    f.site = siteIdentity(f.server, false, nameOf(f.server));
+    setSiteNames(failed, nameOf);
+    last = afterFailure(failed, f, 2, false);
+  }
+  EXPECT_NE(last, AfterFailure::kStop) << "three servers of one named site are one of 2 sites";
+  // Unnamed (the names unknown), they are three sites, and the bound of 2 stops the sequence.
+  std::vector<SiteFailure> unnamed;
+  last = AfterFailure::kRetry;
+  for (const char* s : {"127.0.0.1:1101", "127.0.0.1:1102", "127.0.0.2:1103"})
+    last = afterFailure(unnamed, stalled(s), 2, false);
+  EXPECT_EQ(last, AfterFailure::kStop);
+
+  // The regional lists m4 (T1_ONE, a name), 127.0.0.1:1105 (T2_TWO), 127.0.0.2:1103 (T1_ONE, an
+  // address): the copies of T1_ONE are left out while another site's is listed.
+  Location m4, two, three;
+  m4.host = "m4.one.org";
+  m4.port = 1094;
+  two.host = "127.0.0.1";
+  two.port = 1105;
+  three.host = "127.0.0.2";
+  three.port = 1103;
+  std::vector<SiteFailure> one = {stalled("127.0.0.1:1101")};
+  setSiteNames(one, nameOf);
+  EXPECT_EQ(one.front().site, "T1_ONE");
+  auto order = orderLocations({m4, three, two}, {}, one, nameOf);
+  ASSERT_EQ(order.size(), 1u);
+  EXPECT_EQ(serverOf(order.front()), "127.0.0.1:1105");
+  // Without names, the address 127.0.0.2:1103 and m4 (another domain than the failed address)
+  // are taken first, in the list's order.
+  order = orderLocations({m4, three, two}, {}, {stalled("127.0.0.1:1101")});
+  ASSERT_EQ(order.size(), 3u);
+  EXPECT_EQ(order.front().host, "m4.one.org");
+  // A site that failed and is all that is listed: its copies are given, as before.
+  order = orderLocations({m4, three}, {}, one, nameOf);
+  EXPECT_EQ(order.size(), 2u);
+  // A failed server whose name became known after it failed is renamed: its site is the name.
+  std::vector<SiteFailure> late = {stalled("127.0.0.1:1102")};
+  EXPECT_EQ(late.front().site, "127.0.0.1:1102");
+  setSiteNames(late, nameOf);
+  EXPECT_EQ(late.front().site, "T1_ONE");
+  EXPECT_TRUE(failedBefore(late, {"127.0.0.1:1101", "T1_ONE", "", ""}));
+  EXPECT_EQ(serverOf(Location{"2001:DB8::7", 1094, false, false}), "[2001:db8::7]:1094");
 }
 
 TEST(OpenPolicy, FailureClasses) {
