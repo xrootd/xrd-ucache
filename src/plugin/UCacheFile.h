@@ -541,6 +541,19 @@ void dropEntryOfBadCopy(HandleState& st, const std::string& server) noexcept;
 // none yet, `parked` is set and `then` (when given and set) is posted to the executor once that
 // parse ends (keySeeksBuilt): the caller serves the request again then, rather than unchecked.
 // Null, not parked: the setting is off, or no map could be made (a failed parse).
+// adaptive_federation, a handle whose reads move (byte path or slot layout): a read of the file's
+// records that uCache's own parse made on the File `on` failed with `s`, or answered `got` of the
+// `len` bytes asked at `off` from `server` (s OK: a short answer, a data failure of the copy when it
+// lies inside the confirmed size; recorded against `tally` as a miss's is, and the entry dropped).
+// When that failure is one that moves (readStep, or a data failure) and the parse has time left
+// (counted from `startUs`, as a read's deadline is), the handle moves as a read does (moveOn: tried=,
+// the regional's list, the bounds, the size shown, a copy found bad never taken again), and true is
+// returned once it reads from another copy: the parse goes on there. False otherwise: the parse fails
+// as before (nothing else is done). BLOCKS until the move ends, on the parse's thread (the reader's
+// own); holds no lock of its own across it.
+bool parseReadMoves(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
+                    const XrdCl::XRootDStatus& s, uint64_t off, uint64_t len, uint64_t got,
+                    const std::string& server, ServerTally* tally, uint64_t startUs);
 std::shared_ptr<const KeyMap> originCheckMapFor(const std::shared_ptr<HandleState>& st,
                                                 const std::shared_ptr<FileEntry>& entry,
                                                 std::function<void()>* then, bool& parked);

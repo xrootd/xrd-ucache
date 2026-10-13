@@ -1083,13 +1083,15 @@ ct() {
   RES=$(fuzz "$RFC" "$W/ct$n.log" "root://127.0.0.1:$RX/$l" "$FIXW" 1 1 1 read-failover $c)
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-300
   SV=($(echo "$RES" | sed -n 's/^SERVERS //p' | pnorm))
-  F14=$(recs "$RFC" origin_failure | grep -c '"op":"read".*"code":14,\|"op":"relay".*"code":14,')
+  F14=$(recs "$RFC" origin_failure | grep -c '"op":"read".*"code":14,\|"op":"relay".*"code":14,\|"op":"records".*"code":14,')
   F14OPS=$(recs "$RFC" origin_failure | grep '"code":14,' | field op | tr '\n' ' ')
   NRA=$(recs "$RFC" open | grep -c '"route":"read"')
 }
 ct cut cut /store/ci/ct-cut.root
 echo "$RES" | grep -q '^read-failover cut: clean$'; verdict "cut: the read past the cut is the file's own bytes, from another server, once (${SV[*]})" $?
-[ "$F14" = 1 ] && [ "$F14OPS" = "read " ]; verdict "cut: the short answer is one failed read of class data, code 14, op read: a miss of the cache ($F14, $F14OPS)" $?
+# The read past the cut is the file's first miss: the parse of its records that the check needs
+# reads them first, past the cut too, and that short answer is the copy's data failure (op records).
+[ "$F14" = 1 ] && [ "$F14OPS" = "records " ]; verdict "cut: the short answer is one failed read of class data, code 14, op records: the parse of the records for the first miss, which moves the handle ($F14, $F14OPS)" $?
 recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | tail -1 | grep -q "\"size\":$FIXW_SIZE,"
 verdict "cut: a move of route read ended at a copy of $FIXW_SIZE bytes" $?
 [ "$(counter "$RFC" origin_failures_data)" -ge 1 ]; verdict "cut: origin_failures_data counts it" $?
@@ -1133,8 +1135,11 @@ echo "$RES" | grep -q '^read-failover end: clean$'; verdict "end: reads that rea
 # the fixture on a and b only, the copy the handle opened at cut after the open): the copy is marked as one the
 # handle never opens again, as for a data failure on the File it reads from. Two Reads issued 400 ms apart at X: the
 # first's miss fails (a connection error, 1 s late) and moves the handle to Y; the second, past the cut, is answered
-# short by X 2.5 s late, after that move. X is then made whole again (UCACHE_RESTORE_CMD), so that only its mark keeps
-# a move from it. A third Read fails at Y: its move stays at Y (an X marked only as a failure is taken again, as the
+# short by X 2.5 s late, after that move. With the reads of the records' parse moving as any read does, the first
+# miss's parse meets the cut first: its read of the records past the cut (the page at 49152) is answered short by X,
+# a data failure that marks X and moves the handle to Y before either Read is issued at X; the first Read's miss then
+# fails at Y (the connection error) and is made again at Y (X is refused), and the second is served whole. X is then made whole
+# again (UCACHE_RESTORE_CMD), so that only its mark keeps a move from it. A third Read fails at Y: its move stays at Y (an X marked only as a failure is taken again, as the
 # oldest failure: the redirector's sending the move to X, which an address cannot keep it from, is refused as a copy
 # whose read answered with bad bytes).
 L=/store/ci/ct-leftdata.root
@@ -1155,9 +1160,9 @@ MV=($(recs "$RFC" open | grep '"route":"read"' | grep '"outcome":"ok"' | field d
 recs "$RFC" origin_failure | sed 's/^/    fail: /' | cut -c1-240
 echo "$RES" | grep -q '^read-failover leftdata: clean$'
 verdict "leftdata: three Reads exact, once each; the third does not move the handle back to the copy that answered short (${LD[*]})" $?
-[ "${#LD[@]}" = 3 ] && [ "${LD[0]}" != "${LD[1]}" ] && [ "${#FL[@]}" = 3 ] && [ "${FL[0]} ${FO[0]}" = "108 8192" ] &&
-  [ "${FL[1]} ${FO[1]}" = "14 36864" ] && [ "${FL[2]} ${FO[2]}" = "108 16384" ]
-verdict "leftdata: the faults struck as meant: a connection error at 8192, then the short answer past the cut (code 14, the page at 36864), then a connection error at 16384 (${FL[*]} at ${FO[*]})" $?
+[ "${#LD[@]}" = 3 ] && [ "${LD[0]}" != "${LD[1]}" ] && [ "${#FL[@]}" = 3 ] && [ "${FL[0]} ${FO[0]}" = "14 49152" ] &&
+  [ "${FL[1]} ${FO[1]}" = "108 8192" ] && [ "${FL[2]} ${FO[2]}" = "108 16384" ]
+verdict "leftdata: the faults struck as meant: the parse's read of the records past the cut answered short (code 14, the page at 49152), then a connection error at 8192, then one at 16384 (${FL[*]} at ${FO[*]})" $?
 [ "${#MV[@]}" -ge 2 ] && [ "${MV[0]}" = "${LD[1]:-}" ] && ! printf '%s\n' "${MV[@]}" | grep -qx "${LD[0]:-none}" &&
   [ "$(stat -c %s "$W/data/a$L") $(stat -c %s "$W/data/b$L")" = "$FIXW_SIZE $FIXW_SIZE" ]
 verdict "leftdata: the moves landed at Y, never at X, though X was whole again (${MV[*]}; X ${LD[0]:-}, Y ${LD[1]:-})" $?

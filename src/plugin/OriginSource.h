@@ -35,6 +35,11 @@ struct OriginSource : transpose::Source {
   bool readFailed = false; // a read from the origin failed (which says nothing of the file)
   std::string fetchedFrom; // the server of its last read from the origin ("" for none)
   XrdTimeout timeout = 0;  // of each read from the origin (0: the client's default)
+  // adaptive_federation: a failed read moves the handle to another copy and is made again there
+  // (parseReadMoves), for a parse that runs on the reader's own thread; its time counts from
+  // `startUs`. Off for a parse on the executor, which never waits for a move.
+  bool mayMove = false;
+  uint64_t startUs = 0;
 
   bool has(uint64_t off, uint64_t n) override {
     return off + n >= off && off + n <= entry->fileSize();
@@ -60,54 +65,64 @@ struct OriginSource : transpose::Source {
   }
 
  private:
-  bool fetch(uint64_t ws, uint64_t we, void* dst, uint64_t off, uint64_t n) {
+   bool fetch(uint64_t ws, uint64_t we, void* dst, uint64_t off, uint64_t n) {
     if (we - ws > UINT32_MAX)
       return false;
     std::vector<char> buf(we - ws);
-    XrdCl::File* f = st->acquireInner();
-    if (!f) {
-      readFailed = true;
-      return false;
+    if (!startUs)
+      startUs = nowUs();
+    for (int attempt = 1;; ++attempt) {
+      XrdCl::File* f = st->acquireInner();
+      if (!f) {
+        readFailed = true;
+        return false;
+      }
+      uint32_t got = 0;
+      const uint64_t t0 = nowUs();
+      // Counted among the reads in flight to its server for as long as it is
+      // out, as the asynchronous ones are (inFlight: those once it was counted,
+      // itself included), but not among all of the process's origin reads,
+      // which have only ever counted the asynchronous ones. Its answer names no
+      // host, so it is put down to the server it was sent to.
+      const std::string server = issueServer(*st, f);
+      std::atomic<uint64_t>* srv = st->store ? serverInFlight(server) : nullptr;
+      const uint64_t inFlight = srv ? srv->fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+      XrdCl::XRootDStatus s =
+          f->Read(ws, static_cast<uint32_t>(we - ws), buf.data(), got, st->originTimeout(timeout));
+      if (srv)
+        srv->fetch_sub(1, std::memory_order_relaxed);
+      st->releaseInner();
+      if (!s.IsOK())
+        noteOriginFailure(*st, &entry->obs().servers, "records", ws, we - ws, s, server);
+      if (!s.IsOK() || got < off + n - ws) {
+        // A failure of the copy (a stall, an error of its own, a short answer inside the file's
+        // confirmed size) moves the handle, as any read's does, and the read is made again at the
+        // new copy: the parse goes on there.
+        if (mayMove && attempt < kReadMaxAttempts &&
+            parseReadMoves(st, f, s, ws, we - ws, got, server, &entry->obs().servers, startUs))
+          continue;
+        readFailed = true;
+        return false;
+      }
+      if (st->store) {
+        auto& stats = st->store->stats();
+        stats.originBytes.fetch_add(got, std::memory_order_relaxed);
+        stats.originReads.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t rt = nowUs() - t0;
+        stats.originRtUs.add(rt);
+        entry->obs().originRtUs.add(rt);
+        entry->obs().servers.add(server, got, rt, inFlight);
+        if (stats.tracer)
+          stats.tracer->rec("wire", entry->key().key, ws, got, rt, true,
+                            wireTraceFields(server, t0, inFlight));
+      }
+      entry->writePages(ws, got, buf.data());
+      if (n)
+        std::memcpy(dst, buf.data() + (off - ws), n);
+      fetchedFrom = server;
+      return true;
     }
-    uint32_t got = 0;
-    const uint64_t t0 = nowUs();
-    // Counted among the reads in flight to its server for as long as it is
-    // out, as the asynchronous ones are (inFlight: those once it was counted,
-    // itself included), but not among all of the process's origin reads,
-    // which have only ever counted the asynchronous ones. Its answer names no
-    // host, so it is put down to the server it was sent to.
-    const std::string server = issueServer(*st, f);
-    std::atomic<uint64_t>* srv = st->store ? serverInFlight(server) : nullptr;
-    const uint64_t inFlight = srv ? srv->fetch_add(1, std::memory_order_relaxed) + 1 : 0;
-    XrdCl::XRootDStatus s =
-        f->Read(ws, static_cast<uint32_t>(we - ws), buf.data(), got, st->originTimeout(timeout));
-    if (srv)
-      srv->fetch_sub(1, std::memory_order_relaxed);
-    st->releaseInner();
-    if (!s.IsOK())
-      noteOriginFailure(*st, &entry->obs().servers, "records", ws, we - ws, s, server);
-    if (!s.IsOK() || got < off + n - ws) {
-      readFailed = true;
-      return false;
-    }
-    if (st->store) {
-      auto& stats = st->store->stats();
-      stats.originBytes.fetch_add(got, std::memory_order_relaxed);
-      stats.originReads.fetch_add(1, std::memory_order_relaxed);
-      const uint64_t rt = nowUs() - t0;
-      stats.originRtUs.add(rt);
-      entry->obs().originRtUs.add(rt);
-      entry->obs().servers.add(server, got, rt, inFlight);
-      if (stats.tracer)
-        stats.tracer->rec("wire", entry->key().key, ws, got, rt, true,
-                          wireTraceFields(server, t0, inFlight));
-    }
-    entry->writePages(ws, got, buf.data());
-    if (n)
-      std::memcpy(dst, buf.data() + (off - ws), n);
-    fetchedFrom = server;
-    return true;
-  }
+   }
 };
 
 } // namespace ucache

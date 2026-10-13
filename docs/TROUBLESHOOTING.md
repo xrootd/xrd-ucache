@@ -513,13 +513,21 @@ take any copy the regional redirector lists.
 A file whose size uCache does not know is not moved: the client's own recovery of its
 reads stays on.
 
-What does not move: uCache's own reads of the file's records, made to know where each
-basket is for `check_origin_integrity` (and to find a direct file's baskets under
-`max_read_fraction`), are not made again at another copy. On a file whose reads move, the
-client's own recovery is off, so a connection lost during those reads (which the client
-would otherwise have recovered) fails them: the file's reads are then served unchecked, and
-nothing of them kept, until a read a second later or more reads the records again. This
-holds for a file shown in uCache's own layout and for one served as it is alike.
+uCache's own reads of the file's records, made to know where each basket is for
+`check_origin_integrity` (and to find a direct file's baskets under `max_read_fraction`),
+move as a read does: one that stalls, whose connection is lost, that the server fails with an
+error of its own, or that a copy answers short inside the file's confirmed size, is a failure
+of that copy; the file is opened at another site by the same rules, and the records are read
+there, on the job's own thread, so the reads that wait for them are checked once they are
+read. A failure of uCache's own (not the copy's) does not move.
+
+What does not move: the reads with which a file shown in uCache's own layout
+(`recompress = on`) is set up at its first use, which come before its reads are armed to move
+(when they fail, the file is served as it is, and then its reads move as above); and the reads
+of the records that a replica's first pass makes for `max_read_fraction` on uCache's own
+threads. On a file whose reads move, the client's own recovery is off, so a connection lost
+during those reads fails them: the file's reads are then served unchecked, and nothing of them
+kept, until a read a second later or more reads the records again.
 
 A file shown in uCache's own layout (`recompress = on`) bounds its fetches by the read
 deadline (5 minutes, within the client's `RequestTimeout`), not by a timeout the job gave

@@ -168,6 +168,7 @@ keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEn
     src.st = st;
     src.entry = entry;
     src.timeout = timeout;
+    src.mayMove = st != nullptr; // the parse runs on the reader's thread (armKeyCheck)
     own = parseRecords(src, static_cast<int64_t>(entry->fileSize()));
     g.lock();
     if (src.readFailed) {

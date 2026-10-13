@@ -23,6 +23,7 @@
 #include "vendor/crc32c.h"
 
 #include <functional>
+#include <future>
 #include <map>
 #include <pthread.h>
 #include <XProtocol/XProtocol.hh> // kXR_* wire codes for the OpenRetry drift asserts
@@ -3365,6 +3366,7 @@ static std::shared_ptr<ReadRule> directRule(const std::shared_ptr<HandleState>& 
     OriginSource src;
     src.st = st;
     src.entry = entry;
+    src.mayMove = true; // the reader's thread
     rule->observe(ranges, src);
   }
   return rule->direct() ? rule : nullptr;
@@ -3928,6 +3930,44 @@ bool moveSlotRequest(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
            });
          });
   return true;
+}
+
+static XRootDStatus* shortAnswer(HandleState& st, ServerTally* tally, const char* op, uint64_t off,
+                                 uint64_t len, uint64_t got, const std::string& server);
+bool parseReadMoves(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
+                    const XRootDStatus& s, uint64_t off, uint64_t len, uint64_t got,
+                    const std::string& server, ServerTally* tally, uint64_t startUs) try {
+  if (!st || !on || processExiting() ||
+      !(st->moveOnReads.load(std::memory_order_relaxed) ||
+        st->moveSlotReads.load(std::memory_order_relaxed)))
+    return false;
+  XRootDStatus why = s;
+  if (s.IsOK()) { // a short answer: a failure of the copy only inside the confirmed size
+    if (!shortInsideConfirmed(st->confirmedSize.load(std::memory_order_relaxed), off, len, got))
+      return false;
+    std::unique_ptr<XRootDStatus> refused(shortAnswer(*st, tally, "records", off, len, got, server));
+    why = *refused;
+  }
+  if (why.code != XrdCl::errDataError &&
+      readStep(why.code, static_cast<int>(why.errNo)) != ReadStep::kMove)
+    return false;
+  if (st->originTimeout(0, startUs, true) == 0)
+    return false;
+  const int capS = readBudgetS(0, defaultRequestTimeoutS()) -
+                   static_cast<int>((nowUs() - std::min(startUs, nowUs())) / 1000000);
+  auto moved = std::make_shared<std::promise<bool>>();
+  auto done = moved->get_future();
+  moveOn(st, on, why, capS, [st, moved](bool m, const std::string&) {
+    st->unpark();
+    moved->set_value(m);
+    return std::function<void()>([] {});
+  });
+  // The move ends within its own bounds (the sequence's budget, capS); the wait is a backstop.
+  if (done.wait_for(std::chrono::seconds(std::max(capS, 1) + 60)) != std::future_status::ready)
+    return false;
+  return done.get() && !processExiting() && st->originTimeout(0, startUs, true) > 0;
+} catch (...) {
+  return false;
 }
 
 // Whether a request whose `attempt`-th attempt failed with `s`, begun `startUs`
