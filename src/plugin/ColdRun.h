@@ -159,9 +159,14 @@ bool coldExactOriginRanges(ColdFill& cf, uint64_t off, uint64_t len,
 // Completes `user` exactly once: with the chunks (VectorReadInfo when isVRead,
 // ChunkInfo of the first chunk otherwise), or with the origin's error. `startUs`: when the
 // request began (its time counts from there, the map's parse on the reader's thread included);
-// 0 for now.
+// 0 for now. `readerT`: the reader's own timeout of the request (0 for none): its fetches, and
+// the attempts made again after a failure, are held to it, as a byte-path miss's are.
 void coldServe(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
                std::shared_ptr<ColdFill> cf, XrdCl::ChunkList chunks, bool isVRead,
-               XrdCl::ResponseHandler* user, uint64_t startUs = 0);
+               XrdCl::ResponseHandler* user, uint64_t startUs = 0, int readerT = 0);
+
+// Whether the calling thread is one of the replica layout's own pools (its conversions, commits
+// and maps), on which a reader's request may be completed and must not wait for a move.
+bool onColdPoolThread();
 
 } // namespace ucache

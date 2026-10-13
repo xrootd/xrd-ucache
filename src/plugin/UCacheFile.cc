@@ -12,6 +12,7 @@
 #include "OpenPolicy.h"
 #include "OpenRetry.h"
 #ifdef UCACHE_HAVE_COLDRUN
+#include "FetchCheck.h"
 #include "OriginSource.h"
 #include "ReadRule.h"
 #endif
@@ -186,9 +187,11 @@ bool headerFaultFires() {
 // decodenomem: the slot run's conversions, each struck one made with every allocation of its
 // decoders failing, as for want of memory (decodeNoMemFire, transpose::DecoderNoMemory).
 // pagenomem: the same for the decodes of stored RNTuple pages a request copies (pageNoMemFire).
+// ioerr: the misses, each failing with the server's own I/O error (kXR_IOError), as if it had
+// answered so.
 enum class FaultKind : uint8_t {
   kMiss, kRelay, kRefuse, kFinal, kLate, kAgain, kLeftData, kConvert, kSplitMove, kDecodeNoMem,
-  kPageNoMem
+  kPageNoMem, kIoErr
 };
 static const FaultKind gFaultKind = [] {
   const char* v = ::getenv("UCACHE_TEST_READ_FAIL_KIND");
@@ -203,6 +206,7 @@ static const FaultKind gFaultKind = [] {
          : k == "splitmove" ? FaultKind::kSplitMove
          : k == "decodenomem" ? FaultKind::kDecodeNoMem
          : k == "pagenomem" ? FaultKind::kPageNoMem
+         : k == "ioerr" ? FaultKind::kIoErr
                            : FaultKind::kMiss;
 }();
 bool convertFaultFire() {
@@ -217,7 +221,7 @@ bool pageNoMemFire() {
 bool slotFetchFaultFire() {
   return gFaultKind != FaultKind::kConvert && gFaultKind != FaultKind::kSplitMove &&
          gFaultKind != FaultKind::kDecodeNoMem && gFaultKind != FaultKind::kPageNoMem &&
-         readFaultFire();
+         gFaultKind != FaultKind::kIoErr && readFaultFire();
 }
 static std::atomic<bool> gSplitMoveArmed{false};
 bool splitMoveKind() {
@@ -281,7 +285,11 @@ static bool injectReadFault(bool relaySite, ResponseHandler* h, XRootDStatus& s,
       *late = true;
     return false;
   }
-  const XRootDStatus err(XrdCl::stError, k == FaultKind::kFinal ? XrdCl::errInvalidResponse
+  const XRootDStatus err =
+      k == FaultKind::kIoErr
+          ? XRootDStatus(XrdCl::stError, XrdCl::errErrorResponse, kXR_IOError,
+                         "injected: the server's own I/O error")
+          : XRootDStatus(XrdCl::stError, k == FaultKind::kFinal ? XrdCl::errInvalidResponse
                                                                 : XrdCl::errConnectionError);
   const uint64_t lateMs = k == FaultKind::kLate ? 500 : k == FaultKind::kLeftData ? 1000 : 0;
   Executor::instance().postAfter(lateMs, [h, err] {
@@ -306,6 +314,9 @@ class WaitHandler : public ResponseHandler {
     while (cur < tier && !tier_.compare_exchange_weak(cur, tier, std::memory_order_relaxed)) {
     }
   }
+  // Every completion it delivers is marked a client callback, whatever thread runs it (the
+  // client's, the executor, the decode pool, the deliver or open-wait pool): a request the reader
+  // makes from inside it is parked (parkForParse), never made where a move would be waited for.
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
     ClientCallback inClientCallback; // PluginSupport.h
@@ -740,13 +751,23 @@ SiteNameTable& siteNameTable() {
   return *t;
 }
 // The FileSystem the queries of `server` use (SiteNameTable::fss): made at the first (throws for
-// want of memory). On the executor only.
+// want of memory). On the executor only. Made with no lock of ours held: its constructor takes the
+// client's fork-handler lock, which a fork holds while it waits for the client's workers, and those
+// take the table's lock (knownSiteName); one made by two threads at once keeps the first, and the
+// other is left behind (a FileSystem is never destroyed, above).
 XrdCl::FileSystem* siteNameFs(const std::string& server) {
   const SiteNameTable t = siteNameTable();
+  {
+    std::lock_guard<std::mutex> g(*t.mu);
+    const auto it = t.fss->find(server);
+    if (it != t.fss->end() && it->second)
+      return it->second;
+  }
+  auto* made = new XrdCl::FileSystem(XrdCl::URL("root://" + server), false);
   std::lock_guard<std::mutex> g(*t.mu);
   XrdCl::FileSystem*& fs = (*t.fss)[server];
   if (!fs)
-    fs = new XrdCl::FileSystem(XrdCl::URL("root://" + server), false); // left behind, never deleted
+    fs = made; // else `made` is left behind, never deleted
   return fs;
 }
 std::string serverKey(std::string server) {
@@ -834,10 +855,21 @@ void askSiteName(const std::shared_ptr<CacheStore>& store, const std::string& se
   try {
     Executor::instance().postAfter(siteNameDelayMs(key), [op, key, store] {
       try {
+        // A task that starts once the process is exiting asks nothing: the client's own teardown
+        // (which runs after the plug-in's exit handler sets the flag) may have begun.
+        if (processExiting()) {
+          endSiteName(op, key, std::string(), true, store);
+          return;
+        }
         XrdCl::FileSystem* fs = siteNameFs(key);
         auto* h = new SiteNameHandler(op, key, store);
         XrdCl::Buffer arg;
         arg.FromString("sitename");
+        if (processExiting()) {
+          delete h;
+          endSiteName(op, key, std::string(), true, store);
+          return;
+        }
         const XRootDStatus s = fs->Query(XrdCl::QueryCode::Config, arg, h, kSiteNameQueryS);
         if (!s.IsOK()) { // no answer will come
           delete h;
@@ -907,8 +939,11 @@ constexpr uint64_t kStallWitnessUs = 60ull * 1000000;
 // The source-memory writes posted to the executor and not yet done, of the fork generation that
 // posted them (a parent's never run in a child): waitForSourceWrites waits for them at exit.
 // Constant-initialized, never destroyed.
-std::atomic<int> gSourceWrites{0};
-std::atomic<uint64_t> gSourceWritesGen{0};
+// Its fork generation in the high 32 bits, the count in the low 32: a write of a generation that
+// is not the current one starts the count over in one step (a forked child's first writes, made
+// at once by two threads, both counted).
+std::atomic<uint64_t> gSourceWrites{0};
+uint64_t sourceWritesGen() { return Executor::forkGeneration() & 0xffffffffull; }
 // UCACHE_TEST_SOURCE_WRITE_DELAY_MS=N (inert unless set): each source-memory write waits N ms on
 // the executor before it is made, for tests of the exit's wait for them.
 long sourceWriteDelayMs() {
@@ -918,23 +953,33 @@ long sourceWriteDelayMs() {
   }();
   return ms;
 }
+void sourceWriteEnds(uint64_t gen) {
+  uint64_t cur = gSourceWrites.load(std::memory_order_acquire);
+  while ((cur >> 32) == gen && (cur & 0xffffffffull) > 0 &&
+         !gSourceWrites.compare_exchange_weak(cur, cur - 1, std::memory_order_acq_rel)) {
+  }
+}
 void postSourceWrite(std::function<void()> fn) { // throws as Executor::post does
+  const uint64_t gen = sourceWritesGen();
+  uint64_t cur = gSourceWrites.load(std::memory_order_acquire);
+  for (;;) {
+    const uint64_t next = (cur >> 32) == gen ? cur + 1 : (gen << 32) | 1; // a child starts over
+    if (gSourceWrites.compare_exchange_weak(cur, next, std::memory_order_acq_rel))
+      break;
+  }
   struct Done {
-    ~Done() { gSourceWrites.fetch_sub(1, std::memory_order_acq_rel); }
+    uint64_t gen;
+    ~Done() { sourceWriteEnds(gen); }
   };
-  const uint64_t gen = Executor::forkGeneration();
-  if (gSourceWritesGen.exchange(gen, std::memory_order_acq_rel) != gen)
-    gSourceWrites.store(0, std::memory_order_release); // a forked child: the parent's never end here
-  gSourceWrites.fetch_add(1, std::memory_order_acq_rel);
   try {
-    Executor::instance().post([fn = std::move(fn)] {
-      Done done;
+    Executor::instance().post([fn = std::move(fn), gen] {
+      Done done{gen};
       if (const long d = sourceWriteDelayMs(); d > 0)
         std::this_thread::sleep_for(std::chrono::milliseconds(d));
       fn();
     });
   } catch (...) {
-    gSourceWrites.fetch_sub(1, std::memory_order_acq_rel);
+    sourceWriteEnds(gen);
     throw;
   }
 }
@@ -1149,10 +1194,13 @@ void noteSourceAnswer(HandleState& st, const std::string& server, bool opened) n
 } catch (...) {
 }
 void waitForSourceWritesHere(int ms) {
-  if (gSourceWritesGen.load(std::memory_order_acquire) != Executor::forkGeneration())
-    return; // a parent's writes: they never run here
-  for (int waited = 0; waited < ms && gSourceWrites.load(std::memory_order_acquire) > 0; waited += 10)
+  const uint64_t gen = sourceWritesGen();
+  for (int waited = 0; waited < ms; waited += 10) {
+    const uint64_t cur = gSourceWrites.load(std::memory_order_acquire);
+    if ((cur >> 32) != gen || (cur & 0xffffffffull) == 0)
+      return; // none of this process's (a parent's writes never run here)
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
 }
 // The marks of the cache's sources, read now (and kept as the process's snapshot, which an open's
 // success looks in), and the live copy faults of the handle's file, as one question for
@@ -1456,9 +1504,17 @@ struct FailoverSeq {
   }
   // The next request's timeout: the open deadline, or what is left of the
   // budget when that is less (at least 1 s).
+  // The last timeout given (timeout()) and when: an attempt's own time, for the site-fault memory
+  // (an expiry cut short by the budget is not a stall at uCache's own deadline).
+  mutable int lastTimeoutS = 0;
+  mutable uint64_t lastIssuedUs = 0;
   ucache::XrdTimeout timeout() const {
     const int64_t leftS = (remainingMs() + 999) / 1000;
-    return static_cast<ucache::XrdTimeout>(std::max<int64_t>(1, std::min<int64_t>(deadlineS, leftS)));
+    const auto t =
+        static_cast<ucache::XrdTimeout>(std::max<int64_t>(1, std::min<int64_t>(deadlineS, leftS)));
+    lastTimeoutS = static_cast<int>(t);
+    lastIssuedUs = nowUs();
+    return t;
   }
   // Nothing more may be issued: the process is exiting, or the stop rule of
   // the budget holds (OpenPolicy.h budgetSpent).
@@ -1631,9 +1687,11 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     if (!ok)
       noteSiteFault(st, markedFailure(w, f),
                     siteFaultOf(s.code, static_cast<int>(s.errNo),
-                                seq->deadlineS == openDeadlineS(0, gTestOpenDeadlineS),
+                                seq->deadlineS == openDeadlineS(0, gTestOpenDeadlineS) &&
+                                    seq->lastTimeoutS >= seq->deadlineS, // not cut short
                                 jobStreamTimeout()),
-                    nowUs() - uint64_t(std::max(seq->deadlineS, 1)) * 1000000);
+                    seq->lastIssuedUs ? seq->lastIssuedUs
+                                      : nowUs() - uint64_t(std::max(seq->deadlineS, 1)) * 1000000);
     // A copy refused for what it is earlier in this sequence, or that a read of the handle found
     // bad (it answered with bad bytes), is never taken again, wherever the redirector or the list
     // of copies sends the open: it is refused again as it is, with no check made of it again
@@ -1984,12 +2042,15 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     SiteFailure f;
     f.server = server;
     f.siteName = knownSiteName(server);
-    f.domain = server; // it did not answer
+    // A server that answered (an error of its own) has its domain; one that did not, itself.
+    f.domain = siteIdentity(server, s.code == XrdCl::errErrorResponse, std::string());
     f.site = f.siteName.empty() ? f.domain : f.siteName;
     f.error = s.ToString();
-    // The copy's state was asked with uCache's own time (kCandidateStatS).
+    // An expiry is uCache's own only when the stat had uCache's own time (kCandidateStatS), not one
+    // the reader's shorter open timeout or the sequence's budget cut short.
     noteSiteFault(st, f,
-                  siteFaultOf(s.code, static_cast<int>(s.errNo), /*ownTime=*/true, jobStreamTimeout()),
+                  siteFaultOf(s.code, static_cast<int>(s.errNo), /*ownTime=*/t == kCandidateStatS,
+                              jobStreamTimeout()),
                   asked);
     setSiteNames(q.failed, siteNames());
     if (afterFailure(q.failed, f, failoverMaxSites(), q.stopped()) == AfterFailure::kStop) {
@@ -4398,16 +4459,17 @@ static void moveOn(const std::shared_ptr<HandleState>& st, XrdCl::File* on, cons
 
 bool moveSlotRequest(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
                      const XRootDStatus& s, bool checkFailed, int attempt, uint64_t startUs,
-                     std::function<void(bool, const XRootDStatus&)> cont) {
+                     std::function<void(bool, const XRootDStatus&)> cont, int readerT) {
   if (!st || !on || !st->moveSlotReads.load(std::memory_order_relaxed) ||
       !(checkFailed || readStep(s.code, static_cast<int>(s.errNo)) == ReadStep::kMove) ||
-      attempt + 1 >= kReadMaxAttempts || st->originTimeout(0, startUs, true) == 0)
+      attempt + 1 >= kReadMaxAttempts || st->originTimeout(readerT, startUs, true) == 0)
     return false;
-  const int capS = readBudgetS(0, defaultRequestTimeoutS()) -
+  const int capS = readBudgetS(readerT, defaultRequestTimeoutS()) -
                    static_cast<int>((nowUs() - std::min(startUs, nowUs())) / 1000000);
   moveOn(st, on, s, capS,
-         [st, s, startUs, cont = std::move(cont)](bool moved, const std::string& failure) {
-           const bool time = moved && !processExiting() && st->originTimeout(0, startUs, true) > 0;
+         [st, s, startUs, readerT, cont = std::move(cont)](bool moved, const std::string& failure) {
+           const bool time =
+               moved && !processExiting() && st->originTimeout(readerT, startUs, true) > 0;
            std::string tried;
            if (moved && !time) { // moved, but the request's time is spent: the copies it failed at
              std::lock_guard<std::mutex> g(st->mu);
@@ -4433,13 +4495,22 @@ static XRootDStatus* shortAnswer(HandleState& st, ServerTally* tally, const char
 // or the open-wait pool's, which makes requests again and may block (releaseOpenWaiters); never a
 // client callback thread, nor the pools that serve hits, run moves or give reads their answers.
 bool mayWaitForMove() {
-  return !onClientCallback() && !Executor::instance().runsThisThread() &&
-         !moveExecutor().runsThisThread() && !deliverExecutor().runsThisThread();
+  if (onClientCallback() || Executor::instance().runsThisThread() ||
+      moveExecutor().runsThisThread() || deliverExecutor().runsThisThread())
+    return false;
+#ifdef UCACHE_HAVE_COLDRUN
+  // The pools that complete a reader's requests too (the checks' decodes, the replica layout's
+  // conversions): a reader that asks again from inside that completion would hold them up.
+  if (decodePool().runsThisThread() || onColdPoolThread())
+    return false;
+#endif
+  return true;
 }
 
 bool parseReadMoves(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
                     const XRootDStatus& s, uint64_t off, uint64_t len, uint64_t got,
-                    const std::string& server, ServerTally* tally, uint64_t startUs) try {
+                    const std::string& server, ServerTally* tally, uint64_t startUs,
+                    int readerT, const std::shared_ptr<FileEntry>& entry) try {
   // Never on a client callback thread (a read a reader issued from inside its own completion):
   // the move's answers come on those threads. The parse fails there, as it did before reads of the
   // records moved.
@@ -4454,14 +4525,16 @@ bool parseReadMoves(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
       return false;
     std::unique_ptr<XRootDStatus> refused(shortAnswer(*st, tally, "records", off, len, got, server));
     why = *refused;
+    if (entry) // during a replica layout's setup the entry is not the handle's yet (shortAnswer)
+      dropEntryOfBadCopy(*st, entry, server);
   }
   if (why.code != XrdCl::errDataError &&
       readStep(why.code, static_cast<int>(why.errNo)) != ReadStep::kMove)
     return false;
-  // The parse's time: a read's budget, counted from its first read (for a handle not armed yet,
-  // whose own timeout says nothing of it, as for an armed one).
-  const auto leftS = [startUs] {
-    return readBudgetS(0, defaultRequestTimeoutS()) -
+  // The parse's time: the reader's request's budget (its own timeout, else the client's), counted
+  // from the request's start (for a handle not armed yet as for an armed one).
+  const auto leftS = [startUs, readerT] {
+    return readBudgetS(readerT, defaultRequestTimeoutS()) -
            static_cast<int>((nowUs() - std::min(startUs, nowUs())) / 1000000);
   };
   const int capS = leftS();
@@ -4474,9 +4547,15 @@ bool parseReadMoves(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
     moved->set_value(m);
     return std::function<void()>([] {});
   });
-  // The move ends within its own bounds (the sequence's budget, capS); the wait is a backstop.
-  if (done.wait_for(std::chrono::seconds(std::max(capS, 1) + 60)) != std::future_status::ready)
-    return false;
+  // The move ends within its own bounds (the sequence's budget, capS); the wait is a backstop. A
+  // handle whose plug-in object is being destroyed (its destructor waits for this request,
+  // ownerUses) waits no longer: the parse fails, and the request goes on unchecked.
+  const auto until =
+      std::chrono::steady_clock::now() + std::chrono::seconds(std::max(capS, 1) + 60);
+  while (done.wait_for(std::chrono::milliseconds(200)) != std::future_status::ready) {
+    if (std::chrono::steady_clock::now() >= until || st->ownerGone.load(std::memory_order_acquire))
+      return false;
+  }
   return done.get() && !processExiting() && leftS() > 0;
 } catch (...) {
   return false;
@@ -5106,6 +5185,10 @@ XrdCl::File* HandleState::resetInner(bool leakOld, bool onlyIfIdle, bool closeOl
   // may still be inside it. The validity check sits in the same section as the
   // swap, so a handle shut down meanwhile gets no File that nothing destroys.
   std::vector<std::unique_ptr<XrdCl::File>> expired; // destroyed once mu is released
+  // The new File is made before mu is taken, and one not used is destroyed after it is released:
+  // a File's constructor and destructor take the client's fork lock, which a thread that forks
+  // holds while it waits for the client's workers, and those wait for mu (releaseInner).
+  std::unique_ptr<XrdCl::File> made = std::make_unique<XrdCl::File>(false); // no recursion
   std::lock_guard<std::mutex> g(mu);
   if (!innerValid || (onlyIfIdle && innerOps != 0))
     return nullptr;
@@ -5126,14 +5209,13 @@ XrdCl::File* HandleState::resetInner(bool leakOld, bool onlyIfIdle, bool closeOl
     expired.push_back(std::move(retiredFailed.front().first));
     retiredFailed.erase(retiredFailed.begin());
   }
-  innerOwned = makeInner();
+  innerOwned = configureInner(std::move(made));
   inner = innerOwned.get();
   return innerOwned.get();
 }
 
-std::unique_ptr<XrdCl::File> HandleState::makeInner() {
-  auto f = std::make_unique<XrdCl::File>(false); // plugins disabled (no recursion)
-  for (const auto& p : readerProps)              // the reader's settings, in the order it made them
+std::unique_ptr<XrdCl::File> HandleState::configureInner(std::unique_ptr<XrdCl::File> f) {
+  for (const auto& p : readerProps) // the reader's settings, in the order it made them
     f->SetProperty(p.first, p.second);
   if (moveOnReads)
     recoveryOff(*f); // after the reader's: it cannot turn it back on
@@ -5402,7 +5484,10 @@ class MissReadHandler : public ResponseHandler {
 #else
   void finish(Answer& a, uint64_t got, const std::string& server, const KeyMap* m) {
 #endif
-    bool keepNone = false;
+    // check_origin_integrity on and no map (its parse failed, threw, or another handle's ended
+    // without one): served unchecked, and nothing kept, so no later read takes unchecked bytes from
+    // the cache.
+    bool keepNone = !m && globalConfig().checkOriginIntegrity;
 #ifdef UCACHE_HAVE_COLDRUN
     if (m) {
       std::string why;
@@ -5534,15 +5619,32 @@ void redispatchRead(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> 
   }
   const int left = parkedRefetchTimeoutS(readerT, currentRequestTimeoutS(),
                                          static_cast<int64_t>(t0 - std::min(startUs, t0)));
-  if (left < 0) {
-    complete(handler,
-             new XRootDStatus(XrdCl::stError, XrdCl::errOperationExpired, 0,
-                              "uCache: the read's time ran out while it waited for another read "
-                              "of the same bytes"),
-             nullptr);
+  auto [ws, we] = roundChunk(*entry, offset, size);
+  if (left <= 1) {
+    // Its own time is spent, or all but its last second (the insurance comes 1 s before the end,
+    // parkedInsuranceMs). A plain client fails a request only at its timer's next check after its
+    // time, and serves an answer that comes before: the read is sent itself, outside the fetch
+    // gate, with 1 s, so that the client stamps it with the end its own request had (to the
+    // second) and expires it at its own check of that, or it is served.
+    auto wireBuf = std::make_shared<std::vector<char>>(we - ws);
+    if (XrdCl::File* f = st->acquireInner()) {
+      auto* mh = new MissReadHandler(st, f, entry, offset, size, buffer, handler, ws, wireBuf,
+                                     startUs ? startUs : nowUs(), /*gateLen=*/0, 1);
+      XRootDStatus s = issueWireRead(st, f, ws, we - ws, wireBuf->data(), mh, 1, startUs);
+      if (!s.IsOK()) {
+        delete mh;
+        st->releaseInner();
+        complete(handler,
+                 new XRootDStatus(XrdCl::stError, XrdCl::errOperationExpired, 0,
+                                  "uCache: the read's time ran out while it waited for another "
+                                  "read of the same bytes"),
+                 nullptr);
+      }
+      return;
+    }
+    complete(handler, new XRootDStatus(st->missError()), nullptr);
     return;
   }
-  auto [ws, we] = roundChunk(*entry, offset, size);
   auto again = parkedRead(st, entry, offset, size, buffer, handler, readerT, startUs);
   if (!entry->beginFetch(ws, we - ws, again)) {
     Executor::instance().postAfter(
@@ -5553,12 +5655,16 @@ void redispatchRead(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> 
   }
   // Its own fetch, with what is left of its time (an armed handle's reads have their own
   // limits, from the reader's own timeout: originTimeout).
-  const int t = st->moveOnReads.load(std::memory_order_relaxed) ? readerT : left;
+  const bool armed = st->moveOnReads.load(std::memory_order_relaxed);
+  const int t = armed ? readerT : left;
   auto wireBuf = std::make_shared<std::vector<char>>(we - ws);
   if (XrdCl::File* f = st->acquireInner()) {
-    auto* mh = new MissReadHandler(st, f, entry, offset, size, buffer, handler, ws, wireBuf,
-                                   nowUs(), we - ws, t);
-    XRootDStatus s = issueWireRead(st, f, ws, we - ws, wireBuf->data(), mh, t);
+    // An armed handle's read keeps its start: its deadline and its moves count from when the reader
+    // asked, not from this fetch.
+    const uint64_t from = armed && startUs ? startUs : nowUs();
+    auto* mh = new MissReadHandler(st, f, entry, offset, size, buffer, handler, ws, wireBuf, from,
+                                   we - ws, t);
+    XRootDStatus s = issueWireRead(st, f, ws, we - ws, wireBuf->data(), mh, t, armed ? startUs : 0);
     if (!s.IsOK()) {
       delete mh;
       st->releaseInner();
@@ -5732,7 +5838,7 @@ class MissVReadHandler : public ResponseHandler {
 #else
   void finish(Answer& a, uint64_t wireBytes, const std::string& server, const KeyMap* m) {
 #endif
-    bool keepNone = false;
+    bool keepNone = !m && globalConfig().checkOriginIntegrity; // as MissReadHandler::finish
 #ifdef UCACHE_HAVE_COLDRUN
     if (m) {
       countChecks(*st_, v);
@@ -5992,13 +6098,14 @@ XRootDStatus originCheckRefused(HandleState& st, ServerTally* tally, const char*
 
 UCacheFile::UCacheFile() : st_(std::make_shared<HandleState>()) {
   st_->store = globalStore();
+  auto inner = std::make_unique<XrdCl::File>(false); // made with no lock of ours held
   {
     std::lock_guard<std::mutex> g(st_->mu);
     // The inner file is owned by HandleState (not as a plugin member): a posted
     // retry task swaps it and may run after Open returns, so it must reach the
     // file through st_ without capturing the plugin object.
     // enablePlugIns=false — prevents recursion.
-    st_->innerOwned = std::make_unique<XrdCl::File>(false);
+    st_->innerOwned = std::move(inner);
     st_->inner = st_->innerOwned.get();
     st_->innerValid = true;
     st_->owner = this; // for the requests parked while the reader's open is in flight
@@ -6013,6 +6120,8 @@ UCacheFile::~UCacheFile() {
   {
     std::unique_lock<std::mutex> g(st_->mu);
     st_->owner = nullptr;
+    // a parse waiting for a move stops (parseReadMoves)
+    st_->ownerGone.store(true, std::memory_order_release);
     waiters.swap(st_->openWaiters);
     st_->openCv.wait(g, [this] { return st_->ownerUses == 0; });
   }
@@ -7024,9 +7133,11 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
     auto st = st_;
     ChunkList one;
     one.emplace_back(offset, served, buffer);
-    Executor::instance().post([st, entry, cold, one = std::move(one), handler, t0]() mutable {
-      coldServe(st, entry, cold, std::move(one), /*isVRead=*/false, handler, t0);
-    });
+    const int readerT = static_cast<int>(timeout);
+    Executor::instance().post(
+        [st, entry, cold, one = std::move(one), handler, t0, readerT]() mutable {
+          coldServe(st, entry, cold, std::move(one), /*isVRead=*/false, handler, t0, readerT);
+        });
     return XRootDStatus();
   }
 #endif
@@ -7253,8 +7364,9 @@ XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void
     auto st = st_;
     ChunkList one;
     one.emplace_back(offset, size, buffer);
-    Executor::instance().post([st, entry, cold, one = std::move(one), pg, t0]() mutable {
-      coldServe(st, entry, cold, std::move(one), /*isVRead=*/false, pg, t0);
+    const int readerT = static_cast<int>(timeout);
+    Executor::instance().post([st, entry, cold, one = std::move(one), pg, t0, readerT]() mutable {
+      coldServe(st, entry, cold, std::move(one), /*isVRead=*/false, pg, t0, readerT);
     });
     return XRootDStatus();
   }
@@ -7476,8 +7588,9 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
     noteVectorRequest(st_, chunks);
     ChunkList userChunks = chunks;
     Executor::instance().post(
-        [st, entry, cold, userChunks = std::move(userChunks), handler, t0]() mutable {
-          coldServe(st, entry, cold, std::move(userChunks), /*isVRead=*/true, handler, t0);
+        [st, entry, cold, userChunks = std::move(userChunks), handler, t0,
+         readerT = static_cast<int>(timeout)]() mutable {
+          coldServe(st, entry, cold, std::move(userChunks), /*isVRead=*/true, handler, t0, readerT);
         });
     return XRootDStatus();
   }

@@ -316,8 +316,17 @@ ReadRule::State ReadRule::observe(const std::vector<std::pair<uint64_t, uint64_t
   // is otherwise a few lookups. With adaptive_federation on, a read of the
   // parse that fails at its copy may move the handle (parseReadMoves) while
   // mu_ is held: the file's other first requests wait for that too, as for the
-  // parse's reads; the move takes no lock of the rule's.
-  std::lock_guard<std::mutex> g(mu_);
+  // parse's reads; the move takes no lock of the rule's. A request on the pool
+  // that serves hits never waits for it: when another thread holds mu_ it is
+  // not seen (served as the rule stands, undecided: cached as usual), so a
+  // parse waiting for a move never holds those threads.
+  std::unique_lock<std::mutex> g(mu_, std::defer_lock);
+  if (Executor::instance().runsThisThread()) {
+    if (!g.try_lock())
+      return kUndecided;
+  } else {
+    g.lock();
+  }
   s = state();
   if (s != kUndecided)
     return s;

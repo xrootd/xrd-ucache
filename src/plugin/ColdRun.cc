@@ -815,6 +815,8 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   int attempt = 0;
   bool mayPark = true; // may wait once for read-ahead already on the wire
   uint64_t t0 = 0;
+  int readerT = 0; // the reader's own timeout of the request, 0 for none (coldServe)
+  int retryS = 0;  // a request made again after a failure: its fetches' timeout (finish), 0: none
 
   // Filled in by classify(), consumed when every fetch it started is done.
   struct SlotPiece {
@@ -889,11 +891,14 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   std::mutex emu;
   XRootDStatus err;
 
-  // The request fails with `s` (the first failure stands); `on`: the File of the fetch it is the
-  // copy's failure of, null for none (failedOn).
+  // The request fails with `s` (the first failure stands, but a data failure of a copy takes the
+  // place of an earlier failure of another kind, so that the copy whose bytes failed is the one
+  // charged, and marked bad); `on`: the File of the fetch it is the copy's failure of, null for
+  // none (failedOn).
   void fail(const XRootDStatus& s, XrdCl::File* on = nullptr) {
     std::lock_guard<std::mutex> g(emu);
-    if (!failed.exchange(true)) {
+    if (!failed.exchange(true) ||
+        (s.code == XrdCl::errDataError && err.code != XrdCl::errDataError && on)) {
       err = s;
       failedOn.store(on);
     }
@@ -912,7 +917,7 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   // a record that fails its check is left for copySlot, which drops it.
   void readStoredTogether(std::unordered_map<uint32_t, ColdFill::Where>& mine);
   // Serve the same chunks again from the start (a slot fell through).
-  void again(bool mayParkAgain);
+  void again(bool mayParkAgain, int retryS = 0);
 };
 
 // Bytes [from, from+len) of an RNTuple slot: the decoded page, then the decoded
@@ -1093,7 +1098,7 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
   return true;
 }
 
-void ColdRequest::again(bool mayParkAgain) {
+void ColdRequest::again(bool mayParkAgain, int retryAfterS) {
   auto r2 = std::make_shared<ColdRequest>();
   r2->st = st;
   r2->entry = entry;
@@ -1104,6 +1109,8 @@ void ColdRequest::again(bool mayParkAgain) {
   r2->attempt = attempt + 1;
   r2->mayPark = mayParkAgain;
   r2->t0 = t0;
+  r2->readerT = readerT;
+  r2->retryS = retryAfterS ? retryAfterS : retryS;
   Executor::instance().post([r2] { serveRequest(r2); });
 }
 
@@ -1209,20 +1216,29 @@ void ColdRequest::finish() {
                             }
                             answered();
                             complete(self->user, new XRootDStatus(e), nullptr);
-                          }))
+                          },
+                          readerT))
         return;
-    }
-    // Served again from the start, as a request whose slot fell through is
-    // (requests that waited on this fetch do the same): a read the origin
-    // failed once is asked for once more, as the plain miss path relays it.
-    if (attempt < 2 && !refused.load() && !checkFailed.load()) {
-      again(false);
-      return;
     }
     XRootDStatus s;
     {
       std::lock_guard<std::mutex> g(emu);
       s = err;
+    }
+    // Served again from the start, as a request whose slot fell through is
+    // (requests that waited on this fetch do the same): a read the origin
+    // failed once is asked for once more, as the plain miss path relays it, and
+    // by its rule (missRelayTimeoutS): a fetch that ran out of time at its
+    // server is the reader's answer at once (sent again it would wait as long
+    // again), and another failure is asked for again only with the reader's
+    // time left, and with that time.
+    if (attempt < 2 && !refused.load() && !checkFailed.load()) {
+      const int elapsedS = static_cast<int>((nowUs() - std::min(t0, nowUs())) / 1000000);
+      const int relayS = missRelayTimeoutS(s.code, readerT, currentRequestTimeoutS(), elapsedS);
+      if (relayS >= 0) {
+        again(false, std::max(relayS, 1));
+        return;
+      }
     }
     // NOT noteCacheError: that trips a handle to pass-through after a few
     // errors, and a pass-through handle would send the origin offsets that
@@ -1233,6 +1249,7 @@ void ColdRequest::finish() {
     return;
   }
   bool lost = retry.load(); // another request's fetch failed
+  const bool lostByOther = lost; // waited for a fetch of another request that failed (it may move)
   uint64_t fillRec = 0, replicaRec = 0;
   std::sort(fetched.begin(), fetched.end());
   std::unordered_map<uint32_t, ColdFill::Where> mine;
@@ -1268,7 +1285,9 @@ void ColdRequest::finish() {
       (std::binary_search(fetched.begin(), fetched.end(), p.slot) ? fillRec : replicaRec) += rec;
     }
   if (lost) {
-    if (attempt < 2 && !fatal) {
+    // A request that waited for another's fetch is served again as often as that one may be made
+    // again (it moves up to kReadMaxAttempts times): each failure of the owner costs it an attempt.
+    if ((attempt < 2 || (lostByOther && attempt + 1 < kReadMaxAttempts)) && !fatal) {
       again(false);
       return;
     }
@@ -1828,8 +1847,12 @@ void issuePart(const std::shared_ptr<ColdRequest>& req, std::vector<PartItem> it
       h->HandleResponseWithHosts(new XRootDStatus(XrdCl::stError, XrdCl::errConnectionError),
                                  nullptr, nullptr);
     });
-  else // the read deadline of a handle whose requests move (HandleState::originTimeout); none else
-    s = f->VectorRead(chunks, nullptr, h, req->st->originTimeout(0, req->t0, false));
+  else // the reader's own timeout, a request made again: what was left of it (finish); a handle
+       // whose requests move: the read deadline (HandleState::originTimeout)
+    s = f->VectorRead(chunks, nullptr, h,
+                      req->retryS > 0 && !req->st->moveSlotReads.load(std::memory_order_relaxed)
+                          ? ucache::xrdTimeoutOf(req->retryS)
+                          : req->st->originTimeout(req->readerT, req->t0, req->attempt > 0));
   if (!s.IsOK()) {
     delete h;
     req->st->releaseInner();
@@ -2169,6 +2192,8 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
       r2->attempt = req->attempt;
       r2->mayPark = req->mayPark;
       r2->t0 = req->t0;
+      r2->readerT = req->readerT;
+      r2->retryS = req->retryS;
       r2->mapWaited = true;
       serveRequest(r2);
     };
@@ -2247,6 +2272,8 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
         r2->attempt = req->attempt;
         r2->mayPark = false;
         r2->t0 = req->t0;
+        r2->readerT = req->readerT;
+        r2->retryS = req->retryS;
         Executor::instance().post([r2] { serveRequest(r2); });
       };
       if (req->entry->waitForInFlight(want, again)) {
@@ -3481,7 +3508,7 @@ bool coldExactOriginRanges(ColdFill& cf, uint64_t off, uint64_t len,
 
 void coldServe(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
                std::shared_ptr<ColdFill> cf, ChunkList chunks, bool isVRead,
-               ResponseHandler* user, uint64_t startUs) {
+               ResponseHandler* user, uint64_t startUs, int readerT) {
   noteWaitTier(user, ReaderWait::kSlots);
   auto req = std::make_shared<ColdRequest>();
   req->st = std::move(st);
@@ -3491,7 +3518,13 @@ void coldServe(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry
   req->isVRead = isVRead;
   req->user = user;
   req->t0 = startUs ? startUs : nowUs();
+  req->readerT = readerT;
   serveRequest(req);
+}
+
+bool onColdPoolThread() {
+  return convertPool().runsThisThread() || commitPool().runsThisThread() ||
+         mapPool().runsThisThread();
 }
 
 } // namespace ucache

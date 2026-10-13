@@ -471,7 +471,10 @@ the error gives no advice for it.
 ## A server or a copy is tried last (`ucache sources`)
 
 With `adaptive_federation = on`, the log says when a server is marked or a
-copy is proven missing:
+copy is proven missing (a server's fault of its own is marked from a read, a
+listed copy's stat, or an open made at that server; an open made through a
+redirector does not see it: the XRootD client itself makes such an open again
+at the redirector, which sends it elsewhere):
 
 - `<file>: the server <host:port> (<site>) stalled while other sites answered:
   its copies are tried after the others for <n> min (failure <k> in a row)`, or
@@ -487,7 +490,9 @@ puts copies last in the regional redirector's list: a job is never refused a
 copy for it. To forget every server mark, remove `<dir>/sources`; a copy's mark
 goes with its file's in-use record (`<dir>/inuse/...`, FORMAT.md).
 A mark is written off the job's threads; a process that ends while one is being
-written waits for it, at most a second, so that it is kept and counted.
+written waits for it, at most a second, so that it is kept and counted. A write
+that cannot take `<dir>/sources.lock` within about a tenth of a second (another
+process holds it, stopped) is dropped: a lost mark costs one more failover.
 
 ## uCache read the file at another site
 
@@ -565,8 +570,15 @@ file's reads are then served unchecked, and nothing of them kept, until a read a
 or more reads the records again.
 
 A file shown in uCache's own layout (`recompress = on`) bounds its fetches by the read
-deadline (5 minutes, within the client's `RequestTimeout`), not by a timeout the job gave
-the read: a job's own shorter read timeout does not shorten them.
+deadline (5 minutes, within the client's `RequestTimeout`) and by the job's own timeout of the
+read when that is shorter, as a plain read is: a fetch that ran out of time at its server is
+the job's answer at once, and one that failed otherwise is made again only with what is left of
+the read's time.
+
+On a file shown in uCache's own layout, these requests do not move, and with the client's own
+recovery off on such a file a connection lost under them fails them: a `Stat` the job forces
+(`force = true`), read-ahead fetches (`prefetch = on`), and the reads of the records made for
+`max_read_fraction` on uCache's own threads. The job's reads move.
 
 A job's open that the cache entry answered within its freshness window opens the file at an
 origin only when a read needs it. When the entry is gone by the job's first read (evicted
@@ -680,6 +692,20 @@ Note the byte cap is best-effort under extreme concurrent write rates; the
 free-disk floor is the hard guard against actually filling the volume.
 
 ## Jobs are killed for memory with `recompress = on`
+
+With recompression on, the conversion uses one thread per CPU the process may use,
+and each thread that converts reserves a block of address space of its own for
+its allocations (the C library's arena, 64 MiB). Under a limit on the job's
+address space (`ulimit -v`, or a batch system's virtual-memory limit) a reader on
+a machine with many CPUs can reach that limit: the job then ends with
+`std::system_error` ("Resource temporarily unavailable") or fails to allocate,
+though it holds little memory. Raise the limit, run the job on fewer CPUs (the pool
+follows the CPUs the process may use, as `taskset` or a batch slot sets them), or
+turn recompression off for such jobs. A stored page of a replica that uCache cannot
+decode for want of memory is kept, and the read that needs it is made again; one
+that still cannot have it fails with
+`[ERROR] OS Error: cannot allocate memory; uCache: a stored page could not be
+decoded for want of memory (this process's, not the copy's)`, never as damaged data.
 
 With recompression on, a job holds more memory while it reads a recompressed
 file: ROOT sizes its read buffers from the layout the file is shown in and does

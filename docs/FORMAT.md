@@ -16,6 +16,10 @@ $UCACHE_DIR/                         (0700)
   stats/<stem>.files.jsonl           # per-file lifetime records (docs/STATS.md), and
                                      #  origin open and failure lines (below)
   stats/<stem>.trace.jsonl           # sampled IO trace, `trace = io` (docs/STATS.md)
+  inuse/<hh>/<sha256(key)>           # in-use record of a file's maps, and its copies' faults
+  sources                            # servers that failed (adaptive_federation; below)
+  sources.lock                       # flock held while `sources` is written
+  sources.new                        # transient during its rewrite
   LOCK                               # cache-wide flock for eviction
   objects.cleared.<pid>-<ms>/        # an objects/ tree `ucache clear` set aside,
                                      #  deleted in the background
@@ -341,10 +345,10 @@ fault <site> <server host:port> <last proof> <first proof> <reason> <proofs>
   proven bad at a server: reason `enoent`, the server said the file is not
   there although the regional redirector, asked again, still listed it. Such a
   copy is tried after every other copy of the file for 7 days after its last
-  proof (USER_GUIDE.md). A site with a space or a byte that is not printable is
-  percent-encoded (`-` for none). A fault that holds keeps the record from
+  proof (USER_GUIDE.md). A site with a space, a `%` or a byte that is not
+  printable is percent-encoded (`-` for none). A fault that holds keeps the record from
   being removed, but does not make the file's maps in use (it does not protect
-  the file from eviction). Builds before 1.5.0 skip these lines and may drop
+  the file from eviction). Earlier builds skip these lines and may drop
   them when they rewrite the record; the cost is one more failover, which notes
   the copy again.
 - Written in place under an exclusive `flock`, never fsynced; a line that does
@@ -365,8 +369,8 @@ server <host:port> <site name, or -> <domain> <count> <first failure> <last fail
 - One line per server: the name it gave for its site (`-` while none is known)
   and its domain (the server itself for one that never answered), its failures
   in a row since its last success (`count`), and wall-clock seconds. Its mark
-  holds until `marked until`: 10 minutes after the first failure of a row,
-  doubled at each further one, at most an hour. A success clears the line. A
+  holds until `marked until`: 10 minutes after the latest failure, for the
+  first of a row, doubled at each further one, at most an hour. A success clears the line. A
   mark whose end lies more than an hour and a minute ahead (the clock went
   back) is taken as ended: the clock never lengthens a mark.
 - A name or domain with a space, a `%` or a byte that is not printable is
@@ -461,8 +465,10 @@ can hold an access token, and `file` is the cache key, which has none.
   An open that ended because its handle was closed before a next attempt was
   issued has no such line.
 - With `adaptive_federation = on`, `"sitename"` at the end of the line: the
-  name the server that `site` is held against (the chain's effective server,
-  else its last host) gave for its site, when the name was known when the
+  name the chain's effective server (the one the client names in `tried=`,
+  else its last host) gave for its site; when a data server sent the open on
+  to another host, that is an earlier host than `data_server` and `site`,
+  which name the last host. Written when the name was known when the
   line was written (it is asked once per server and process, after its first
   answer, so the first line of a server has none; a server that does not
   answer this attempt keeps the name it gave earlier). `site` stays the

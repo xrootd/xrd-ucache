@@ -1247,7 +1247,9 @@ int parkedRefetchTimeoutS(int readerTimeoutS, int requestTimeoutS, int64_t elaps
 uint64_t parkedInsuranceMs(int readerTimeoutS, int requestTimeoutS, int64_t elapsedUs) {
   const int64_t leftUs = int64_t{readBudgetS(readerTimeoutS, requestTimeoutS)} * 1000000 -
                          std::max<int64_t>(elapsedUs, 0);
-  const uint64_t ms = static_cast<uint64_t>(std::max<int64_t>(leftUs, 0) / 1000) + 20;
+  // 1 s before its end: the read is then sent itself with 1 s, so the client stamps it with the
+  // end its own request had (redispatchRead) and expires it at its own check of that
+  const uint64_t ms = static_cast<uint64_t>(std::max<int64_t>(leftUs - 1000000, 0) / 1000) + 20;
   return std::min<uint64_t>(ms, 10000);
 }
 

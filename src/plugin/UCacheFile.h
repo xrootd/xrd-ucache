@@ -258,6 +258,9 @@ struct HandleState {
   // never waits for itself.
   UCacheFile* owner = nullptr;
   int ownerUses = 0;
+  // Set by the plugin's destructor before it waits: a parse waiting for a move in such a request
+  // waits no longer (parseReadMoves).
+  std::atomic<bool> ownerGone{false};
   // With adaptive_federation on, for a file the cache caches: what the checks made at the reader's
   // open read of the copy the open took, as whole pages of the file (OpenPolicy.h checkReadSpan),
   // kept here from the open's answer until the handle's entry is set up (ensureEntry), which stores
@@ -399,9 +402,10 @@ struct HandleState {
   // `closeOld`: the old one is open (an open refused its copy) and is closed
   // without waiting, as it moves to `retired`.
   XrdCl::File* resetInner(bool leakOld = false, bool onlyIfIdle = false, bool closeOld = false);
-  // A File of this handle's: plugins off, the reader's properties given again in
-  // order and, on an armed handle, the client's read recovery off. Under mu.
-  std::unique_ptr<XrdCl::File> makeInner();
+  // `f` (a File made with plugins off, outside mu) made one of this handle's: the
+  // reader's properties given again in order and, on an armed handle, the client's
+  // read recovery off. Under mu.
+  std::unique_ptr<XrdCl::File> configureInner(std::unique_ptr<XrdCl::File> f);
   // A forked child has yet to open this handle's origin file afresh, or is doing so.
   // With adaptive_federation on it never waits: a move holds innerOpenMu for its whole
   // budget, and a caller that needs the open calls ensureInnerOpen, which waits for it.
@@ -569,9 +573,14 @@ void dropEntryOfBadCopy(HandleState& st, const std::string& server) noexcept;
 // returned once it reads from another copy: the parse goes on there. False otherwise: the parse fails
 // as before (nothing else is done). BLOCKS until the move ends, on the parse's thread (the reader's
 // own); holds no lock of its own across it.
+// `readerT`: the reader's own timeout of the request that made the parse (0 for none), whose
+// budget the move counts against from `startUs`.
+// `entry`: the entry the parse reads into, which a short answer inside the confirmed size drops
+// (it may not be the handle's yet: a replica layout's setup).
 bool parseReadMoves(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
                     const XrdCl::XRootDStatus& s, uint64_t off, uint64_t len, uint64_t got,
-                    const std::string& server, ServerTally* tally, uint64_t startUs);
+                    const std::string& server, ServerTally* tally, uint64_t startUs,
+                    int readerT = 0, const std::shared_ptr<FileEntry>& entry = nullptr);
 std::shared_ptr<const KeyMap> originCheckMapFor(const std::shared_ptr<HandleState>& st,
                                                 const std::shared_ptr<FileEntry>& entry,
                                                 std::function<void()>* then, bool& parked);
@@ -586,9 +595,11 @@ std::shared_ptr<const KeyMap> originCheckMapFor(const std::shared_ptr<HandleStat
 // executor: `cont(true, ...)` when the handle reads from another copy and the request has time
 // left (it is served again from the start there), `cont(false, err)` with the error the reader
 // gets (naming the copies tried) when no copy could serve it. Never blocks.
+// `readerT`: the reader's own timeout of the request (0 for none), its budget counted from
+// `startUs`.
 bool moveSlotRequest(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
                      const XrdCl::XRootDStatus& s, bool checkFailed, int attempt, uint64_t startUs,
-                     std::function<void(bool, const XrdCl::XRootDStatus&)> cont);
+                     std::function<void(bool, const XrdCl::XRootDStatus&)> cont, int readerT = 0);
 // The verdict's passed, none and unjudged counts, to the store's counters (the byte path's).
 void countOriginChecks(HandleState& st, const transpose::FetchVerdict& v);
 // A fetch's basket that failed the byte path's check: said, counted (`n` baskets), recorded, and

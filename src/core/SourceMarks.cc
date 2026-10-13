@@ -1,6 +1,7 @@
 #include "SourceMarks.h"
 
 #include <algorithm>
+#include <unistd.h>
 #include <cctype>
 #include <cerrno>
 #include <cinttypes>
@@ -57,7 +58,15 @@ bool update(IOBackend& io, const std::string& path, uint64_t nowS, Edit edit) {
   const int lfd = io.open(path + ".lock", O_RDWR | O_CREAT | O_CLOEXEC, 0600);
   if (lfd < 0)
     return false;
-  bool ok = io.flock(lfd, LOCK_EX) == 0;
+  // Never blocked for long: these writes run on the threads that serve the cache's hits, and the
+  // lock is shared by every process of the cache (one stopped while it holds it). After about
+  // 100 ms the write is dropped: a lost mark costs one more failover, which marks again.
+  bool ok = false;
+  for (int i = 0; i < 20 && !ok; ++i) {
+    ok = io.flock(lfd, LOCK_EX | LOCK_NB) == 0;
+    if (!ok)
+      ::usleep(5000);
+  }
   std::string text;
   ok = ok && readSources(io, path, text);
   if (ok) {

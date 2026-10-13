@@ -88,7 +88,8 @@ struct OriginSource : transpose::Source {
       std::atomic<uint64_t>* srv = st->store ? serverInFlight(server) : nullptr;
       const uint64_t inFlight = srv ? srv->fetch_add(1, std::memory_order_relaxed) + 1 : 0;
       XrdCl::XRootDStatus s =
-          f->Read(ws, static_cast<uint32_t>(we - ws), buf.data(), got, st->originTimeout(timeout));
+          f->Read(ws, static_cast<uint32_t>(we - ws), buf.data(), got,
+                  st->originTimeout(static_cast<int>(timeout), startUs, attempt > 1));
       if (srv)
         srv->fetch_sub(1, std::memory_order_relaxed);
       st->releaseInner();
@@ -99,7 +100,8 @@ struct OriginSource : transpose::Source {
         // confirmed size) moves the handle, as any read's does, and the read is made again at the
         // new copy: the parse goes on there.
         if (mayMove && attempt < kReadMaxAttempts &&
-            parseReadMoves(st, f, s, ws, we - ws, got, server, &entry->obs().servers, startUs))
+            parseReadMoves(st, f, s, ws, we - ws, got, server, &entry->obs().servers, startUs,
+                           static_cast<int>(timeout), entry))
           continue;
         readFailed = true;
         return false;

@@ -765,12 +765,12 @@ TEST(OpenPolicy, ParkedRefetchTimeout) {
 TEST(OpenPolicy, ParkedInsurance) {
   constexpr int64_t S = 1000000;
   EXPECT_EQ(parkedInsuranceMs(0, RT, 0), 10000u) << "the client's 1800 s: the 10 s insurance";
-  EXPECT_EQ(parkedInsuranceMs(5, RT, 0), 5020u) << "5 s of its own: just past them";
-  EXPECT_EQ(parkedInsuranceMs(5, RT, 2 * S), 3020u);
-  EXPECT_EQ(parkedInsuranceMs(5, RT, 5 * S), 20u) << "spent: at once, after 20 ms";
+  EXPECT_EQ(parkedInsuranceMs(5, RT, 0), 4020u) << "5 s of its own: 1 s before their end";
+  EXPECT_EQ(parkedInsuranceMs(5, RT, 2 * S), 2020u);
+  EXPECT_EQ(parkedInsuranceMs(5, RT, 4 * S), 20u) << "in its last second: at once, after 20 ms";
   EXPECT_EQ(parkedInsuranceMs(5, RT, 9 * S), 20u);
-  EXPECT_EQ(parkedInsuranceMs(30, RT, 25 * S), 5020u);
-  EXPECT_EQ(parkedInsuranceMs(0, 8, 0), 8020u) << "a client's request timeout of 8 s";
+  EXPECT_EQ(parkedInsuranceMs(30, RT, 25 * S), 4020u);
+  EXPECT_EQ(parkedInsuranceMs(0, 8, 0), 7020u) << "a client's request timeout of 8 s";
   EXPECT_EQ(parkedInsuranceMs(0, 12, 0), 10000u);
 }
 
