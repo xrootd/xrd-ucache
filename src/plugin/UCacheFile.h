@@ -205,6 +205,11 @@ struct HandleState {
   // off on every File of an armed handle, and a read that fails in a way another
   // site may not share is issued again at another site (UCacheFile.cc moveOn).
   std::atomic<bool> moveOnReads{false};
+  // The same for a handle shown a slot layout (recompress = on): its reader's addresses are the
+  // layout's, so its requests are never issued again as they are; a request whose fetch from the
+  // origin failed is served again from the start, at the origin's offsets, once the handle reads
+  // from another copy (moveSlotRequest). The client's own recovery is off on its Files too.
+  std::atomic<bool> moveSlotReads{false};
   bool viaRedirector = false;
   // Under mu: the server and site the current File was opened at; where reads
   // of the handle failed, the 3 newest (the next open names them in tried= and
@@ -539,6 +544,19 @@ void dropEntryOfBadCopy(HandleState& st, const std::string& server) noexcept;
 std::shared_ptr<const KeyMap> originCheckMapFor(const std::shared_ptr<HandleState>& st,
                                                 const std::shared_ptr<FileEntry>& entry,
                                                 std::function<void()>* then, bool& parked);
+// adaptive_federation, a handle shown a slot layout (HandleState::moveSlotReads): a request of the
+// slot run whose fetch from the origin failed with `s` on the File `on` (`checkFailed`: its bytes
+// failed a check: a data failure of that copy) moves as a byte-path read does (the same move,
+// moveOn: the read deadline, tried=, the regional's list, the size the reader was shown, a copy
+// found bad never taken again), when it is one that moves (readStep, or checkFailed) and has
+// attempts (`attempt`, kReadMaxAttempts) and time left (counted from `startUs`). Returns false
+// when it does not move (then nothing is done). Otherwise `cont` runs once, on the deliver
+// executor: `cont(true, ...)` when the handle reads from another copy and the request has time
+// left (it is served again from the start there), `cont(false, err)` with the error the reader
+// gets (naming the copies tried) when no copy could serve it. Never blocks.
+bool moveSlotRequest(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
+                     const XrdCl::XRootDStatus& s, bool checkFailed, int attempt, uint64_t startUs,
+                     std::function<void(bool, const XrdCl::XRootDStatus&)> cont);
 // The verdict's passed, none and unjudged counts, to the store's counters (the byte path's).
 void countOriginChecks(HandleState& st, const transpose::FetchVerdict& v);
 // A fetch's basket that failed the byte path's check: said, counted (`n` baskets), recorded, and

@@ -353,7 +353,8 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   codec not converted among them) and a converted branch's basket the conversion leaves as
   stored; a basket the conversion decodes has its data checked once, by its conversion, and its
   key against the tree's record (counted under `origin_checks_failed` when it fails). A basket a
-  fetch does not hold whole (cut by its edge) is judged by the fetch that holds it whole.
+  fetch does not hold whole (cut by its edge) is not judged by that fetch; it is judged only if
+  another fetch holds it whole, and is otherwise not checked (USER_GUIDE, "Not checked").
   With `check_origin_integrity` on, these counters also count the byte path: the baskets of a
   fetch from the origin (a byte-cache miss, a read the cache relays to the origin for a handle
   that holds the file's map, read-ahead, the bytes the checks at open keep) that lie wholly in

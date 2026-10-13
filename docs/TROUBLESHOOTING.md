@@ -473,7 +473,10 @@ With `adaptive_federation = on`, a read that fails at the server a file was
 opened at, in a way another site may not share (the server stopped answering,
 the connection was lost, the request ran past its time limit of 5 minutes, or
 the server reported a fault of its own or of its storage), is made again at
-another site, and the job gets the bytes. The log says so, once for every move:
+another site, and the job gets the bytes. A file shown in a layout of uCache's own
+(`recompress = on`) moves too: its request is served again from the start at the other
+copy, its fetches made at the origin's offsets, and the job's addresses stay as they were.
+The log says so, once for every move:
 
 - `<file>: reads from <host>:<port> stopped (<error>); reading it from
   <host>:<port> from now on`, when another site served it;

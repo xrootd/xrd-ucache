@@ -608,8 +608,11 @@ std::string earlierMoveText(const std::string& moveText, uint64_t agoMs);
 
 // ---- Reading a file from another site (adaptive_federation on) --------------
 // A handle is armed to move its reads when the cache serves it, an open of it
-// succeeded through a redirector, it was not shown a slot layout (whose
-// addresses no other site has), and the size its reader was shown is known. The
+// succeeded through a redirector, and the size its reader was shown is known. A
+// handle shown a slot layout (`slotLayout`) is not armed this way: its reader's
+// addresses are the layout's, which no other site has, so its requests are never
+// issued again as they are; it is armed for its slot run's requests to move as a
+// whole instead (UCacheFile.h moveSlotRequest), at the origin's offsets. The
 // origin reads of an armed handle have a deadline, and one that fails in a way
 // another site may not share is issued again, in full, at another site of that
 // size: the reader gets the bytes, never the error, within a bound on the

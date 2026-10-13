@@ -861,6 +861,9 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   // the same bytes, so the read is not asked again (another source is a matter
   // for adaptive_federation).
   std::atomic<bool> checkFailed{false};
+  // The File the request's first fetch from the origin was issued on (null: none issued): the
+  // copy a failure of the request is held against when it moves (moveSlotRequest).
+  std::atomic<XrdCl::File*> issuedOn{nullptr};
   // check_origin_integrity: the file map the original pieces' bytes are checked against (null: not
   // checked, and then not kept), taken before the fetch is issued (originCheckMapFor; the reader's
   // thread parsed; a request made during another handle's parse waits for it, serveRequest).
@@ -1150,6 +1153,27 @@ void ColdRequest::finish() {
     for (uint32_t i : claimed)
       if (!std::binary_search(done.begin(), done.end(), i))
         cf->abandon(i);
+    // adaptive_federation: a fetch that failed in a way another copy may not share, or whose bytes
+    // failed a check, moves the handle to another copy, as a byte-path read moves, and the request
+    // is served again from the start there (its addresses, the layout's, never change).
+    if (!refused.load()) {
+      XRootDStatus s;
+      {
+        std::lock_guard<std::mutex> g(emu);
+        s = err;
+      }
+      auto self = shared_from_this();
+      if (moveSlotRequest(st, issuedOn.load(), s, checkFailed.load(), attempt, t0,
+                          [self, answered](bool moved, const XRootDStatus& e) {
+                            if (moved) {
+                              self->again(false);
+                              return;
+                            }
+                            answered();
+                            complete(self->user, new XRootDStatus(e), nullptr);
+                          }))
+        return;
+    }
     // Served again from the start, as a request whose slot fell through is
     // (requests that waited on this fetch do the same): a read the origin
     // failed once is asked for once more, as the plain miss path relays it.
@@ -1737,14 +1761,16 @@ void issuePart(const std::shared_ptr<ColdRequest>& req, std::vector<PartItem> it
     return;
   }
   auto* h = new PartHandler(req, f, std::move(items), std::move(wire));
+  XrdCl::File* none = nullptr;
+  req->issuedOn.compare_exchange_strong(none, f);
   XRootDStatus s;
   if (readFaultFire()) // test hook: the origin's vector read dies mid-stream
     Executor::instance().post([h] {
       h->HandleResponseWithHosts(new XRootDStatus(XrdCl::stError, XrdCl::errConnectionError),
                                  nullptr, nullptr);
     });
-  else
-    s = f->VectorRead(chunks, nullptr, h, 0);
+  else // the read deadline of a handle whose requests move (HandleState::originTimeout); none else
+    s = f->VectorRead(chunks, nullptr, h, req->st->originTimeout(0, req->t0, false));
   if (!s.IsOK()) {
     delete h;
     req->st->releaseInner();

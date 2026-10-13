@@ -2980,10 +2980,12 @@ void HandleState::applyReadPolicy() {
     std::lock_guard<std::mutex> g(mu);
     // A copy's one read of the whole file would be repeated, in full, at the next site, and its
     // deadline is not a read's.
-    if (moveOnReads || !innerValid || !setupDone || wholeCopy ||
-        !armedForReads(true, reopenInChild, viaRedirector, cold != nullptr, sizeShownLocked() != 0))
+    // A handle shown a slot layout is armed for its requests to move as a whole (moveSlotReads):
+    // its fetches are made at the origin's offsets, so another copy can answer them.
+    if (moveOnReads || moveSlotReads || !innerValid || !setupDone || wholeCopy ||
+        !armedForReads(true, reopenInChild, viaRedirector, false, sizeShownLocked() != 0))
       return;
-    moveOnReads = true;
+    (cold ? moveSlotReads : moveOnReads) = true;
     f = inner.load(); // a File that is replaced meanwhile is kept, and the new one is made armed
   }
   recoveryOff(*f);
@@ -3007,7 +3009,7 @@ void HandleState::unpark() {
 }
 
 ucache::XrdTimeout HandleState::originTimeout(int readerTimeoutS, uint64_t startUs, bool again) {
-  if (!moveOnReads.load(std::memory_order_relaxed))
+  if (!moveOnReads.load(std::memory_order_relaxed) && !moveSlotReads.load(std::memory_order_relaxed))
     return ucache::xrdTimeoutOf(readerTimeoutS);
   const int elapsedS = startUs ? static_cast<int>((nowUs() - startUs) / 1000000) : 0;
   return ucache::xrdTimeoutOf(readAttemptTimeoutS(readerTimeoutS, defaultRequestTimeoutS(),
@@ -3615,6 +3617,37 @@ static void moveOn(const std::shared_ptr<HandleState>& st, XrdCl::File* on, cons
   moveExecutor().post([st, capS, failUs = nowUs(), why = recordText(s.ToString())] {
     runMove(st, capS, failUs, why);
   });
+}
+
+bool moveSlotRequest(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
+                     const XRootDStatus& s, bool checkFailed, int attempt, uint64_t startUs,
+                     std::function<void(bool, const XRootDStatus&)> cont) {
+  if (!st || !on || !st->moveSlotReads.load(std::memory_order_relaxed) ||
+      !(checkFailed || readStep(s.code, static_cast<int>(s.errNo)) == ReadStep::kMove) ||
+      attempt + 1 >= kReadMaxAttempts || st->originTimeout(0, startUs, true) == 0)
+    return false;
+  const int capS = readBudgetS(0, defaultRequestTimeoutS()) -
+                   static_cast<int>((nowUs() - std::min(startUs, nowUs())) / 1000000);
+  moveOn(st, on, s, capS,
+         [st, s, startUs, cont = std::move(cont)](bool moved, const std::string& failure) {
+           const bool time = moved && !processExiting() && st->originTimeout(0, startUs, true) > 0;
+           std::string tried;
+           if (moved && !time) { // moved, but the request's time is spent: the copies it failed at
+             std::lock_guard<std::mutex> g(st->mu);
+             if (!st->readFailed.empty())
+               tried = noCopyServedText(recordFile(st->url), st->readFailed);
+           }
+           st->unpark();
+           return std::function<void()>([s, time, moved, failure, tried, cont] {
+             if (time) {
+               cont(true, XRootDStatus());
+               return;
+             }
+             const std::string& text = !moved && !failure.empty() ? failure : tried;
+             cont(false, text.empty() ? s : XRootDStatus(s.status, s.code, s.errNo, text));
+           });
+         });
+  return true;
 }
 
 // Whether a request whose `attempt`-th attempt failed with `s`, begun `startUs`
@@ -6124,7 +6157,11 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
     }
     if (!st_->copyGuard.allow(entry->fileSize(), shownSize(), offset, size))
       return refuseCopy(st_);
-    armKeyCheck(st_, entry, timeout); // check_origin_integrity: the map, on this thread (as a miss)
+    // check_origin_integrity: the map, made on this (the reader's) thread with its timeout, as a
+    // byte-cache miss makes it once per handle; a reader that makes its first read from inside a
+    // client completion handler thus runs the parse's synchronous origin reads on that callback
+    // thread, as a miss does.
+    armKeyCheck(st_, entry, timeout);
     auto st = st_;
     ChunkList one;
     one.emplace_back(offset, served, buffer);
