@@ -81,6 +81,13 @@ ChainView readChain(const std::vector<Hop>& hops) {
   return v;
 }
 
+int markedHop(const ChainView& v, const std::vector<Hop>& hops) {
+  if (v.last < 0 || static_cast<size_t>(v.last) >= hops.size() ||
+      (hops[static_cast<size_t>(v.last)].flags & kIsManager))
+    return -1;
+  return v.last;
+}
+
 std::string chainText(const std::vector<Hop>& hops) {
   std::string out;
   char flags[16];

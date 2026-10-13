@@ -100,6 +100,13 @@ struct ChainView {
   size_t hops = 0;
 };
 ChainView readChain(const std::vector<Hop>& hops);
+// The hop the site-fault memory marks for an attempt that failed (adaptive_federation): the last
+// host the attempt reached, the one that did not answer in time or answered with the fault, unless
+// it is a redirector (which holds no copy and is never marked); -1 for none. Not `effective`: for
+// a chain that went on after a data server's own answer (a "not found" the client took elsewhere,
+// a pool that sent it to a disk server), that is the earlier server, whom the client names in
+// tried=.
+int markedHop(const ChainView& v, const std::vector<Hop>& hops);
 
 // The chain as one line: "host:port/0x<flags>" per hop, comma separated, with
 // '*' after the load balancer and '^' after an EOS data server.

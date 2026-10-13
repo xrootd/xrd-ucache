@@ -255,6 +255,23 @@ TEST(OpenPolicy, ASiteByNamesWhenBothAreKnownElseByDomains) {
 // What a failure says of the server: a stall at uCache's own time or a quiet connection, a fault
 // of its own; never authorization, TLS, resolution, connections, a missing file, bad bytes or the
 // job's own timeout.
+// The site-fault memory marks the last host an attempt reached, never a redirector, and not the
+// earlier server whose own answer sent the client on (the one tried= names).
+TEST(OpenPolicy, TheLastHostIsMarked) {
+  const std::vector<Hop> notFoundThenStall = {hop("regional.example.org", kManager),
+                                              hop("b.site.org", kServer),
+                                              makeHop("c.other.org", 1094, 0, false, "")};
+  ChainView v = readChain(notFoundThenStall);
+  EXPECT_EQ(v.effective, 1) << "tried= names b";
+  EXPECT_EQ(markedHop(v, notFoundThenStall), 2) << "c did not answer: c is marked";
+  const std::vector<Hop> one = {hop("regional.example.org", kManager), hop("a.site.org", kServer)};
+  EXPECT_EQ(markedHop(readChain(one), one), 1);
+  const std::vector<Hop> regionalOnly = {hop("global.example.org", kMeta, true),
+                                         hop("regional.example.org", kManager)};
+  EXPECT_EQ(markedHop(readChain(regionalOnly), regionalOnly), -1) << "a redirector is never marked";
+  EXPECT_EQ(markedHop(readChain({}), {}), -1);
+}
+
 TEST(OpenPolicy, SiteFaultOfAFailure) {
   EXPECT_EQ(siteFaultOf(kErrOperationExpired, 0, true), SiteFault::kStall);
   EXPECT_EQ(siteFaultOf(kErrOperationExpired, 0, false), SiteFault::kNone) << "the job's own time";

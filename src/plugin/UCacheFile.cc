@@ -1280,18 +1280,22 @@ void noteOriginOpen(const OpenAttempt& a, const XRootDStatus* status, const Host
 // host), its site (its domain; a server that never answered is its own site,
 // host:port), the name a retry may carry for it, and the error. `sentTo`: the
 // host:port the attempt was sent to, named when no host answered.
+// `f`'s server, site and name as the hop `i` of `w`.
+void setFailureHop(SiteFailure& f, const AttemptView& w, int i) {
+  const Hop& h = w.hops[static_cast<size_t>(i)];
+  f.server = h.host + ":" + std::to_string(h.port);
+  // The name the server gave, once known (even when it did not answer this time), else its
+  // domain when it answered, else itself; the name and the domain kept apart (sameSite).
+  f.siteName = knownSiteName(f.server);
+  f.domain = siteIdentity(f.server, h.flags != 0, std::string());
+  f.site = f.siteName.empty() ? f.domain : f.siteName;
+  f.name = exclusionName(w.hops, i);
+}
 SiteFailure siteFailure(const AttemptView& w, const XRootDStatus& s, const std::string& sentTo) {
   SiteFailure f;
   const int i = w.v.effective >= 0 ? w.v.effective : w.v.last;
   if (i >= 0) {
-    const Hop& h = w.hops[static_cast<size_t>(i)];
-    f.server = h.host + ":" + std::to_string(h.port);
-    // The name the server gave, once known (even when it did not answer this time), else its
-    // domain when it answered, else itself; the name and the domain kept apart (sameSite).
-    f.siteName = knownSiteName(f.server);
-    f.domain = siteIdentity(f.server, h.flags != 0, std::string());
-    f.site = f.siteName.empty() ? f.domain : f.siteName;
-    f.name = exclusionName(w.hops, i);
+    setFailureHop(f, w, i);
   } else {
     f.server = f.site = f.domain = sentTo.empty() ? std::string("the origin") : sentTo;
     f.siteName = sentTo.empty() ? std::string() : knownSiteName(sentTo);
@@ -1301,6 +1305,20 @@ SiteFailure siteFailure(const AttemptView& w, const XRootDStatus& s, const std::
   f.error = s.ToString();
   f.size = w.size; // known for a copy that opened
   return f;
+}
+// The failure the site-fault memory marks for the attempt `w` that failed as `f` (markedHop): `f`
+// at the last host the attempt reached; its server "" when that is a redirector; `f` itself when
+// the attempt reached no host.
+SiteFailure markedFailure(const AttemptView& w, const SiteFailure& f) {
+  if (w.hops.empty())
+    return f;
+  SiteFailure m = f;
+  const int i = markedHop(w.v, w.hops);
+  if (i < 0)
+    m.server.clear();
+  else
+    setFailureHop(m, w, i);
+  return m;
 }
 std::string hostPortOfUrl(const std::string& url) {
   const XrdCl::URL u(url);
@@ -1551,7 +1569,7 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     // Site-fault memory: a stall at uCache's own deadline (not a shorter one the job gave), or a
     // fault of the server's own. The attempt ran at most the sequence's deadline.
     if (!ok)
-      noteSiteFault(st, f,
+      noteSiteFault(st, markedFailure(w, f),
                     siteFaultOf(s.code, static_cast<int>(s.errNo),
                                 seq->deadlineS == openDeadlineS(0, gTestOpenDeadlineS)),
                     nowUs() - uint64_t(std::max(seq->deadlineS, 1)) * 1000000);
