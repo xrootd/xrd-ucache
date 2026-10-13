@@ -71,7 +71,6 @@ struct Executor::Core {
   }
 
   void loop() {
-    tCore = this;
     for (;;) {
       Task task;
       {
@@ -82,6 +81,11 @@ struct Executor::Core {
       }
       Stats* s = task.postedNs ? stats->load(std::memory_order_acquire) : nullptr;
       const uint64_t start = s ? nowNs() : 0;
+      // Marked when a task runs, not when the thread starts: this library is loaded at run time,
+      // so a thread's first touch of its thread_local storage allocates that storage, and with
+      // it a malloc arena of the thread's own (64 MiB of address space). A worker that never
+      // runs a task then takes none, which a process under an address-space limit needs.
+      tCore = this;
       task.fn(); // tasks must not throw (no exceptions cross the ABI)
       if (s) {
         s->poolQueueUs.add((start - task.postedNs) / 1000);
@@ -160,7 +164,13 @@ Executor::Core* Executor::core() {
 
 void Executor::post(std::function<void()> task) { core()->post(std::move(task)); }
 
-bool Executor::runsThisThread() { return tCore != nullptr && tCore == core(); }
+// Never builds the pool: a question about a pool that has no threads yet starts none (each pool's
+// threads take address space, which a process under a limit on it needs for other work).
+bool Executor::runsThisThread() {
+  const Core* c = core_.load(std::memory_order_acquire);
+  return tCore != nullptr && c != nullptr && tCore == c &&
+         c->gen == g_gen.load(std::memory_order_acquire);
+}
 
 void Executor::postAfter(uint64_t delayMs, std::function<void()> task) {
   if (delayMs == 0) {
