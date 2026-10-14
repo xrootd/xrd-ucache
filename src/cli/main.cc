@@ -393,6 +393,7 @@ void printStats(const StatsTotals& t) {
   row("open_retries_exhausted", t.openRetriesExhausted);
   row("validations_failed", t.validationsFailed);
   row("size_disagreements", t.sizeDisagreements);
+  row("name_size_mismatches", t.nameSizeMismatches);
   if (t.originChecksPassed || t.originChecksFailed || t.originChecksNone ||
       t.originChecksUnjudged || t.originChecksNotExamined) {
     row("origin_checks_passed", t.originChecksPassed);
@@ -3220,7 +3221,6 @@ int cmdRm(CacheStore& store, const Config& cfg, int argc, char** argv) {
     bool removed = false;
     for (const auto& key : keys)
       if (store.removeEntry(key)) {
-        dropEntryNames(cfg.cacheDir, key.hashHex); // its list of names (its aliases stay)
         std::printf("removed %s\n", key.key.c_str());
         removed = true;
       }
@@ -3341,6 +3341,12 @@ int cmdClear(CacheStore& store, int argc, char** argv) {
     std::fputs("clear: another process holds the eviction lock; try again\n", stderr);
     return 1;
   }
+  // The entries' names go with them (EntryNames.h): all of them, or, with pinned entries kept,
+  // those left dangling.
+  if (keepPinned)
+    sweepEntryNames(store.config().cacheDir, SIZE_MAX);
+  else
+    clearEntryNames(store.config().cacheDir);
   const bool background = freeCleared();
   std::printf("cleared %zu entr%s (%s %s)%s\n", rep.victims.size(),
               rep.victims.size() == 1 ? "y" : "ies", human(rep.diskBytes).c_str(),
@@ -3349,9 +3355,9 @@ int cmdClear(CacheStore& store, int argc, char** argv) {
 }
 
 int cmdPin(CacheStore& store, const Config& cfg, const char* url, bool pin) {
-  // SAME normalization as the plugin. A pin goes on the first of the file's entries that is
-  // cached (by logical name, else by URL: the entry by name is pinned too at the next open); an unpin takes it
-  // off each of them, so that none is left pinned.
+  // SAME normalization as the plugin, through the entry's names (namedKeys). A pin goes on the
+  // first of the entries named that is cached (the file's entry); an unpin takes it off each of
+  // them (the URL's own old entry too, when one is left beside it), so that none is left pinned.
   const auto keys = namedKeys(cfg, url);
   if (keys.empty()) {
     std::fprintf(stderr, "%s: not a valid URL\n", url);

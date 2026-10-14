@@ -7,6 +7,7 @@
 #endif
 
 #include "CopyDetect.h"
+#include "EntryNames.h"
 #include "Executor.h"
 #include "Log.h"
 #include "OpenPolicy.h"
@@ -6323,7 +6324,9 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // every open) never enters here.
   if (!passthroughOnly_ && cfg.revalidateSeconds > 0) {
     auto key = cfg.entryKey(url);
-    if (key && cacheFresh(*key, cfg.cacheDir, cfg.revalidateSeconds) &&
+    // A URL that has just become a name of another URL's entry is opened at its origin once, so
+    // that its copy's size is compared with the entry's (ensureEntry) before it is trusted.
+    if (key && !key->joined && cacheFresh(*key, cfg.cacheDir, cfg.revalidateSeconds) &&
         !dropCutWarmEntry(*key, url, cfg, *st_->store)) {
       {
         std::lock_guard<std::mutex> g(st_->mu);
@@ -6787,6 +6790,22 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
     if (s.IsOK() && si && allowed) {
       statClone = std::make_unique<XrdCl::StatInfo>(*si);
       bool declinedForSpace = false, declinedSizeDiffers = false;
+      // A URL that reached another URL's entry by its logical name, with a copy of another size: not
+      // that file's copy. The URL gets an entry of its own (EntryNames.h keepOwnEntry), never the
+      // name's bytes, and the name's entry is left as it is.
+      if (key->logical() && !key->urlHash.empty() && key->hashHex != key->urlHash) {
+        const auto m = MetaFile::loadSummary(RealIO::instance(), key->metaPath(cfg.cacheDir));
+        if (m && m->fileSize != si->GetSize()) {
+          keepOwnEntry(*key, cfg.cacheDir);
+          UCACHE_INFO("%s: its copy (%llu bytes) is not the size of the entry of %s (%llu bytes): "
+                      "it is cached apart, under its own URL",
+                      key->urlKey.c_str(), static_cast<unsigned long long>(si->GetSize()),
+                      key->key.c_str(), static_cast<unsigned long long>(m->fileSize));
+          st_->store->stats().nameSizeMismatches.fetch_add(1, std::memory_order_relaxed);
+          UrlKey own = UrlKey::ofEntry(key->urlKey, key->urlHash);
+          key = own;
+        }
+      }
       const WholeFirstRead whole = wholeFirstRead(firstRead, si->GetSize(), *key, cfg, forkLayout);
       keepOriginal = keepOriginal || whole == WholeFirstRead::kAsStored;
       if (whole == WholeFirstRead::kCopy)

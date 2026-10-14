@@ -153,6 +153,10 @@ not to cache, and says the cache is under pressure rather than broken.
   changed page size. The entry is refetched from scratch, so a read still
   succeeds; a steadily rising count means the data is being rewritten
   underneath the cache.
+- `name_size_mismatches` — with `logical_name_prefixes` set: times a URL reached
+  the entry of its file's logical name with a copy of another size (compared the
+  first time the URL reaches that entry). The URL is then cached apart, under its own
+  key; the name's entry is left as it is.
 - `size_disagreements` — times a source reported a different file size than
   the cached entry it was about to extend. Bytes from that source are never
   mixed into the entry: a handle that already holds the cached size fails its

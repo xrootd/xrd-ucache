@@ -1118,7 +1118,9 @@ names (`ucache pin lfn:/store/mc/...`, or a URL).
   the entry: with the prefixes off a URL still reaches the entry it was a name of
   while that entry exists, and its own key is its own again once it is removed.
 - **Copies of another size.** One name reached through several sites can meet a
-  copy that is not the file: cut short, or another version. The rules that keep a
+  copy that is not the file: cut short, or another version. A URL whose copy is not
+  the size of the name's entry, found the first time that URL reaches it, is cached
+  apart under its own URL (`name_size_mismatches`); otherwise the rules that keep a
   file's bytes from two copies apart hold as they do for one URL: an entry is never
   filled from a copy whose size differs from it (the read is made at a copy of its
   size, through the redirector the file was opened through, or fails naming both
@@ -1132,8 +1134,11 @@ names (`ucache pin lfn:/store/mc/...`, or a URL).
   already cached get their logical names: at once with `ucache set` (it says how
   many), else once, in the background, by the first job with them. An entry cached by
   a URL keeps its data, its pin, its replica and its records; nothing is fetched again
-  or copied, and every other URL of the file then reaches that entry (its copy's size
-  must be the entry's, as for any copy). A job that opens a file before its entry was
+  or copied, and every other URL of the file then reaches that entry. The first time a
+  URL reaches another URL's entry, the job opens that URL's copy (inside the freshness
+  window too) and compares its size with the entry's: a copy of another size is not
+  the file, and that URL is cached apart, under its own key, from then on
+  (`name_size_mismatches`, STATS.md). A job that opens a file before its entry was
   named names it itself. When two URLs of one file were cached as two entries before,
   the one named first (by the naming, the most recently used) becomes the file's
   entry, and the other URL becomes a name of it; that URL's own old entry is not read
@@ -1153,8 +1158,8 @@ names (`ucache pin lfn:/store/mc/...`, or a URL).
 - **Removing, pinning, verifying.** `ucache rm`, `pin`, `unpin`, `verify`,
   `branches` and `untranspose` act on the file's entry whichever of its names they
   are given; `rm <url>` also removes that URL's own old entry if one is left beside
-  it. The aliases (names) stay after `rm`: the next job to read the file through any
-  of them caches it again as one entry.
+  it. The entry's names go with it (`rm`, eviction, `clear`): the next job to read the
+  file through any URL caches it again, under the name.
 - **The readouts.** With the prefixes set in the settings a command reads (`ucache
   history`, `stats --files`, `summary`, `publish`), or when any run of the records
   keyed files by the cache's prefixes (its `run_settings` say `logical_names=on/`

@@ -1,5 +1,7 @@
 #include "FileEntry.h"
 
+#include "EntryNames.h"
+
 #include "CpuCounters.h"
 
 
@@ -1394,6 +1396,7 @@ void FileEntry::removeFiles(IOBackend& io, const UrlKey& key, const std::string&
   io.unlink(base + ".tok");
   io.unlink(base + ".val");
   io.unlink(base + ".slots");
+  dropEntryNames(cacheDir, key.hashHex); // its names go with it (EntryNames.h)
 }
 
 bool FileEntry::pinned() {

@@ -25,13 +25,13 @@ bool exists(const std::string& p) {
   return ::stat(p.c_str(), &st) == 0;
 }
 // An entry under `k`'s own hash, as the store makes one (its sidecar), with one page cached.
-void makeEntry(const std::string& dir, const UrlKey& k, bool pin = false) {
+void makeEntry(const std::string& dir, const UrlKey& k, bool pin = false, uint64_t size = 50000) {
   RealIO io;
   Config cfg;
   cfg.cacheDir = dir;
   CacheStore store(io, cfg);
   store.disableStatsDump();
-  auto e = store.open(k, 50000);
+  auto e = store.open(k, size);
   ASSERT_TRUE(e);
   ASSERT_TRUE(exists(k.metaPath(dir)));
   if (pin) {
@@ -155,6 +155,9 @@ TEST(EntryNames, AnAliasIsMadeOnceAndAMalformedOneIsIgnored) {
   ::mkdir(entryNamesDir(dir).c_str(), 0755);
   ::mkdir((entryNamesDir(dir) + "/" + n.hashHex.substr(0, 2)).c_str(), 0755);
   std::ofstream(aliasPath(dir, n.hashHex)) << "ucache-alias 1 " << other << " lfn:/elsewhere\n";
+  ::mkdir((dir + "/objects").c_str(), 0755);
+  ::mkdir((dir + "/objects/ee").c_str(), 0755);
+  std::ofstream(dir + "/objects/ee/" + other + ".meta") << "x"; // the entry it names exists
   const UrlKey e = resolveEntry(n, dir);
   EXPECT_EQ(e.hashHex, other); // the alias another process made first
   EXPECT_EQ(e.key, "lfn:/elsewhere");
@@ -216,4 +219,117 @@ TEST(EntryNames, CachedEntriesAreNamedOnce) {
   EXPECT_EQ(resolveEntry(*kOn.key("root://b.example//store/mc/h.root"), dir).hashHex, third.hashHex);
   EXPECT_EQ(resolveEntry(other, dir).hashHex, other.hashHex);
   EXPECT_FALSE(entryNames(dir, third.hashHex).lfn.empty());
+}
+
+// An alias is followed only while its entry exists: once the entry is gone (removed, with its
+// aliases or, after a crash between, without them), no name ever makes an entry under its hash. The
+// case: a user's copy keyed by the official name, removed; the official file's next fill must not
+// land under the user URL's key.
+TEST(EntryNames, ADanglingAliasIsNeverFollowed) {
+  TempDir td;
+  const std::string dir = td.path();
+  const std::string user = "root://u.example//user/me/store/mc/test/a.root";
+  const std::string official = "root://o.example//store/mc/test/a.root";
+  const UrlKey u = *kOff.key(user);
+  makeEntry(dir, u);
+  Writable w;
+  EXPECT_EQ(resolveEntry(*kOn.key(user), dir).hashHex, u.hashHex);     // the user's entry named
+  EXPECT_EQ(resolveEntry(*kOn.key(official), dir).hashHex, u.hashHex); // the documented risk
+  // The entry goes as a crash would leave it: its files gone, its aliases not.
+  ASSERT_EQ(::unlink(u.metaPath(dir).c_str()), 0);
+  const UrlKey lfn = *kOn.key(official);
+  const UrlKey again = resolveEntry(lfn, dir); // remembered, but its entry is gone: resolved again
+  EXPECT_EQ(again.hashHex, lfn.hashHex);       // a new entry under the name's own hash
+  EXPECT_EQ(again.key, "lfn:/store/mc/test/a.root");
+  makeEntry(dir, again);
+  EXPECT_EQ(resolveEntry(u, dir).hashHex, u.hashHex); // prefixes off: the user's URL is its own
+  const UrlKey o = *kOff.key(official);
+  EXPECT_EQ(resolveEntry(o, dir).hashHex, lfn.hashHex); // reaches the name's entry
+}
+
+// Removing an entry removes the aliases its list names and the list; `clear` removes every name;
+// the sweep removes what is left dangling.
+TEST(EntryNames, NamesGoWithTheirEntry) {
+  TempDir td;
+  const std::string dir = td.path();
+  Writable w;
+  const UrlKey n = *kOn.key("root://a.example//store/mc/r.root");
+  const UrlKey e = resolveEntry(n, dir);
+  makeEntry(dir, e);
+  const UrlKey p2 = *kOn.key("root://b.example//store/mc/r.root");
+  EXPECT_EQ(resolveEntry(p2, dir).hashHex, e.hashHex);
+  const std::string a2 = aliasPath(dir, p2.urlHash);
+  ASSERT_TRUE(exists(a2));
+  {
+    RealIO io;
+    Config cfg;
+    cfg.cacheDir = dir;
+    CacheStore store(io, cfg);
+    store.disableStatsDump();
+    ASSERT_TRUE(store.removeEntry(e));
+  }
+  EXPECT_FALSE(exists(a2));
+  EXPECT_FALSE(exists(namesPath(dir, e.hashHex)));
+  // A drop (a bad copy, a write) takes the names too.
+  const UrlKey e2 = resolveEntry(*kOn.key("root://a.example//store/mc/r2.root"), dir);
+  makeEntry(dir, e2);
+  const UrlKey j2 = *kOn.key("root://b.example//store/mc/r2.root");
+  EXPECT_EQ(resolveEntry(j2, dir).hashHex, e2.hashHex);
+  ASSERT_TRUE(exists(aliasPath(dir, j2.urlHash)));
+  {
+    RealIO io;
+    Config cfg;
+    cfg.cacheDir = dir;
+    CacheStore store(io, cfg);
+    store.disableStatsDump();
+    store.dropEntry(e2);
+  }
+  EXPECT_FALSE(exists(aliasPath(dir, j2.urlHash)));
+  EXPECT_FALSE(exists(e2.metaPath(dir)));
+  // A dangling alias (a list past its bound, or a crash) is swept.
+  ::mkdir((entryNamesDir(dir) + "/" + std::string(64, 'c').substr(0, 2)).c_str(), 0755);
+  std::ofstream(aliasPath(dir, std::string(64, 'c'))) << "ucache-alias 1 " << std::string(64, 'd') << " x\n";
+  std::ofstream(namesPath(dir, std::string(64, 'd'))) << "url x\n";
+  size_t swept = 0;
+  for (int i = 0; i < 256 && exists(aliasPath(dir, std::string(64, 'c'))); ++i)
+    swept += sweepEntryNames(dir, 64);
+  EXPECT_FALSE(exists(aliasPath(dir, std::string(64, 'c'))));
+  EXPECT_FALSE(exists(namesPath(dir, std::string(64, 'd'))));
+  EXPECT_GE(swept, 1u);
+  resolveEntry(*kOn.key("root://a.example//store/mc/s.root"), dir);
+  ASSERT_TRUE(exists(entryNamesDir(dir)));
+  clearEntryNames(dir);
+  EXPECT_FALSE(exists(entryNamesDir(dir)));
+}
+
+// A URL whose copy is not the name's entry's size keeps an entry of its own; and the naming of the
+// cached entries does not join two entries of different sizes.
+TEST(EntryNames, ACopyOfAnotherSizeKeepsItsOwnEntry) {
+  TempDir td;
+  const std::string dir = td.path();
+  Writable w;
+  const UrlKey e = resolveEntry(*kOn.key("root://a.example//store/mc/t.root"), dir);
+  makeEntry(dir, e);
+  const UrlKey j = resolveEntry(*kOn.key("root://b.example//store/mc/t.root"), dir);
+  EXPECT_EQ(j.hashHex, e.hashHex);
+  EXPECT_TRUE(j.joined); // the caller compares the sizes before it trusts the entry
+  keepOwnEntry(j, dir);   // it found another size
+  const UrlKey own = UrlKey::ofEntry(j.urlKey, j.urlHash);
+  makeEntry(dir, own, false, 60000);
+  EXPECT_EQ(resolveEntry(*kOn.key("root://b.example//store/mc/t.root"), dir).hashHex, j.urlHash);
+  EXPECT_FALSE(resolveEntry(*kOn.key("root://a.example//store/mc/t.root"), dir).joined);
+  // The scan: two old entries of one name, of two sizes.
+  TempDir td2;
+  const std::string d2 = td2.path();
+  const UrlKey q1 = *kOff.key("root://a.example//store/mc/v.root");
+  const UrlKey q2 = *kOff.key("root://b.example//store/mc/v.root");
+  makeEntry(d2, q1, false, 50000);
+  makeEntry(d2, q2, false, 70000);
+  EXPECT_EQ(nameCachedEntries(d2, kOn), 1); // one named; the other kept on its own
+  const UrlKey r1 = resolveEntry(*kOn.key("root://a.example//store/mc/v.root"), d2);
+  const UrlKey r2 = resolveEntry(*kOn.key("root://b.example//store/mc/v.root"), d2);
+  EXPECT_NE(r1.hashHex, r2.hashHex);
+  EXPECT_TRUE((r1.hashHex == q1.hashHex && r2.hashHex == q2.hashHex) ||
+              (r1.hashHex == q2.hashHex && r2.hashHex == q1.hashHex) ||
+              (r1.hashHex == q1.hashHex || r2.hashHex == q2.hashHex));
 }

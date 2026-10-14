@@ -1,4 +1,6 @@
 #include "CacheStore.h"
+
+#include "EntryNames.h"
 #include "InUse.h"
 #include "SlotStore.h"
 
@@ -689,6 +691,7 @@ int CacheStore::evictNow() {
         io_.unlink(base + ".cost"); // CPU-span evidence
       if (s.artifacts & kArtSlots)
         io_.unlink(base + ".slots"); // the slot store goes with its entry
+      dropEntryNames(cfg_.cacheDir, s.hashHex); // and its names (EntryNames.h)
       const uint64_t reclaimed = s.cachedBytes + s.replicaBytes + s.earlierReplicaBytes;
       usage -= std::min(usage, reclaimed);
       avail += reclaimed; // reclaimed disk (approx; ignored when !haveSpace)
@@ -700,6 +703,7 @@ int CacheStore::evictNow() {
                 static_cast<unsigned long long>(usage));
   }
   sweepReplicaOrphans();
+  sweepEntryNames(cfg_.cacheDir, 256); // a bounded look for names left dangling (EntryNames.h)
   // In-use records of files nobody used within the window (at most hourly per
   // process: it lists a directory).
   static std::atomic<uint64_t> lastInUseSweepS{0};
@@ -975,6 +979,7 @@ CacheStore::CleanupReport CacheStore::cleanup(CleanupMode mode, uint64_t arg, bo
           io_.unlink(base + ".cost");
         if (s->artifacts & kArtSlots)
           io_.unlink(base + ".slots");
+        dropEntryNames(cfg_.cacheDir, s->hashHex); // its names go with it (EntryNames.h)
         stats_.evictedEntries.fetch_add(1, std::memory_order_relaxed);
         stats_.evictedBytes.fetch_add(s->cachedBytes + s->replicaBytes,
                                       std::memory_order_relaxed);

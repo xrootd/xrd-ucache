@@ -55,9 +55,15 @@ had `logical_name_prefixes` set has no such directory, and nothing below is read
 
 - `<namehash>` is the SHA-256 of a name (`lfn:/...` or a URL key). An alias says
   which entry the name is: it is made whole (written apart, then linked in) and never
-  changed; when two processes name one file at once, the first link wins and the
-  other reads it. It outlives its entry: the next fill through the name makes the
-  entry again under the same hash. A torn temporary file is debris.
+  changed while its entry exists; when two processes name one file at once, the
+  first link wins and the other reads it. An alias is followed only while the entry
+  it names exists: one whose entry is gone (dangling) is as none, is replaced when
+  the name is given again, and no entry is ever made under its hash. When an entry
+  goes (`ucache rm`, eviction, a drop for a bad copy, a write), the aliases its list
+  names go with it; `ucache clear` removes `names/`; each eviction pass looks at up to
+  256 files of `names/` for dangling ones. A torn temporary file is debris.
+- An alias may name the URL's own entry ("self"): its copy is not the name's entry's
+  size, so the URL is cached apart (`name_size_mismatches`, STATS.md).
 - A name's entry: an entry under its own hash first, else its alias; a URL with a
   logical name whose name has neither, and whose own entry exists (cached before the
   prefixes were set), makes that entry the name's (USER_GUIDE.md, "Keys by logical
@@ -67,7 +73,7 @@ had `logical_name_prefixes` set has no such directory, and nothing below is read
   plug-in's first process with them; `named-<hash>` is written at the end.
 - `.names` is appended one line at a time (a torn last line is skipped) and read as
   the logical name and the newest 8 distinct URLs; written again compacted when it
-  grows past twice that. `ucache rm` removes it; aliases stay.
+  grows past twice that. It goes with its entry.
 
 ## .meta layout (all integers little-endian; no implicit struct packing)
 

@@ -66,22 +66,36 @@ bool mkdirs(const std::string& path) {
   return true;
 }
 
+// A temporary name beside `path` that no other process or thread uses.
+std::string tmpName(const std::string& path) {
+  static std::atomic<uint64_t> seq{0};
+  return path + ".tmp." + std::to_string(::getpid()) + "." +
+         std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
+}
+
 // Makes the alias of `nameHash` to `t`, whole or not at all: a file written apart and linked in,
-// which fails when another process linked one first. True when this one is now the alias.
+// which fails when another process linked one first. An alias whose entry is gone (a dangling one:
+// left by a removal that ended before its aliases went) is replaced. True when this one is now the
+// alias.
 bool createAlias(const std::string& dir, const std::string& nameHash, const Target& t) {
   const std::string path = aliasPath(dir, nameHash);
   if (!mkdirs(path.substr(0, path.rfind('/'))))
     return false;
-  static std::atomic<uint64_t> seq{0};
-  const std::string tmp = path + ".tmp." + std::to_string(::getpid()) + "." +
-                          std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
+  const std::string tmp = tmpName(path);
   const std::string body = "ucache-alias 1 " + t.hash + " " + t.key + "\n";
   const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
   if (fd < 0)
     return false;
   const bool wrote = ::write(fd, body.data(), body.size()) == static_cast<ssize_t>(body.size());
   ::close(fd);
-  const bool linked = wrote && ::link(tmp.c_str(), path.c_str()) == 0;
+  bool linked = wrote && ::link(tmp.c_str(), path.c_str()) == 0;
+  if (wrote && !linked && errno == EEXIST) {
+    Target there;
+    if (!readAlias(dir, nameHash, there) || !entryExists(dir, there.hash)) {
+      ::unlink(path.c_str()); // dangling, or not an alias at all
+      linked = ::link(tmp.c_str(), path.c_str()) == 0;
+    }
+  }
   ::unlink(tmp.c_str());
   return linked;
 }
@@ -119,7 +133,7 @@ void addName(const std::string& dir, const std::string& entryHash, const std::st
     std::string body = now.lfn.empty() ? std::string() : "lfn " + now.lfn + "\n";
     for (const auto& u : now.urls)
       body += "url " + u + "\n";
-    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+    const std::string tmp = tmpName(path);
     {
       std::ofstream out(tmp, std::ios::trunc);
       out << body;
@@ -191,11 +205,16 @@ UrlKey resolve(const UrlKey& k, const std::string& dir, bool writable) noexcept 
     Memory m = memory();
     std::lock_guard<std::mutex> g(*m.mu);
     const auto it = m.done->find(memoKey);
-    if (it != m.done->end())
+    // A remembered entry under another name's hash holds only while it exists: once it is gone,
+    // the name is resolved again (a new entry is made only under the name's own hash).
+    if (it != m.done->end() && (it->second.hash == k.hashHex || entryExists(dir, it->second.hash)))
       return at(k, it->second);
+    if (it != m.done->end())
+      m.done->erase(it);
   }
   Target t;
   bool decided = false;
+  bool joined = false; // this URL is a name of another URL's entry from now on (its size unseen)
   if (!named) {
     // A key with no logical name: its own entry; else, in a cache that has names, its alias.
     // Not remembered: the alias is followed only while the entry it names exists (removed, the
@@ -206,14 +225,22 @@ UrlKey resolve(const UrlKey& k, const std::string& dir, bool writable) noexcept 
       return k;
     return at(k, t);
   } else {
+    Target via;
+    // A URL kept on its own entry (keepOwnEntry: its copy is not the name's size) stays its own
+    // while that entry exists.
+    if (readAlias(dir, k.urlHash, via) && via.hash == k.urlHash && entryExists(dir, k.urlHash))
+      return at(k, via);
     if (entryExists(dir, k.hashHex)) {
       t = {k.hashHex, k.key};
-    } else if (readAlias(dir, k.hashHex, t)) {
+    } else if (readAlias(dir, k.hashHex, via) && entryExists(dir, via.hash)) {
+      t = via; // a live alias only: a dangling one is as none (never an entry under its hash)
     } else if (entryExists(dir, k.urlHash)) {
       // The URL's entry, cached before the name was used, becomes the name's.
       t = {k.urlHash, k.urlKey};
-      if (writable && !createAlias(dir, k.hashHex, t))
-        readAlias(dir, k.hashHex, t); // another process named an entry first: that one
+      Target won;
+      if (writable && !createAlias(dir, k.hashHex, t) && readAlias(dir, k.hashHex, won) &&
+          entryExists(dir, won.hash))
+        t = won; // another process named an entry first: that one
     } else {
       t = {k.hashHex, k.key}; // a new entry, under the name
     }
@@ -221,8 +248,10 @@ UrlKey resolve(const UrlKey& k, const std::string& dir, bool writable) noexcept 
     if (writable) {
       if (t.hash != k.urlHash) {
         Target own;
-        if (!readAlias(dir, k.urlHash, own))
-          createAlias(dir, k.urlHash, t);
+        if (!readAlias(dir, k.urlHash, own) || own.hash != t.hash) {
+          if (createAlias(dir, k.urlHash, t))
+            joined = entryExists(dir, t.hash) && !entryExists(dir, k.urlHash);
+        }
       }
       addName(dir, t.hash, "lfn", k.key);
       addName(dir, t.hash, "url", k.urlKey);
@@ -235,7 +264,9 @@ UrlKey resolve(const UrlKey& k, const std::string& dir, bool writable) noexcept 
       m.done->clear();
     (*m.done)[memoKey] = t;
   }
-  return at(k, t);
+  UrlKey r = at(k, t);
+  r.joined = joined;
+  return r;
 } catch (...) {
   return k;
 }
@@ -264,7 +295,98 @@ EntryNameList entryNames(const std::string& cacheDir, const std::string& entryHa
 }
 
 void dropEntryNames(const std::string& cacheDir, const std::string& entryHash) {
-  ::unlink(namesPath(cacheDir, entryHash).c_str());
+  const std::string list = namesPath(cacheDir, entryHash);
+  std::ifstream in(list);
+  if (!in)
+    return; // no names (and, in a cache that never had them, no names/ at all)
+  std::string l;
+  while (std::getline(in, l)) {
+    if (l.size() < 5 || (l.compare(0, 4, "lfn ") != 0 && l.compare(0, 4, "url ") != 0))
+      continue;
+    const std::string nameHash = sha256Hex(l.substr(4));
+    Target t;
+    if (readAlias(cacheDir, nameHash, t) && t.hash == entryHash)
+      ::unlink(aliasPath(cacheDir, nameHash).c_str());
+  }
+  ::unlink(list.c_str());
+}
+
+void keepOwnEntry(const UrlKey& k, const std::string& cacheDir) {
+  if (k.urlHash.empty() || k.urlKey.empty())
+    return;
+  const std::string path = aliasPath(cacheDir, k.urlHash);
+  if (!mkdirs(path.substr(0, path.rfind('/'))))
+    return;
+  const std::string tmp = tmpName(path);
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    out << "ucache-alias 1 " << k.urlHash << " " << k.urlKey << "\n";
+    if (!out)
+      return;
+  }
+  ::rename(tmp.c_str(), path.c_str()); // over the alias to the name's entry
+  Memory m = memory();
+  std::lock_guard<std::mutex> g(*m.mu);
+  const std::string tail = "\n" + k.urlKey;
+  for (auto it = m.done->begin(); it != m.done->end();)
+    if (it->first.size() >= tail.size() &&
+        it->first.compare(it->first.size() - tail.size(), tail.size(), tail) == 0)
+      it = m.done->erase(it);
+    else
+      ++it;
+}
+
+void clearEntryNames(const std::string& cacheDir) {
+  const std::string nd = entryNamesDir(cacheDir);
+  std::vector<std::string> shards;
+  if (RealIO::instance().listDir(nd, shards) < 0)
+    return;
+  for (const auto& sh : shards) {
+    const std::string d = nd + "/" + sh;
+    std::vector<std::string> files;
+    if (RealIO::instance().listDir(d, files) >= 0) {
+      for (const auto& f : files)
+        ::unlink((d + "/" + f).c_str());
+      ::rmdir(d.c_str());
+    } else {
+      ::unlink(d.c_str()); // a marker or the lock file
+    }
+  }
+  ::rmdir(nd.c_str());
+  Memory m = memory();
+  std::lock_guard<std::mutex> g(*m.mu);
+  m.done->clear();
+}
+
+size_t sweepEntryNames(const std::string& cacheDir, size_t budget) noexcept try {
+  const std::string nd = entryNamesDir(cacheDir);
+  if (!exists(nd))
+    return 0;
+  static std::atomic<unsigned> next{0};
+  size_t seen = 0, removed = 0;
+  for (unsigned n = 0; n < 256 && seen < budget; ++n) {
+    char sh[3];
+    std::snprintf(sh, sizeof sh, "%02x", (next.fetch_add(1, std::memory_order_relaxed)) & 0xff);
+    const std::string d = nd + "/" + sh;
+    std::vector<std::string> files;
+    if (RealIO::instance().listDir(d, files) < 0)
+      continue;
+    for (const auto& f : files) {
+      if (++seen > budget)
+        break;
+      if (f.size() == 67 && f.compare(64, 3, ".to") == 0) {
+        Target t;
+        if (!readAlias(cacheDir, f.substr(0, 64), t) || !entryExists(cacheDir, t.hash))
+          removed += ::unlink((d + "/" + f).c_str()) == 0;
+      } else if (f.size() == 70 && f.compare(64, 6, ".names") == 0) {
+        if (!entryExists(cacheDir, f.substr(0, 64)))
+          removed += ::unlink((d + "/" + f).c_str()) == 0;
+      }
+    }
+  }
+  return removed;
+} catch (...) {
+  return 0;
 }
 
 } // namespace ucache
@@ -287,7 +409,7 @@ long nameCachedEntries(const std::string& dir, const KeyRules& rules) noexcept t
   }
   struct Cached {
     std::string key, hash;
-    uint64_t atime;
+    uint64_t atime, size;
   };
   std::vector<Cached> all;
   IOBackend& io = RealIO::instance();
@@ -303,7 +425,7 @@ long nameCachedEntries(const std::string& dir, const KeyRules& rules) noexcept t
           continue;
         const auto m = MetaFile::loadSummary(io, objRoot + "/" + sh + "/" + f);
         if (m && m->key.compare(0, 4, "lfn:") != 0)
-          all.push_back({m->key, f.substr(0, 64), m->atime});
+          all.push_back({m->key, f.substr(0, 64), m->atime, m->fileSize});
       }
     }
   std::sort(all.begin(), all.end(), [](const Cached& a, const Cached& b) { return a.atime > b.atime; });
@@ -318,6 +440,16 @@ long nameCachedEntries(const std::string& dir, const KeyRules& rules) noexcept t
     k.hashHex = sha256Hex(name);
     k.urlKey = c.key;
     k.urlHash = c.hash;
+    // A name already given to an entry of another size: this one is another copy, and keeps its URL
+    // as its own (no alias), as an open would find (resolveEntry's caller compares the sizes).
+    Target first;
+    if (readAlias(dir, k.hashHex, first) && first.hash != c.hash && entryExists(dir, first.hash)) {
+      const auto a = MetaFile::loadSummary(io, dir + "/objects/" + shard(first.hash) + "/" + first.hash + ".meta");
+      if (!a || a->fileSize != c.size) {
+        keepOwnEntry(k, dir);
+        continue;
+      }
+    }
     resolve(k, dir, /*writable=*/true);
     ++named;
   }

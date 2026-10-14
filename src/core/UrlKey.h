@@ -33,6 +33,9 @@ struct UrlKey {
   // For a key by logical name made from a URL: that URL's own key, as it is with
   // logical names off, and its hash (KeyRules::key). Empty otherwise.
   std::string urlKey, urlHash;
+  // Set by resolveEntry (EntryNames.h): this URL has just become a name of an entry another URL
+  // filled, so the caller is to compare the sizes before it trusts that entry for it.
+  bool joined = false;
 
   bool logical() const { return scheme == "lfn"; }
 

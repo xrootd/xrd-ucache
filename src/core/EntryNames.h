@@ -20,8 +20,8 @@
 //                                           a torn last line is skipped
 //
 // <namehash> is the SHA-256 of the name's key (lfn:/... or a URL key), <hh> its first two hex
-// digits. An alias outlives its entry's eviction: the next fill through any of its names makes
-// the entry again under the same hash. `ucache rm` removes the entry's names file.
+// digits. When an entry goes, the aliases its names file lists go with it (dropEntryNames); one
+// left behind (dangling) is as none: never followed, and replaced when the name is given again.
 //
 // Resolution of a key made from a URL with a logical name (K = lfn:<name>, P = the URL's key):
 //   1. an entry under K's hash: that one;
@@ -30,7 +30,8 @@
 //      alias of K is made to it), so the cache stays warm;
 //   4. none: a new entry, under K's hash.
 // In each case (the plug-in only) an alias of P is made to the entry when P is not that entry, and
-// both names are added to its names file. Two entries of one name cached before (two URLs of one
+// both names are added to its names file. An alias is followed only while the entry it names
+// exists; a new entry is made only under the name's own hash, never under another name's. Two entries of one name cached before (two URLs of one
 // file): the first one named becomes the name's entry (nameCachedEntries names the most recently
 // used first); the other URL is then an alias of it (that
 // URL's own entry is not read while the prefixes are set and ages out; with them off it is that
@@ -67,8 +68,22 @@ struct EntryNameList {
 };
 // The names recorded for the entry `entryHash`; empty when none are.
 EntryNameList entryNames(const std::string& cacheDir, const std::string& entryHash);
-// Removes the names file of the entry `entryHash` (its aliases stay: they are names, not data).
+// The entry `entryHash` is gone (removed, evicted, dropped): the aliases its list names that point
+// to it, and the list. An alias left (a list past its bound, a removal that ended between) is
+// dangling, and a dangling alias is as none: never followed, replaced when the name is given again,
+// swept (sweepEntryNames).
 void dropEntryNames(const std::string& cacheDir, const std::string& entryHash);
+// The URL of `k` (resolved: its entry is another URL's, reached by the logical name) met that
+// entry with a copy of another size: from now on the URL is its own entry (a self alias, which
+// resolveEntry takes before the logical name while that entry exists). Removes the URL from the
+// process's memory of resolutions.
+void keepOwnEntry(const UrlKey& k, const std::string& cacheDir);
+// `ucache clear`: every name of the cache goes with its entries.
+void clearEntryNames(const std::string& cacheDir);
+// Removes dangling aliases and lists of entries that are gone, looking at most `budget` files of
+// <cacheDir>/names (the next shards from where the last call of this process stopped). Returns the
+// files removed.
+size_t sweepEntryNames(const std::string& cacheDir, size_t budget) noexcept;
 
 // Names the entries already cached: every entry stored under a URL key whose path has a logical
 // name under `rules` gets that name (resolveEntry's case 3, as if a job opened it now, whatever
