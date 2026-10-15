@@ -1656,6 +1656,20 @@ TEST(RootCheck, LabelSpans) {
   EXPECT_TRUE(sp[1].kept);
   EXPECT_EQ(sp[2].off, 60000u);
   EXPECT_EQ(sp[3].off, 61000u);
+  // A label that starts inside a widened span and ends past it, or overlaps one before it: one
+  // span with it, never two elements of the read that overlap.
+  RootHeaderVerdict o = v;
+  o.labels = {{50000, 34, true, "class descriptions"}, {53200, 2000, false, "TH1F h"},
+              {56000, 100, false, "TH1F g"}, {56050, 100, false, "TH1F k"}};
+  sp = rootLabelSpans(o, {}, true, 4096, 1u << 20);
+  for (size_t i = 1; i < sp.size(); ++i)
+    EXPECT_GE(sp[i].off, sp[i - 1].off + sp[i - 1].len) << "elements " << i - 1 << " and " << i << " overlap";
+  ASSERT_EQ(sp.size(), 2u);
+  EXPECT_EQ(sp[0].off, 49152u);
+  EXPECT_EQ(sp[0].len, 55200u - 49152u);
+  EXPECT_TRUE(sp[0].kept);
+  EXPECT_EQ(sp[1].off, 56000u);
+  EXPECT_EQ(sp[1].len, 150u);
   // No room left to keep: as they are.
   sp = rootLabelSpans(v, {}, true, 4096, 100);
   ASSERT_EQ(sp.size(), 5u);

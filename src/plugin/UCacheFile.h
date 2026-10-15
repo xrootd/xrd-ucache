@@ -385,6 +385,9 @@ struct HandleState {
   // the origin instead, where the sizes are compared.
   std::string trustedHash;
   uint32_t trustedGen = 0;
+  // Under mu: the URL's key as Open resolved it (names followed: EntryNames.h), or as the set-up
+  // did; none before. For work on a client callback thread, which may not resolve names (I/O).
+  std::optional<UrlKey> resolvedKey;
   std::atomic<bool> sizeRefused{false}; // set: no origin read of this handle reaches that source
   bool ensureInnerOpen(); // lazy origin open on first miss; the caller waits for it
   // The status a cache miss should fail with when the inner file is

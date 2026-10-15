@@ -4236,7 +4236,10 @@ void federationNote(const Config& cfg) {
               "         %s,\n"
               "         except where a client.conf sets one; a file opened through a redirector also has\n"
               "         the client's own read recovery turned off and a time limit of 5 minutes for each read\n"
-              "         (a read that fails is made again at another site)\n",
+              "         (a read that fails is made again at another site); an open of a ROOT file checks\n"
+              "         its header, list and labels (a few small reads at a cold open), each server is asked\n"
+              "         once for its site's name, and servers and copies that failed are remembered in\n"
+              "         <dir>/sources (`ucache sources`)\n",
               predicted.c_str());
   if (!cfg.cacheDir.empty())
     if (const std::string rs = lastRunSettings(cfg.cacheDir + "/stats"); !rs.empty())

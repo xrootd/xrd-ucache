@@ -829,8 +829,11 @@ std::vector<ByteSpan> rootLabelSpans(const RootHeaderVerdict& v, const std::vect
       ByteSpan& p = out.back();
       if (sp.off >= p.off && sp.off + sp.len <= p.off + p.len)
         continue; // held whole in the one before
-      if (p.kept && sp.kept && sp.off <= p.off + p.len) {
+      // Overlapping (any two), or touching (two kept): made one, kept when either is, so that the
+      // origin never sees two elements of one read that overlap.
+      if (sp.off < p.off + p.len || (p.kept && sp.kept && sp.off == p.off + p.len)) {
         p.len = sp.off + sp.len - p.off;
+        p.kept = p.kept || sp.kept;
         continue;
       }
     }

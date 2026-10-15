@@ -1402,7 +1402,10 @@ void FileEntry::removeDroppedFiles() {
   // Under the entry lock, so that another process's commit either lands before the sidecar goes,
   // or finds the data file unlinked and stores nothing (commitSnapshot).
   io_.flock(dataFd_, LOCK_EX);
-  removeFiles(io_, key_, cfg_.cacheDir);
+  // Again under the lock: the wait for it may have let another process remove these files and an
+  // opener make a new entry at the path, whose files are not this entry's to remove.
+  if (io_.stat(dataPath_, &there) == 0 && mine.st_dev == there.st_dev && mine.st_ino == there.st_ino)
+    removeFiles(io_, key_, cfg_.cacheDir);
   io_.flock(dataFd_, LOCK_UN);
 }
 

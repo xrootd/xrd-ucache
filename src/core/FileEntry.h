@@ -99,6 +99,9 @@ class FileEntry {
   FileEntry& operator=(const FileEntry&) = delete;
 
   uint64_t fileSize() const { return meta_.fileSize; }
+  // The modification time of the copy the entry was started from (0 when none was given); fixed
+  // for the entry's life, as its size is.
+  uint64_t originMtime() const { return meta_.originMtime; }
   uint32_t pageSize() const { return meta_.pageSize; }
   const UrlKey& key() const { return key_; }
 

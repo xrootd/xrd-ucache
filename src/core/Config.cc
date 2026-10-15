@@ -509,6 +509,9 @@ std::string Config::setNote(const std::string& key, const std::string& value) co
            "client.conf sets it; every read open of a cached file gets a 60 s deadline; "
            "a file opened through a redirector has the client's own read recovery turned off and a "
            "time limit of 5 minutes for each read, and a read that fails is made again at another site; "
+           "an open of a ROOT file checks its header, list and labels (a few small reads at a cold "
+           "open), and each server is asked once for its site's name; servers and copies that "
+           "failed are remembered in <dir>/sources (`ucache sources` lists them); "
            "check_origin_integrity is forced on";
   if (key == "logical_name_prefixes")
     return normalizedPrefixes(value) != "off" && logicalNamePrefixesValid(value)

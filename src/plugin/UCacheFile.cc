@@ -1470,17 +1470,22 @@ void noteSizeDisagreement(HandleState& st, const std::string& server, uint64_t s
 // of its servers, as noteSizeDisagreement does.
 void noteBadCopy(HandleState& st, const std::string& server, const std::string& why) try {
   std::shared_ptr<FileEntry> e;
+  std::optional<UrlKey> key;
   {
     std::lock_guard<std::mutex> g(st.mu);
     e = st.entry;
+    key = st.resolvedKey;
   }
   noteOriginFailure(st, e ? &e->obs().servers : nullptr, "open", 0, 0,
                     XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, why), server);
   // The copy was refused for what it is: an entry of the file this process holds (this handle's,
-  // or another's: an open sets its own up only later) that took bytes from it is dropped.
-  if (!e && st.store)
-    if (const auto key = globalConfig().entryKey(st.url))
-      e = st.store->liveEntry(*key);
+  // or another's: an open sets its own up only later) that took bytes from it is dropped. On a
+  // client callback thread: the key Open resolved, else the URL's own derivation (no I/O; an
+  // entry reached only through a name is then left to the first read that finds the copy bad).
+  if (!key)
+    key = globalConfig().keys.key(st.url);
+  if (!e && st.store && key)
+    e = st.store->liveEntry(*key);
   dropEntryOfBadCopy(st, e, server);
 } catch (...) {
 }
@@ -6384,6 +6389,10 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // every open) never enters here.
   if (!passthroughOnly_ && cfg.revalidateSeconds > 0) {
     auto key = cfg.entryKey(url);
+    {
+      std::lock_guard<std::mutex> g(st_->mu);
+      st_->resolvedKey = key;
+    }
     // A URL that is a name of an entry another copy filled, its copy's size not compared with that
     // entry's yet (in any process: the alias says so), is opened at its origin, so that the sizes
     // are compared (ensureEntry) before the entry is trusted for it.
@@ -6939,7 +6948,9 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
 #ifdef UCACHE_HAVE_COLDRUN
       if (entry && cfg.transpose && !keepOriginal) {
         st_->armForSetup(copy); // the layout's reads of the records may move (adaptive_federation)
-        chooseLayout(st_, entry, *key, cfg, si->GetModTime(), MetaData::kCksumNone, 0, cold,
+        // The entry's own modification time, not this URL's copy's: an entry by logical name is
+        // one file through every URL, and its store is judged against the entry it was made of.
+        chooseLayout(st_, entry, *key, cfg, entry->originMtime(), MetaData::kCksumNone, 0, cold,
                      forkLayout != ForkLayout::kNone);
       }
       if (entry && cold)
@@ -7017,6 +7028,8 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
         st_->trustedHash = key->hashHex;
         st_->trustedGen = key->entryGen;
       }
+      if (key)
+        st_->resolvedKey = key;
 #ifdef UCACHE_HAVE_COLDRUN
       // A slot run keeps its own rule (ColdRun).
       if (entry && !cold)
