@@ -104,7 +104,7 @@ SIZE      CACHED    COV%   LAST   RECOMP    PIN   KEY
   (`logical_name_prefixes` set and a path that holds one of them), `lfn:` and that
   name (`lfn:/store/mc/...`): one entry for every URL of the file (USER_GUIDE.md,
   "Keys by logical name"). `ls -l` lists under it the URLs the entry was reached
-  through (the newest 8 that still lead to it), and, when the entry was cached by a
+  through (of the newest 8 it recorded, those that still lead to it), and, when the entry was cached by a
   URL before it had the name, the key it is stored under. Every command takes any of those names.
 
 By default `ls` is sorted largest-first. To hunt for stale data, sort by age:

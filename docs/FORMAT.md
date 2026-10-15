@@ -184,8 +184,10 @@ treat the entry as absent), and a sidecar written before the bit reads as not co
   the entry is not resurrected. Every writer of a sidecar does the same (a pin,
   the generation given by a name, which also checks again after its write). A
   sidecar left without its `.data` all the same (a crash between a removal's two
-  unlinks) is no entry: no name leads to it, and the eviction pass removes it,
-  with its names, once it is an hour old.
+  unlinks) is followed by no alias (an alias needs the data). The next open of
+  its own key may take it over a new, empty `.data`; every page then misses its
+  checksum and is fetched again. The eviction pass removes it, with its names,
+  once it is an hour old.
 - A commit that finds a sidecar of another generation on disk (another process
   started the entry afresh) stores its own view whole, with generation 0.
 

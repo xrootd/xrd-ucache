@@ -1101,8 +1101,8 @@ printable, with no empty, `.` or `..` part; `ucache set` refuses a list that is
 not, and one in the conf or the state file keys every file by its URL, said once in
 each job's log, and fails `ucache doctor`. Parameters
 kept by `keep_cgi` follow the name as they follow a URL's path. `ucache ls` prints
-an entry by its logical name, `ucache ls -l` lists its URLs under it (the newest 8
-that still lead to it; every URL that reached it stays a name of it), and every
+an entry by its logical name, `ucache ls -l` lists its URLs under it (of the newest 8
+it recorded, those that still lead to it; every URL that reached it stays a name of it), and every
 command takes any of its names (`ucache pin lfn:/store/mc/...`, or a URL).
 
 - **The assumption.** A path that holds a prefix names the same unchanging bytes
