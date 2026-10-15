@@ -119,6 +119,21 @@ bool commitFaultFire() {
   return budget.fetch_sub(1, std::memory_order_relaxed) > 0;
 }
 
+// UCACHE_TEST_COMMIT_HOLD_MS=N (inert unless set): the process's first slot-store commit that wrote
+// records waits N ms after its write before it notes them as in the store, so a gate can drop the
+// file's entry (a copy found bad) while a commit is under way.
+void commitHoldOnce() {
+  static const long holdMs = [] {
+    const char* v = std::getenv("UCACHE_TEST_COMMIT_HOLD_MS");
+    return v ? std::strtol(v, nullptr, 10) : 0L;
+  }();
+  static std::atomic<bool> done{false};
+  if (holdMs <= 0 || done.exchange(true))
+    return;
+  UCACHE_INFO("test hook: a slot-store commit held %ld ms after its write", holdMs);
+  std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
+}
+
 
 // The store's kind for a converted basket, and back.
 uint8_t entryKind(uint8_t basketKind) {
@@ -1671,15 +1686,13 @@ void serveOriginalPieces(const std::shared_ptr<ColdRequest>& req,
     if (req->cf->direct())
       runs = withoutData(runs, *req->cf->rule, req->entry->pageSize());
     if (!runs.empty()) {
-      st->beginPersist();
       auto entry = req->entry;
       const uint64_t rs = o.it.rs;
       auto buf = o.buf;
-      Executor::instance().post([st, entry, buf, rs, runs] {
+      HandleState::postPersist(st, [entry, buf, rs, runs] {
         for (const auto& [a, b] : runs)
           entry->writePages(a, b - a, buf->data() + (a - rs));
         entry->flushMeta(false);
-        st->endPersist();
       });
     }
   }
@@ -2988,14 +3001,22 @@ void ColdFill::commit() try {
     dropRecords(recs, std::strerror(static_cast<int>(-n)));
     return;
   }
+  if (n > 0)
+    commitHoldOnce();
   std::vector<std::pair<uint64_t, uint64_t>> punch;
-  std::vector<SlotEntry> forgotten;
+  std::vector<SlotEntry> reApply;
   {
     std::lock_guard<std::mutex> g(mu);
+    // The entry was dropped for a bad copy while this commit wrote (forgetAllRecords): what it
+    // wrote may have come from that copy, and a slot may be staged again from another copy
+    // meanwhile. Nothing it wrote is noted or served, and nothing is released from the byte
+    // cache for it; the store goes with the entry.
+    if (forgotten)
+      committed.clear();
     for (const auto& e : committed) {
       auto it = info.find(e.slot);
       if (it == info.end()) { // forgotten meanwhile: its new entry makes it ready
-        forgotten.push_back(e);
+        reApply.push_back(e);
         continue;
       }
       Info& s = it->second;
@@ -3019,8 +3040,8 @@ void ColdFill::commit() try {
       }
     }
   }
-  if (!forgotten.empty())
-    apply(forgotten, /*foreign=*/false);
+  if (!reApply.empty())
+    apply(reApply, /*foreign=*/false);
   // Converted baskets that touch are released as one range, so a page they
   // share goes too -- and so does a page one of them shares with a basket
   // committed earlier. The file's first 128 KiB never does.

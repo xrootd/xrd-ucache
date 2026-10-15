@@ -2837,16 +2837,9 @@ class RetryingOpenHandler : public ResponseHandler {
         return; // no entry to store them in: they go now
       entry = st_->entry;
     }
-    std::shared_ptr<HandleState> st = st_;
-    st->beginPersist();
-    try {
-      Executor::instance().post([st, entry, ob] {
-        storeOpenBytesIn(*st, entry, *ob);
-        st->endPersist();
-      });
-    } catch (...) {
-      st->endPersist();
-    }
+    // Made by the executor's task (which holds the handle) or by a drain of this handle's.
+    HandleState::postPersist(st_,
+                             [stp = st_.get(), entry, ob] { storeOpenBytesIn(*stp, entry, *ob); });
   } catch (...) {
   }
 
@@ -5080,6 +5073,7 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   copyGuard.afterForkChild();
   innerOps = 0;        // requests XrdCl dropped in this child
   pendingPersists = 0; // tasks queued on the parent's pool, which never run here
+  new (&persistJobs) std::deque<std::shared_ptr<PersistJob>>; // the parent's writes: left behind
   moveInFlight = false; // a move is the parent's: its reads wait there, and are left behind
   headerReading = false; // so is the header read of an open: its end never comes here
   readerOpenPending = false; // and the open itself: its answer never comes here
@@ -5255,9 +5249,37 @@ void HandleState::noteCacheOk() {
   errors = 0;
 }
 
-void HandleState::beginPersist() {
-  std::lock_guard<std::mutex> g(persistMu);
-  ++pendingPersists;
+void HandleState::postPersist(const std::shared_ptr<HandleState>& st,
+                              std::function<void()> write) {
+  auto job = std::make_shared<PersistJob>();
+  job->write = std::move(write);
+  {
+    std::lock_guard<std::mutex> g(st->persistMu);
+    ++st->pendingPersists;
+    while (!st->persistJobs.empty() && st->persistJobs.front()->taken.load())
+      st->persistJobs.pop_front(); // made already
+    st->persistJobs.push_back(job);
+  }
+  try {
+    Executor::instance().post([st, job] {
+      if (!job->taken.exchange(true, std::memory_order_acq_rel))
+        st->runPersist(*job);
+    });
+  } catch (...) { // not posted: a drain makes it, or it is dropped here
+    if (!job->taken.exchange(true, std::memory_order_acq_rel)) {
+      job->write = nullptr;
+      st->endPersist();
+    }
+  }
+}
+
+void HandleState::runPersist(PersistJob& job) {
+  try {
+    job.write();
+  } catch (...) {
+  }
+  job.write = nullptr; // its buffers go now
+  endPersist();         // wakes a draining Close/dtor when the last one lands
 }
 
 void HandleState::endPersist() {
@@ -5267,6 +5289,23 @@ void HandleState::endPersist() {
 }
 
 void HandleState::drainPersists() {
+  // Every write not yet started is made here, in the order posted; then the wait is only for
+  // those an executor thread is making.
+  for (;;) {
+    std::shared_ptr<PersistJob> job;
+    {
+      std::lock_guard<std::mutex> g(persistMu);
+      while (!persistJobs.empty() && !job) {
+        auto j = std::move(persistJobs.front());
+        persistJobs.pop_front();
+        if (!j->taken.exchange(true, std::memory_order_acq_rel))
+          job = std::move(j);
+      }
+    }
+    if (!job)
+      break;
+    runPersist(*job);
+  }
   std::unique_lock<std::mutex> lk(persistMu);
   persistCv.wait(lk, [this] { return pendingPersists == 0; });
 }
@@ -5280,16 +5319,14 @@ namespace {
 // to fall through uncached; lazy sync setup on the caller thread closes that
 // race by construction.)
 
-void persistPagesReserved(const std::shared_ptr<HandleState>& st,
-                          const std::shared_ptr<FileEntry>& entry, uint64_t off,
-                          std::shared_ptr<std::vector<char>> buf, uint64_t len,
-                          uint64_t gateLen = 0) {
-  Executor::instance().post([st, entry, off, buf, len, gateLen] {
+void persistPages(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEntry>& entry,
+                  uint64_t off, std::shared_ptr<std::vector<char>> buf, uint64_t len,
+                  uint64_t gateLen = 0) {
+  HandleState::postPersist(st, [entry, off, buf = std::move(buf), len, gateLen] {
     entry->writePages(off, len, buf->data());
     entry->flushMeta(false);
-    if (gateLen) // waiters re-dispatch only AFTER the pages are staged
+    if (gateLen) // waiters re-dispatch only AFTER the pages are staged (endFetch only posts them)
       entry->endFetch(off, gateLen);
-    st->endPersist(); // wakes a draining Close/dtor when the last one lands
   });
 }
 
@@ -5530,15 +5567,14 @@ class MissReadHandler : public ResponseHandler {
     st_->noteCacheOk();
     // The persist is counted and posted BEFORE the user is completed, so a Close on the
     // just-woken app thread cannot race past a not-yet-counted persist, and a Close or a destructor
-    // that waits for the persists (drainPersists) waits only for the executor's write, never for
-    // this completion (which a reader may hold up: Python's needs the lock the destroying thread
-    // holds). Ownership of the wire buffer MOVES to the task: single owner, no cross-thread
+    // that waits for the persists (drainPersists) never waits for this completion (which a reader
+    // may hold up: Python's needs the lock the destroying thread holds), nor for another one queued
+    // before the write on the executor (the drain makes a write not yet started itself).
+    // Ownership of the wire buffer MOVES to the write: single owner, no cross-thread
     // refcount teardown (keeps TSan exact and the lifetime obvious); the user's bytes were copied
     // out of it above. Nothing of it is kept when its edge failed the check (parked readers then
     // fetch for themselves).
-    st_->beginPersist();
-    persistPagesReserved(st_, entry_, wireOff_, std::move(wireBuf_), keepNone ? 0 : got,
-                         gateLen_);
+    persistPages(st_, entry_, wireOff_, std::move(wireBuf_), keepNone ? 0 : got, gateLen_);
     complete(user_, okStatus(), chunkResponse(userOff_, userLen_, userBuf_));
     delete this;
   }
@@ -5929,10 +5965,8 @@ class MissVReadHandler : public ResponseHandler {
     }
     // Persist each wire element's full pages asynchronously, posted before the user is completed
     // (see MissReadHandler); buffer ownership moves to each task (single owner).
-    for (size_t i = 0; i < wire_.size(); ++i)
-      st_->beginPersist();
     for (auto& w : wire_)
-      persistPagesReserved(st_, entry_, w.off, std::move(w.buf), w.len);
+      persistPages(st_, entry_, w.off, std::move(w.buf), w.len);
     complete(user_, okStatus(), vreadResponse(userChunks_));
     delete this;
   }
@@ -5972,15 +6006,11 @@ class MissVReadHandler : public ResponseHandler {
           keep.push_back({p, pe, w.buf, w.off});
       }
     }
-    for (size_t i = 0; i < keep.size(); ++i)
-      st_->beginPersist();
     for (auto& r : keep) { // posted before the user is completed (see MissReadHandler)
-      auto st = st_;
       auto entry = entry_;
-      Executor::instance().post([st, entry, r] {
+      HandleState::postPersist(st_, [entry, r] {
         entry->writePages(r.a, r.b - r.a, r.buf->data() + (r.a - r.base));
         entry->flushMeta(false);
-        st->endPersist();
       });
     }
     complete(user_, okStatus(), vreadResponse(userChunks_));

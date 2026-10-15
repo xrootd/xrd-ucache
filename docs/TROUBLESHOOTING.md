@@ -674,7 +674,10 @@ entry:
   nothing it converted from it, and once the entry is dropped every record the process holds of
   the file is forgotten and fetched again. A read answered before the copy was found bad (a
   request of its own, all of whose bytes passed their checks or carry none) got that copy's
-  bytes, as it would without uCache; so does a request already under way at that moment.
+  bytes; so does a request already under way at that moment. For a handle opened at that copy
+  this is what a read without uCache gets. Another handle of the same process, opened at a good
+  copy, can also be served that copy's bytes from the cache until the entry is dropped, which
+  without uCache it would not be.
 
 `bad_entries_dropped` (STATS.md) counts both. Only the process that found the copy bad
 knows it: another job that has the file open at that moment goes on reading what its view

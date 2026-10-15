@@ -45,6 +45,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -413,12 +414,26 @@ struct HandleState {
 
   // Async page-persist accounting. Persists are posted off the read path
   // (§5.2 step 4), but Close/destruction must wait for them so short-lived
-  // processes still leave a fully populated cache. begin/end bracket each
-  // posted task; drainPersists blocks (Close/dtor only, never a read).
+  // processes still leave a fully populated cache. postPersist counts a write
+  // and posts it; drainPersists blocks (Close/dtor only, never a read).
+  //
+  // A write waits on the executor behind whatever runs there, and a hit's
+  // completion runs there too and may wait for a lock the draining thread holds
+  // (Python's interpreter lock, held by a thread that frees a File). So the
+  // drain never waits for a write that has not started: it takes each such
+  // write of this handle's and makes it itself, then waits only for those an
+  // executor thread is making, which wait for nothing a reader holds.
+  struct PersistJob {
+    std::atomic<bool> taken{false}; // by the executor's task or by a drain: made once
+    std::function<void()> write;    // the pages' write; owns no reference to this handle
+  };
   std::mutex persistMu;
   std::condition_variable persistCv;
   int pendingPersists = 0;
-  void beginPersist();
+  std::deque<std::shared_ptr<PersistJob>> persistJobs; // posted, oldest first; under persistMu
+  // Counts `write` and posts it to the executor, before the caller completes its reader.
+  static void postPersist(const std::shared_ptr<HandleState>& st, std::function<void()> write);
+  void runPersist(PersistJob& job);
   void endPersist();
   void drainPersists();
 
