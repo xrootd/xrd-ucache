@@ -1101,9 +1101,9 @@ printable, with no empty, `.` or `..` part; `ucache set` refuses a list that is
 not, and one in the conf or the state file keys every file by its URL, said once in
 each job's log, and fails `ucache doctor`. Parameters
 kept by `keep_cgi` follow the name as they follow a URL's path. `ucache ls` prints
-an entry by its logical name, `ucache ls -l` lists its URLs under it (the newest 8;
-every URL that reached it stays a name of it), and every command takes any of its
-names (`ucache pin lfn:/store/mc/...`, or a URL).
+an entry by its logical name, `ucache ls -l` lists its URLs under it (the newest 8
+that still lead to it; every URL that reached it stays a name of it), and every
+command takes any of its names (`ucache pin lfn:/store/mc/...`, or a URL).
 
 - **The assumption.** A path that holds a prefix names the same unchanging bytes
   on every server. CMS's official data is written once under a name that is never
@@ -1151,7 +1151,10 @@ names (`ucache pin lfn:/store/mc/...`, or a URL).
   never mixed.
 - **Turning it off keeps every entry reachable.** With the prefixes off again, each
   entry is still found through each URL that reached it, while it exists (and is
-  not started afresh); only the logical name is no longer used.
+  not started afresh); only the logical name is no longer used. With `validate =
+  size+mtime` the modification time counts again once the prefixes are off: a URL
+  whose site's copy has another modification time than the one the entry was cached
+  from is not served the entry, and is cached apart under its own key from then on.
 - **One setting for the cache.** Set the prefixes for the cache with `ucache set`
   (its state file, which every job of the cache reads); never from a job's
   environment. A value set in one job's conf only makes that job key files by name
@@ -1159,6 +1162,11 @@ names (`ucache pin lfn:/store/mc/...`, or a URL).
   other job caches first is cached twice. `ucache doctor` says so when the value
   comes from the conf. Readers that hand positions in a file to workers in other
   processes (uproot.dask) rely on one setting.
+- **A cache shared with an older release.** A release without logical names reads
+  and writes a cache that has them, safely, but an entry whose index it rewrites (a
+  job of it reading the file, or its `ucache pin`) loses its names: the file's other
+  URLs no longer reach that entry and may cache the file again, and `ucache ls -l`
+  stops listing them under it. Nothing wrong is served.
 - **Removing, pinning, verifying.** `ucache rm`, `pin`, `unpin`, `verify`,
   `branches` and `untranspose` act on the file's entry whichever of its names they
   are given; `rm <url>` also removes that URL's own old entry if one is left beside

@@ -251,6 +251,13 @@ TEST(Config, SetNotes) {
   Config rec = Config::fromEnv(&conf);
   EXPECT_EQ(rec.setNote("check_origin_integrity", "false"), "")
       << "recompress = on does not force the check: turning it off needs no note";
+
+  // Turning logical names on keeps the cache warm: the note says so, never that files are
+  // fetched again.
+  const std::string names = plain.setNote("logical_name_prefixes", "/store/mc/");
+  EXPECT_NE(names.find("nothing is fetched again"), std::string::npos) << names;
+  EXPECT_EQ(names.find("age out"), std::string::npos) << names;
+  EXPECT_EQ(plain.setNote("logical_name_prefixes", "off"), "  files are keyed by their URL");
 }
 
 // mixed_maps: on by default. in_use_seconds: 1 day, seconds >= 0 only (0 = no

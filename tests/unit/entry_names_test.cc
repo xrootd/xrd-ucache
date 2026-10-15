@@ -15,6 +15,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
+#include <atomic>
+#include <random>
+#include <thread>
+#include <ctime>
 
 using namespace ucache;
 using test::TempDir;
@@ -673,4 +677,184 @@ TEST(EntryNames, TheSweepRemovesOldTemporaryFiles) {
     sweepEntryNames(dir, 64);
   EXPECT_FALSE(exists(old));
   EXPECT_TRUE(exists(young));
+}
+
+// ---- A sidecar without its data, and the generation through every write of a sidecar. ----
+
+// A removal (eviction, rm) takes no lock: it unlinks the data file, then the sidecar. Naming the
+// entry meanwhile (its generation written into the sidecar) never puts the sidecar back once the
+// removal took it, and no name of the file leads to what is left.
+TEST(EntryNames, ANamingNeverPutsBackTheSidecarOfARemovedEntry) {
+  TempDir td;
+  const std::string dir = td.path();
+  Writable w;
+  int orphans = 0, nameToOrphan = 0;
+  std::mt19937 rng(1);
+  for (int i = 0; i < 4000; ++i) {
+    const std::string tail = "//store/mc/race/f" + std::to_string(i) + ".root";
+    const UrlKey q = *kOff.key("root://q.example" + tail);
+    makeEntry(dir, q);
+    std::atomic<bool> go{false};
+    const int spin = static_cast<int>(rng() % 400);
+    std::thread rm([&] {
+      while (!go.load()) {
+      }
+      for (volatile int s = 0; s < spin * 20; s = s + 1) {
+      }
+      ::unlink(q.dataPath(dir).c_str()); // as eviction: the data first, then the sidecar
+      ::unlink(q.metaPath(dir).c_str());
+      dropEntryNames(dir, q.hashHex);
+    });
+    go = true;
+    (void)resolveEntry(*kOn.key("root://q.example" + tail), dir); // names it: its generation
+    rm.join();
+    if (exists(q.metaPath(dir)) && !exists(q.dataPath(dir))) {
+      ++orphans;
+      setEntryNamesWritable(false);
+      const UrlKey r = resolveEntry(*kOn.key("root://o.example" + tail), dir);
+      setEntryNamesWritable(true);
+      nameToOrphan += r.hashHex == q.hashHex;
+    }
+  }
+  EXPECT_EQ(orphans, 0) << "sidecars with no data file: " << orphans << ", the name leads to "
+                        << nameToOrphan;
+}
+
+// A sidecar left without its data file all the same (a crash between a removal's two unlinks) is
+// no entry: no name of the file leads to it, and the eviction pass removes it, with its names,
+// once it is an hour old (not before: an entry is made with its data file first).
+TEST(EntryNames, ASidecarWithoutItsDataIsNoEntry) {
+  TempDir td;
+  const std::string dir = td.path();
+  const UrlKey u = *kOff.key("root://u.example//store/mc/half/a.root");
+  makeEntry(dir, u);
+  Writable w;
+  ASSERT_EQ(resolveEntry(*kOn.key("root://u.example//store/mc/half/a.root"), dir).hashHex,
+            u.hashHex);
+  const UrlKey on = *kOn.key("root://o.example//store/mc/half/a.root");
+  ASSERT_EQ(resolveEntry(on, dir).hashHex, u.hashHex);
+  ASSERT_EQ(::unlink(u.dataPath(dir).c_str()), 0); // the removal ended between its unlinks
+  EXPECT_NE(resolveEntry(on, dir).hashHex, u.hashHex) << "the name leads to a sidecar alone";
+  setEntryNamesWritable(false);
+  const UrlKey off = *kOff.key("root://o.example//store/mc/half/a.root");
+  EXPECT_EQ(resolveEntry(off, dir).hashHex, off.hashHex) << "the URL leads to a sidecar alone";
+  setEntryNamesWritable(true);
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = dir;
+  {
+    CacheStore store(io, cfg);
+    store.disableStatsDump();
+    store.evictNow();
+  }
+  EXPECT_TRUE(exists(u.metaPath(dir))) << "a young sidecar is left: it may be an entry being made";
+  struct ::timespec ts[2] = {{::time(nullptr) - 7200, 0}, {::time(nullptr) - 7200, 0}};
+  ASSERT_EQ(::utimensat(AT_FDCWD, u.metaPath(dir).c_str(), ts, 0), 0);
+  {
+    CacheStore store(io, cfg);
+    store.disableStatsDump();
+    store.evictNow();
+  }
+  EXPECT_FALSE(exists(u.metaPath(dir))) << "the eviction pass keeps a sidecar with no data";
+  EXPECT_FALSE(exists(namesPath(dir, u.hashHex)));
+}
+
+// A handle opened before its entry was named keeps the generation the naming gave: its commit
+// takes it from the sidecar on disk, so the names made meanwhile still lead to the entry.
+TEST(EntryNames, ACommitKeepsTheGenerationGivenMeanwhile) {
+  TempDir td;
+  const std::string dir = td.path();
+  const UrlKey u = *kOff.key("root://u.example//store/mc/hold/a.root");
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = dir;
+  CacheStore store(io, cfg);
+  store.disableStatsDump();
+  auto e = store.open(u, 50000);
+  ASSERT_TRUE(e);
+  Writable w;
+  ASSERT_EQ(resolveEntry(*kOn.key("root://u.example//store/mc/hold/a.root"), dir).hashHex,
+            u.hashHex);
+  const uint32_t gen = MetaFile::loadHead(io, u.metaPath(dir))->gen;
+  ASSERT_NE(gen, 0u);
+  e->setPinned(true); // the handle's commit, its own view of generation 0
+  EXPECT_EQ(MetaFile::loadHead(io, u.metaPath(dir))->gen, gen);
+  EXPECT_EQ(resolveEntry(*kOn.key("root://o.example//store/mc/hold/a.root"), dir).hashHex,
+            u.hashHex);
+  setEntryNamesWritable(false);
+  const UrlKey off = *kOff.key("root://o.example//store/mc/hold/a.root");
+  EXPECT_EQ(resolveEntry(off, dir).hashHex, u.hashHex);
+}
+
+// A handle that wrote its view back over an entry another process started afresh (the whole view,
+// since the sidecar on disk is another file's) gives it no generation: the names made to the
+// generation it held are never followed again.
+TEST(EntryNames, AViewWrittenBackOverAFreshStartCarriesNoName) {
+  TempDir td;
+  const std::string dir = td.path();
+  const UrlKey u = *kOff.key("root://u.example//store/mc/back/a.root");
+  makeEntry(dir, u);
+  const UrlKey off = *kOff.key("root://o.example//store/mc/back/a.root");
+  UrlKey r;
+  {
+    Writable w;
+    ASSERT_EQ(resolveEntry(*kOn.key("root://u.example//store/mc/back/a.root"), dir).hashHex,
+              u.hashHex);
+    r = resolveEntry(*kOn.key("root://o.example//store/mc/back/a.root"), dir);
+    ASSERT_EQ(r.hashHex, u.hashHex);
+  }
+  ASSERT_EQ(resolveEntry(off, dir).hashHex, u.hashHex);
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = dir;
+  CacheStore one(io, cfg); // a process holding the entry through the name
+  one.disableStatsDump();
+  auto held = one.open(r, 50000);
+  ASSERT_TRUE(held);
+  {
+    CacheStore two(io, cfg); // another, whose copy of the user's file changed: a fresh start
+    two.disableStatsDump();
+    ASSERT_TRUE(two.open(u, 60000));
+  }
+  ASSERT_EQ(MetaFile::loadHead(io, u.metaPath(dir))->gen, 0u);
+  held->setPinned(true); // the first one's commit: its view, whole
+  EXPECT_EQ(MetaFile::loadHead(io, u.metaPath(dir))->fileSize, 50000u);
+  EXPECT_EQ(MetaFile::loadHead(io, u.metaPath(dir))->gen, 0u)
+      << "the generation the names were made to came back";
+  EXPECT_EQ(resolveEntry(off, dir).hashHex, off.hashHex);
+}
+
+// The readouts (`ucache ls -l`) list only the names that lead to the entry now: once the entry
+// started afresh, the names made to its earlier generation are no longer listed under it, and the
+// key it is stored under still is.
+TEST(EntryNames, TheReadoutsListOnlyNamesThatLeadToTheEntry) {
+  TempDir td;
+  const std::string dir = td.path();
+  const UrlKey u = *kOff.key("root://u.example//store/mc/list/a.root");
+  makeEntry(dir, u);
+  {
+    Writable w;
+    ASSERT_EQ(resolveEntry(*kOn.key("root://u.example//store/mc/list/a.root"), dir).hashHex,
+              u.hashHex);
+    ASSERT_EQ(resolveEntry(*kOn.key("root://o.example//store/mc/list/a.root"), dir).hashHex,
+              u.hashHex);
+  }
+  const UrlKey o = *kOff.key("root://o.example//store/mc/list/a.root");
+  EntryNameList names = liveEntryNames(dir, u.hashHex);
+  EXPECT_EQ(names.lfn, "lfn:/store/mc/list/a.root");
+  EXPECT_EQ(names.urls.size(), 2u);
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = dir;
+  {
+    CacheStore store(io, cfg);
+    store.disableStatsDump();
+    ASSERT_TRUE(store.open(u, 60000)); // the user's file changed: the entry starts afresh
+  }
+  EXPECT_EQ(entryNames(dir, u.hashHex).urls.size(), 2u); // the list itself is not rewritten
+  names = liveEntryNames(dir, u.hashHex);
+  EXPECT_TRUE(names.lfn.empty()) << names.lfn;
+  ASSERT_EQ(names.urls.size(), 1u);
+  EXPECT_EQ(names.urls[0], u.key);
+  EXPECT_NE(names.urls[0], o.key);
 }

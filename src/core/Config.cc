@@ -513,8 +513,9 @@ std::string Config::setNote(const std::string& key, const std::string& value) co
   if (key == "logical_name_prefixes")
     return normalizedPrefixes(value) != "off" && logicalNamePrefixesValid(value)
                ? "  a file whose path holds one of these prefixes is cached under its logical name: "
-                 "files cached before under such a URL are fetched again once and the old entries "
-                 "age out (a pinned one keeps its pin, and the new entry is pinned too)"
+                 "the entries already cached keep their data and take the name (nothing is "
+                 "fetched again or copied), and every URL of a file reaches its entry once its "
+                 "copy is found that entry's size"
                : "  files are keyed by their URL";
   return "";
 }

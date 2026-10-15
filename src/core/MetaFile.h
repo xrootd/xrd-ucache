@@ -1,5 +1,8 @@
 // .meta sidecar (format_version 1 — full field table in
-// docs/FORMAT.md; bump kFormatVersion on ANY layout change).
+// docs/FORMAT.md; bump kFormatVersion on ANY layout change). Reserved bytes
+// may be given a meaning without a bump when every older reader ignores them,
+// and a value of 0 (what an older writer puts back) keeps the meaning safe; the
+// generation (bytes 41-43) is such a field.
 //
 // Integrity: the header carries a crc32c over the entire serialized image
 // (computed with the crc field zeroed), so torn or corrupt sidecars fail to

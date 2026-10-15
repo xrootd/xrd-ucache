@@ -24,9 +24,10 @@
 // digits. An alias names one generation of an entry: <gen> (6 hex digits) is the id the entry's
 // sidecar carries (MetaData::gen), given when the first alias to it is made; an entry made, or
 // started again, has none, and ids are not given twice. An alias is followed only while the entry
-// it names exists in that generation, so an alias left behind (by a names list that lost its line,
-// a crash, a removal racing a naming) is never followed again, whatever is cached under that hash
-// later: it is as none, replaced when the name is given again, and swept. A self alias (the URL's
+// it names exists in that generation (its data file there too), so an alias left behind (by a
+// names list that lost its line, a crash, a removal racing a naming) is never followed again,
+// whatever is cached under that hash later: it is as none, replaced when the name is given again,
+// and swept. A self alias (the URL's
 // own entry: its copy is not the size of the name's entry) holds while that entry exists. <c|u>:
 // whether the URL's copy's size was compared with the entry's ("c") or not yet ("u": the caller
 // compares it at the origin before it trusts the entry, see UrlKey::joined). When an entry goes,
@@ -81,6 +82,11 @@ struct EntryNameList {
 };
 // The names recorded for the entry `entryHash`; empty when none are.
 EntryNameList entryNames(const std::string& cacheDir, const std::string& entryHash);
+// The names of `entryHash` (as entryNames) that lead to it now: the key it is stored under, and
+// each name whose alias names it in the generation it holds. A name whose alias is gone, names
+// another entry, or names a generation the entry no longer holds (started afresh, or its sidecar
+// rewritten by a release that knows no names) is left out. For the readouts.
+EntryNameList liveEntryNames(const std::string& cacheDir, const std::string& entryHash);
 // The entry `entryHash` is gone (removed, evicted, dropped): the aliases its list names that point
 // to it, and the list. An alias left (a list past its bound, a removal that ended between) names a
 // generation that is gone, and is as none: never followed (also once the hash holds an entry

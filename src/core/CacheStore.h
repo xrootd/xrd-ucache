@@ -387,7 +387,8 @@ class CacheStore {
   // by a crash, a store an older release left behind when it evicted the
   // entry), age-guarded (1 h) so nothing being written is swept; and every
   // replica an earlier release made beside the byte cache (.tdata, .tmeta,
-  // .tok), entry or not, which this release never serves.
+  // .tok), entry or not, which this release never serves. Also a sidecar
+  // whose data file is gone (age-guarded the same way), with its names.
   // Caller must hold the cache-wide eviction LOCK.
   void sweepReplicaOrphans();
   // Called from the page-write path: add persisted bytes to the running total

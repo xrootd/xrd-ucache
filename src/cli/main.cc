@@ -634,7 +634,7 @@ int cmdStatsFiles(const Config& cfg, size_t topN) {
                   human(a.wire).c_str(), tail.c_str());
       // The URLs the file's entry was reached through (EntryNames.h), when it has names.
       if (const auto ek = cfg.entryKey(key))
-        for (const auto& u : entryNames(cfg.cacheDir, ek->hashHex).urls)
+        for (const auto& u : liveEntryNames(cfg.cacheDir, ek->hashHex).urls)
           std::printf("  %-10s %-6s %-9s %-5s %-7s %-10s %-10s   url %s\n", "", "", "", "", "", "",
                       "", u.c_str());
       ++shown;
@@ -2552,7 +2552,7 @@ int cmdLs(CacheStore& store, int argc, char** argv) {
   const std::string& dir = store.config().cacheDir;
   for (const auto& e : entries) {
     // An entry with a logical name is shown by it: the core name, which groups its URLs.
-    const EntryNameList names = entryNames(dir, e.hashHex);
+    const EntryNameList names = liveEntryNames(dir, e.hashHex);
     std::printf("%-9s %-9s %5.1f%% %-6s %-9s %-4s  %s\n", human(e.fileSize).c_str(),
                 human(e.cachedBytes).c_str(), e.coverage * 100.0,
                 humanAge(e.atime, now).c_str(),

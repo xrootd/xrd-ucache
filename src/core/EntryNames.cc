@@ -88,14 +88,16 @@ bool readAlias(const std::string& dir, const std::string& nameHash, Target& out)
 // entry), while that entry exists; any other, while the entry it names exists in the generation
 // it names (its key too). A generation is given only once (nextGen), and a fresh start has none,
 // so an alias left behind by any path (a list that lost its line, a crash, a race with a
-// removal) is never followed again, whatever is cached under that hash later.
+// removal) is never followed again, whatever is cached under that hash later. The entry's data
+// file must be there too: a sidecar without it is an entry a removal is taking (data first), or
+// one a crash left half removed, and holds nothing to serve.
 bool live(const std::string& dir, const std::string& nameHash, const Target& t) {
   if (t.hash == nameHash)
     return entryExists(dir, t.hash);
   if (t.gen == 0)
     return false;
   const auto h = entryHead(dir, t.hash);
-  return h && h->gen == t.gen && h->key == t.key;
+  return h && h->gen == t.gen && h->key == t.key && exists(objectBase(dir, t.hash) + ".data");
 }
 
 bool mkdirs(const std::string& path) {
@@ -154,8 +156,21 @@ uint32_t nextGen(const std::string& dir) {
   return v ? v : randomGen();
 }
 
+// Whether the data file held open as `fd` is still the entry's (a removal unlinks it first).
+bool stillLinked(int fd) {
+  struct ::stat st;
+  return ::fstat(fd, &st) == 0 && st.st_nlink > 0;
+}
+
 // The generation of the entry `hash`, given one if it has none (its sidecar rewritten under the
 // entry's lock, as the store writes it). 0 when the entry is not there or cannot be given one.
+//
+// A removal (eviction, rm) takes no lock: it unlinks the data file, then the sidecar. The sidecar
+// is therefore written only while the data file is still linked, as every sidecar writer of the
+// store does, and looked at again after the write: a removal that unlinked the data file in
+// between may have unlinked the sidecar before the write put it back, so the sidecar written is
+// taken away again (when it is still the one written here and no data file has come back) and no
+// generation is given. A sidecar never stays without its data, and no name is made to one.
 uint32_t stampEntry(const std::string& dir, const std::string& hash) {
   const auto h = entryHead(dir, hash);
   if (!h)
@@ -169,11 +184,19 @@ uint32_t stampEntry(const std::string& dir, const std::string& hash) {
   uint32_t gen = 0;
   if (::flock(fd, LOCK_EX) == 0) {
     IOBackend& io = RealIO::instance();
-    auto m = MetaFile::load(io, base + ".meta");
+    auto m = stillLinked(fd) ? MetaFile::load(io, base + ".meta") : std::optional<MetaData>();
     if (m && m->gen == 0) {
       m->gen = nextGen(dir);
-      if (MetaFile::store(io, base + ".meta", *m, /*fsyncMeta=*/false) != 0)
+      if (!stillLinked(fd) || MetaFile::store(io, base + ".meta", *m, /*fsyncMeta=*/false) != 0) {
         m->gen = 0;
+      } else if (!stillLinked(fd)) {
+        struct ::stat st;
+        const auto there = MetaFile::loadHead(io, base + ".meta");
+        if (there && there->gen == m->gen && ::stat((base + ".data").c_str(), &st) != 0 &&
+            errno == ENOENT)
+          ::unlink((base + ".meta").c_str());
+        m->gen = 0;
+      }
     }
     if (m)
       gen = m->gen;
@@ -528,6 +551,24 @@ EntryNameList entryNames(const std::string& cacheDir, const std::string& entryHa
   if (urls.size() > kEntryNamesMax)
     urls.erase(urls.begin(), urls.end() - static_cast<long>(kEntryNamesMax));
   out.urls = std::move(urls);
+  return out;
+}
+
+EntryNameList liveEntryNames(const std::string& cacheDir, const std::string& entryHash) {
+  EntryNameList all = entryNames(cacheDir, entryHash);
+  const auto leads = [&](const std::string& name) {
+    const std::string nameHash = sha256Hex(name);
+    if (nameHash == entryHash)
+      return true; // the key the entry is stored under
+    Target t;
+    return readAlias(cacheDir, nameHash, t) && t.hash == entryHash && live(cacheDir, nameHash, t);
+  };
+  EntryNameList out;
+  if (!all.lfn.empty() && leads(all.lfn))
+    out.lfn = all.lfn;
+  for (auto& u : all.urls)
+    if (leads(u))
+      out.urls.push_back(std::move(u));
   return out;
 }
 

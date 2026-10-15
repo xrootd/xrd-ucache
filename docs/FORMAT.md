@@ -66,7 +66,8 @@ had `logical_name_prefixes` set has no such directory, and nothing below is read
   file; 1 to 0xffffff and round again, starting at a random value), so that two
   generations of one cache share an id only 16.7 million ids apart. An entry made, or
   started again (its file changed at the origin), has none. An alias is followed only
-  while the entry it names exists in that generation, with that key: an alias left
+  while the entry it names exists in that generation, with that key and its `.data`:
+  an alias left
   behind by any path (a names list that lost its line, a crash between a removal's
   unlinks, a removal racing a naming) names nothing, also once the same hash holds an
   entry again; it is as none, is replaced when the name is given again, and is swept.
@@ -180,7 +181,13 @@ treat the entry as absent), and a sidecar written before the bit reads as not co
   `.data`; their sidecar changes are merged by the commit rule above.
 - An entry unlinked while open (eviction) keeps serving through its open fd;
   the owner detects `st_nlink == 0` before sidecar flushes and skips them so
-  the entry is not resurrected.
+  the entry is not resurrected. Every writer of a sidecar does the same (a pin,
+  the generation given by a name, which also checks again after its write). A
+  sidecar left without its `.data` all the same (a crash between a removal's two
+  unlinks) is no entry: no name leads to it, and the eviction pass removes it,
+  with its names, once it is an hour old.
+- A commit that finds a sidecar of another generation on disk (another process
+  started the entry afresh) stores its own view whole, with generation 0.
 
 ## Replicas of earlier releases: `<hash>.tdata`, `.tmeta`, `.tok`
 

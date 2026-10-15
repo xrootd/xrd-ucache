@@ -1138,9 +1138,26 @@ void CacheStore::sweepReplicaOrphans() {
     if (io_.listDir(objRoot + "/" + sh, files) < 0)
       continue;
     std::set<std::string> metas; // hashes with a live v1 sidecar
+    const std::set<std::string> listed(files.begin(), files.end());
     for (const auto& f : files)
-      if (f.size() > 5 && f.compare(f.size() - 5, 5, ".meta") == 0)
-        metas.insert(f.substr(0, f.size() - 5));
+      if (f.size() > 5 && f.compare(f.size() - 5, 5, ".meta") == 0) {
+        const std::string hash = f.substr(0, f.size() - 5);
+        // A sidecar whose data file is gone: an entry a removal is taking (data first), or one
+        // a crash, or a sidecar write racing a removal, left behind. It holds nothing, yet it is
+        // counted, listed and never evicted (eviction starts with the data file). Removed with
+        // its names once it is an hour old: an entry is made with its data file first, so
+        // nothing that is being made is ever without one.
+        struct ::stat st;
+        const std::string base = objRoot + "/" + sh + "/" + hash;
+        if (!listed.count(hash + ".data") && io_.stat(base + ".meta", &st) == 0 &&
+            now >= static_cast<uint64_t>(st.st_mtime) + 3600 &&
+            io_.stat(base + ".data", &st) == -ENOENT && io_.unlink(base + ".meta") == 0) {
+          dropEntryNames(cfg_.cacheDir, hash);
+          UCACHE_INFO("swept a page index with no data file: %s.meta", base.c_str());
+          continue;
+        }
+        metas.insert(hash);
+      }
     for (const auto& f : files) {
       bool replicaArtifact = false;
       std::string hash;

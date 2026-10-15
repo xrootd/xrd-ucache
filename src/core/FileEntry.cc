@@ -1266,8 +1266,8 @@ bool FileEntry::commitSnapshot(MetaData snapshot, const PageBitmap& sets, const 
   // sibling re-add it from a stale full view.
   MetaData out;
   bool merged = false;
-  if (auto disk = MetaFile::load(io_, metaPath_);
-      disk && disk->pageSize == snapshot.pageSize &&
+  auto disk = MetaFile::load(io_, metaPath_);
+  if (disk && disk->pageSize == snapshot.pageSize &&
       adoptable(*disk, cfg_, key_, snapshot.fileSize, snapshot.originMtime, snapshot.cksumKind,
                 snapshot.originCksum)) {
     out = std::move(*disk);
@@ -1295,6 +1295,11 @@ bool FileEntry::commitSnapshot(MetaData snapshot, const PageBitmap& sets, const 
     // No sidecar, a torn one, or another generation of this key: this view is
     // the whole truth, as it always was for a lone process.
     out = std::move(snapshot);
+    // Over a sidecar of another generation (another process started the entry
+    // afresh), the view goes back without its names: a generation once left is
+    // never followed again by the names made to it (EntryNames.h).
+    if (disk && disk->gen != out.gen)
+      out.gen = 0;
   }
   int rc = MetaFile::store(io_, metaPath_, out, cfg_.fsync == FsyncMode::kAll);
   io_.flock(dataFd_, LOCK_UN);
