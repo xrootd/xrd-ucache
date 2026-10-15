@@ -109,8 +109,9 @@ TEST(Config, ParsesEverything) {
   EXPECT_EQ(c.sources.at("revalidate_seconds"), "env");
 }
 
-// max_read_fraction: a percentage, 25 by default; anything outside 1..100 is
-// refused and the value below it stands.
+// max_read_fraction: a percentage, 25 by default; 0 (every file read straight
+// from the origin) is taken only as a plain zero; anything outside 0..100, or
+// not a number, is refused and the value below it stands.
 TEST(Config, MaxReadFraction) {
   EnvGuard g;
   {
@@ -129,11 +130,51 @@ TEST(Config, MaxReadFraction) {
     Config c = Config::fromEnv(&conf);
     EXPECT_EQ(c.maxReadFraction, 100) << "the per-job override wins";
   }
-  for (const char* bad : {"0", "101", "-5", "abc"}) {
+  for (const char* bad : {"101", "-5", "abc", "", "-0", " 0", "0x", "0.5"}) {
     ::setenv("UCACHE_MAX_READ_FRACTION", bad, 1);
     Config c = Config::fromEnv(&conf);
-    EXPECT_EQ(c.maxReadFraction, 60) << bad;
+    EXPECT_EQ(c.maxReadFraction, 60) << "'" << bad << "'";
+    EXPECT_EQ(c.valueOf("max_read_fraction"), "60") << "'" << bad << "'";
   }
+  for (const char* zero : {"0", "00"}) {
+    ::setenv("UCACHE_MAX_READ_FRACTION", zero, 1);
+    Config c = Config::fromEnv(&conf);
+    EXPECT_EQ(c.maxReadFraction, 0) << zero;
+    EXPECT_EQ(c.valueOf("max_read_fraction"), "0") << zero;
+    EXPECT_EQ(c.sources.at("max_read_fraction"), "env") << zero;
+  }
+  ::unsetenv("UCACHE_MAX_READ_FRACTION");
+  std::map<std::string, std::string> zconf = {{"max_read_fraction", "0"}};
+  {
+    Config c = Config::fromEnv(&zconf);
+    EXPECT_EQ(c.maxReadFraction, 0) << "0 from the conf";
+    EXPECT_EQ(c.sources.at("max_read_fraction"), "conf");
+  }
+  ::setenv("UCACHE_MAX_READ_FRACTION", "25", 1);
+  {
+    Config c = Config::fromEnv(&zconf);
+    EXPECT_EQ(c.maxReadFraction, 25) << "the per-job override wins over a conf's 0";
+  }
+  // 1..100 read as before: a leading number
+  ::setenv("UCACHE_MAX_READ_FRACTION", "40%", 1);
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_EQ(c.maxReadFraction, 40);
+  }
+}
+
+// `ucache set max_read_fraction 0` says what 0 does; other values say nothing.
+TEST(Config, MaxReadFractionZeroNote) {
+  EnvGuard g;
+  const Config c = Config::fromEnv();
+  const std::string note = c.setNote("max_read_fraction", "0");
+  EXPECT_NE(note.find("read straight from the origin"), std::string::npos) << note;
+  EXPECT_NE(note.find("other files are cached"), std::string::npos) << note;
+  EXPECT_EQ(c.setNote("max_read_fraction", "00"), note);
+  EXPECT_EQ(c.setNote("max_read_fraction", "25"), "");
+  EXPECT_EQ(c.setNote("max_read_fraction", "100"), "");
+  EXPECT_EQ(c.setNote("max_read_fraction", "abc"), "");
+  EXPECT_EQ(c.setNote("max_read_fraction", ""), "");
 }
 
 // check_origin_integrity: off by default, its own setting. recompress = on does not

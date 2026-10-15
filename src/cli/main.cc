@@ -4319,6 +4319,11 @@ int cmdDoctor(const Config& cfg) {
                 "         removes a file's replica while no job is reading it\n");
   if (cfg.adaptiveFederation)
     federationNote(cfg);
+  if (cfg.maxReadFraction == 0)
+    std::printf("  [NOTE] max_read_fraction = 0: every ROOT file with a TTree or RNTuple is read\n"
+                "         straight from the origin and none of its data is cached (its own\n"
+                "         records are); bytes cached earlier are still served, and other files\n"
+                "         are cached as usual\n");
   if (cfg.keys.logical())
     std::printf("  [NOTE] logical_name_prefixes = %s: a file whose path holds one of them is cached\n"
                 "         under its logical name (one entry through any site or redirector),\n"

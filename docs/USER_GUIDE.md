@@ -803,7 +803,7 @@ overriding your defaults. Common keys:
 | `prefetch_threads = 4` | `UCACHE_PREFETCH_THREADS` | threads predicting and reading basket maps. One cannot both parse a new file's map and keep up with the batches of many reader threads |
 | `announce = on`     | `UCACHE_ANNOUNCE`       | name uCache as the application in what the client tells servers at login, so a site can see traffic that comes through a cache (default on; see below). `off` = send your program's own name, as without uCache |
 | `copy_detect = on`  | `UCACHE_COPY_DETECT`    | copy tools and copy engines read straight from the origin, so a copy is the origin's bytes (default on; see below). `off` = they are ordinary readers and use the cache |
-| `max_read_fraction = 25` | `UCACHE_MAX_READ_FRACTION` | a job whose reads of a ROOT file (a TTree or RNTuple of 64 MiB or more) cover branches holding more than this percentage of the file's data reads that file straight from the origin and caches none of its data (see below). `100` = cache every file |
+| `max_read_fraction = 25` | `UCACHE_MAX_READ_FRACTION` | a job whose reads of a ROOT file (a TTree or RNTuple of 64 MiB or more) cover branches holding more than this percentage of the file's data reads that file straight from the origin and caches none of its data (see below). `100` = cache every file. `0` = read every ROOT file with a TTree or RNTuple, of any size, straight from the origin, caching none of its data (see below) |
 | `disable = true`    | `UCACHE_DISABLE`        | turn caching off (pure pass-through) |
 
 Sizes accept `k`/`m`/`g`/`t` suffixes.
@@ -1351,8 +1351,41 @@ straight from the origin:
 To cache such a job anyway — decompression is what slows it and a replica
 would help, or you want its second pass warm — raise the limit for that job,
 `UCACHE_MAX_READ_FRACTION=100 ./my_job`, or for every job with
-`ucache set max_read_fraction 100`. Files under 64 MiB, and files that are not
-a TTree or RNTuple, are always cached.
+`ucache set max_read_fraction 100`. Files that are not a TTree or RNTuple are
+always cached, and so are files under 64 MiB unless the limit is `0`.
+
+**`max_read_fraction = 0`: read through uCache, cache no data.** With `0`,
+every ROOT file with a TTree or RNTuple, whatever its size and whatever the
+job reads, is read straight from the origin. uCache stays in the data path, so
+everything it does for the reads themselves still applies — with
+`adaptive_federation = on`, the move of a failed open or read to another site,
+the checks of what the origin sends, and the memory of sites that failed — but
+none of the file's data is kept. Use it to have those for jobs whose data you
+do not want on the local disk; `UCACHE_MAX_READ_FRACTION=0 ./my_job` does it
+for one job.
+
+- The decision is made once uCache has read the file's own records, at the
+  job's first read of the file that needs the origin; until then what the job
+  fetches is not kept either. A file whose records cannot be read as a TTree or
+  RNTuple (not a ROOT file, or one with neither) is cached as usual.
+- What is read directly is the data of the file's main tree (the one named
+  `Events`, else its first TTree) or of its RNTuple. The file's other trees
+  (in a NanoAOD file, for example, `Runs` and `ParameterSets`) are cached as
+  its records are.
+- What is still written to the cache directory: the pages that hold the file's
+  own records (header, keys list, tree metadata, the other trees; for an
+  RNTuple file its first 128 KiB too) and the bytes `adaptive_federation`'s
+  checks at open read, so that the next job does not fetch them again; the
+  entry's small files beside them (`.meta`, `.cost`, FORMAT.md); the run
+  records under `stats/` that `ucache stats` reads; and, with
+  `adaptive_federation = on`, the marks of servers that failed (`sources`).
+- Bytes already cached are still served: a file cached before you set `0`
+  is read from the cache as before (`ucache rm` removes it). A replica made
+  earlier is served in its layout, and no file gets a new one (`recompress =
+  on` makes none).
+- `ucache stats` counts each such file in `direct_read_files` and its bytes in
+  `direct_read_bytes` and as direct, like pass-through. There is no warning per
+  job: you asked for it.
 
 **Eviction is on by default.** With no `max_bytes` set, the cache uses the disk
 freely and evicts least-recently-used entries only to keep a free-space floor

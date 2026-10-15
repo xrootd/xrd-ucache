@@ -96,7 +96,10 @@ second. If not:
    the first such file and the share it read, and `ucache stats` counts them in
    `direct_read_files`. That is deliberate — such a job would fill the cache
    with the whole dataset. To cache it anyway, `UCACHE_MAX_READ_FRACTION=100
-   <your job>`, or `ucache set max_read_fraction 100` for every job.
+   <your job>`, or `ucache set max_read_fraction 100` for every job. With
+   `max_read_fraction = 0` (`ucache settings` shows it) every ROOT file with a
+   TTree or RNTuple, of any size, is read this way, with no warning: that
+   setting caches no such file's data.
 9. **`XRD_PLUGIN` is set.** While it is, XrdCl loads the library it names for
    every URL and reads no plugin config file at all, so a `ucache.conf` does
    nothing — and if it names some other plugin, uCache is not loaded.

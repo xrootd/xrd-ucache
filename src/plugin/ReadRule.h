@@ -17,6 +17,14 @@
 // than kMinBytes, files that are not TTree or RNTuple, and a limit of 100 have
 // no rule: they are cached as before.
 //
+// A limit of 0 reads every such file directly, of any size: the decision is
+// made as soon as the parse has found the file's data, whatever the request
+// asks. Until then (the first request's parse, or a request that does not wait
+// for it) the rule counts as direct and holds every byte for data, so nothing
+// is kept; a parse that a failed origin read stopped is made again at the next
+// request. A file whose records do not parse (not ROOT, no TTree or RNTuple)
+// has no rule, as with any limit.
+//
 // Thread-safety: all methods are thread-safe. A rule is shared by every handle
 // of the file in the process and lives for the process.
 #pragma once
@@ -64,7 +72,11 @@ class ReadRule : public std::enable_shared_from_this<ReadRule> {
   static std::shared_ptr<ReadRule> forFile(const std::string& key, uint64_t originSize);
 
   State state() const { return static_cast<State>(state_.load(std::memory_order_acquire)); }
-  bool direct() const { return state() == kDirect; }
+  // Decided direct, or undecided with a limit of 0 (nothing is kept before the decision).
+  bool direct() const {
+    const State s = state();
+    return s == kDirect || (s == kUndecided && limit_ == 0);
+  }
 
   // A request that needs the origin, as ranges of the ORIGINAL file. Parses
   // the file's map on the first call (reading through `src`: byte cache first,
@@ -73,7 +85,8 @@ class ReadRule : public std::enable_shared_from_this<ReadRule> {
   State observe(const std::vector<std::pair<uint64_t, uint64_t>>& ranges, OriginSource& src);
 
   // After a direct decision: does [off, off + len) read the file's data? The
-  // file's own records are fetched and kept as usual.
+  // file's own records are fetched and kept as usual. Undecided with a limit
+  // of 0: every byte counts as data.
   bool readsData(uint64_t off, uint64_t len) const;
 
   ReadRule(std::string key, uint64_t size, int limit)
@@ -96,7 +109,7 @@ class ReadRule : public std::enable_shared_from_this<ReadRule> {
 };
 
 // Whether this process decided to read `key` directly: such a file is never
-// given a new slot store.
+// given a new slot store. With a limit of 0 no file is given one.
 bool readRuleDirect(const std::string& key);
 
 // check_origin_integrity: where every basket of the file's tree starts

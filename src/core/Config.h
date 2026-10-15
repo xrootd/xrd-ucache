@@ -167,14 +167,17 @@ struct Config {
   // turns it off to exercise the byte cache with xrdcp). Fixed at process
   // start, like every setting.
   bool copyDetect = true;                 // UCACHE_COPY_DETECT
-  // `max_read_fraction` / UCACHE_MAX_READ_FRACTION, percent, 1..100. A process
+  // `max_read_fraction` / UCACHE_MAX_READ_FRACTION, percent, 0..100. A process
   // whose first read of a ROOT file (a TTree or RNTuple of 64 MiB or more)
   // that needs the origin asks for more than this share of the file's data --
   // of the baskets of every branch (pages of every column) covering the same
   // entries -- reads that file straight from the origin and keeps none of its
   // data: a reader that wide would fill the cache with the dataset. Decided
   // once per file per process, at the first request that reads two or more
-  // branches. 100 = every file is cached.
+  // branches. 100 = every file is cached. 0 = every ROOT file with a TTree or
+  // RNTuple, of any size, is read straight from the origin (decided once its
+  // records are read, whatever the reader asks), and no file gets a new
+  // replica (ReadRule.h).
   int maxReadFraction = 25;               // UCACHE_MAX_READ_FRACTION
   // Recompression: ONE switch.
   // `recompress = on` => a file with no replica gets one on its first pass,

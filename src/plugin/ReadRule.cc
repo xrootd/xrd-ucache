@@ -288,7 +288,7 @@ void ReadRule::dropMap() {
 
 std::shared_ptr<ReadRule> ReadRule::forFile(const std::string& key, uint64_t originSize) {
   const int limit = globalConfig().maxReadFraction;
-  if (limit >= 100 || originSize < kMinBytes)
+  if (limit >= 100 || (limit > 0 && originSize < kMinBytes)) // 0: files of any size
     return nullptr;
   std::lock_guard<std::mutex> g(regMu());
   auto& r = registry();
@@ -303,6 +303,8 @@ std::shared_ptr<ReadRule> ReadRule::forFile(const std::string& key, uint64_t ori
 }
 
 bool readRuleDirect(const std::string& key) {
+  if (globalConfig().maxReadFraction == 0) // nothing a file converts would be kept
+    return true;
   std::lock_guard<std::mutex> g(regMu());
   auto it = registry().find(key);
   return it != registry().end() && it->second->direct();
@@ -336,6 +338,12 @@ ReadRule::State ReadRule::observe(const std::vector<std::pair<uint64_t, uint64_t
   if (!parsed_) {
     parsed_ = true;
     tp::FileMeta fm = tp::parseReaderTree(src, static_cast<int64_t>(size_));
+    if (limit_ == 0 && src.readFailed && !fm.error.empty()) {
+      // Stopped by a failed origin read, not by what the file is: undecided (nothing kept), and
+      // parsed again at the next request that needs the origin.
+      parsed_ = false;
+      return kUndecided;
+    }
     // The server of the parse's reads from the origin; none when the cache answered any of them
     // (they may be another copy's: no claim against a server, see keySeeksFor).
     const std::string from = src.fromCache ? std::string() : src.fetchedFrom;
@@ -350,12 +358,29 @@ ReadRule::State ReadRule::observe(const std::vector<std::pair<uint64_t, uint64_t
       if (rm.error.empty())
         map_ = std::make_unique<tp::ReadMap>(tp::ReadMap::fromRNTuple(rm));
     }
+    if ((!map_ || map_->empty()) && limit_ == 0 && src.readFailed) {
+      map_.reset(); // the RNTuple's parse stopped by a failed read: as above
+      parsed_ = false;
+      return kUndecided;
+    }
     if (!map_ || map_->empty()) {
       UCACHE_DEBUG("read rule: %s has no basket or page map (%s); cached as usual", key_.c_str(),
                    fm.error.empty() ? "no units" : fm.error.c_str());
       map_.reset();
       state_.store(kNoRule, std::memory_order_release);
       return kNoRule;
+    }
+    if (limit_ == 0) { // every such file is read directly: decided now, whatever is asked
+      runs_ = map_->dataRuns();
+      const bool rnt = map_->isRNTuple();
+      map_.reset();
+      state_.store(kDirect, std::memory_order_release);
+      if (src.st && src.st->store)
+        src.st->store->stats().directReadFiles.fetch_add(1, std::memory_order_relaxed);
+      UCACHE_INFO("%s: max_read_fraction = 0: read straight from the origin, its data (%s) "
+                  "not cached",
+                  key_.c_str(), rnt ? "RNTuple pages" : "TTree baskets");
+      return kDirect;
     }
     holdMap();
   }
@@ -409,7 +434,12 @@ void ReadRule::holdMap() {
 }
 
 bool ReadRule::readsData(uint64_t off, uint64_t len) const {
-  if (!direct() || len == 0)
+  if (len == 0)
+    return false;
+  const State s = state();
+  if (s == kUndecided && limit_ == 0) // no map yet: every byte counts as data
+    return true;
+  if (s != kDirect)
     return false;
   const uint64_t end = off + len;
   auto it = std::upper_bound(runs_.begin(), runs_.end(), std::pair<uint64_t, uint64_t>(off, ~uint64_t{0}));
