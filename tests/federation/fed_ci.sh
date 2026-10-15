@@ -164,6 +164,10 @@
 #   left copy              a read's data failure (a short answer inside the confirmed size) that
 #                          arrives after the handle moved, on the File it left: that copy is one the
 #                          handle never opens again, as for a failure on the File it reads from
+#   logical names          logical_name_prefixes = /store/mc/ (the switch off): one file read through
+#                          a and then through b is one entry, keyed lfn:/store/mc/...; the read
+#                          through b fetches nothing; `ucache ls -l` lists both URLs under it, and
+#                          `ucache rm` of b's URL removes the entry
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD=$(cd "${1:?usage: fed_ci.sh BUILD_DIR}" && pwd)
@@ -1333,6 +1337,40 @@ for kind in cut whole; do
   [ "$NH" -ge 1 ]; verdict "degraded $kind: the handle's own open read the copy's first 300 bytes, the checks made at open ($NH)" $?
 done
 FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
+
+echo; echo "=== logical names: one file through two servers is one entry"
+# The plugin's conf with the prefixes; the same random reads (one seed) through a, then b.
+mkdir -p "$W/conf-lfn"
+sed 's/^enable = true$/enable = true\nlogical_name_prefixes = \/store\/mc\//' "$W/conf/u.conf" > "$W/conf-lfn/u.conf"
+L=/store/mc/ci/lfn.root; place $L a b; LC="$W/c-lfn"; mkdir -p "$LC"
+# the origin bytes of the cache's processes, each process's last line, summed
+obytes() {
+  local f
+  for f in "$1"/stats/*.jsonl; do
+    case $f in *.files.jsonl|*.trace.jsonl) continue ;; esac
+    tail -1 "$f" | grep -o '"origin_bytes":[0-9]*' | grep -o '[0-9]*$'
+  done | awk '{s += $1} END {print s + 0}'
+}
+lfnfuzz() { # PORT LOG
+  env XRD_PLUGINCONFDIR="$W/conf-lfn" UCACHE_DIR="$LC" UCACHE_REVALIDATE_S=0 UCACHE_THREADS=8 \
+      XRD_LOGLEVEL=Debug XRD_LOGFILE="$2" timeout 300 "$FUZZ" "root://127.0.0.1:$1/$L" "$W/f.bin" 300 1 7 2>&1
+}
+R1=$(lfnfuzz $AX "$W/lfn-a.log"); O1=$(obytes "$LC")
+R2=$(lfnfuzz $BX "$W/lfn-b.log"); O2=$(obytes "$LC")
+echo "$R1" | tail -1 | sed 's/^/    a: /'; echo "$R2" | tail -1 | sed 's/^/    b: /'
+grep -q "logical_name_prefixes" "$W/conf-lfn/u.conf" && [ "$O1" -gt 0 ] && [ "$O2" = "$O1" ] &&
+  echo "$R1" | grep -q "^plugin_fuzz: clean" && echo "$R2" | grep -q "^plugin_fuzz: clean"
+verdict "logical names: the reads through a and b are exact; the one through b fetched nothing (origin bytes $O1, then $O2)" $?
+if [ -x "$BUILD/src/cli/ucache" ]; then
+  ucli() { env -u XRD_LOGFILE XRD_PLUGINCONFDIR="$W/conf-lfn" UCACHE_DIR="$LC" "$BUILD/src/cli/ucache" "$@"; }
+  LS=$(ucli ls -l 2>&1)
+  echo "$LS" | sed 's/^/    ls -l: /' | cut -c1-200
+  echo "$LS" | grep -q "lfn:$L" && echo "$LS" | grep -q "127.0.0.1:$AX$L" && echo "$LS" | grep -q "127.0.0.1:$BX$L" &&
+    [ "$(echo "$LS" | grep -c 'lfn:')" = 1 ]
+  verdict "logical names: one entry, lfn:$L, with both URLs listed under it" $?
+  ucli rm "root://127.0.0.1:$BX/$L" >/dev/null 2>&1
+  ! ucli ls 2>&1 | grep -q "lfn:$L"; verdict "logical names: rm of b's URL removes the entry" $?
+fi
 
 echo; echo "fed_ci: $FAILS failure(s)"
 exit $((FAILS > 0))
