@@ -5557,7 +5557,10 @@ class MissReadHandler : public ResponseHandler {
       stats.servedBytes.fetch_add(userLen_, std::memory_order_relaxed);
       stats.originBytes.fetch_add(got, std::memory_order_relaxed);
       stats.originReads.fetch_add(1, std::memory_order_relaxed);
-      const uint64_t rt = arrivedUs_ - t0_;
+      // The round trip from the read's issue (its in-flight count's start), never from the
+      // request's start (t0_), which the request's deadlines count from: queueing, the disk reads
+      // of a vector read's hits and the map's parse are no origin time.
+      const uint64_t rt = arrivedUs_ - inflight_.t0;
       stats.originRtUs.add(rt);
       entry_->obs().originRtUs.add(rt);
       entry_->obs().servers.add(server, got, rt, inflight_.nc);
@@ -5947,7 +5950,10 @@ class MissVReadHandler : public ResponseHandler {
       for (const auto& c : userChunks_)
         total += c.length;
       stats.servedBytes.fetch_add(total - directBytes, std::memory_order_relaxed);
-      const uint64_t rt = arrivedUs_ - t0_;
+      // The round trip from the read's issue (its in-flight count's start), never from the
+      // request's start (t0_), which the request's deadlines count from: queueing, the disk reads
+      // of a vector read's hits and the map's parse are no origin time.
+      const uint64_t rt = arrivedUs_ - inflight_.t0;
       stats.originRtUs.add(rt);
       entry_->obs().originRtUs.add(rt);
       entry_->obs().servers.add(server, wireBytes, rt, inflight_.nc);
