@@ -22,6 +22,7 @@ $UCACHE_DIR/                         (0700)
   sources.new                        # transient during its rewrite
   names/<hh>/<sha256(name)>.to       # an entry's other name (logical_name_prefixes; below)
   names/<hh>/<sha256(key)>.names     # the names of an entry (below)
+  names/generation                   # the last generation id given to an entry (below)
   LOCK                               # cache-wide flock for eviction
   objects.cleared.<pid>-<ms>/        # an objects/ tree `ucache clear` set aside,
                                      #  deleted in the background
@@ -46,31 +47,55 @@ Written only by the plug-in, only once a logical name was given (a cache that ne
 had `logical_name_prefixes` set has no such directory, and nothing below is read):
 
 ```
-<dir>/names/<hh>/<namehash>.to       an alias: "ucache-alias 1 <entryhash> <entry key>\n"
+<dir>/names/<hh>/<namehash>.to       an alias: "ucache-alias 2 <entryhash> <gen> <c|u> <entry key>\n"
 <dir>/names/<hh>/<entryhash>.names   the entry's names: "lfn <key>" and "url <key>" lines
+<dir>/names/generation               the last generation id given: 6 hex digits and a newline
 <dir>/names/named-<hash>             the entries cached before were named for the prefixes of
                                      this hash (run_settings' logical_names=on/<hash>): the count
 <dir>/names/naming.lock              flock held while they are named (one process at a time)
 ```
 
 - `<namehash>` is the SHA-256 of a name (`lfn:/...` or a URL key). An alias says
-  which entry the name is: it is made whole (written apart, then linked in) and never
-  changed while its entry exists; when two processes name one file at once, the
-  first link wins and the other reads it. An alias is followed only while the entry
-  it names exists: one whose entry is gone (dangling) is as none, is replaced when
-  the name is given again, and no entry is ever made under its hash. When an entry
-  goes (`ucache rm`, eviction, a drop for a bad copy, a write), the aliases its list
-  names go with it; `ucache clear` removes `names/`; each eviction pass looks at up to
-  256 files of `names/` for dangling ones. A torn temporary file is debris.
-- An alias may name the URL's own entry ("self"): its copy is not the name's entry's
-  size, so the URL is cached apart (`name_size_mismatches`, STATS.md).
+  which entry the name is, and which generation of it: it is made whole (written
+  apart, then linked in); when two processes name one file at once, the first link
+  wins and the other reads it. An alias of any other shape (an earlier format too) is
+  no alias.
+- `<gen>` (6 hex digits) is the generation of the entry the alias names: the id in its
+  sidecar's header (`.meta` bytes 41-43, below), given when the first name of another
+  key is made to point to it, from the counter in `generation` (under a flock of that
+  file; 1 to 0xffffff and round again, starting at a random value), so that two
+  generations of one cache share an id only 16.7 million ids apart. An entry made, or
+  started again (its file changed at the origin), has none. An alias is followed only
+  while the entry it names exists in that generation, with that key: an alias left
+  behind by any path (a names list that lost its line, a crash between a removal's
+  unlinks, a removal racing a naming) names nothing, also once the same hash holds an
+  entry again; it is as none, is replaced when the name is given again, and is swept.
+  An entry reached through an alias, under another key's hash, is only ever taken as
+  it is in that generation: no entry is ever made, or started again, under that hash
+  for the name (the name is resolved again, and a URL still named to that entry whose
+  copy does not validate against it is cached apart under its own key).
+- `<c|u>`: in a URL's alias, whether the URL's copy was found the size of the entry
+  (`c`) or not yet (`u`). A job that opens such a URL opens it at its origin first,
+  inside the freshness window too, and compares the sizes; a URL whose own entry
+  (cached before) is there is compared with it when its alias is made.
+- An alias may name the URL's own entry ("self", generation `000000`): its copy is not
+  the name's entry's size, so the URL is cached apart (`name_size_mismatches`,
+  STATS.md); it holds while that entry exists.
+- When an entry goes (`ucache rm`, eviction, a drop for a bad copy, a write), the
+  aliases its list names go with it; `ucache clear` removes `names/`. Each eviction
+  pass looks at up to 256 files of `names/`, going on from where the last pass of the
+  process stopped (shard by shard, in file name order), and removes aliases that name
+  nothing, lists of entries that are gone and temporary files (`*.tmp.<pid>.<n>`)
+  older than an hour.
 - A name's entry: an entry under its own hash first, else its alias; a URL with a
   logical name whose name has neither, and whose own entry exists (cached before the
   prefixes were set), makes that entry the name's (USER_GUIDE.md, "Keys by logical
   name").
 - The entries already cached are named once per list of prefixes, the most recently
   used first, by `ucache set logical_name_prefixes` or in the background by the
-  plug-in's first process with them; `named-<hash>` is written at the end.
+  plug-in's first process with them; `named-<hash>` is written at the end. An entry
+  whose size is not that of the name's entry (under the name's own hash, or the one
+  its alias names) keeps its URL as its own (a self alias).
 - `.names` is appended one line at a time (a torn last line is skipped) and read as
   the logical name and the newest 8 distinct URLs; written again compacted when it
   grows past twice that. It goes with its entry.
@@ -87,7 +112,7 @@ had `logical_name_prefixes` set has no such directory, and nothing below is read
 | 24 | 8 | atime u64 | unix seconds, coarse (≤1 update/min) — eviction LRU key |
 | 32 | 8 | origin_mtime u64 | 0 unless `UCACHE_VALIDATE=size+mtime` |
 | 40 | 1 | cksum_kind u8 | 0 none, 1 adler32, 2 crc32c (`UCACHE_VALIDATE=cksum`) |
-| 41 | 3 | reserved | zero |
+| 41 | 3 | generation u24 | 0, or the id given to this generation of the entry when a name of another key was made to point to it ("Names of an entry" above); 0 again when the entry starts afresh. Earlier releases read these bytes as reserved and write 0 |
 | 44 | 4 | origin_cksum u32 | valid when cksum_kind ≠ 0 |
 | 48 | 4 | key_len u32 | ≤ 64 KiB |
 | 52 | 4 | meta_crc u32 | crc32c of the whole image with this field zeroed |

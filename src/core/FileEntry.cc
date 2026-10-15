@@ -68,9 +68,13 @@ std::shared_ptr<FileEntry> FileEntry::open(IOBackend& io, const Config& cfg, Sta
   e->dataPath_ = key.dataPath(cfg.cacheDir);
   e->metaPath_ = key.metaPath(cfg.cacheDir);
   e->onPersist_ = std::move(onPersist);
-  if (io.mkdirs(key.objectDir(cfg.cacheDir), 0700) < 0)
+  // An entry reached through a name of it, stored under another key's hash (EntryNames.h): taken
+  // as it is, in the generation the name points to, or not at all. It is never made, nor started
+  // again, here for this key: those bytes are the other key's.
+  const bool aliased = key.entryGen != 0;
+  if (!aliased && io.mkdirs(key.objectDir(cfg.cacheDir), 0700) < 0)
     return nullptr;
-  e->dataFd_ = io.open(e->dataPath_, O_RDWR | O_CREAT, 0600);
+  e->dataFd_ = io.open(e->dataPath_, aliased ? O_RDWR : O_RDWR | O_CREAT, 0600);
   if (e->dataFd_ < 0)
     return nullptr;
 
@@ -82,6 +86,8 @@ std::shared_ptr<FileEntry> FileEntry::open(IOBackend& io, const Config& cfg, Sta
 
   bool adopt =
       loaded && adoptable(*loaded, cfg, key, originSize, originMtime, cksumKind, originCksum);
+  if (aliased && !(adopt && loaded->gen == key.entryGen))
+    return nullptr; // gone, started again, or not this copy's: the caller resolves the name again
   if (!adopt) {
     // Fresh start, under the entry's EXCLUSIVE lock. Another process may have
     // created this entry between the shared read above and now, and a second

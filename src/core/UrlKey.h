@@ -33,9 +33,16 @@ struct UrlKey {
   // For a key by logical name made from a URL: that URL's own key, as it is with
   // logical names off, and its hash (KeyRules::key). Empty otherwise.
   std::string urlKey, urlHash;
-  // Set by resolveEntry (EntryNames.h): this URL has just become a name of an entry another URL
-  // filled, so the caller is to compare the sizes before it trusts that entry for it.
+  // Set by resolveEntry (EntryNames.h): this URL is a name of an entry another URL filled, and
+  // its copy's size has not been compared with that entry's yet, so the caller is to compare them
+  // (at the origin) before it trusts that entry for it.
   bool joined = false;
+  // Set by resolveEntry when the entry was reached through a name of it (an alias) and is stored
+  // under another key's hash: the generation of that entry the name points to (MetaData::gen).
+  // Such an entry is only ever taken as it is, in that generation: never started, nor started
+  // again, under that hash for this key (FileEntry::open). 0 otherwise. A key of this kind
+  // also carries the URL's own key and hash in urlKey/urlHash, with or without a logical name.
+  uint32_t entryGen = 0;
 
   bool logical() const { return scheme == "lfn"; }
 

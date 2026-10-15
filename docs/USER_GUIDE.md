@@ -1116,17 +1116,22 @@ names (`ucache pin lfn:/store/mc/...`, or a URL).
   A cache that holds such copies sets `logical_name_prefixes = off` (every file
   keyed by its URL), or a list that none of its users' paths holds, and `ucache rm`s
   the entry: with the prefixes off a URL still reaches the entry it was a name of
-  while that entry exists, and its own key is its own again once it is removed.
+  while that entry exists, and its own key is its own again once it is removed (a
+  name points to one generation of an entry: a file cached again later under the
+  same key is not reached through it).
 - **Copies of another size.** One name reached through several sites can meet a
   copy that is not the file: cut short, or another version. A URL whose copy is not
-  the size of the name's entry, found the first time that URL reaches it, is cached
-  apart under its own URL (`name_size_mismatches`); otherwise the rules that keep a
-  file's bytes from two copies apart hold as they do for one URL: an entry is never
-  filled from a copy whose size differs from it (the read is made at a copy of its
-  size, through the redirector the file was opened through, or fails naming both
-  sizes), a copy whose header
-  contradicts its size is refused at the open, and after the freshness window an
-  open at a copy of another size starts the entry again from that copy.
+  the size of the entry it reaches by the name is cached apart under its own URL
+  (`name_size_mismatches`), and the name's entry is left as it is. The sizes are
+  compared before the entry is ever served to that URL: at once when the URL has an
+  entry of its own cached before (with the prefixes off, or by a job with other
+  settings), else by opening that URL's copy at its origin (inside the freshness
+  window too) the first time a job reaches the entry through it, and again by every
+  job that reaches the origin through it. Otherwise the rules that keep a file's
+  bytes from two copies apart hold as they do for one URL: an entry is never filled
+  from a copy whose size differs from it (the read is made at a copy of its size,
+  through the redirector the file was opened through, or fails naming both sizes),
+  and a copy whose header contradicts its size is refused at the open.
 - **Freshness.** With `validate = size+mtime` a file keyed by its logical name is
   checked on its size alone: a modification time belongs to one site's copy, and a
   change of site would start the entry again.
@@ -1134,10 +1139,9 @@ names (`ucache pin lfn:/store/mc/...`, or a URL).
   already cached get their logical names: at once with `ucache set` (it says how
   many), else once, in the background, by the first job with them. An entry cached by
   a URL keeps its data, its pin, its replica and its records; nothing is fetched again
-  or copied, and every other URL of the file then reaches that entry. The first time a
-  URL reaches another URL's entry, the job opens that URL's copy (inside the freshness
-  window too) and compares its size with the entry's: a copy of another size is not
-  the file, and that URL is cached apart, under its own key, from then on
+  or copied, and every other URL of the file then reaches that entry, once its copy
+  was found that entry's size ("Copies of another size" above): a copy of another size
+  is not the file, and that URL is cached apart, under its own key, from then on
   (`name_size_mismatches`, STATS.md). A job that opens a file before its entry was
   named names it itself. When two URLs of one file were cached as two entries before,
   the one named first (by the naming, the most recently used) becomes the file's
@@ -1146,8 +1150,8 @@ names (`ucache pin lfn:/store/mc/...`, or a URL).
   stays until `ucache unpin <its key as ls prints it>`). Bytes of two entries are
   never mixed.
 - **Turning it off keeps every entry reachable.** With the prefixes off again, each
-  entry is still found through each URL that reached it, while it exists; only the
-  logical name is no longer used.
+  entry is still found through each URL that reached it, while it exists (and is
+  not started afresh); only the logical name is no longer used.
 - **One setting for the cache.** Set the prefixes for the cache with `ucache set`
   (its state file, which every job of the cache reads); never from a job's
   environment. A value set in one job's conf only makes that job key files by name

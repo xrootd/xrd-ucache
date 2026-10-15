@@ -39,6 +39,13 @@ struct MetaData {
   uint64_t originMtime = 0; // 0 when validation mode doesn't use it
   uint8_t cksumKind = kCksumNone;
   uint32_t originCksum = 0;
+  // The generation id the entry's names gave it (24 bits; EntryNames.h): 0 until a name of
+  // another key is made to point to it, then fixed for as long as these bytes are this entry's.
+  // A fresh start (a new entry, or one started again) has 0, so a name made to an earlier
+  // generation never matches it. Kept in the header's reserved bytes: a reader that knows nothing
+  // of it reads the sidecar as before and writes 0 back.
+  uint32_t gen = 0;
+  static constexpr uint32_t kGenMask = 0xffffffu;
   std::string key; // full normalized key, for ls/debug
   PageBitmap bitmap;
   std::vector<uint32_t> pageCrcs; // crc32c per present page; 0 when absent
@@ -71,8 +78,14 @@ class MetaFile {
   // for reporting/eviction accounting only — never serve or validate pages
   // from it, and never store() it back (crcs would serialize as absent).
   static std::optional<MetaData> loadSummary(IOBackend& io, const std::string& path);
+  // The header and the key alone (no bitmap, no crc table): for the names of an entry, which
+  // need its size, key and generation only. Integrity as loadSummary's.
+  static std::optional<MetaData> loadHead(IOBackend& io, const std::string& path);
   // Atomic rewrite via tmp+rename; 0 or -errno. fsyncMeta per UCACHE_FSYNC=all.
   static int store(IOBackend& io, const std::string& path, const MetaData& m, bool fsyncMeta);
+
+  // loadSummary, or loadHead with `headOnly`.
+  static std::optional<MetaData> loadPart(IOBackend& io, const std::string& path, bool headOnly);
 
   // Exposed for tests.
   static std::vector<uint8_t> serialize(const MetaData& m);

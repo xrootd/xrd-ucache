@@ -27,6 +27,11 @@ template <typename T> T get(const uint8_t* p) {
 
 size_t align8(size_t n) { return (n + 7) & ~size_t(7); }
 
+uint32_t genAt(const uint8_t* hdr) {
+  return static_cast<uint32_t>(hdr[41]) | static_cast<uint32_t>(hdr[42]) << 8 |
+         static_cast<uint32_t>(hdr[43]) << 16;
+}
+
 } // namespace
 
 uint64_t MetaData::cachedBytes() const {
@@ -67,7 +72,10 @@ std::vector<uint8_t> MetaFile::serialize(const MetaData& m) {
   put<uint64_t>(buf, 16, m.fileSize);
   put<uint64_t>(buf, 24, m.atime);
   put<uint64_t>(buf, 32, m.originMtime);
-  buf[40] = m.cksumKind; // 41..43 reserved
+  buf[40] = m.cksumKind;
+  buf[41] = static_cast<uint8_t>(m.gen & 0xff); // 41..43: the generation id, 24 bits
+  buf[42] = static_cast<uint8_t>((m.gen >> 8) & 0xff);
+  buf[43] = static_cast<uint8_t>((m.gen >> 16) & 0xff);
   put<uint32_t>(buf, 44, m.originCksum);
   put<uint32_t>(buf, 48, static_cast<uint32_t>(m.key.size()));
   // meta_crc at 52 stays 0 for the digest pass
@@ -95,6 +103,7 @@ std::optional<MetaData> MetaFile::deserialize(const uint8_t* p, size_t n) {
   m.atime = get<uint64_t>(p + 24);
   m.originMtime = get<uint64_t>(p + 32);
   m.cksumKind = p[40];
+  m.gen = genAt(p);
   m.originCksum = get<uint32_t>(p + 44);
   uint32_t keyLen = get<uint32_t>(p + 48);
   uint32_t storedCrc = get<uint32_t>(p + kCrcFieldOff);
@@ -127,6 +136,14 @@ std::optional<MetaData> MetaFile::deserialize(const uint8_t* p, size_t n) {
 }
 
 std::optional<MetaData> MetaFile::loadSummary(IOBackend& io, const std::string& path) {
+  return loadPart(io, path, /*headOnly=*/false);
+}
+
+std::optional<MetaData> MetaFile::loadHead(IOBackend& io, const std::string& path) {
+  return loadPart(io, path, /*headOnly=*/true);
+}
+
+std::optional<MetaData> MetaFile::loadPart(IOBackend& io, const std::string& path, bool headOnly) {
   struct ::stat st;
   if (io.stat(path, &st) < 0)
     return std::nullopt;
@@ -149,6 +166,7 @@ std::optional<MetaData> MetaFile::loadSummary(IOBackend& io, const std::string& 
   m.atime = get<uint64_t>(hdr + 24);
   m.originMtime = get<uint64_t>(hdr + 32);
   m.cksumKind = hdr[40];
+  m.gen = genAt(hdr);
   m.originCksum = get<uint32_t>(hdr + 44);
   const uint32_t keyLen = get<uint32_t>(hdr + 48);
   if (m.pageSize == 0 || (m.pageSize & (m.pageSize - 1)) != 0 || keyLen > 64 * 1024) {
@@ -167,6 +185,14 @@ std::optional<MetaData> MetaFile::loadSummary(IOBackend& io, const std::string& 
   if (static_cast<uint64_t>(st.st_size) != total) {
     io.close(fd);
     return std::nullopt;
+  }
+  if (headOnly) {
+    m.key.resize(keyLen);
+    const int64_t r = keyLen ? io.preadFull(fd, m.key.data(), keyLen, keyOff) : 0;
+    io.close(fd);
+    if (r != static_cast<int64_t>(keyLen))
+      return std::nullopt;
+    return m;
   }
   std::vector<uint8_t> buf(crcsOff - keyOff);
   int64_t r = io.preadFull(fd, buf.data(), buf.size(), keyOff);

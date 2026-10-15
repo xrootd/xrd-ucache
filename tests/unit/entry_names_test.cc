@@ -10,7 +10,11 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <string>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
 
 using namespace ucache;
 using test::TempDir;
@@ -42,6 +46,12 @@ struct Writable {
   Writable() { setEntryNamesWritable(true); }
   ~Writable() { setEntryNamesWritable(false); }
 };
+// As the plug-in fills an entry it resolved: the entry made (or opened) with the URL's copy, then
+// the URL's name of it confirmed (its copy is that entry's size).
+void fill(const std::string& dir, const UrlKey& r, uint64_t size = 50000) {
+  makeEntry(dir, r, false, size);
+  confirmEntryName(r, dir);
+}
 } // namespace
 
 // The upgrade: a URL's entry cached with the prefixes off becomes the name's entry when they are
@@ -99,7 +109,7 @@ TEST(EntryNames, ANewEntryIsTheNamesAndEveryUrlReachesIt) {
   const UrlKey e = resolveEntry(n, dir);
   EXPECT_EQ(e.hashHex, n.hashHex);
   EXPECT_EQ(e.key, "lfn:/store/data/R/b.root");
-  makeEntry(dir, e);
+  fill(dir, e);
   EXPECT_EQ(resolveEntry(*kOff.key("root://x.example//store/data/R/b.root"), dir).hashHex, n.hashHex);
   EXPECT_EQ(resolveEntry(*kOn.key("root://y.example//store/data/R/b.root"), dir).hashHex, n.hashHex);
   EXPECT_EQ(resolveEntry(*kOff.key("root://y.example//store/data/R/b.root"), dir).hashHex, n.hashHex);
@@ -145,22 +155,39 @@ TEST(EntryNames, WithoutNamesNothingChanges) {
   EXPECT_EQ(resolveEntry(k, "").hashHex, k.hashHex); // no cache: the key itself
 }
 
-// An alias is made once and never changed; one that does not parse is no alias.
+// An alias is made once and never changed; one that does not parse (an earlier format too) is no
+// alias, and one of another generation of its entry is none either.
 TEST(EntryNames, AnAliasIsMadeOnceAndAMalformedOneIsIgnored) {
   TempDir td;
   const std::string dir = td.path();
   Writable w;
   const UrlKey n = *kOn.key("root://h//store/mc/d.root");
-  const std::string other(64, 'e');
-  ::mkdir(entryNamesDir(dir).c_str(), 0755);
-  ::mkdir((entryNamesDir(dir) + "/" + n.hashHex.substr(0, 2)).c_str(), 0755);
-  std::ofstream(aliasPath(dir, n.hashHex)) << "ucache-alias 1 " << other << " lfn:/elsewhere\n";
-  ::mkdir((dir + "/objects").c_str(), 0755);
-  ::mkdir((dir + "/objects/ee").c_str(), 0755);
-  std::ofstream(dir + "/objects/ee/" + other + ".meta") << "x"; // the entry it names exists
+  const UrlKey other = UrlKey::ofEntry("root://e.example:1094/elsewhere", std::string(64, 'e'));
+  makeEntry(dir, other); // the entry another process named
+  {
+    RealIO io;
+    auto m = MetaFile::load(io, other.metaPath(dir));
+    ASSERT_TRUE(m);
+    m->gen = 0x12ab;
+    ASSERT_EQ(MetaFile::store(io, other.metaPath(dir), *m, false), 0);
+    EXPECT_EQ(MetaFile::loadHead(io, other.metaPath(dir))->gen, 0x12abu);
+  }
+  auto put = [&dir](const UrlKey& name, const std::string& body) {
+    ::mkdir(entryNamesDir(dir).c_str(), 0755);
+    ::mkdir((entryNamesDir(dir) + "/" + name.hashHex.substr(0, 2)).c_str(), 0755);
+    std::ofstream(aliasPath(dir, name.hashHex)) << body;
+  };
+  const UrlKey n1 = *kOn.key("root://h//store/mc/d1.root");
+  const UrlKey n2 = *kOn.key("root://h//store/mc/d2.root");
+  put(n1, "ucache-alias 1 " + other.hashHex + " " + other.key + "\n");
+  EXPECT_EQ(resolveEntry(n1, dir).hashHex, n1.hashHex); // the earlier format: no alias
+  put(n2, "ucache-alias 2 " + other.hashHex + " 0012ac c " + other.key + "\n");
+  EXPECT_EQ(resolveEntry(n2, dir).hashHex, n2.hashHex); // another generation: no alias
+  put(n, "ucache-alias 2 " + other.hashHex + " 0012ab c " + other.key + "\n");
   const UrlKey e = resolveEntry(n, dir);
-  EXPECT_EQ(e.hashHex, other); // the alias another process made first
-  EXPECT_EQ(e.key, "lfn:/elsewhere");
+  EXPECT_EQ(e.hashHex, other.hashHex); // the alias another process made first
+  EXPECT_EQ(e.key, other.key);
+  EXPECT_EQ(e.entryGen, 0x12abu);
   const UrlKey m = *kOn.key("root://h//store/mc/f.root");
   ::mkdir((entryNamesDir(dir) + "/" + m.hashHex.substr(0, 2)).c_str(), 0755);
   std::ofstream(aliasPath(dir, m.hashHex)) << "ucache-alias 1 not-a-hash x\n";
@@ -178,7 +205,7 @@ TEST(EntryNames, TheListIsBounded) {
     const UrlKey e = resolveEntry(*kOn.key("root://s" + std::to_string(i) + ".example//store/mc/g.root"), dir);
     if (i == 0) {
       entry = e.hashHex;
-      makeEntry(dir, e); // the entry is filled (the names hold also while it is not)
+      fill(dir, e); // the entry is filled (the names hold also while it is not)
     }
     EXPECT_EQ(e.hashHex, entry) << i;
   }
@@ -241,7 +268,7 @@ TEST(EntryNames, ADanglingAliasIsNeverFollowed) {
   const UrlKey again = resolveEntry(lfn, dir); // remembered, but its entry is gone: resolved again
   EXPECT_EQ(again.hashHex, lfn.hashHex);       // a new entry under the name's own hash
   EXPECT_EQ(again.key, "lfn:/store/mc/test/a.root");
-  makeEntry(dir, again);
+  fill(dir, again);
   EXPECT_EQ(resolveEntry(u, dir).hashHex, u.hashHex); // prefixes off: the user's URL is its own
   const UrlKey o = *kOff.key(official);
   EXPECT_EQ(resolveEntry(o, dir).hashHex, lfn.hashHex); // reaches the name's entry
@@ -309,7 +336,7 @@ TEST(EntryNames, ACopyOfAnotherSizeKeepsItsOwnEntry) {
   const std::string dir = td.path();
   Writable w;
   const UrlKey e = resolveEntry(*kOn.key("root://a.example//store/mc/t.root"), dir);
-  makeEntry(dir, e);
+  fill(dir, e);
   const UrlKey j = resolveEntry(*kOn.key("root://b.example//store/mc/t.root"), dir);
   EXPECT_EQ(j.hashHex, e.hashHex);
   EXPECT_TRUE(j.joined); // the caller compares the sizes before it trusts the entry
@@ -329,7 +356,321 @@ TEST(EntryNames, ACopyOfAnotherSizeKeepsItsOwnEntry) {
   const UrlKey r1 = resolveEntry(*kOn.key("root://a.example//store/mc/v.root"), d2);
   const UrlKey r2 = resolveEntry(*kOn.key("root://b.example//store/mc/v.root"), d2);
   EXPECT_NE(r1.hashHex, r2.hashHex);
-  EXPECT_TRUE((r1.hashHex == q1.hashHex && r2.hashHex == q2.hashHex) ||
-              (r1.hashHex == q2.hashHex && r2.hashHex == q1.hashHex) ||
-              (r1.hashHex == q1.hashHex || r2.hashHex == q2.hashHex));
+  EXPECT_EQ(r1.hashHex, q1.hashHex); // each URL its own entry, whichever was named
+  EXPECT_EQ(r2.hashHex, q2.hashHex);
+}
+
+// ---- The rows below also build on the change before generations, where they fail. ----
+
+namespace {
+// `n` URLs of the logical name `lfn` whose own keys' hashes begin with `hh` (so that their aliases
+// share one shard of names/).
+std::vector<std::string> urlsInShard(const std::string& lfn, const std::string& hh, int n) {
+  std::vector<std::string> out;
+  for (int i = 0; static_cast<int>(out.size()) < n; ++i) {
+    const std::string u = "root://s" + std::to_string(i) + ".example/" + lfn;
+    if (kOff.key(u)->hashHex.compare(0, 2, hh) == 0)
+      out.push_back(u);
+  }
+  return out;
+}
+size_t removeWithStore(const std::string& dir, const UrlKey& k) {
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = dir;
+  CacheStore store(io, cfg);
+  store.disableStatsDump();
+  return store.removeEntry(k) ? 1 : 0;
+}
+} // namespace
+
+// An alias the entry's list does not hold (the list keeps the newest 8 URLs) is left when the entry
+// goes; once the same hash holds an entry again (the user's URL read again with the prefixes off),
+// that alias is never followed: the official URL is its own key, not the user's copy.
+TEST(EntryNames, AnAliasLostFromTheListIsNotRevived) {
+  TempDir td;
+  const std::string dir = td.path();
+  const std::string user = "root://u.example//user/me/store/mc/test/a.root";
+  const std::string official = "root://o.example//store/mc/test/a.root";
+  const UrlKey u = *kOff.key(user);
+  makeEntry(dir, u);
+  Writable w;
+  EXPECT_EQ(resolveEntry(*kOn.key(user), dir).hashHex, u.hashHex);
+  EXPECT_EQ(resolveEntry(*kOn.key(official), dir).hashHex, u.hashHex); // the documented risk
+  for (int i = 0; i < 17; ++i) {
+    const std::string s = "root://s" + std::to_string(i) + ".example//store/mc/test/a.root";
+    EXPECT_EQ(resolveEntry(*kOn.key(s), dir).hashHex, u.hashHex);
+  }
+  const UrlKey o = *kOff.key(official);
+  bool listed = false;
+  for (const auto& x : entryNames(dir, u.hashHex).urls)
+    listed = listed || x == o.key;
+  ASSERT_FALSE(listed); // the official URL's line is gone from the bounded list
+  ASSERT_EQ(removeWithStore(dir, u), 1u); // the documented remedy: rm (the prefixes off)
+  ASSERT_TRUE(exists(aliasPath(dir, o.hashHex))); // the official URL's alias is left behind
+  makeEntry(dir, u); // the user's URL read again with the prefixes off: the user's copy
+  setEntryNamesWritable(false);
+  EXPECT_EQ(resolveEntry(o, dir).hashHex, o.hashHex) << "the official URL reached the user's copy";
+  setEntryNamesWritable(true);
+  EXPECT_EQ(resolveEntry(*kOn.key(official), dir).hashHex, kOn.key(official)->hashHex)
+      << "the name reached the user's copy";
+}
+
+// The same with the alias left by a crash between a removal's unlinks and its names' removal.
+TEST(EntryNames, AnAliasLeftByACrashIsNotRevived) {
+  TempDir td;
+  const std::string dir = td.path();
+  const std::string user = "root://u.example//user/me/store/mc/test/b.root";
+  const std::string official = "root://o.example//store/mc/test/b.root";
+  const UrlKey u = *kOff.key(user);
+  makeEntry(dir, u);
+  {
+    Writable w;
+    EXPECT_EQ(resolveEntry(*kOn.key(user), dir).hashHex, u.hashHex);
+    EXPECT_EQ(resolveEntry(*kOn.key(official), dir).hashHex, u.hashHex);
+  }
+  ASSERT_EQ(::unlink(u.metaPath(dir).c_str()), 0); // the crash: files gone, aliases not
+  makeEntry(dir, u);                               // the user's URL, prefixes off, read again
+  const UrlKey o = *kOff.key(official);
+  EXPECT_EQ(resolveEntry(o, dir).hashHex, o.hashHex) << "the official URL reached the user's copy";
+  EXPECT_EQ(resolveEntry(*kOn.key(official), dir).hashHex, kOn.key(official)->hashHex);
+}
+
+// A URL whose own entry (cached with the prefixes off) is another size than the name's entry keeps
+// its own entry; of the same size, it joins the name's, compared already (not to be opened again).
+TEST(EntryNames, AUrlWithItsOwnEntryOfAnotherSizeKeepsIt) {
+  TempDir td;
+  const std::string dir = td.path();
+  Writable w;
+  const UrlKey e = resolveEntry(*kOn.key("root://a.example//store/mc/w.root"), dir);
+  fill(dir, e, 50000);
+  const UrlKey ob = *kOff.key("root://b.example//store/mc/w.root");
+  makeEntry(dir, ob, false, 60000); // b's own copy, another size, cached with the prefixes off
+  const UrlKey j = resolveEntry(*kOn.key("root://b.example//store/mc/w.root"), dir);
+  EXPECT_EQ(j.hashHex, ob.hashHex) << "b's URL reached the name's entry of another size";
+  EXPECT_EQ(resolveEntry(*kOn.key("root://b.example//store/mc/w.root"), dir).hashHex, ob.hashHex);
+  const UrlKey oc = *kOff.key("root://c.example//store/mc/w.root");
+  makeEntry(dir, oc, false, 50000); // c's own copy, the name's size
+  const UrlKey jc = resolveEntry(*kOn.key("root://c.example//store/mc/w.root"), dir);
+  EXPECT_EQ(jc.hashHex, e.hashHex);
+  EXPECT_FALSE(jc.joined);
+}
+
+// The naming of the cached entries compares a URL entry's size with an entry under the name's own
+// hash too: a URL entry of another size keeps its own entry.
+TEST(EntryNames, TheNamingComparesWithAnEntryUnderTheName) {
+  TempDir td;
+  const std::string dir = td.path();
+  {
+    Writable w;
+    const UrlKey e = resolveEntry(*kOn.key("root://a.example//store/mc/x.root"), dir);
+    fill(dir, e, 50000);
+  }
+  const UrlKey ob = *kOff.key("root://b.example//store/mc/x.root");
+  makeEntry(dir, ob, false, 70000);
+  EXPECT_GE(nameCachedEntries(dir, kOn), 0);
+  setEntryNamesWritable(false); // the CLI's view of what the naming did
+  EXPECT_EQ(resolveEntry(*kOn.key("root://b.example//store/mc/x.root"), dir).hashHex, ob.hashHex)
+      << "b (70000 bytes) is a name of the 50000-byte entry";
+}
+
+// The eviction pass's sweep goes on, call after call, from where it stopped: in a shard of more
+// live files than its budget, every dangling alias is reached.
+TEST(EntryNames, TheSweepReachesEveryFileOfAShard) {
+  TempDir td;
+  const std::string dir = td.path();
+  Writable w;
+  const UrlKey dead = resolveEntry(*kOn.key("root://first.example//store/mc/dead.root"), dir);
+  fill(dir, dead);
+  const UrlKey live = resolveEntry(*kOn.key("root://first.example//store/mc/live.root"), dir);
+  fill(dir, live);
+  const auto deadUrls = urlsInShard("/store/mc/dead.root", "cc", 300);
+  const auto liveUrls = urlsInShard("/store/mc/live.root", "cc", 300);
+  for (size_t i = 0; i < 300; ++i) { // made in turn, whatever order a directory lists them in
+    ASSERT_EQ(resolveEntry(*kOn.key(liveUrls[i]), dir).hashHex, live.hashHex);
+    ASSERT_EQ(resolveEntry(*kOn.key(deadUrls[i]), dir).hashHex, dead.hashHex);
+  }
+  ASSERT_EQ(::unlink(dead.metaPath(dir).c_str()), 0); // its aliases left (a crash)
+  size_t swept = 0;
+  for (int i = 0; i < 50; ++i)
+    swept += sweepEntryNames(dir, 256);
+  size_t deadLeft = 0, liveLeft = 0;
+  for (const auto& u : deadUrls)
+    deadLeft += exists(aliasPath(dir, kOff.key(u)->hashHex));
+  for (const auto& u : liveUrls)
+    liveLeft += exists(aliasPath(dir, kOff.key(u)->hashHex));
+  EXPECT_EQ(deadLeft, 0u) << "dangling aliases the sweep never reached (" << swept << " removed)";
+  EXPECT_EQ(liveLeft, 300u);
+}
+
+// A URL that joined another URL's entry and whose copy was not compared yet is "joined" (to be
+// compared at its origin before the entry is trusted) every time it is resolved, in this process
+// and in another, until it is compared.
+TEST(EntryNames, AnUncomparedUrlIsJoinedInEveryProcess) {
+  TempDir td;
+  const std::string dir = td.path();
+  Writable w;
+  const UrlKey e = resolveEntry(*kOn.key("root://a.example//store/mc/y.root"), dir);
+  fill(dir, e);
+  const UrlKey b = *kOn.key("root://b.example//store/mc/y.root");
+  EXPECT_TRUE(resolveEntry(b, dir).joined);
+  EXPECT_TRUE(resolveEntry(b, dir).joined) << "the second resolution trusts it unchecked";
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0)
+    ::_exit(resolveEntry(b, dir).joined ? 0 : 1);
+  int st = 0;
+  ASSERT_EQ(::waitpid(pid, &st, 0), pid);
+  EXPECT_TRUE(WIFEXITED(st) && WEXITSTATUS(st) == 0) << "another process trusts it unchecked";
+}
+
+// A process that resolved a URL to the name's entry sees it kept apart once another process found
+// its copy another size.
+TEST(EntryNames, AUrlKeptApartByAnotherProcessIsKeptApartHere) {
+  TempDir td;
+  const std::string dir = td.path();
+  Writable w;
+  const UrlKey e = resolveEntry(*kOn.key("root://a.example//store/mc/z.root"), dir);
+  fill(dir, e);
+  const UrlKey b = *kOn.key("root://b.example//store/mc/z.root");
+  const UrlKey j = resolveEntry(b, dir);
+  ASSERT_EQ(j.hashHex, e.hashHex);
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) { // the other process: b's copy is another size
+    keepOwnEntry(j, dir);
+    ::_exit(0);
+  }
+  int st = 0;
+  ASSERT_EQ(::waitpid(pid, &st, 0), pid);
+  makeEntry(dir, UrlKey::ofEntry(j.urlKey, j.urlHash), false, 60000); // its own entry, made there
+  EXPECT_EQ(resolveEntry(b, dir).hashHex, j.urlHash)
+      << "this process still gives b the name's entry";
+}
+
+// An entry reached through an alias, under another key's hash, is never made, nor started again,
+// for that key: an alias resolved just before its entry went (or was made again) opens nothing.
+TEST(EntryNames, AnEntryReachedThroughANameIsNeverStartedUnderItsHash) {
+  TempDir td;
+  const std::string dir = td.path();
+  const std::string user = "root://u.example//user/me/store/mc/test/c.root";
+  const std::string official = "root://o.example//store/mc/test/c.root";
+  const UrlKey u = *kOff.key(user);
+  makeEntry(dir, u);
+  {
+    Writable w;
+    EXPECT_EQ(resolveEntry(*kOn.key(user), dir).hashHex, u.hashHex);
+    EXPECT_EQ(resolveEntry(*kOn.key(official), dir).hashHex, u.hashHex);
+  }
+  const UrlKey r = resolveEntry(*kOff.key(official), dir); // the prefixes off: the alias
+  ASSERT_EQ(r.hashHex, u.hashHex);
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = dir;
+  {
+    ASSERT_EQ(removeWithStore(dir, u), 1u); // the entry goes between the resolution and the open
+    CacheStore store(io, cfg);
+    store.disableStatsDump();
+    EXPECT_FALSE(store.open(r, 50000)) << "an entry was made under the user's URL's hash";
+    EXPECT_FALSE(exists(u.metaPath(dir)));
+  }
+  makeEntry(dir, u); // the user's URL read again: another generation under that hash
+  {
+    CacheStore store(io, cfg);
+    store.disableStatsDump();
+    EXPECT_FALSE(store.open(r, 50000)) << "the new generation was taken through the old name";
+  }
+}
+
+// ---- The generation of an entry and the comparison of a URL's copy (no counterpart before). ----
+
+// Once a URL's copy was found the entry's size (the plug-in, after its open at the origin), the
+// URL is no longer "joined", here or in another process.
+TEST(EntryNames, AUrlIsComparedOnce) {
+  TempDir td;
+  const std::string dir = td.path();
+  Writable w;
+  const UrlKey e = resolveEntry(*kOn.key("root://a.example//store/mc/q.root"), dir);
+  fill(dir, e);
+  const UrlKey b = *kOn.key("root://b.example//store/mc/q.root");
+  const UrlKey j = resolveEntry(b, dir);
+  ASSERT_TRUE(j.joined);
+  confirmEntryName(j, dir);
+  EXPECT_FALSE(resolveEntry(b, dir).joined);
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0)
+    ::_exit(resolveEntry(b, dir).joined ? 1 : 0);
+  int st = 0;
+  ASSERT_EQ(::waitpid(pid, &st, 0), pid);
+  EXPECT_TRUE(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+  // The URL that filled the entry is never joined to it.
+  EXPECT_FALSE(resolveEntry(*kOn.key("root://a.example//store/mc/q.root"), dir).joined);
+}
+
+// An entry's generation is given when a name of another key is made to it, is kept by every write
+// of the entry's sidecar (a pin, the entry's own commits), and is gone when the entry starts
+// afresh: the names made to it are then names of nothing.
+TEST(EntryNames, AGenerationLastsAsLongAsTheEntrysBytes) {
+  TempDir td;
+  const std::string dir = td.path();
+  const UrlKey u = *kOff.key("root://u.example//store/mc/g1.root");
+  makeEntry(dir, u);
+  RealIO io;
+  EXPECT_EQ(MetaFile::loadHead(io, u.metaPath(dir))->gen, 0u); // no name of it: none
+  Writable w;
+  const UrlKey o = *kOn.key("root://o.example//store/mc/g1.root");
+  EXPECT_EQ(resolveEntry(*kOn.key("root://u.example//store/mc/g1.root"), dir).hashHex, u.hashHex);
+  const uint32_t gen = MetaFile::loadHead(io, u.metaPath(dir))->gen;
+  EXPECT_NE(gen, 0u);
+  const UrlKey r = resolveEntry(o, dir);
+  EXPECT_EQ(r.hashHex, u.hashHex);
+  EXPECT_EQ(r.entryGen, gen);
+  Config cfg;
+  cfg.cacheDir = dir;
+  {
+    CacheStore store(io, cfg);
+    store.disableStatsDump();
+    ASSERT_TRUE(store.setPinnedByKey(u, true));
+    auto e = store.open(r, 50000); // through the name, as it is
+    ASSERT_TRUE(e);
+    e->setPinned(false); // the entry's own commit
+  }
+  EXPECT_EQ(MetaFile::loadHead(io, u.metaPath(dir))->gen, gen);
+  setEntryNamesWritable(false);
+  EXPECT_EQ(resolveEntry(*kOff.key("root://o.example//store/mc/g1.root"), dir).hashHex, u.hashHex);
+  {
+    CacheStore store(io, cfg);
+    store.disableStatsDump();
+    ASSERT_TRUE(store.open(u, 60000)); // the user's file changed: the entry starts afresh
+  }
+  EXPECT_EQ(MetaFile::loadHead(io, u.metaPath(dir))->gen, 0u);
+  const UrlKey off = *kOff.key("root://o.example//store/mc/g1.root");
+  EXPECT_EQ(resolveEntry(off, dir).hashHex, off.hashHex); // its names name nothing now
+  // Generations are not given twice: the next one differs.
+  setEntryNamesWritable(true);
+  EXPECT_EQ(resolveEntry(*kOn.key("root://u.example//store/mc/g1.root"), dir).hashHex, u.hashHex);
+  const uint32_t gen2 = MetaFile::loadHead(io, u.metaPath(dir))->gen;
+  EXPECT_NE(gen2, 0u);
+  EXPECT_NE(gen2, gen);
+}
+
+// The sweep removes a temporary file of names/ left by a process that ended while writing it, once
+// it is an hour old, and not before.
+TEST(EntryNames, TheSweepRemovesOldTemporaryFiles) {
+  TempDir td;
+  const std::string dir = td.path();
+  const std::string sh = entryNamesDir(dir) + "/ab";
+  ASSERT_EQ(::mkdir(entryNamesDir(dir).c_str(), 0755), 0);
+  ASSERT_EQ(::mkdir(sh.c_str(), 0755), 0);
+  const std::string old = sh + "/" + std::string(64, 'a') + ".to.tmp.123.0";
+  const std::string young = sh + "/" + std::string(64, 'b') + ".to.tmp.123.1";
+  std::ofstream(old) << "x";
+  std::ofstream(young) << "x";
+  struct ::timespec ts[2] = {{::time(nullptr) - 7200, 0}, {::time(nullptr) - 7200, 0}};
+  ASSERT_EQ(::utimensat(AT_FDCWD, old.c_str(), ts, 0), 0);
+  for (int i = 0; i < 300; ++i)
+    sweepEntryNames(dir, 64);
+  EXPECT_FALSE(exists(old));
+  EXPECT_TRUE(exists(young));
 }

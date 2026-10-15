@@ -6324,8 +6324,9 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // every open) never enters here.
   if (!passthroughOnly_ && cfg.revalidateSeconds > 0) {
     auto key = cfg.entryKey(url);
-    // A URL that has just become a name of another URL's entry is opened at its origin once, so
-    // that its copy's size is compared with the entry's (ensureEntry) before it is trusted.
+    // A URL that is a name of an entry another copy filled, its copy's size not compared with that
+    // entry's yet (in any process: the alias says so), is opened at its origin, so that the sizes
+    // are compared (ensureEntry) before the entry is trusted for it.
     if (key && !key->joined && cacheFresh(*key, cfg.cacheDir, cfg.revalidateSeconds) &&
         !dropCutWarmEntry(*key, url, cfg, *st_->store)) {
       {
@@ -6790,22 +6791,31 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
     if (s.IsOK() && si && allowed) {
       statClone = std::make_unique<XrdCl::StatInfo>(*si);
       bool declinedForSpace = false, declinedSizeDiffers = false;
-      // A URL that reached another URL's entry by its logical name, with a copy of another size: not
-      // that file's copy. The URL gets an entry of its own (EntryNames.h keepOwnEntry), never the
-      // name's bytes, and the name's entry is left as it is.
-      if (key->logical() && !key->urlHash.empty() && key->hashHex != key->urlHash) {
-        const auto m = MetaFile::loadSummary(RealIO::instance(), key->metaPath(cfg.cacheDir));
-        if (m && m->fileSize != si->GetSize()) {
-          keepOwnEntry(*key, cfg.cacheDir);
+      // A URL that reaches an entry another key's copy filled (by its logical name, or by an alias
+      // with the prefixes off), with a copy of another size: not that file's copy. The URL gets an
+      // entry of its own (EntryNames.h keepOwnEntry), never that entry's bytes, and that entry is
+      // left as it is. Compared at every open that reaches the origin, so also after the window.
+      auto keepApart = [&] {
+        keepOwnEntry(*key, cfg.cacheDir);
+        UrlKey own = UrlKey::ofEntry(key->urlKey, key->urlHash);
+        key = own;
+      };
+      auto compareSize = [&] {
+        if (key->urlHash.empty() || key->hashHex == key->urlHash)
+          return;
+        // (an entry of another generation than the alias named is not compared: the open refuses
+        // it, and the name is resolved again)
+        const auto m = MetaFile::loadHead(RealIO::instance(), key->metaPath(cfg.cacheDir));
+        if (m && (!key->entryGen || m->gen == key->entryGen) && m->fileSize != si->GetSize()) {
           UCACHE_INFO("%s: its copy (%llu bytes) is not the size of the entry of %s (%llu bytes): "
                       "it is cached apart, under its own URL",
                       key->urlKey.c_str(), static_cast<unsigned long long>(si->GetSize()),
                       key->key.c_str(), static_cast<unsigned long long>(m->fileSize));
           st_->store->stats().nameSizeMismatches.fetch_add(1, std::memory_order_relaxed);
-          UrlKey own = UrlKey::ofEntry(key->urlKey, key->urlHash);
-          key = own;
+          keepApart();
         }
-      }
+      };
+      compareSize();
       const WholeFirstRead whole = wholeFirstRead(firstRead, si->GetSize(), *key, cfg, forkLayout);
       keepOriginal = keepOriginal || whole == WholeFirstRead::kAsStored;
       if (whole == WholeFirstRead::kCopy)
@@ -6814,6 +6824,26 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
         entry = st_->store->open(*key, si->GetSize(), si->GetModTime(),
                                  MetaData::kCksumNone, 0, &declinedForSpace,
                                  &declinedSizeDiffers);
+      // An entry reached through an alias, under another key's hash, is taken as it is or not at
+      // all (FileEntry::open): when it went, was started again, or does not validate for this
+      // URL's copy since the name was resolved, the name is resolved again, once. A URL still
+      // named to that same entry is cached apart.
+      if (!entry && !copy && key->entryGen && !key->urlHash.empty() && !declinedForSpace &&
+          !declinedSizeDiffers) {
+        const auto again = cfg.entryKey(st_->url);
+        if (again && (!again->entryGen || again->hashHex != key->hashHex ||
+                      again->entryGen != key->entryGen)) {
+          key = again;
+          compareSize();
+        } else {
+          keepApart();
+        }
+        entry = st_->store->open(*key, si->GetSize(), si->GetModTime(), MetaData::kCksumNone, 0,
+                                 &declinedForSpace, &declinedSizeDiffers);
+      }
+      // This URL's copy is the size of the entry it reached: its name is made, or marked compared.
+      if (entry && !key->urlHash.empty() && key->hashHex != key->urlHash)
+        confirmEntryName(*key, cfg.cacheDir);
       // A capacity DECISION is not a fail-open. failopenEvents means something
       // went wrong and every benchmark requires it to be zero, so counting a
       // deliberate decline there would make a cache that is merely full look

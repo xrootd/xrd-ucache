@@ -272,17 +272,39 @@ uint64_t KeyRules::nextId() {
   return next.fetch_add(1, std::memory_order_relaxed);
 }
 
+namespace {
+// KeyRules::key's last answer, per thread. Freed when the thread ends, by an owner whose destructor
+// also marks it gone: a call made after that on the same thread (the main thread's at process
+// exit, while the final records are written) derives the key without keeping it, and never meets
+// a destroyed object. The pointer and the mark are trivially destructible, so they can be read
+// until the thread itself is gone.
+struct LastKey {
+  uint64_t id = 0;
+  std::string url;
+  std::optional<UrlKey> key;
+};
+thread_local LastKey* tLastKey = nullptr;
+thread_local bool tLastKeyGone = false;
+struct LastKeyOwner {
+  ~LastKeyOwner() {
+    delete tLastKey;
+    tLastKey = nullptr;
+    tLastKeyGone = true;
+  }
+};
+} // namespace
+
 std::optional<UrlKey> KeyRules::key(const std::string& url) const {
   // The same URL is keyed again and again by one thread (a handle's records and reads): the last
   // answer is kept per thread, for these rules (a regular expression is not free).
-  struct Last {
-    uint64_t id = 0;
-    std::string url;
-    std::optional<UrlKey> key;
-  };
-  // Never destroyed: a thread's exit (the main thread's at process exit, while the final records
-  // are written) must not leave a destroyed object behind for a later call.
-  thread_local Last* last = new Last;
+  if (tLastKeyGone)
+    return derive(url); // the thread is ending: nothing kept
+  if (!tLastKey) {
+    static thread_local LastKeyOwner owner; // frees it when the thread ends
+    (void)owner;
+    tLastKey = new LastKey;
+  }
+  LastKey* last = tLastKey;
   if (last->id == id_ && last->url == url)
     return last->key;
   std::optional<UrlKey> k = derive(url);
