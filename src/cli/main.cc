@@ -393,7 +393,8 @@ void printStats(const StatsTotals& t) {
   row("open_retries_exhausted", t.openRetriesExhausted);
   row("validations_failed", t.validationsFailed);
   row("size_disagreements", t.sizeDisagreements);
-  row("name_size_mismatches", t.nameSizeMismatches);
+  if (t.nameSizeMismatches) // only a cache with logical names counts them
+    row("name_size_mismatches", t.nameSizeMismatches);
   if (t.originChecksPassed || t.originChecksFailed || t.originChecksNone ||
       t.originChecksUnjudged || t.originChecksNotExamined) {
     row("origin_checks_passed", t.originChecksPassed);
@@ -3678,6 +3679,9 @@ int cmdSet(const Config& cfg, const char* key, const char* value) {
     return 2;
   }
   if (k == "logical_name_prefixes") {
+    // The words the conf reads as off (Config.cc falsy) are taken here too, and stored as "off".
+    if (std::string(value) == "false" || std::string(value) == "0")
+      value = "off";
     std::string why;
     if (!logicalNamePrefixesValid(value, &why)) {
       std::fprintf(stderr, "set: logical_name_prefixes '%s' is not valid: %s\n", value, why.c_str());

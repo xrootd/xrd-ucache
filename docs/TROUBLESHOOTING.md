@@ -397,8 +397,10 @@ it reads), and refuses:
 - one whose list of top-level objects is damaged: zeroed or overwritten (`its list of
   top-level objects at 1750173 is labelled as lying at 0`, `... does not hold its own
   label`, `... is labelled with the directory at 0, not the top directory at 100`), or
-  naming an object outside the copy, in another directory, or in one below 64, where ROOT
-  stops reading a list (`its list of top-level objects names an object at ..., ... bytes,
+  naming an object outside the copy, in another directory, or at a position below 64
+  (ROOT opens such a copy with an error and reads only the objects listed before the
+  damaged entry; an object in another directory ROOT does not hold against the copy
+  at all) (`its list of top-level objects names an object at ..., ... bytes,
   outside the file's records (100 to ...)`, the last
   number being the copy's size; `... in the directory at ..., not the top directory at
   100`), or ending inside its own entries;
@@ -927,7 +929,8 @@ With `logical_name_prefixes = /store/data/ /store/mc/ /store/hidata/`, any path
 that contains `/store/data/`, `/store/mc/` or `/store/hidata/` is keyed by the name
 from there on, a user's copy that keeps CMS's layout included (`/eos/user/x/me/store/mc/...`):
 it and the official file are one entry, and inside the freshness window either is
-served the bytes of whichever was cached first. Set `logical_name_prefixes = off`
+served the bytes of whichever was cached first, when the two are the same size (a
+copy of another size is cached apart, under its own URL: `name_size_mismatches`). Set `logical_name_prefixes = off`
 for such a cache (or a list that none of its users' paths holds), and `ucache rm`
 the entry.
 

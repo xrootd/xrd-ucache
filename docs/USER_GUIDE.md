@@ -1118,7 +1118,11 @@ command takes any of its names (`ucache pin lfn:/store/mc/...`, or a URL).
   the entry: with the prefixes off a URL still reaches the entry it was a name of
   while that entry exists, and its own key is its own again once it is removed (a
   name points to one generation of an entry: a file cached again later under the
-  same key is not reached through it).
+  same key is not reached through it). In the same way, one site's copy of the
+  file's size whose bytes are damaged reaches the readers of every URL of the file
+  once it is cached, a healthy site's direct URL included, unless
+  `check_origin_integrity` (which `adaptive_federation` turns on) catches it as it
+  is fetched.
 - **Copies of another size.** One name reached through several sites can meet a
   copy that is not the file: cut short, or another version. A URL whose copy is not
   the size of the entry it reaches by the name is cached apart under its own URL
@@ -1148,7 +1152,12 @@ command takes any of its names (`ucache pin lfn:/store/mc/...`, or a URL).
   entry, and the other URL becomes a name of it; that URL's own old entry is not read
   while the prefixes are set and ages out like any entry nobody reads (a pinned one
   stays until `ucache unpin <its key as ls prints it>`). Bytes of two entries are
-  never mixed.
+  never mixed. Turned off (or set to another list) and set again with `ucache set`,
+  the same list too, the entries cached by URL in between are named the same way;
+  a cache whose prefixes are changed only in a job's conf is named once per list.
+  A job that holds an entry trusted at its open and finds, at its first read, that
+  the name now leads to another entry (the first was removed meanwhile) opens the
+  file at its origin, where the sizes are compared, before it is served from it.
 - **Turning it off keeps every entry reachable.** With the prefixes off again, each
   entry is still found through each URL that reached it, while it exists (and is
   not started afresh); only the logical name is no longer used. With `validate =
@@ -1166,7 +1175,13 @@ command takes any of its names (`ucache pin lfn:/store/mc/...`, or a URL).
   and writes a cache that has them, safely, but an entry whose index it rewrites (a
   job of it reading the file, or its `ucache pin`) loses its names: the file's other
   URLs no longer reach that entry and may cache the file again, and `ucache ls -l`
-  stops listing them under it. Nothing wrong is served.
+  stops listing them under it. Nothing wrong is served. An older `ucache` lists an
+  entry stored under its logical name by its `lfn:` key, cannot act on it through
+  a URL (`pin`, `rm`, `verify`, `branches`), and its `recompress` counts each such
+  entry as failed ("not a usable cache key") and leaves it as it is. With
+  `validate = size+mtime`, a job that checks a file's modification time and finds it
+  changed starts the entry again; a job that holds the entry from before never adds
+  its pages of the earlier copy to it.
 - **Removing, pinning, verifying.** `ucache rm`, `pin`, `unpin`, `verify`,
   `branches` and `untranspose` act on the file's entry whichever of its names they
   are given; `rm <url>` also removes that URL's own old entry if one is left beside
