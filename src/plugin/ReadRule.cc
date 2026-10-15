@@ -180,14 +180,17 @@ keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEn
     }
     fm = &own;
   }
-  // The copy the records came from: the server of the parse's reads from the origin, or, when the
-  // cache held them all (the checks at open keep the records the reader reads first, from the copy
-  // the handle reads from), the handle's own server.
-  std::string from = fm == &own ? src.fetchedFrom : fmServer;
-  if (from.empty() && current)
+  // The copy the records came from: the server of the parse's reads from the origin. When the
+  // cache answered any of them, none: the cache's records may be another copy's (an entry by
+  // logical name serves every URL of the file, and a process that checked nothing may have filled
+  // it), and a map made of them makes no claim against a server. Its caller drops the entry, when
+  // the map shows the records bad, and the map is made again from the origin at once (no wait
+  // between parses).
+  std::string from = fm == &own ? (src.fromCache ? std::string() : src.fetchedFrom) : fmServer;
+  if (from.empty() && current && fm != &own)
     from = *current;
   auto m = std::make_shared<const KeyMap>(keyMapOf(*fm, entry->fileSize(), from));
-  t->badUs = m->bad.empty() ? 0 : nowUs();
+  t->badUs = m->bad.empty() || m->server.empty() ? 0 : nowUs();
   t->seeks = m;
   if (end) {
     end->finish();
@@ -333,7 +336,9 @@ ReadRule::State ReadRule::observe(const std::vector<std::pair<uint64_t, uint64_t
   if (!parsed_) {
     parsed_ = true;
     tp::FileMeta fm = tp::parseReaderTree(src, static_cast<int64_t>(size_));
-    const std::string from = src.fetchedFrom.empty() ? issueServer(*src.st, nullptr) : src.fetchedFrom;
+    // The server of the parse's reads from the origin; none when the cache answered any of them
+    // (they may be another copy's: no claim against a server, see keySeeksFor).
+    const std::string from = src.fromCache ? std::string() : src.fetchedFrom;
     if (fm.recordFailed && globalConfig().checkOriginIntegrity) // the copy shown bad, for the check
       keySeeksFor(src.st, src.entry, 0, &fm, from);
     if (fm.error.empty()) {

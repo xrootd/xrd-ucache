@@ -3177,6 +3177,18 @@ void dropEntryOfBadCopy(HandleState& st, const std::shared_ptr<FileEntry>& entry
   // nothing; its files go at its last release)
 }
 
+void dropEntryOfBadRecords(HandleState& st, const std::shared_ptr<FileEntry>& entry) noexcept try {
+  if (!entry || !st.store || !globalConfig().checkOriginIntegrity || !st.store->markDropped(entry))
+    return;
+  st.store->stats().badEntriesDropped.fetch_add(1, std::memory_order_relaxed);
+  UCACHE_WARN("%s: the file's records the cache entry holds fail their check: the entry is "
+              "dropped, and the records are read again from the origin",
+              recordFile(st.url).c_str());
+  auto store = st.store;
+  Executor::instance().post([store, entry] { store->removeDropped(entry); });
+} catch (...) {
+}
+
 void dropEntryOfBadCopy(HandleState& st, const std::string& server) noexcept try {
   std::shared_ptr<FileEntry> e;
   {
@@ -3948,9 +3960,20 @@ static void armKeyCheck(const std::shared_ptr<HandleState>& st,
     return; // a parse that threw (no memory): no map, the miss goes unchecked, as after a failed
             // read
   }
+  // A map made of the cache's records alone that shows them bad names no copy (keySeeksFor): the
+  // entry is dropped (its records are bad, whichever copy they came from), and the map is made
+  // again at once, from the origin, before this request is checked against it.
+  if (seeks && !seeks->bad.empty() && seeks->server.empty() && seeks != had) {
+    dropEntryOfBadRecords(*st, entry);
+    try {
+      seeks = keySeeksFor(st, entry, timeout, nullptr, std::string(), &current, startUs);
+    } catch (...) {
+      return;
+    }
+  }
   // A map that shows a copy bad: what the entry took from that copy is dropped now (its records,
   // read by the parse, among them), not only at the first read the map refuses.
-  if (seeks && !seeks->bad.empty() && seeks != had)
+  if (seeks && !seeks->bad.empty() && !seeks->server.empty() && seeks != had)
     dropEntryOfBadCopy(*st, entry, seeks->server);
   std::lock_guard<std::mutex> g(st->mu);
   st->keySeeks = std::move(seeks);

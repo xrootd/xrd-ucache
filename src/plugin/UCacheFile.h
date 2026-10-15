@@ -589,6 +589,10 @@ void dropEntryOfBadCopy(HandleState& st, const std::shared_ptr<FileEntry>& entry
                         const std::string& server) noexcept;
 // The same, with the handle's own entry.
 void dropEntryOfBadCopy(HandleState& st, const std::string& server) noexcept;
+// The file's records `entry` holds failed their check, and no copy is named (the map was made of
+// the cache's records alone, which may be another copy's): the entry is dropped as above, whatever
+// copy it took them from. Only with check_origin_integrity on.
+void dropEntryOfBadRecords(HandleState& st, const std::shared_ptr<FileEntry>& entry) noexcept;
 // check_origin_integrity for the fetches of a file that has a replica (the slot run, ColdRun.cc):
 // the handle's file map, or the entry's when another handle's parse has built it; never parses
 // (the reader's own thread made the parse before the request reached the slot run, with the

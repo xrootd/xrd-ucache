@@ -34,6 +34,7 @@ struct OriginSource : transpose::Source {
   std::shared_ptr<FileEntry> entry;
   bool readFailed = false; // a read from the origin failed (which says nothing of the file)
   std::string fetchedFrom; // the server of its last read from the origin ("" for none)
+  bool fromCache = false;  // a read was answered from the cache (whose bytes may be another copy's)
   XrdTimeout timeout = 0;  // of each read from the origin (0: the client's default)
   // adaptive_federation: a failed read moves the handle to another copy and is made again there
   // (parseReadMoves), for a parse that runs on the reader's own thread; its time counts from
@@ -47,8 +48,10 @@ struct OriginSource : transpose::Source {
   bool read(void* dst, uint64_t n, uint64_t off) override {
     if (n == 0)
       return true;
-    if (entry->hasRange(off, n) && entry->readCached(off, n, dst, /*account=*/false))
+    if (entry->hasRange(off, n) && entry->readCached(off, n, dst, /*account=*/false)) {
+      fromCache = true;
       return true;
+    }
     auto [ws, we] = roundSpan(entry->pageSize(), entry->fileSize(), off, n);
     return fetch(ws, we, dst, off, n);
   }
