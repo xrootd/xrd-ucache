@@ -453,7 +453,9 @@ struct HandleState {
   static void postPersist(const std::shared_ptr<HandleState>& st, std::function<void()> write);
   void runPersist(PersistJob& job);
   void endPersist();
-  void drainPersists();
+  // Makes every write of the handle not yet started, and waits for those in flight (a write posted
+  // while it waits is taken too). True when there was any.
+  bool drainPersists();
 
   void noteCacheError(const Config& cfg);
   void noteCacheOk();

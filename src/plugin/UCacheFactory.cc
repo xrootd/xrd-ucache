@@ -35,6 +35,7 @@
 #include <dlfcn.h>
 #include <mutex>
 #include <pthread.h>
+#include <thread>
 #if defined(__APPLE__)
 #include <sys/mount.h> // statfs, and f_fstypename instead of a magic number
 #include <sys/param.h>
@@ -425,13 +426,21 @@ void initGlobals() {
   if (*gStore && gConfig->metaFlushSeconds > 0)
     scheduleCheckpoint();
   // With logical names set, the entries cached before get their names once per cache and list of
-  // prefixes, in the background (an open meanwhile names its own URL's entry as it goes).
+  // prefixes, in the background (an open meanwhile names its own URL's entry as it goes), on a
+  // thread of its own: the scan reads every sidecar of the cache and may take minutes, and on the
+  // executor it would hold up every hit, page write and completion queued behind it. Detached; it
+  // touches only the cache's files and objects that are never destroyed, and stops at the
+  // process's end (processExiting) without its marker. A forked child does not inherit it: the
+  // naming is left to the next process (the parent's goes on; naming.lock keeps it one at a time).
   if (*gStore && gConfig->keys.logical()) {
     const std::string dir = gConfig->cacheDir;
     const KeyRules rules = gConfig->keys;
     try {
-      Executor::instance().post([dir, rules] { (void)nameCachedEntries(dir, rules); });
+      std::thread([dir, rules] {
+        (void)nameCachedEntries(dir, rules, [] { return processExiting(); });
+      }).detach();
     } catch (...) {
+      // no thread: the entries are named as jobs open them (resolveEntry's case 3)
     }
   }
   ::atexit([] {
@@ -464,6 +473,10 @@ std::shared_ptr<CacheStore> globalStore() {
 int defaultRequestTimeoutS() { return gRequestTimeoutS.load(std::memory_order_relaxed); }
 
 int currentRequestTimeoutS() {
+  // At the process's end the client's environment is deleted (DefaultEnv::Finalize), maybe between
+  // a load of it and its use here: the value read at load is taken instead.
+  if (gExiting.load(std::memory_order_acquire))
+    return defaultRequestTimeoutS();
   int v = XrdCl::DefaultRequestTimeout;
   if (XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv())
     env->GetInt("RequestTimeout", v);

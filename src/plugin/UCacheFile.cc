@@ -5275,14 +5275,30 @@ void HandleState::noteCacheOk() {
 
 void HandleState::postPersist(const std::shared_ptr<HandleState>& st,
                               std::function<void()> write) {
-  auto job = std::make_shared<PersistJob>();
-  job->write = std::move(write);
-  {
-    std::lock_guard<std::mutex> g(st->persistMu);
-    ++st->pendingPersists;
-    while (!st->persistJobs.empty() && st->persistJobs.front()->taken.load())
-      st->persistJobs.pop_front(); // made already
-    st->persistJobs.push_back(job);
+  std::shared_ptr<PersistJob> job;
+  try {
+    job = std::make_shared<PersistJob>();
+    job->write = std::move(write);
+    {
+      std::lock_guard<std::mutex> g(st->persistMu);
+      while (!st->persistJobs.empty() && st->persistJobs.front()->taken.load())
+        st->persistJobs.pop_front(); // made already
+      st->persistJobs.push_back(job);
+      // Counted once it is queued: a count with no job behind it would hold a drain for good.
+      ++st->pendingPersists;
+    }
+    st->persistCv.notify_all(); // a drain waiting for a write in flight takes this one too
+  } catch (...) {
+    // Not queued (no memory): made here and now, so that what it ends (its fetch's gate, the
+    // waiters of those pages) is ended.
+    try {
+      if (job && job->write)
+        job->write();
+      else if (write)
+        write();
+    } catch (...) {
+    }
+    return;
   }
   try {
     Executor::instance().post([st, job] {
@@ -5312,26 +5328,41 @@ void HandleState::endPersist() {
     persistCv.notify_all();
 }
 
-void HandleState::drainPersists() {
+bool HandleState::drainPersists() {
   // Every write not yet started is made here, in the order posted; then the wait is only for
-  // those an executor thread is making.
+  // those an executor thread is making. A write posted meanwhile (a read in flight answered while
+  // the drain waits) wakes the wait and is taken too: the drain never waits for a write that has
+  // not started, which may queue on the executor behind a completion a reader holds up.
+  auto untakenLocked = [this] {
+    for (const auto& j : persistJobs)
+      if (!j->taken.load(std::memory_order_acquire))
+        return true;
+    return false;
+  };
+  bool any = false;
   for (;;) {
-    std::shared_ptr<PersistJob> job;
-    {
-      std::lock_guard<std::mutex> g(persistMu);
-      while (!persistJobs.empty() && !job) {
-        auto j = std::move(persistJobs.front());
-        persistJobs.pop_front();
-        if (!j->taken.exchange(true, std::memory_order_acq_rel))
-          job = std::move(j);
+    for (;;) {
+      std::shared_ptr<PersistJob> job;
+      {
+        std::lock_guard<std::mutex> g(persistMu);
+        while (!persistJobs.empty() && !job) {
+          auto j = std::move(persistJobs.front());
+          persistJobs.pop_front();
+          if (!j->taken.exchange(true, std::memory_order_acq_rel))
+            job = std::move(j);
+        }
       }
+      if (!job)
+        break;
+      any = true;
+      runPersist(*job);
     }
-    if (!job)
-      break;
-    runPersist(*job);
+    std::unique_lock<std::mutex> lk(persistMu);
+    any = any || pendingPersists > 0;
+    persistCv.wait(lk, [&] { return pendingPersists == 0 || untakenLocked(); });
+    if (pendingPersists == 0)
+      return any;
   }
-  std::unique_lock<std::mutex> lk(persistMu);
-  persistCv.wait(lk, [this] { return pendingPersists == 0; });
 }
 
 //--------------------------------------------------------------- handlers --
@@ -7090,6 +7121,11 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
   // bounded wait for what was already sent.
   if (!st_->waitInnerIdle(std::chrono::seconds(10)))
     return XRootDStatus(XrdCl::stError, XrdCl::errInvalidOp); // requests are left: not closed, as the client's own Close
+  // A read answered between the drain above and the wait (read-ahead's, or any still in flight)
+  // posted its page writes after them: made now, and the entry committed again, so that they are
+  // on disk when the process exits right after Close.
+  if (st_->drainPersists() && e)
+    e->flushAll();
   // A trusted cache-only handle that never hit a miss never opened the origin;
   // there is nothing to close remotely (UCACHE_REVALIDATE_S). Nor has a forked
   // child that never opened afresh the handle it inherited: that file is the
