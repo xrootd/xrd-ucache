@@ -60,7 +60,8 @@ std::atomic<bool> g_warned{false};
 // for another's. Lock order: a rule's lock, then this one.
 constexpr size_t kMaxKeySeekTables = 32;
 // After a parse that a failed origin read stopped, no other for this long: a
-// failing origin costs one parse attempt a second, not one a miss.
+// failing origin costs one parse attempt a second, not one a miss. The same
+// for the rule's own parse with a limit of 0 (ReadRule::observe).
 constexpr uint64_t kKeySeekRetryUs = 1'000'000;
 struct KeySeekTable {
   std::weak_ptr<FileEntry> entry; // compared by identity, never locked
@@ -336,12 +337,21 @@ ReadRule::State ReadRule::observe(const std::vector<std::pair<uint64_t, uint64_t
   if (s != kUndecided)
     return s;
   if (!parsed_) {
+    // With 0, a parse that a failed origin read stopped is made again a second later at the
+    // earliest: until then a request is served as undecided (read directly, nothing kept) without
+    // first waiting for another attempt, so a failing origin does not double each request's wait.
+    if (limit_ == 0 && failedUs_ && nowUs() - failedUs_ < kKeySeekRetryUs)
+      return kUndecided;
     parsed_ = true;
     tp::FileMeta fm = tp::parseReaderTree(src, static_cast<int64_t>(size_));
     if (limit_ == 0 && src.readFailed && !fm.error.empty()) {
       // Stopped by a failed origin read, not by what the file is: undecided (nothing kept), and
-      // parsed again at the next request that needs the origin.
+      // parsed again at a later request that needs the origin.
       parsed_ = false;
+      failedUs_ = nowUs();
+      UCACHE_DEBUG("read rule: %s: a read of its records failed; read directly, its records read "
+                   "again in a second at the earliest",
+                   key_.c_str());
       return kUndecided;
     }
     // The server of the parse's reads from the origin; none when the cache answered any of them
@@ -353,19 +363,45 @@ ReadRule::State ReadRule::observe(const std::vector<std::pair<uint64_t, uint64_t
       map_ = std::make_unique<tp::ReadMap>(tp::ReadMap::fromTree(fm));
       if (globalConfig().checkOriginIntegrity) // the key-position check's table, from this parse
         keySeeksFor(src.st, src.entry, 0, &fm, from);
-    } else if (fm.error.find("not found") != std::string::npos && src.fetchHead()) {
+    }
+    // A ROOT file that holds neither a TTree nor an RNTuple (no tree, and the RNTuple's parse found
+    // none, or could not look): no rule, whatever the limit.
+    const bool noTree = fm.error.find("not found") != std::string::npos;
+    bool neither = noTree;
+    std::string why = fm.error;
+    if (noTree && src.fetchHead()) {
       tp::RNTupleMeta rm = tp::parseRNTuple(src, static_cast<int64_t>(size_), "");
       if (rm.error.empty())
         map_ = std::make_unique<tp::ReadMap>(tp::ReadMap::fromRNTuple(rm));
+      neither = rm.error.find("not found") != std::string::npos;
+      if (!rm.error.empty() && !neither)
+        why = "RNTuple: " + rm.error;
     }
     if ((!map_ || map_->empty()) && limit_ == 0 && src.readFailed) {
       map_.reset(); // the RNTuple's parse stopped by a failed read: as above
       parsed_ = false;
+      failedUs_ = nowUs();
       return kUndecided;
+    }
+    if ((!map_ || map_->empty()) && limit_ == 0 && !fm.error.empty() &&
+        fm.error != "not a ROOT file" && !neither) {
+      // A ROOT file whose records cannot be mapped: its tree's record failed its own check (a
+      // damaged copy: ROOT cannot read the tree from it either), or uses a layout the walk does
+      // not support. With 0 it is read directly WHOLE: where its data lies is not known, so
+      // nothing it reads is kept (what this parse read is), from every copy it is read from.
+      map_.reset();
+      runs_.assign(1, {0, size_});
+      state_.store(kDirect, std::memory_order_release);
+      if (src.st && src.st->store)
+        src.st->store->stats().directReadFiles.fetch_add(1, std::memory_order_relaxed);
+      UCACHE_INFO("%s: max_read_fraction = 0: its records cannot be mapped (%s); read straight "
+                  "from the origin, nothing it reads cached",
+                  key_.c_str(), why.c_str());
+      return kDirect;
     }
     if (!map_ || map_->empty()) {
       UCACHE_DEBUG("read rule: %s has no basket or page map (%s); cached as usual", key_.c_str(),
-                   fm.error.empty() ? "no units" : fm.error.c_str());
+                   fm.error.empty() ? "no units" : why.c_str());
       map_.reset();
       state_.store(kNoRule, std::memory_order_release);
       return kNoRule;

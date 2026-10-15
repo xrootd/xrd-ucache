@@ -21,9 +21,12 @@
 // made as soon as the parse has found the file's data, whatever the request
 // asks. Until then (the first request's parse, or a request that does not wait
 // for it) the rule counts as direct and holds every byte for data, so nothing
-// is kept; a parse that a failed origin read stopped is made again at the next
-// request. A file whose records do not parse (not ROOT, no TTree or RNTuple)
-// has no rule, as with any limit.
+// is kept; a parse that a failed origin read stopped is made again at a request
+// a second later or more. A ROOT file whose records the parse cannot map (its
+// tree's record fails its own check, or uses a layout the walk does not
+// support) is read directly whole: every byte counts as data. A file that is
+// not ROOT, or a ROOT file with neither a TTree nor an RNTuple, has no rule, as
+// with any limit.
 //
 // Thread-safety: all methods are thread-safe. A rule is shared by every handle
 // of the file in the process and lives for the process.
@@ -102,6 +105,7 @@ class ReadRule : public std::enable_shared_from_this<ReadRule> {
   std::atomic<uint8_t> state_{kUndecided};
   std::mutex mu_;              // one parse or step at a time
   bool parsed_ = false;        // guarded by mu_
+  uint64_t failedUs_ = 0;      // limit 0: when a failed origin read last stopped the parse; mu_
   std::unique_ptr<transpose::ReadMap> map_; // until the decision; guarded by mu_
   std::vector<uint32_t> seen_; // branches (columns) requests touched so far; guarded by mu_
   // Written once, before state_ becomes kDirect (release), read after (acquire).

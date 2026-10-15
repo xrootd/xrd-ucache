@@ -99,7 +99,9 @@ second. If not:
    <your job>`, or `ucache set max_read_fraction 100` for every job. With
    `max_read_fraction = 0` (`ucache settings` shows it) every ROOT file with a
    TTree or RNTuple, of any size, is read this way, with no warning: that
-   setting caches no such file's data.
+   setting caches none of the data of such a file's main tree or RNTuple (its
+   records and other trees are cached). On a build without the codec libraries no file is
+   read this way, whatever the setting (`ucache doctor` warns when it is `0`).
 9. **`XRD_PLUGIN` is set.** While it is, XrdCl loads the library it names for
    every URL and reads no plugin config file at all, so a `ucache.conf` does
    nothing — and if it names some other plugin, uCache is not loaded.

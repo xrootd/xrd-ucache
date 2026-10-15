@@ -194,7 +194,8 @@ not to cache, and says the cache is under pressure rather than broken.
   process decided to read straight from the origin because its reads covered
   branches holding more than `max_read_fraction` of the file's data, and the
   bytes it fetched for their data and did not keep (also in `relay_bytes`).
-  A file is counted once per process. Zero with `max_read_fraction = 100`;
+  A file is counted once per process. Zero with `max_read_fraction = 100`, and
+  on a build without the codec libraries whatever the value;
   with `max_read_fraction = 0`, every ROOT file with a TTree or RNTuple the
   process read from the origin, of any size.
 - `open_retries` / `open_retries_exhausted` (plugin layer) —

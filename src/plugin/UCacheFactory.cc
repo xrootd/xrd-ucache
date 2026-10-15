@@ -456,6 +456,10 @@ void initGlobals() {
   if (gConfig->checkOriginIntegrity)
     UCACHE_INFO("check_origin_integrity is on, but this build has no codec libraries: nothing "
                 "fetched is checked, and what is fetched is kept as without the setting");
+  if (gConfig->maxReadFraction == 0)
+    UCACHE_WARN("max_read_fraction = 0, but this build has no codec libraries: it cannot read a "
+                "file's records, so no file is read straight from the origin and every file's "
+                "data is cached");
 #endif
 }
 } // namespace

@@ -170,6 +170,8 @@ TEST(Config, MaxReadFractionZeroNote) {
   const std::string note = c.setNote("max_read_fraction", "0");
   EXPECT_NE(note.find("read straight from the origin"), std::string::npos) << note;
   EXPECT_NE(note.find("other files are cached"), std::string::npos) << note;
+  // Only the main tree's (or the RNTuple's) data is read directly: the note says what is kept.
+  EXPECT_NE(note.find("its records and its other trees are"), std::string::npos) << note;
   EXPECT_EQ(c.setNote("max_read_fraction", "00"), note);
   EXPECT_EQ(c.setNote("max_read_fraction", "25"), "");
   EXPECT_EQ(c.setNote("max_read_fraction", "100"), "");

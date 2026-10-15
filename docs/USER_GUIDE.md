@@ -70,11 +70,16 @@ sudo dnf -y install gcc-c++ cmake make \
 - `xrootd-client-devel` provides `libXrdCl` + headers (must be ≥ 5.6; EPEL 9
   ships 5.6+). Its headers live under `/usr/include/xrootd`, which is why the
   build needs `-DUCACHE_XROOTD_ROOT=/usr` below.
-- The four `*-devel` codec packages are only needed for the **recompression**
-  feature (`ucache recompress`, see §Configuration). Omit them
-  and everything else still builds — the page cache works fully; the replica
-  tier is simply skipped (fail-open at build time). `lz4-devel` is optional even
-  among those (it only lets the transposer *read* LZ4-compressed inputs).
+- The four `*-devel` codec packages let uCache read a ROOT file's own records,
+  which the **recompression** feature (`ucache recompress`, see
+  §Configuration), read-ahead (`prefetch`), `max_read_fraction` and the checks
+  of what the origin sends (`check_origin_integrity`, which
+  `adaptive_federation = on` turns on) all need. Omit them and everything else
+  still builds — the page cache works fully — but those are skipped (fail-open
+  at build time): no replica is made, nothing is read ahead or checked, and
+  every file is cached whatever `max_read_fraction` says (`ucache doctor` warns
+  when it is `0`). `lz4-devel` is optional even among those (it only lets the
+  transposer *read* LZ4-compressed inputs).
 
 Build against the **host** XRootD (point the version pin at `/usr`) and install
 to a user prefix — no root needed for the build/install itself:
@@ -120,7 +125,7 @@ MacPorts.
 ```sh
 xcode-select --install                     # clang, linker, SDK
 sudo port install cmake xrootd root6 +xrootd
-sudo port install xz zstd lz4              # codec libs — recompression only, optional
+sudo port install xz zstd lz4              # codec libs — optional, see the note above
 ```
 
 **2. Check which XRootD client your ROOT loads**, and build against that one —
@@ -803,7 +808,7 @@ overriding your defaults. Common keys:
 | `prefetch_threads = 4` | `UCACHE_PREFETCH_THREADS` | threads predicting and reading basket maps. One cannot both parse a new file's map and keep up with the batches of many reader threads |
 | `announce = on`     | `UCACHE_ANNOUNCE`       | name uCache as the application in what the client tells servers at login, so a site can see traffic that comes through a cache (default on; see below). `off` = send your program's own name, as without uCache |
 | `copy_detect = on`  | `UCACHE_COPY_DETECT`    | copy tools and copy engines read straight from the origin, so a copy is the origin's bytes (default on; see below). `off` = they are ordinary readers and use the cache |
-| `max_read_fraction = 25` | `UCACHE_MAX_READ_FRACTION` | a job whose reads of a ROOT file (a TTree or RNTuple of 64 MiB or more) cover branches holding more than this percentage of the file's data reads that file straight from the origin and caches none of its data (see below). `100` = cache every file. `0` = read every ROOT file with a TTree or RNTuple, of any size, straight from the origin, caching none of its data (see below) |
+| `max_read_fraction = 25` | `UCACHE_MAX_READ_FRACTION` | a job whose reads of a ROOT file (a TTree or RNTuple of 64 MiB or more) cover branches holding more than this percentage of the file's data reads that file straight from the origin and caches none of its data (see below). `100` = cache every file. `0` = read every ROOT file with a TTree or RNTuple, of any size, straight from the origin, caching none of its main tree's or RNTuple's data (its records and other trees are cached; see below). Needs a build with the codec libraries: without them every file is cached, whatever the value |
 | `disable = true`    | `UCACHE_DISABLE`        | turn caching off (pure pass-through) |
 
 Sizes accept `k`/`m`/`g`/`t` suffixes.
@@ -1364,10 +1369,22 @@ none of the file's data is kept. Use it to have those for jobs whose data you
 do not want on the local disk; `UCACHE_MAX_READ_FRACTION=0 ./my_job` does it
 for one job.
 
+- It needs a build with the codec libraries (Install): uCache reads the file's
+  records with them. A build without them caches every file, whatever the
+  value; `ucache doctor` warns, and so does each job.
 - The decision is made once uCache has read the file's own records, at the
   job's first read of the file that needs the origin; until then what the job
-  fetches is not kept either. A file whose records cannot be read as a TTree or
-  RNTuple (not a ROOT file, or one with neither) is cached as usual.
+  fetches is not kept either. When a read of those records from the origin
+  fails, the job's reads go on directly, nothing kept, and the records are
+  read again by a later read, a second later at the earliest. A file that is
+  not a ROOT file, or a ROOT file with neither a TTree nor an RNTuple, is
+  cached as usual. A ROOT file whose records uCache cannot map — its tree's record fails its own
+  check, as on a damaged copy (ROOT cannot read the tree from it either), or
+  uses a layout uCache's reader does not support — is read directly whole:
+  nothing the job fetches of it is kept (only what uCache read of its records
+  to judge it), from that copy or, after a move with `adaptive_federation =
+  on`, from any other. The decision holds for the file for the life of the
+  process.
 - What is read directly is the data of the file's main tree (the one named
   `Events`, else its first TTree) or of its RNTuple. The file's other trees
   (in a NanoAOD file, for example, `Runs` and `ParameterSets`) are cached as
@@ -1383,9 +1400,17 @@ for one job.
   is read from the cache as before (`ucache rm` removes it). A replica made
   earlier is served in its layout, and no file gets a new one (`recompress =
   on` makes none).
+- The checks of what the origin sends judge a basket only when the bytes
+  fetched hold it whole. A single read of a file read directly is passed to
+  the origin exactly as the job asks it, not rounded out to the cache's pages,
+  so a read that starts inside a basket is served as the origin sends it,
+  unchecked — as a plain client would get it. ROOT and uproot read whole
+  baskets, so their reads are checked.
 - `ucache stats` counts each such file in `direct_read_files` and its bytes in
   `direct_read_bytes` and as direct, like pass-through. There is no warning per
   job: you asked for it.
+- A process keeps its decisions for up to 200000 files; a file it opens past
+  that is cached as usual (a long-lived process such as a proxy can reach it).
 
 **Eviction is on by default.** With no `max_bytes` set, the cache uses the disk
 freely and evicts least-recently-used entries only to keep a free-space floor

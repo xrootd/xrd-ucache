@@ -3715,8 +3715,19 @@ int cmdSet(const Config& cfg, const char* key, const char* value) {
   if (k == "recompress" && (v == "on" || v == "1" || v == "true"))
     std::printf("  files already cached get a replica the next time a job reads them, or now "
                 "with `ucache recompress`\n");
+#ifdef UCACHE_HAVE_TRANSPOSE
   if (const std::string note = cfg.setNote(k, v); !note.empty())
     std::printf("%s\n", note.c_str());
+#else
+  // A build without the codec libraries has no read rule: max_read_fraction below 100 does nothing.
+  const int pct = std::atoi(value);
+  if (k == "max_read_fraction" && (!cfg.setNote(k, v).empty() || (pct >= 1 && pct <= 99)))
+    std::printf("  this build has no codec libraries: it cannot read a file's records, so "
+                "max_read_fraction has no effect and every file's data is cached (build uCache "
+                "with the codec libraries for it to apply)\n");
+  else if (const std::string note = cfg.setNote(k, v); !note.empty())
+    std::printf("%s\n", note.c_str());
+#endif
   // The entries already cached get their logical names now, so that every URL of a file finds its
   // entry from the first job on (EntryNames.h nameCachedEntries).
   if (k == "logical_name_prefixes") {
@@ -4319,11 +4330,23 @@ int cmdDoctor(const Config& cfg) {
                 "         removes a file's replica while no job is reading it\n");
   if (cfg.adaptiveFederation)
     federationNote(cfg);
+#ifdef UCACHE_HAVE_TRANSPOSE
   if (cfg.maxReadFraction == 0)
     std::printf("  [NOTE] max_read_fraction = 0: every ROOT file with a TTree or RNTuple is read\n"
-                "         straight from the origin and none of its data is cached (its own\n"
-                "         records are); bytes cached earlier are still served, and other files\n"
-                "         are cached as usual\n");
+                "         straight from the origin and the data of its main tree or RNTuple is\n"
+                "         not cached (its records and its other trees are); bytes cached earlier\n"
+                "         are still served, and other files are cached as usual\n");
+#else
+  // A build without the codec libraries cannot read a file's records, so it has no read rule:
+  // the opposite of what 0 asks for, which nothing else would show.
+  if (cfg.maxReadFraction == 0) {
+    std::printf("  [WARN] max_read_fraction = 0, but this build has no codec libraries: it cannot\n"
+                "         read a file's records, so no file is read straight from the origin and\n"
+                "         every file's data is cached; build uCache with the codec libraries\n"
+                "         (USER_GUIDE, Install) for max_read_fraction to apply\n");
+    ++problems;
+  }
+#endif
   if (cfg.keys.logical())
     std::printf("  [NOTE] logical_name_prefixes = %s: a file whose path holds one of them is cached\n"
                 "         under its logical name (one entry through any site or redirector),\n"

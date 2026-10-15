@@ -518,9 +518,9 @@ std::string Config::setNote(const std::string& key, const std::string& value) co
            "check_origin_integrity is forced on";
   if (key == "max_read_fraction" && !value.empty() &&
       value.find_first_not_of('0') == std::string::npos)
-    return "  every ROOT file with a TTree or RNTuple is read straight from the origin and none of "
-           "its data is cached (its own records are); bytes cached earlier are still served, and "
-           "other files are cached as usual";
+    return "  every ROOT file with a TTree or RNTuple is read straight from the origin and the "
+           "data of its main tree or RNTuple is not cached (its records and its other trees are); "
+           "bytes cached earlier are still served, and other files are cached as usual";
   if (key == "logical_name_prefixes")
     return normalizedPrefixes(value) != "off" && logicalNamePrefixesValid(value)
                ? "  a file whose path holds one of these prefixes is cached under its logical name: "
