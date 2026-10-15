@@ -215,6 +215,16 @@ struct HandleState {
   // records, at its first use) may move as its reads will once it is set up (armForSetup), though
   // the handle is armed only at the end of the setup (applyReadPolicy).
   std::atomic<bool> setupMoves{false};
+  // Whether the client's own recovery is off on the handle's Files: armed to move its reads (the
+  // byte path's or a slot layout's), or the reads of its setup. Everything that depends on that
+  // recovery being off asks this, never one of the flags: a File the client puts in its Error
+  // state in a forked child (the handle's own reopen stands in for it), a reader's setting of the
+  // recovery (kept off), a File made again (configureInner), a read's time (originTimeout).
+  bool recoveryIsOff() const {
+    return moveOnReads.load(std::memory_order_relaxed) ||
+           moveSlotReads.load(std::memory_order_relaxed) ||
+           setupMoves.load(std::memory_order_relaxed);
+  }
   bool viaRedirector = false;
   // Under mu: the server and site the current File was opened at; where reads
   // of the handle failed, the 3 newest (the next open names them in tried= and

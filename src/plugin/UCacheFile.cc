@@ -2291,7 +2291,7 @@ static void giveBackCheckProps(HandleState& st, XrdCl::File* f, const std::strin
   {
     std::lock_guard<std::mutex> g(st.mu);
     const size_t seen = st.readerProps.size();
-    armed = st.moveOnReads;
+    armed = st.recoveryIsOff();
     for (size_t j = std::min(st.headerProps, seen); j < seen; ++j)
       for (int i = 0; i < kCheckProps; ++i)
         if (st.readerProps[j].first == kCheckPropNames[i]) {
@@ -2306,7 +2306,7 @@ static void giveBackCheckProps(HandleState& st, XrdCl::File* f, const std::strin
   {
     std::lock_guard<std::mutex> g(st.mu);
     st.headerReading = false;
-    armedSince = !armed && st.moveOnReads && (have[0] || have[1]);
+    armedSince = !armed && st.recoveryIsOff() && (have[0] || have[1]);
   }
   // Armed after `armed` was read (applyReadPolicy arms under mu and then turns the recovery off,
   // without propMu): the recovery given back above is turned off again (SetProperty's way).
@@ -3824,7 +3824,7 @@ void HandleState::unpark() {
 }
 
 ucache::XrdTimeout HandleState::originTimeout(int readerTimeoutS, uint64_t startUs, bool again) {
-  if (!moveOnReads.load(std::memory_order_relaxed) && !moveSlotReads.load(std::memory_order_relaxed))
+  if (!recoveryIsOff()) // the client recovers the read itself, within the reader's timeout
     return ucache::xrdTimeoutOf(readerTimeoutS);
   const int elapsedS = startUs ? static_cast<int>((nowUs() - startUs) / 1000000) : 0;
   return ucache::xrdTimeoutOf(readAttemptTimeoutS(readerTimeoutS, defaultRequestTimeoutS(),
@@ -5212,7 +5212,7 @@ XrdCl::File* HandleState::resetInner(bool leakOld, bool onlyIfIdle, bool closeOl
 std::unique_ptr<XrdCl::File> HandleState::configureInner(std::unique_ptr<XrdCl::File> f) {
   for (const auto& p : readerProps) // the reader's settings, in the order it made them
     f->SetProperty(p.first, p.second);
-  if (moveOnReads)
+  if (recoveryIsOff())
     recoveryOff(*f); // after the reader's: it cannot turn it back on
   return f;
 }
@@ -7837,7 +7837,7 @@ XrdCl::XRootDStatus UCacheFile::Fcntl(const XrdCl::Buffer& arg, ResponseHandler*
                                       ucache::XrdTimeout timeout) {
   st_->syncFork();
   setUpBeforeOwnOpen();
-  if (((st_->moveOnReads && st_->reopenPending()) || ownOpenPending(*st_)) &&
+  if (((st_->recoveryIsOff() && st_->reopenPending()) || ownOpenPending(*st_)) &&
       !st_->ensureInnerOpen())
     return st_->missError();
   return st_->inner.load()->Fcntl(arg, handler, timeout);
@@ -7846,7 +7846,7 @@ XrdCl::XRootDStatus UCacheFile::Fcntl(const XrdCl::Buffer& arg, ResponseHandler*
 XrdCl::XRootDStatus UCacheFile::Visa(ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
   setUpBeforeOwnOpen();
-  if (((st_->moveOnReads && st_->reopenPending()) || ownOpenPending(*st_)) &&
+  if (((st_->recoveryIsOff() && st_->reopenPending()) || ownOpenPending(*st_)) &&
       !st_->ensureInnerOpen())
     return st_->missError();
   return st_->inner.load()->Visa(handler, timeout);
@@ -7855,8 +7855,9 @@ XrdCl::XRootDStatus UCacheFile::Visa(ResponseHandler* handler, ucache::XrdTimeou
 bool UCacheFile::IsOpen() const {
   // The client puts a File inherited by a forked child, whose read recovery is
   // off, in its Error state, where it is not open and answers a call with its old
-  // status without completing it: an armed handle's reopen is the plugin's.
-  if (st_->moveOnReads) {
+  // status without completing it: an armed handle's reopen is the plugin's (a handle armed to
+  // move its reads, on the byte path or in a slot layout, or for its setup's reads).
+  if (st_->recoveryIsOff()) {
     st_->syncFork();
     if (st_->reopenPending())
       return true;
@@ -7893,10 +7894,10 @@ bool UCacheFile::SetProperty(const std::string& name, const std::string& value) 
     std::this_thread::sleep_for(std::chrono::milliseconds(gPropDelayMs));
   // On an armed handle the reader cannot turn the client's read recovery back
   // on: the handle's own reads depend on it being off.
-  if (recovery && st_->moveOnReads)
+  if (recovery && st_->recoveryIsOff())
     return true;
   const bool ok = st_->inner.load()->SetProperty(name, value);
-  if (recovery && st_->moveOnReads) // armed while this was set
+  if (recovery && st_->recoveryIsOff()) // armed while this was set
     recoveryOff(*st_->inner.load());
   return ok;
 }
