@@ -383,8 +383,18 @@ ReadRule::State ReadRule::observe(const std::vector<std::pair<uint64_t, uint64_t
       failedUs_ = nowUs();
       return kUndecided;
     }
-    if ((!map_ || map_->empty()) && limit_ == 0 && !fm.error.empty() &&
-        fm.error != "not a ROOT file" && !neither) {
+    // A decoder's want of memory is this process's, not the file's: as a failed read, try later.
+    if ((!map_ || map_->empty()) && limit_ == 0 && fm.error == "tree record not readable") {
+      map_.reset();
+      parsed_ = false;
+      failedUs_ = nowUs();
+      return kUndecided;
+    }
+    // Only a file whose tree key, or RNTuple anchor, was found is a ROOT file with records that
+    // cannot be mapped; a file that merely starts with "root" and fails before that is not ROOT.
+    const bool rootWithRecords = fm.treeKey.nbytes != 0 || why.rfind("RNTuple: ", 0) == 0;
+    if ((!map_ || map_->empty()) && limit_ == 0 && !fm.error.empty() && rootWithRecords &&
+        !neither) {
       // A ROOT file whose records cannot be mapped: its tree's record failed its own check (a
       // damaged copy: ROOT cannot read the tree from it either), or uses a layout the walk does
       // not support. With 0 it is read directly WHOLE: where its data lies is not known, so

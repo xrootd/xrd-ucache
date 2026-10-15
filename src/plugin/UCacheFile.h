@@ -379,7 +379,8 @@ struct HandleState {
   std::string trustMarker; // under mu: the entry's .val path, removed on such a refusal
   // Under mu: the entry the handle was trusted with at Open, or was set up with (a forked child
   // sets it up again from the cache alone): its hash and the generation its name named
-  // (UrlKey::entryGen). Empty when none. A set-up from the cache alone takes only that entry: when
+  // (UrlKey::entryGen; always 0 for an entry the URL keys directly, so the generation tells apart
+  // only entries reached through a name). Empty when none. A set-up from the cache alone takes only that entry: when
   // the URL resolves to another one by then (the entry went, and the name now leads elsewhere), or
   // to one whose copy's size was never compared with the URL's (UrlKey::joined), the handle opens
   // the origin instead, where the sizes are compared.

@@ -197,7 +197,8 @@ not to cache, and says the cache is under pressure rather than broken.
   A file is counted once per process. Zero with `max_read_fraction = 100`, and
   on a build without the codec libraries whatever the value;
   with `max_read_fraction = 0`, every ROOT file with a TTree or RNTuple the
-  process read from the origin, of any size.
+  process read from the origin, of any size, including those read directly
+  whole because their records cannot be mapped.
 - `open_retries` / `open_retries_exhausted` (plugin layer) —
   transient inner-open failures re-attempted (`UCACHE_OPEN_RETRIES`), and opens
   that ultimately gave up after retrying. Uncounted when caching is off (retry

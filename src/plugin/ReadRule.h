@@ -25,8 +25,9 @@
 // a second later or more. A ROOT file whose records the parse cannot map (its
 // tree's record fails its own check, or uses a layout the walk does not
 // support) is read directly whole: every byte counts as data. A file that is
-// not ROOT, or a ROOT file with neither a TTree nor an RNTuple, has no rule, as
-// with any limit.
+// not ROOT (also one that starts with "root" but holds no tree key or RNTuple
+// anchor the walk can reach), or a ROOT file with neither a TTree nor an
+// RNTuple, has no rule, as with any limit.
 //
 // Thread-safety: all methods are thread-safe. A rule is shared by every handle
 // of the file in the process and lives for the process.
