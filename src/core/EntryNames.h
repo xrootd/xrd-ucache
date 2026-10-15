@@ -60,6 +60,7 @@
 
 #include "UrlKey.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -116,7 +117,14 @@ size_t sweepEntryNames(const std::string& cacheDir, size_t budget) noexcept;
 // <cacheDir>/names/named-<prefixes hash> exists (made at the end); one process at a time (a flock of
 // <cacheDir>/names/naming.lock; another that finds it held returns at once). Reads every sidecar
 // once. Returns the entries named, -1 when it was done before, held, or `rules` has no names.
-long nameCachedEntries(const std::string& cacheDir, const KeyRules& rules) noexcept;
+// `stop`, when given, is asked between entries: true ends the naming where it is, without the
+// marker (the next process with the prefixes names the rest).
+long nameCachedEntries(const std::string& cacheDir, const KeyRules& rules,
+                       const std::function<bool()>& stop = nullptr) noexcept;
+// The cache's prefixes are changed or turned off (`ucache set`, `ucache unset`): every marker of a
+// naming done is removed, so that the entries cached by URL from now on are named when a list of
+// prefixes is set again, the same list too. Names given stay. Returns the markers removed.
+size_t forgetNamings(const std::string& cacheDir) noexcept;
 
 // Paths (for tests and the CLI).
 std::string entryNamesDir(const std::string& cacheDir);

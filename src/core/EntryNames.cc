@@ -709,7 +709,24 @@ size_t sweepEntryNames(const std::string& cacheDir, size_t budget) noexcept try 
 
 namespace ucache {
 
-long nameCachedEntries(const std::string& dir, const KeyRules& rules) noexcept try {
+size_t forgetNamings(const std::string& dir) noexcept try {
+  if (dir.empty())
+    return 0;
+  const std::string nd = entryNamesDir(dir);
+  std::vector<std::string> files;
+  if (RealIO::instance().listDir(nd, files) < 0)
+    return 0;
+  size_t removed = 0;
+  for (const auto& f : files)
+    if (f.compare(0, 6, "named-") == 0 && ::unlink((nd + "/" + f).c_str()) == 0)
+      ++removed;
+  return removed;
+} catch (...) {
+  return 0;
+}
+
+long nameCachedEntries(const std::string& dir, const KeyRules& rules,
+                       const std::function<bool()>& stop) noexcept try {
   if (dir.empty() || !rules.logical())
     return -1;
   const std::string nd = entryNamesDir(dir);
@@ -736,6 +753,10 @@ long nameCachedEntries(const std::string& dir, const KeyRules& rules) noexcept t
       std::vector<std::string> files;
       if (io.listDir(objRoot + "/" + sh, files) < 0)
         continue;
+      if (stop && stop()) { // asked to stop (the process ends): not done, no marker
+        ::close(lock);
+        return 0;
+      }
       for (const auto& f : files) {
         if (f.size() != 69 || f.compare(64, 5, ".meta") != 0)
           continue;
@@ -747,6 +768,10 @@ long nameCachedEntries(const std::string& dir, const KeyRules& rules) noexcept t
   std::sort(all.begin(), all.end(), [](const Cached& a, const Cached& b) { return a.atime > b.atime; });
   long named = 0;
   for (const auto& c : all) {
+    if (stop && stop()) { // asked to stop (the process ends): not done, no marker
+      ::close(lock);
+      return named;
+    }
     const std::string name = rules.mapStored(c.key);
     if (name.compare(0, 4, "lfn:") != 0)
       continue;

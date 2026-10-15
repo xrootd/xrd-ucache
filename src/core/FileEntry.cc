@@ -1264,10 +1264,19 @@ bool FileEntry::commitSnapshot(MetaData snapshot, const PageBitmap& sets, const 
   // back a bit this handle cleared on purpose -- releaseRanges clears bits and
   // THEN punches, so a resurrected bit is a bit over a hole -- and would let a
   // sibling re-add it from a stale full view.
+  // Only within one generation of the entry: one started again by another process (a fresh
+  // sidecar with its copy's modification time, or another generation of its names) holds another
+  // copy's bytes, which this handle's pages must never join, also where this handle's freshness
+  // check would not tell the two apart (validate = size+mtime is checked on the size alone for an
+  // entry keyed by logical name, and a process with another setting may start it again).
   MetaData out;
   bool merged = false;
   auto disk = MetaFile::load(io_, metaPath_);
-  if (disk && disk->pageSize == snapshot.pageSize &&
+  const bool sameGeneration =
+      disk && (!disk->originMtime || !snapshot.originMtime ||
+               disk->originMtime == snapshot.originMtime) &&
+      (!disk->gen || !snapshot.gen || disk->gen == snapshot.gen);
+  if (disk && sameGeneration && disk->pageSize == snapshot.pageSize &&
       adoptable(*disk, cfg_, key_, snapshot.fileSize, snapshot.originMtime, snapshot.cksumKind,
                 snapshot.originCksum)) {
     out = std::move(*disk);

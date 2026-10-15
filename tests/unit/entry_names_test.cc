@@ -252,6 +252,35 @@ TEST(EntryNames, CachedEntriesAreNamedOnce) {
   EXPECT_FALSE(entryNames(dir, third.hashHex).lfn.empty());
 }
 
+// The prefixes turned off and set again (the same list too): the entries cached by URL in between
+// are named then, once the namings done were forgotten (`ucache set` to another list or off, and
+// `unset`, call forgetNamings). Without that, a cache named once for a list was never scanned again.
+// A naming asked to stop leaves no marker: the next one names the rest.
+TEST(EntryNames, NamedAgainAfterTheNamingsAreForgotten) {
+  TempDir td;
+  const std::string dir = td.path();
+  const UrlKey p1 = *kOff.key("root://a.example//store/mc/i.root");
+  makeEntry(dir, p1);
+  EXPECT_EQ(nameCachedEntries(dir, kOn), 1);
+  EXPECT_EQ(nameCachedEntries(dir, kOn), -1); // done for these prefixes
+  // the prefixes off: a file cached by URL
+  const UrlKey p2 = *kOff.key("root://a.example//store/mc/j.root");
+  makeEntry(dir, p2);
+  EXPECT_EQ(forgetNamings(dir), 1u);
+  EXPECT_EQ(forgetNamings(dir), 0u);
+  // set again: the scan runs, and the file cached meanwhile is found by another URL
+  EXPECT_GE(nameCachedEntries(dir, kOn), 1);
+  EXPECT_EQ(resolveEntry(*kOn.key("root://b.example//store/mc/j.root"), dir).hashHex, p2.hashHex);
+  EXPECT_EQ(nameCachedEntries(dir, kOn), -1);
+  // stopped at once: nothing named, no marker, so the next naming runs
+  const UrlKey p3 = *kOff.key("root://a.example//store/mc/k.root");
+  makeEntry(dir, p3);
+  EXPECT_EQ(forgetNamings(dir), 1u);
+  EXPECT_EQ(nameCachedEntries(dir, kOn, [] { return true; }), 0);
+  EXPECT_GE(nameCachedEntries(dir, kOn), 1);
+  EXPECT_EQ(resolveEntry(*kOn.key("root://b.example//store/mc/k.root"), dir).hashHex, p3.hashHex);
+}
+
 // An alias is followed only while its entry exists: once the entry is gone (removed, with its
 // aliases or, after a crash between, without them), no name ever makes an entry under its hash. The
 // case: a user's copy keyed by the official name, removed; the official file's next fill must not

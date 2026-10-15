@@ -23,6 +23,8 @@ $UCACHE_DIR/                         (0700)
   names/<hh>/<sha256(name)>.to       # an entry's other name (logical_name_prefixes; below)
   names/<hh>/<sha256(key)>.names     # the names of an entry (below)
   names/generation                   # the last generation id given to an entry (below)
+  names/named-<hash>                 # the entries cached before were named for a list (below)
+  names/naming.lock                  # flock held while they are named
   LOCK                               # cache-wide flock for eviction
   objects.cleared.<pid>-<ms>/        # an objects/ tree `ucache clear` set aside,
                                      #  deleted in the background
@@ -51,7 +53,10 @@ had `logical_name_prefixes` set has no such directory, and nothing below is read
 <dir>/names/<hh>/<entryhash>.names   the entry's names: "lfn <key>" and "url <key>" lines
 <dir>/names/generation               the last generation id given: 6 hex digits and a newline
 <dir>/names/named-<hash>             the entries cached before were named for the prefixes of
-                                     this hash (run_settings' logical_names=on/<hash>): the count
+                                     this hash (run_settings' logical_names=on/<hash>): the count;
+                                     every such marker is removed when `ucache set` changes the
+                                     prefixes (or turns them off) and at `ucache unset`, so that
+                                     the entries cached meanwhile are named when a list is set again
 <dir>/names/naming.lock              flock held while they are named (one process at a time)
 ```
 

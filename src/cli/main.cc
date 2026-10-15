@@ -3688,13 +3688,19 @@ int cmdSet(const Config& cfg, const char* key, const char* value) {
   const std::string sp = Config::statePath(cfg.cacheDir);
   auto kv = readStateEntries(sp);
   bool replaced = false;
+  bool changed = true;
   for (auto& e : kv)
     if (e.first == k) {
+      changed = e.second != value;
       e.second = value;
       replaced = true;
     }
   if (!replaced)
     kv.emplace_back(k, value);
+  // Another list of prefixes, or none: the namings done are forgotten, so that the entries cached
+  // by URL meanwhile are named when a list is set again, the same one too (EntryNames.h).
+  if (k == "logical_name_prefixes" && changed)
+    forgetNamings(cfg.cacheDir);
   if (int rc = writeStateFile(sp, kv))
     return rc;
   std::printf("%s = %s   (current value, %s)\n"
@@ -3715,6 +3721,9 @@ int cmdSet(const Config& cfg, const char* key, const char* value) {
       const long n = nameCachedEntries(cfg.cacheDir, rules);
       if (n >= 0)
         std::printf("  %ld cached entr%s named by these prefixes\n", n, n == 1 ? "y" : "ies");
+      else
+        std::printf("  the cached entries were named by these prefixes before (or a job is "
+                    "naming them now)\n");
     }
   }
   return 0;
@@ -3736,6 +3745,8 @@ int cmdUnset(const Config& cfg, const char* key) {
     std::printf("unset: '%s' has no current value (already from defaults/env)\n", key);
     return 0;
   }
+  if (std::string(key) == "logical_name_prefixes")
+    forgetNamings(cfg.cacheDir); // as `set` to another list (cmdSet)
   if (int rc = writeStateFile(sp, kv))
     return rc;
   std::printf("%s unset — back to your defaults (conf/built-in)\n", key);

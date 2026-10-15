@@ -188,6 +188,38 @@ TEST(FileEntry, MtimeAndCksumValidation) {
   }
 }
 
+// A process whose freshness check is on the size alone (validate = size, or an entry by logical
+// name with validate = size+mtime) holds an entry; another process, checking the mtime too, finds
+// the file changed (same size, another mtime) and starts the entry again with the new copy. The
+// first one's pages, of the old copy, are never merged into that new generation: its commit stores
+// its own view (with the old mtime, which the next size+mtime open starts again), never the new
+// generation with old pages in it.
+TEST(FileEntry, PagesOfAnEarlierGenerationAreNeverMerged) {
+  Fixture fx;
+  Config cfgMtime = fx.cfg;
+  cfgMtime.validate = ValidateMode::kSizeMtime;
+  auto older = FileEntry::open(fx.io, fx.cfg, fx.stats, fx.key, fx.src.size(), 100,
+                               MetaData::kCksumNone, 0);
+  ASSERT_TRUE(older);
+  older->writePages(0, 4096, fx.src.data());
+  older->flushAll();
+  auto newer = FileEntry::open(fx.io, cfgMtime, fx.stats, fx.key, fx.src.size(), 200,
+                               MetaData::kCksumNone, 0);
+  ASSERT_TRUE(newer);
+  EXPECT_FALSE(newer->hasRange(0, 4096)); // started again
+  newer->writePages(4096, 4096, fx.src.data() + 4096);
+  newer->flushAll();
+  older->writePages(8192, 4096, fx.src.data() + 8192); // a page of the old copy, after the restart
+  older->flushAll();
+  auto disk = MetaFile::load(fx.io, fx.key.metaPath(fx.cfg.cacheDir));
+  ASSERT_TRUE(disk);
+  // Never the new generation (mtime 200) holding the old copy's page.
+  EXPECT_FALSE(disk->originMtime == 200 && disk->bitmap.get(2))
+      << "the old copy's page was merged into the generation started again";
+  newer.reset();
+  older.reset();
+}
+
 TEST(FileEntry, CksumModeWithoutAChecksumValidatesSizeOnly) {
   // Characterization: the cksum comparison is gated on a
   // caller-provided kind, and the PLUGIN never queries an origin checksum —
