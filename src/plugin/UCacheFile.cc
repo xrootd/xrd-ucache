@@ -6332,6 +6332,8 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
       {
         std::lock_guard<std::mutex> g(st_->mu);
         st_->cacheOnly = true;
+        st_->trustedHash = key->hashHex; // the entry trusted, which the set-up must find again
+        st_->trustedGen = key->entryGen;
       }
       st_->trustedAtOpen.store(true, std::memory_order_release);
       cacheOpen_ = true;
@@ -6710,11 +6712,23 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
 
   bool cacheOnly;
   ForkLayout forkLayout; // set when a forked child inherited this handle (syncFork)
+  std::string trustedHash;
+  uint32_t trustedGen = 0;
   {
     std::lock_guard<std::mutex> g(st_->mu);
     cacheOnly = st_->cacheOnly;
     forkLayout = st_->forkLayout;
+    trustedHash = st_->trustedHash;
+    trustedGen = st_->trustedGen;
   }
+  // The name is resolved again here, and may lead elsewhere than at Open: the entry trusted then
+  // may have gone (evicted, removed, dropped by another process) and the name now lead to another
+  // entry, one whose copy may be another size than this URL's. Only the entry trusted is set up
+  // from the cache alone, and never one whose size was not compared with this URL's copy (joined):
+  // otherwise the handle opens the origin (below), where the sizes are compared.
+  const bool sameEntry = key && !key->joined &&
+                         (trustedHash.empty() ||
+                          (key->hashHex == trustedHash && key->entryGen == trustedGen));
   // The layout such a handle was set up in before the fork is the one it keeps:
   // its reader holds offsets into it. The original stays the original; a
   // slot layout is matched again.
@@ -6727,7 +6741,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
   // NO remote stat. If the entry is gone (evicted since Open), degrade to the
   // origin path below.
   bool degraded = false;
-  if (cacheOnly && allowed) {
+  if (cacheOnly && allowed && sameEntry) {
     if (auto meta = MetaFile::load(RealIO::instance(), key->metaPath(cfg.cacheDir));
         meta && meta->key == key->key) {
       // Set before anything here can open the origin lazily (the layout choice
@@ -6768,8 +6782,13 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
       degraded = true;
     }
   } else if (cacheOnly) {
-    // Trusted at Open but the key is no longer allowed: degrade so the lazy
-    // origin open below gives the handle a real pass-through target.
+    // Trusted at Open but the key is no longer allowed, or the URL now leads to another entry
+    // than the one trusted (sameEntry): degrade so the lazy origin open below gives the handle a
+    // real target, and the origin path compares the sizes.
+    if (allowed && key)
+      UCACHE_INFO("%s: the entry trusted at open is not the one its name leads to now; the "
+                  "origin is opened, and the sizes compared",
+                  st_->url.c_str());
     std::lock_guard<std::mutex> g(st_->mu);
     st_->cacheOnly = false;
     degraded = true;
@@ -6934,6 +6953,10 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
       st_->layoutLost.store(true, std::memory_order_release);
     if (!st_->closed && !st_->tripped) {
       st_->entry = entry;
+      if (entry && key) { // the entry a forked child's set-up must find again
+        st_->trustedHash = key->hashHex;
+        st_->trustedGen = key->entryGen;
+      }
 #ifdef UCACHE_HAVE_COLDRUN
       // A slot run keeps its own rule (ColdRun).
       if (entry && !cold)

@@ -367,6 +367,14 @@ struct HandleState {
   // entry carries the size confirmed (MetaData::kFlagSizeConfirmed).
   std::atomic<uint64_t> confirmedSize{0};
   std::string trustMarker; // under mu: the entry's .val path, removed on such a refusal
+  // Under mu: the entry the handle was trusted with at Open, or was set up with (a forked child
+  // sets it up again from the cache alone): its hash and the generation its name named
+  // (UrlKey::entryGen). Empty when none. A set-up from the cache alone takes only that entry: when
+  // the URL resolves to another one by then (the entry went, and the name now leads elsewhere), or
+  // to one whose copy's size was never compared with the URL's (UrlKey::joined), the handle opens
+  // the origin instead, where the sizes are compared.
+  std::string trustedHash;
+  uint32_t trustedGen = 0;
   std::atomic<bool> sizeRefused{false}; // set: no origin read of this handle reaches that source
   bool ensureInnerOpen(); // lazy origin open on first miss; the caller waits for it
   // The status a cache miss should fail with when the inner file is
