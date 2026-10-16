@@ -133,7 +133,6 @@ void CacheStore::afterForkChild() {
     std::deque<std::string> records;
     std::map<std::string, uint32_t> recordCaps;
     std::set<std::string> removing;
-    std::set<std::string> redirectorHosts;
   };
   auto* left = new LeftBehind; // leaked on purpose
   new (&relayFpMu_) std::mutex;
@@ -146,7 +145,8 @@ void CacheStore::afterForkChild() {
   // The parent's queued record lines are the parent's to write.
   left->records.swap(records_);
   left->recordCaps.swap(recordCaps_);
-  left->redirectorHosts.swap(redirectorHosts_); // the child asks again for what it opens
+  // The parent's redirector hosts are kept: they are facts about servers, and the child's run line
+  // must name them for the handles it inherited (decided in the parent).
   left->relayFp.swap(relayFp_);
   left->registry.swap(registry_);
   // A drop by key under way in a parent thread marks its key until its files are gone; that thread

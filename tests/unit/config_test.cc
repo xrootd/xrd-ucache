@@ -303,10 +303,37 @@ TEST(Config, AdaptiveFederationAuto) {
     EXPECT_EQ(c.sources.at("adaptive_federation"), "env");
     EXPECT_FALSE(c.checkOriginIntegrity);
   }
-  ::setenv("UCACHE_ADAPTIVE_FEDERATION", "bogus", 1);
-  {
+  // Any case of off/on/auto; a value it does not know is ignored (the layer below governs, the
+  // default when none sets it) and recorded for doctor.
+  for (const char* v : {"Auto", "AUTO", "auto"}) {
+    ::setenv("UCACHE_ADAPTIVE_FEDERATION", v, 1);
     Config c = Config::fromEnv();
-    EXPECT_EQ(c.adaptiveFederation, FederationMode::kOff) << "a value it does not know is off";
+    EXPECT_EQ(c.adaptiveFederation, FederationMode::kAuto) << v;
+    EXPECT_TRUE(c.badAdaptiveFederation.empty()) << v;
+  }
+  for (const char* v : {"ON", "True", "1"}) {
+    ::setenv("UCACHE_ADAPTIVE_FEDERATION", v, 1);
+    EXPECT_EQ(Config::fromEnv().adaptiveFederation, FederationMode::kOn) << v;
+  }
+  for (const char* v : {"OFF", "False", "0"}) {
+    ::setenv("UCACHE_ADAPTIVE_FEDERATION", v, 1);
+    EXPECT_EQ(Config::fromEnv().adaptiveFederation, FederationMode::kOff) << v;
+  }
+  for (const char* v : {"bogus", "yes", "enabled", "autoo"}) {
+    ::setenv("UCACHE_ADAPTIVE_FEDERATION", v, 1);
+    Config c = Config::fromEnv();
+    EXPECT_EQ(c.adaptiveFederation, FederationMode::kAuto) << v << ": ignored, the default holds";
+    EXPECT_EQ(c.valueOf("adaptive_federation"), "auto") << v;
+    EXPECT_EQ(c.sources.count("adaptive_federation"), 0u) << v;
+    EXPECT_NE(c.badAdaptiveFederation.find(v), std::string::npos) << c.badAdaptiveFederation;
+  }
+  {
+    std::map<std::string, std::string> offConf = {{"adaptive_federation", "off"}};
+    ::setenv("UCACHE_ADAPTIVE_FEDERATION", "yes", 1);
+    Config c = Config::fromEnv(&offConf);
+    EXPECT_EQ(c.adaptiveFederation, FederationMode::kOff) << "the layer below (the conf) governs";
+    EXPECT_EQ(c.sources.at("adaptive_federation"), "conf");
+    EXPECT_FALSE(c.badAdaptiveFederation.empty());
   }
   ::unsetenv("UCACHE_ADAPTIVE_FEDERATION");
   conf = {{"adaptive_federation", "auto"}};

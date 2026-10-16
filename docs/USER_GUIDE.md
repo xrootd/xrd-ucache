@@ -829,8 +829,11 @@ server that names no role (an error, a key it does not know) is taken at its
 login flags. A redirector turns the switch on for the files opened there:
 everything `on` does to a file below, `check_origin_integrity` included.
 Anything else, an error, or no answer in time leaves the files of that server
-exactly as with the switch off; an answer that comes later changes nothing for
-that job. A federation's top
+exactly as with the switch off; an answer that comes after the 5 s changes
+nothing for the opens that went on without it. A server that gave no answer is
+asked again at an open made 10 minutes later or more, and a verdict, an answer
+of this job's or a saved one, is renewed (asked again) at an open of the origin
+made 10 minutes or more after it. A federation's top
 redirector (CMS's global one says `meta manager`) and a regional one
 (`manager`) turn it on; so does **a site's own redirector**, which also says
 `manager`: it too sends opens to several servers. To read every file as with
@@ -838,18 +841,41 @@ the switch off, set `adaptive_federation = off`; to have it on for every file,
 whatever server the URL names, `on`.
 
 The questions cost one round trip to each server a job opens files at (two to
-a redirector), once per job, on the connection the open then uses. An open the cache answers from
-a trusted entry (within its freshness window) asks nothing, so a warm job
-never reaches the network for it: such a handle takes what this job already
-knows of the server, and the switch is off for it when nothing is known yet. A
-handle that only relays (a write, a copy, the cache disabled) is not asked
-for: the switch is off for it. A handle a forked child inherits keeps the
+a redirector), once per job (and once per 10 minutes at most), on the
+connection the open then uses. What a server was found to be is saved in the
+cache directory (`<dir>/roles`, FORMAT.md) for the other jobs of the cache.
+
+An open the cache answers from a trusted entry (within its freshness window)
+asks nothing, so a warm open never reaches the network: it takes what this job
+already knows of the server, else the verdict saved in `<dir>/roles` (whatever
+its age), and the switch is on or off for the file as it was for the job that
+asked. When neither knows the server (an entry filled by uCache 1.4.0, or with
+the switch off), the file is decided at its first access to the origin -- its
+first read the cache does not hold, or the cache's own open of the origin:
+the server is asked then (the same 5 s at most), before that read is made, and
+the reads the cache holds never wait for it. So the second pass of a job, which
+reads other parts of files a first pass cached, has the protections for what it
+fetches. A handle that only relays (a write, a copy, the cache disabled) is not
+asked for: the switch is off for it. A handle a forked child inherits keeps the
 decision its parent made. The XRootD client's connection settings, which `on`
 changes for the whole job, stay as they are with `auto`, so that a file the
-switch is off for is read exactly as without it. `ucache stats` counts the
-servers asked (`role_queries`), those that reported a redirector's role
-(`role_redirectors`) and those that gave none (`role_unanswered`); `log = info`
-names each server's answer.
+switch is off for is read exactly as without it. The protections of a file the
+switch is on for do not depend on them (the open deadline, the moves, the client's
+own read recovery turned off and the checks are the file's), but the time the
+client takes to give up on a server it cannot reach does: with the client's own
+values (a connection tried for 120 s, 5 times, a server that failed answered
+with that failure for 30 minutes) a redirector that was down for more than about
+10 minutes can have the job's opens through it refused for up to 30 minutes
+after it is back, where `on` (31 s, 2 tries, 3 minutes) recovers within about 3
+minutes. `on`, or `XRD_CONNECTIONWINDOW=31 XRD_CONNECTIONRETRY=2
+XRD_STREAMERRORWINDOW=180` in the job's environment, gives the shorter policy
+with `auto`. `ucache stats` counts the
+servers asked (`role_queries`, renewals included), those that reported a
+redirector's role (`role_redirectors`) and those that gave none
+(`role_unanswered`); `log = info` names each server's answer. The setting takes
+`off`, `on` or `auto` in any case (and `1`/`true`, `0`/`false`); any other value
+is ignored with a warning, the layer below (or the default, `auto`) holds, and
+`ucache doctor` names it.
 
 Below, "with `adaptive_federation = on`" means: for a file the switch is on
 for -- every file with `on`, a file opened at a redirector with `auto`.

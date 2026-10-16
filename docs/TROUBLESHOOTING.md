@@ -340,11 +340,19 @@ answer within 5 s) ...`. `ucache stats` counts them (`role_queries`,
   not answer the question in time (it was stopped or overloaded); the switch is off for its files for the rest of the job, and
   later opens there do not wait again. An open the cache answers from a trusted
   entry never asks.
-- **A warm job reads with the switch off.** A job whose opens are all answered
-  from trusted entries asks no server, and the switch is off for those handles
-  (a handle the cache answers does not reach the network for its open). It
-  takes the switch on for a server this job has already found to be a
-  redirector.
+- **A warm job asks no server at its opens.** An open answered from a trusted
+  entry takes the verdict this job or an earlier one found (`<dir>/roles`);
+  with none, the file is decided at its first read the cache does not hold
+  (the log says `decided at its first access to the origin`).
+- **Opens through a redirector were refused for a long time after it came
+  back.** With `auto` the XRootD client keeps its own connection settings: a
+  server that failed is answered with that failure for 30 minutes (after
+  trying it for up to 10). `adaptive_federation = on`, or
+  `XRD_CONNECTIONWINDOW=31 XRD_CONNECTIONRETRY=2 XRD_STREAMERRORWINDOW=180`,
+  gives up sooner and tries again after 3 minutes.
+- **`ucache doctor` says adaptive_federation has a value it does not know.**
+  The value (a typo, `yes`) is ignored and the jobs run with the layer below,
+  or the default `auto`; set `off`, `on` or `auto`.
 
 ## One server refuses or fails and stops the job
 

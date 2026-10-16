@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <cctype>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -221,10 +222,30 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.recompressKeepOriginals = truthy(v);
   else if (k == "check_origin_integrity")
     c.checkOriginIntegrity = truthy(v);
-  else if (k == "adaptive_federation")
-    c.adaptiveFederation = v == "auto"  ? FederationMode::kAuto
-                           : truthy(v) ? FederationMode::kOn
-                                       : FederationMode::kOff;
+  else if (k == "adaptive_federation") {
+    // off, on or auto, in any case (and the words the other switches take: 1/true, 0/false). Any
+    // other value is refused: the layer below governs (the default, auto, when none sets it), and
+    // `doctor` names the value.
+    std::string lv = v;
+    for (char& ch : lv)
+      ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (lv == "auto") {
+      c.adaptiveFederation = FederationMode::kAuto;
+    } else if (truthy(lv)) {
+      c.adaptiveFederation = FederationMode::kOn;
+    } else if (falsy(lv)) {
+      c.adaptiveFederation = FederationMode::kOff;
+    } else {
+      c.badAdaptiveFederation = std::string(src) + " says '" + v + "'";
+      static auto* mu = new std::mutex;
+      static auto* warned = new std::set<std::string>;
+      std::lock_guard<std::mutex> g(*mu);
+      if (warned->insert(c.badAdaptiveFederation).second)
+        UCACHE_WARN("%s: adaptive_federation=%s invalid (off, on or auto); ignored", src,
+                    v.c_str());
+      return false; // the layer below still governs, and `settings` must say so
+    }
+  }
   else if (k == "logical_name_prefixes")
     c.logicalNamePrefixes = falsy(v) ? std::string("off") : v; // checked once, at the end
   else if (k == "mixed_maps")

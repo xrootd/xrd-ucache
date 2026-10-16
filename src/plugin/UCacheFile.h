@@ -126,8 +126,12 @@ struct HandleState {
   // inherits.
   std::atomic<bool> federation{false};
   bool fed() const { return federation.load(std::memory_order_relaxed); }
-  // With `auto`: set once the open has decided `federation`.
+  // With `auto`: set once `federation` is decided: at the open, or, for a handle a trusted open
+  // left undecided (its server not known in this process nor saved in the cache directory), at
+  // its first access to the origin (decideFederationLate).
   std::atomic<bool> fedDecided{false};
+  std::mutex lateFedMu; // serializes decideFederationLate
+  void decideFederationLate() noexcept;
   // The timeout the reader gave its Open (0 = the client's default): with
   // adaptive_federation on, the cache's own opens of this handle honour a
   // shorter one (OpenPolicy.h openDeadlineS); with it off it is unused, and

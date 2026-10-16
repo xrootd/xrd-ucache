@@ -22,9 +22,11 @@
 //
 // An open waits for the answers at most kRoleWaitS in all (or the reader's
 // own open timeout when shorter); one that has none by then goes the way of a
-// file whose server is not a redirector. The first outcome stands for the
-// process: a later answer from a server that did not answer in time changes
-// nothing. (The flags the open's own login brings come only with the open's
+// file whose server is not a redirector. An answer that comes after the bound
+// is not taken. An outcome (an answer, no answer, or a verdict saved by another
+// process of the cache, ServerVerdicts.h) is renewed -- asked again -- at an
+// open that needs the server once it is older than the renewal age; a caller
+// that may not wait takes the old outcome meanwhile. (The flags the open's own login brings come only with the open's
 // answer, too late for that open's failover.)
 //
 // This header is pure (no XRootD, no I/O): the plugin asks (UCacheFile.cc) and
@@ -101,6 +103,8 @@ class ServerRoles {
     std::string role;  // the role it gave; for kNoAnswer, why there was none
     uint64_t untilUs = 0; // an answer later than this (steady clock) is not taken
     uint64_t boundMs = 0; // the query's bound, from its start
+    uint64_t doneUs = 0;  // when it ended (steady clock); for a saved verdict, when it was saved
+    bool saved = false;   // the verdict was read from the cache directory, not asked here
   };
   // What decide() found for one open.
   struct Decision {
@@ -108,7 +112,8 @@ class ServerRoles {
     Kind kind = Kind::kPending; // the server's outcome when the open went on; kPending: none yet
     std::string role;
     bool asked = false; // this call made the server's query (start was called)
-    bool ended = false; // this call ended the query as kNoAnswer (its wait ran out)
+    bool ended = false; // this call ended the query as kNoAnswer (its wait ran out, or the
+                        // query could not be made)
     std::shared_ptr<Op> op; // the server's query (null when it was not asked)
   };
 
@@ -120,8 +125,17 @@ class ServerRoles {
   // answer at most `waitMs` (and never past the query's own bound); without,
   // it takes what is known now. Never throws for want of memory to the caller
   // that may not: a failure is an open read as with the switch off.
+  // `renewMs` > 0: an outcome older than that (an answer, a saved verdict, or no
+  // answer) is asked again; a caller that may not wait meanwhile takes the old
+  // outcome.
   Decision decide(const std::string& server, uint64_t boundMs, uint64_t waitMs, bool mayWait,
-                  const std::function<bool(const std::shared_ptr<Op>&)>& start) noexcept;
+                  const std::function<bool(const std::shared_ptr<Op>&)>& start,
+                  uint64_t renewMs = 0) noexcept;
+  // A verdict saved in the cache directory `ageS` seconds ago: taken as the
+  // server's outcome when this process has none, or only no answer. True when
+  // it was taken.
+  bool seed(const std::string& server, bool redirector, const std::string& role,
+            uint64_t ageS) noexcept;
   // The answer to `op`'s query: `answered` with the verdict (`redirector`, and
   // `role` to say), or no answer (`role` then says why). True when this call
   // ends the query; false when it had ended already. An answer that comes

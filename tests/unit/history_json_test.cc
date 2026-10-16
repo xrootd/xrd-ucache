@@ -243,14 +243,15 @@ TEST(HistoryJson, AnOldRecordAddsOnlyWhatItCanSay) {
 // A run with adaptive_federation = auto: a file whose URL's host reported a
 // redirector's role (the run line's redirector_hosts) is published under its
 // data server's domain, as with the switch on; every other file under its
-// URL's, as with it off.
+// URL's, as with it off. The hosts are host:port (the URL's port 1094 when it names none): a
+// redirector on another port of the same host does not count.
 TEST(HistoryJson, OriginsUnderAutoFollowTheRedirectorHosts) {
   EXPECT_EQ(publishedOrigins("v1 check_origin_integrity=off adaptive_federation=auto", nullptr,
-                             "redirector.example.org"),
+                             "redirector.example.org:1094"),
             (std::vector<std::string>{"root://cern.ch", "root://fnal.gov", "rt root://cern.ch",
                                       "rt root://fnal.gov"}));
   EXPECT_EQ(publishedOrigins("v1 check_origin_integrity=off adaptive_federation=auto", nullptr,
-                             "other.example.org"),
+                             "other.example.org:1094 redirector.example.org:2094"),
             (std::vector<std::string>{"root://cern.ch", "root://example.org", "rt root://cern.ch",
                                       "rt root://example.org"}));
 }

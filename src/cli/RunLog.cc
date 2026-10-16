@@ -328,6 +328,7 @@ namespace {
 std::string signatureOf(const std::map<std::string, Run::FileRec>& files);
 std::string readSignatureOf(const std::map<std::string, Run::FileRec>& files);
 std::string hostOf(const std::string& url);
+std::string hostPortOf(const std::string& url);
 } // namespace
 
 std::string nameHashOf(const std::string& runSettings) {
@@ -480,10 +481,7 @@ std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiv
     const bool byServerAll = federationRun(r.runSettings);
     const bool autoRun = federationAutoRun(r.runSettings);
     for (const auto& [k, f] : r.files) {
-      std::string lowHost = f.urlHost;
-      for (char& c : lowHost)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-      const bool byServer = byServerAll || (autoRun && r.redirectorHosts.count(lowHost));
+      const bool byServer = byServerAll || (autoRun && r.redirectorHosts.count(hostPortOf(k)));
       const bool named = k.compare(0, 4, "lfn:") == 0 && f.urlHost.empty();
       const std::string h = (byServer || named) && !f.dataServer.empty() ? f.dataServer
                             : !f.urlHost.empty()                   ? f.urlHost
@@ -1020,6 +1018,27 @@ std::string readSignatureOf(const std::map<std::string, Run::FileRec>& files) {
 }
 
 // Host out of `root://host:port//path`; empty when the key is not a URL.
+std::string hostPortOf(const std::string& url) {
+  // host:port of a key by URL, lower-cased, the port 1094 when the URL names none (as the client
+  // takes it); "" for a key with no host.
+  const auto p = url.find("://");
+  if (p == std::string::npos)
+    return std::string();
+  const auto start = p + 3;
+  const auto end = url.find('/', start);
+  std::string hp = url.substr(start, end == std::string::npos ? end : end - start);
+  const auto at = hp.rfind('@');
+  if (at != std::string::npos)
+    hp.erase(0, at + 1);
+  for (char& c : hp)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  const auto close = hp.rfind(']');
+  const auto colon = hp.rfind(':');
+  if (colon == std::string::npos || (close != std::string::npos && colon < close))
+    hp += ":1094";
+  return hp;
+}
+
 std::string hostOf(const std::string& url) {
   const auto p = url.find("://");
   if (p == std::string::npos)

@@ -24,6 +24,7 @@
 #include "Trace.h"
 #include "InUse.h"
 #include "ServerRole.h"
+#include "ServerVerdicts.h"
 #include "SourceMarks.h"
 #include "vendor/crc32c.h"
 
@@ -977,10 +978,23 @@ void endRole(const std::shared_ptr<ServerRoles::Op>& op, const std::string& serv
     kind = op->kind;
     role = op->role;
   }
+  // An answer (never "no answer") is saved for the other processes of the cache, off this thread.
+  if ((kind == ServerRoles::Kind::kRedirector || kind == ServerRoles::Kind::kOther) && store &&
+      !globalConfig().cacheDir.empty()) {
+    const std::string path = rolesPath(globalConfig().cacheDir);
+    const bool red = kind == ServerRoles::Kind::kRedirector;
+    try {
+      Executor::instance().post([path, server, red, role] {
+        (void)saveRole(RealIO::instance(), path, server, red, role,
+                       static_cast<uint64_t>(::time(nullptr)));
+      });
+    } catch (...) {
+    }
+  }
   if (kind == ServerRoles::Kind::kRedirector) {
     if (store) {
       store->stats().roleRedirectors.fetch_add(1, std::memory_order_relaxed);
-      store->noteRedirectorHost(server.substr(0, server.rfind(':')));
+      store->noteRedirectorHost(server);
     }
     UCACHE_INFO("adaptive_federation = auto: %s reports the role '%s', a redirector's: the files "
                 "opened there are read with the switch on",
@@ -1123,18 +1137,58 @@ bool startRoleQuery(const std::shared_ptr<ServerRoles::Op>& op, const std::strin
 
 bool mayWaitForMove(); // below
 
-// adaptive_federation = auto, at a handle's Open: whether the switch is on for the file at `url`
-// (HandleState::federation), from its server's role. A handle that only relays (`relayOnly`: a
-// write open, a copy, the cache disabled or without a directory) is not asked for: nothing of the
-// switch is for it. A URL that is not root:// or roots:// (xroot, xroots) names no XRootD server
-// to ask. `knownOnly`: an open the cache answers from a trusted entry, which never touches the
-// network: what is known of the server is taken, and a server not asked yet is not asked (the
-// switch is off for that handle). Never fails the open: anything that goes wrong is the switch
-// off for the file.
-static bool autoFederation(const std::string& url, bool relayOnly, bool knownOnly,
-                           int readerTimeoutS, const std::shared_ptr<CacheStore>& store) noexcept try {
+// adaptive_federation = auto: whether the switch is on for the file at `url` (HandleState::
+// federation), from what its server is. A handle that only relays (`relayOnly`: a write open, a
+// copy, the cache disabled or without a directory) is not asked for: nothing of the switch is for
+// it. A URL that is not root:// or roots:// (xroot, xroots) names no XRootD server to ask. Never
+// fails the open: anything that goes wrong is the switch off for the file.
+//  - kKnownOnly (an open the cache answers from a trusted entry, which never touches the network):
+//    what this process knows of the server, else the verdict saved in the cache directory
+//    (ServerVerdicts.h), whatever its age; with neither, the file is not decided yet (`decided`
+//    false): it is decided before its first access to the origin (decideFederationLate).
+//  - kAsk (an open of the origin, or the first access of an undecided handle): what this process
+//    knows, unless it is older than the renewal age (kRoleRenewS: an answer, a saved verdict, no
+//    answer alike); else a verdict saved less than that age ago; else the server is asked (bounded,
+//    ServerRole.h), and what it answers is saved for the other processes of the cache.
+enum class RoleAsk : uint8_t { kAsk, kKnownOnly };
+struct FedDecision {
+  bool on = false;
+  bool decided = true;
+};
+// The age at which a verdict is renewed (asked again), in seconds; UCACHE_TEST_ROLE_RENEW_S
+// replaces it for tests (read at load).
+constexpr uint64_t kRoleRenewS = 600;
+const uint64_t gRoleRenewS = [] {
+  const char* v = ::getenv("UCACHE_TEST_ROLE_RENEW_S");
+  const uint64_t n = v ? std::strtoull(v, nullptr, 10) : 0ull;
+  return n > 0 ? n : kRoleRenewS;
+}();
+// The verdict saved for `server` in the cache directory, taken into this process's table when it
+// has none of its own (or only no answer) and the verdict is at most `maxAgeS` old. No network.
+static void seedSavedRole(const std::string& server, uint64_t maxAgeS) noexcept try {
+  const Config& cfg = globalConfig();
+  if (cfg.cacheDir.empty())
+    return;
+  RoleSaved r;
+  if (!findRole(RealIO::instance(), rolesPath(cfg.cacheDir), server, r))
+    return;
+  const uint64_t now = static_cast<uint64_t>(::time(nullptr));
+  const uint64_t age = now > r.savedS ? now - r.savedS : 0;
+  if (age > maxAgeS)
+    return;
+  if (roleTable().roles->seed(server, r.redirector, r.role, age))
+    UCACHE_DEBUG("adaptive_federation = auto: %s taken as %s from the cache's saved verdicts (%s, "
+                 "%llu s old)",
+                 server.c_str(), r.redirector ? "a redirector" : "not a redirector", r.role.c_str(),
+                 static_cast<unsigned long long>(age));
+} catch (...) {
+}
+static FedDecision autoFederation(const std::string& url, bool relayOnly, RoleAsk how,
+                                  int readerTimeoutS,
+                                  const std::shared_ptr<CacheStore>& store) noexcept try {
+  FedDecision out;
   if (relayOnly || processExiting())
-    return false;
+    return out;
   const XrdCl::URL u(url);
   std::string proto = u.GetProtocol();
   for (char& c : proto)
@@ -1142,10 +1196,29 @@ static bool autoFederation(const std::string& url, bool relayOnly, bool knownOnl
   if (!u.IsValid() ||
       (proto != "root" && proto != "roots" && proto != "xroot" && proto != "xroots") ||
       u.GetHostName().empty())
-    return false;
+    return out;
   std::string server = u.GetHostName() + ":" + std::to_string(u.GetPort());
   for (char& c : server)
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  ServerRoles& roles = *roleTable().roles;
+  if (how == RoleAsk::kKnownOnly) {
+    ServerRoles::Decision k = roles.known(server);
+    if (!k.op || k.kind == ServerRoles::Kind::kNoAnswer) {
+      seedSavedRole(server, kRoleSavedForgetS);
+      k = roles.known(server);
+    }
+    out.decided = k.op && (k.kind == ServerRoles::Kind::kRedirector ||
+                           k.kind == ServerRoles::Kind::kOther);
+    out.on = out.decided && k.federation;
+    UCACHE_DEBUG("adaptive_federation = auto: %s for %s, a trusted entry's open (%s)",
+                 !out.decided ? "undecided" : out.on ? "on" : "off", url.c_str(),
+                 out.decided ? k.role.c_str()
+                             : "its server not known here: decided at the file's first access to "
+                               "the origin");
+    return out;
+  }
+  if (!roles.known(server).op)
+    seedSavedRole(server, gRoleRenewS);
   const std::string fsUrl = proto + "://" +
                             (u.GetUserName().empty() ? std::string() : u.GetUserName() + "@") +
                             u.GetHostName() + ":" + std::to_string(u.GetPort()) + "/";
@@ -1154,28 +1227,50 @@ static bool autoFederation(const std::string& url, bool relayOnly, bool knownOnl
   // the question than it would for its own answer.
   const uint64_t waitMs =
       readerTimeoutS > 0 ? std::min<uint64_t>(boundMs, uint64_t(readerTimeoutS) * 1000) : boundMs;
-  if (knownOnly) {
-    const ServerRoles::Decision k = roleTable().roles->known(server);
-    UCACHE_DEBUG("adaptive_federation = auto: %s for %s, a trusted entry's open (%s)",
-                 k.federation ? "on" : "off", url.c_str(),
-                 k.op ? (k.kind == ServerRoles::Kind::kPending ? "no answer yet" : k.role.c_str())
-                      : "its server not asked: a trusted open asks nothing");
-    return k.federation;
-  }
   const bool mayWait = mayWaitForMove();
-  const ServerRoles::Decision d = roleTable().roles->decide(
+  const ServerRoles::Decision d = roles.decide(
       server, boundMs, waitMs, mayWait,
       [&](const std::shared_ptr<ServerRoles::Op>& op) {
         return startRoleQuery(op, server, fsUrl, store, kRoleWaitS);
-      });
-  if (d.ended) // this open saw the bound run out: the query's end is said here
+      },
+      gRoleRenewS * 1000);
+  if (d.ended) // this open saw the bound run out, or the query could not be made: said here
     endRole(d.op, server, store);
   UCACHE_DEBUG("adaptive_federation = auto: %s for %s (%s)", d.federation ? "on" : "off",
                url.c_str(),
                d.kind == ServerRoles::Kind::kPending ? "no answer yet" : d.role.c_str());
-  return d.federation;
+  out.on = d.federation;
+  return out;
 } catch (...) {
-  return false;
+  return FedDecision();
+}
+
+// The decision of a handle that a trusted open left undecided (autoFederation, kKnownOnly), made
+// before its first access to the origin: the first miss, or the cache's own open of the origin.
+// The hits before it never wait for it. Once, whichever request comes first; the others wait for
+// it (bounded as an open's question). With the switch off, the reader's properties recorded
+// meanwhile are forgotten, as at an open that decides off. Lock order: innerOpenMu (when the caller
+// holds it), lateFedMu, propMu, mu.
+void HandleState::decideFederationLate() noexcept try {
+  if (fedDecided.load(std::memory_order_acquire) ||
+      globalConfig().adaptiveFederation != FederationMode::kAuto)
+    return;
+  std::lock_guard<std::mutex> g(lateFedMu);
+  if (fedDecided.load(std::memory_order_acquire))
+    return;
+  const FedDecision d =
+      autoFederation(url, false, RoleAsk::kAsk, readerOpenTimeoutS.load(), store);
+  federation.store(d.on, std::memory_order_relaxed);
+  if (!d.on) {
+    std::lock_guard<std::mutex> p(propMu);
+    std::lock_guard<std::mutex> m(mu);
+    readerProps.clear();
+  }
+  fedDecided.store(true, std::memory_order_release);
+  UCACHE_DEBUG("adaptive_federation = auto: %s for %s, decided at its first access to the origin",
+               d.on ? "on" : "off", recordFile(url).c_str());
+} catch (...) {
+  fedDecided.store(true, std::memory_order_release); // off, as a failed decision is
 }
 
 namespace {
@@ -3752,6 +3847,7 @@ bool HandleState::ensureInnerOpen() {
   }
   if (lazyOpenFailUs && nowUs() - lazyOpenFailUs < kLazyOpenRetryCooldownUs)
     return false; // recent failure: rate-limit re-attempts, keep the error
+  decideFederationLate(); // a trusted handle left undecided: decided before this open
   const Config& cfg = globalConfig();
   const bool fo = fed();
   // This open is the cache's own (a trusted handle's first miss, a degraded
@@ -5358,6 +5454,7 @@ void HandleState::startOverAfterFork(uint64_t gen) {
   new (&propMu) std::mutex;
   new (&setupMu) std::mutex;
   new (&innerOpenMu) std::mutex;
+  new (&lateFedMu) std::mutex;
   new (&persistMu) std::mutex;
   new (&innerCv) std::condition_variable;
   new (&persistCv) std::condition_variable;
@@ -6635,13 +6732,18 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // names (ServerRole.h), decided before anything of the open reads it (decideFederation). Off: the
   // reader's properties recorded before the decision (SetProperty) are forgotten, as the switch off
   // never records them. An open the cache answers from a trusted entry decides with what is known
-  // (below); every other decides before its open of the origin.
+  // here or saved in the cache directory, and with neither leaves the file undecided until its
+  // first access to the origin (HandleState::decideFederationLate); every other open decides
+  // before its open of the origin.
   const bool autoMode = cfg.adaptiveFederation == FederationMode::kAuto;
   auto decideFederation = [&](bool knownOnly) {
-    const bool on = autoFederation(url, passthroughOnly_, knownOnly, static_cast<int>(timeout),
-                                   st_->store);
-    st_->federation.store(on, std::memory_order_relaxed);
-    if (!on) {
+    const FedDecision d = autoFederation(url, passthroughOnly_,
+                                         knownOnly ? RoleAsk::kKnownOnly : RoleAsk::kAsk,
+                                         static_cast<int>(timeout), st_->store);
+    if (!d.decided)
+      return; // off until then, its properties recorded as with the switch on
+    st_->federation.store(d.on, std::memory_order_relaxed);
+    if (!d.on) {
       std::lock_guard<std::mutex> p(st_->propMu);
       std::lock_guard<std::mutex> g(st_->mu);
       st_->readerProps.clear();
@@ -6699,7 +6801,7 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
     }
   }
   if (autoMode && !st_->fedDecided.load(std::memory_order_acquire))
-    decideFederation(/*knownOnly=*/false);
+    decideFederation(/*knownOnly=*/false); // an open of the origin: decided now
   // The cache entry is created lazily on the first read (ensureEntry). With
   // open-retry enabled (opt-in) wrap the app handler so a TRANSIENT open failure
   // is retried on a fresh inner file (Case A); write-opens and
@@ -7686,6 +7788,7 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
     ChunkList one;
     one.emplace_back(offset, size, buffer);
     if (auto rule = directRule(st_, entry, one); ruleReadsData(rule, offset, size)) {
+      st_->decideFederationLate(); // the first access to the origin of an undecided handle
       armKeyCheck(st_, entry, timeout); // its answer is checked, as a miss's is
       noteDirectBytes(st_, entry, size);
       return relayToInner(
@@ -7699,6 +7802,7 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
   // One time for the request, the map's parse (and a move of its reads) included: its start is
   // taken before the parse (adaptive_federation: the read's deadline counts from it).
   const uint64_t missT0 = nowUs();
+  st_->decideFederationLate(); // the first access to the origin of an undecided handle
   armKeyCheck(st_, entry, timeout, missT0);
 
   // MISS from the caller's thread: rounded wire read. Dedup: an identical
@@ -7885,8 +7989,10 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
   // max_read_fraction: a file read directly is neither read ahead nor waited
   // for; what it misses is fetched for this request only.
   std::shared_ptr<ReadRule> direct = missIdx.empty() ? nullptr : directRule(st, entry, chunks);
-  if (!missIdx.empty())
+  if (!missIdx.empty()) {
+    st->decideFederationLate(); // the first access to the origin of an undecided handle
     armKeyCheck(st, entry, 0, startUs); // as the wire vector read below
+  }
 #ifdef UCACHE_HAVE_PREFETCH
   // Read-ahead learns from every fill and, once confirmed, fetches the next
   // one while the reader computes; posted to its own thread, never blocking.

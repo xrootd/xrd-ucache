@@ -3688,7 +3688,9 @@ int cmdSet(const Config& cfg, const char* key, const char* value) {
     return 2;
   }
   if (k == "adaptive_federation") {
-    const std::string v = value;
+    std::string v = value;
+    for (char& c : v)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (v != "auto" && v != "on" && v != "off" && v != "1" && v != "0" && v != "true" &&
         v != "false") {
       std::fprintf(stderr, "set: adaptive_federation takes off, on or auto, not '%s'\n", value);
@@ -4332,6 +4334,14 @@ int cmdDoctor(const Config& cfg) {
     std::printf("  [FAIL] logical_name_prefixes '%s' is not valid (%s): files are keyed by their "
                 "URL; `ucache set logical_name_prefixes '<prefix> ...'` (or off)\n",
                 cfg.logicalNamePrefixes.c_str(), cfg.keys.prefixesError().c_str());
+    ++problems;
+  }
+  // A value of adaptive_federation that none of the words names was ignored: the job runs with the
+  // value of the layer below (the default, auto, when none sets it).
+  if (!cfg.badAdaptiveFederation.empty()) {
+    std::printf("  [FAIL] adaptive_federation: %s, which is not off, on or auto: it is ignored, and "
+                "jobs run with %s; set one of the three\n",
+                cfg.badAdaptiveFederation.c_str(), cfg.valueOf("adaptive_federation").c_str());
     ++problems;
   }
   // The prefixes are meant for the cache (its state file, read by every job): set in a conf only,

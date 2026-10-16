@@ -3,6 +3,8 @@
 // one query per server, waits bounded, the first outcome standing. Pure; the
 // query itself is made where the plugin runs.
 #include "ServerRole.h"
+#include "ServerVerdicts.h"
+#include "TestUtil.h"
 
 #include <gtest/gtest.h>
 
@@ -261,4 +263,110 @@ TEST(ServerRole, ErrorsAreOff) {
   EXPECT_EQ(d.kind, ServerRoles::Kind::kNoAnswer);
   // No server: not asked.
   EXPECT_FALSE(roles.decide("", 5000, 5000, true, refuse).asked);
+}
+
+// An outcome older than the renewal age is asked again; a caller that may not
+// wait meanwhile takes the old one. No answer is renewed the same way.
+TEST(ServerRole, RenewedAfterItsAge) {
+  ServerRoles roles;
+  int started = 0;
+  auto answers = [&started](const char* role, bool answered) {
+    return [&started, role, answered](const std::shared_ptr<ServerRoles::Op>& op) {
+      ++started;
+      ServerRoles::answer(op, answered, answered && roleIsRedirector(role), role);
+      return true;
+    };
+  };
+  EXPECT_FALSE(roles.decide("r.example:1094", 5000, 5000, true, answers("t", false), 100).federation);
+  EXPECT_EQ(started, 1);
+  EXPECT_FALSE(roles.decide("r.example:1094", 5000, 5000, true, answers("manager", true), 100)
+                   .asked) << "younger than the age: stands";
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  auto d = roles.decide("r.example:1094", 5000, 5000, true, answers("manager", true), 100);
+  EXPECT_TRUE(d.asked);
+  EXPECT_TRUE(d.federation);
+  EXPECT_EQ(started, 2);
+  // Renewing without waiting: the old outcome is taken while the new question is out.
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  std::shared_ptr<ServerRoles::Op> held;
+  d = roles.decide("r.example:1094", 5000, 5000, false,
+                   [&held](const std::shared_ptr<ServerRoles::Op>& op) {
+                     held = op;
+                     return true;
+                   },
+                   100);
+  EXPECT_TRUE(d.asked);
+  EXPECT_TRUE(d.federation) << "the old answer while the new one is out";
+  EXPECT_TRUE(ServerRoles::answer(held, true, false, "server (login)"));
+  EXPECT_FALSE(roles.decide("r.example:1094", 5000, 5000, false, nullptr, 0).federation);
+}
+
+// A query that could not be started ends at once, and the caller is told so
+// (it says and counts it).
+TEST(ServerRole, FailedStartIsEnded) {
+  ServerRoles roles;
+  auto d = roles.decide("x.example:1094", 5000, 5000, true,
+                        [](const std::shared_ptr<ServerRoles::Op>&) { return false; });
+  EXPECT_TRUE(d.ended);
+  EXPECT_EQ(d.kind, ServerRoles::Kind::kNoAnswer);
+}
+
+// A verdict saved by another process is taken when this one has none, or only
+// no answer; never over an answer of its own.
+TEST(ServerRole, SeedFromSaved) {
+  ServerRoles roles;
+  EXPECT_FALSE(roles.known("s.example:1094").op);
+  EXPECT_TRUE(roles.seed("s.example:1094", true, "manager (login: manager)", 30));
+  auto k = roles.known("s.example:1094");
+  EXPECT_TRUE(k.federation);
+  EXPECT_TRUE(k.op && k.op->saved);
+  EXPECT_FALSE(roles.seed("s.example:1094", false, "server (login)", 0)) << "an outcome stands";
+  // Its age counts toward renewal.
+  int started = 0;
+  auto d = roles.decide("s.example:1094", 5000, 5000, true,
+                        [&started](const std::shared_ptr<ServerRoles::Op>& op) {
+                          ++started;
+                          return ServerRoles::answer(op, true, false, "none (login: manager)");
+                        },
+                        10 * 1000);
+  EXPECT_TRUE(d.asked) << "saved 30 s ago, renewed at 10 s";
+  EXPECT_FALSE(d.federation);
+  EXPECT_EQ(started, 1);
+  // Over no answer, a saved verdict is taken.
+  ServerRoles r2;
+  r2.decide("n.example:1094", 5000, 5000, true,
+            [](const std::shared_ptr<ServerRoles::Op>&) { return false; });
+  EXPECT_TRUE(r2.seed("n.example:1094", true, "manager", 1));
+  EXPECT_TRUE(r2.known("n.example:1094").federation);
+}
+
+// The verdicts kept in the cache directory: written whole under the lock,
+// read back, one per server (the newest), unknown lines and files ignored.
+TEST(ServerVerdicts, SaveFindAndParse) {
+  test::TempDir td;
+  const std::string path = rolesPath(td.path());
+  RealIO io;
+  RoleSaved r;
+  EXPECT_FALSE(findRole(io, path, "a.example:1094", r)) << "no file: none";
+  EXPECT_TRUE(saveRole(io, path, "A.Example:1094", true, "manager (login: manager)", 1000));
+  EXPECT_TRUE(saveRole(io, path, "b.example:1095", false, "server (login)", 1001));
+  EXPECT_TRUE(findRole(io, path, "a.example:1094", r));
+  EXPECT_TRUE(r.redirector);
+  EXPECT_EQ(r.savedS, 1000u);
+  EXPECT_EQ(r.role, "manager (login: manager)");
+  EXPECT_TRUE(saveRole(io, path, "a.example:1094", false, "none (login: manager)", 2000));
+  EXPECT_TRUE(findRole(io, path, "a.example:1094", r));
+  EXPECT_FALSE(r.redirector) << "replaced";
+  EXPECT_EQ(loadRoles(io, path).size(), 2u);
+  // Older than the forget age: dropped at the next write.
+  EXPECT_TRUE(saveRole(io, path, "c.example:1094", true, "manager", 1001 + kRoleSavedForgetS + 1));
+  EXPECT_FALSE(findRole(io, path, "b.example:1095", r));
+  const auto parsed =
+      parseRoles("ucache-roles 1\nrole x:1 redirector 5 meta%20manager\nbogus line\n"
+                 "role y:2 maybe 5 -\nrole x:1 other 3 -\n");
+  ASSERT_EQ(parsed.size(), 1u);
+  EXPECT_EQ(parsed[0].role, "meta manager");
+  EXPECT_TRUE(parsed[0].redirector) << "the newest line of a server wins";
+  EXPECT_TRUE(parseRoles("ucache-roles 2\nrole x:1 redirector 5 -\n").empty());
+  EXPECT_EQ(serializeRoles(parsed), "ucache-roles 1\nrole x:1 redirector 5 meta%20manager\n");
 }

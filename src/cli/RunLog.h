@@ -72,7 +72,7 @@ struct Run {
   // The origin settings the run had (docs/STATS.md `run_settings`), from the
   // last counter line; empty on records written before it existed.
   std::string runSettings;
-  // adaptive_federation = auto: the hosts that reported a redirector's role in this run (the
+  // adaptive_federation = auto: the servers (host:port) found to be redirectors in this run (the
   // counter line's `redirector_hosts`), lower-cased.
   std::set<std::string> redirectorHosts;
   // perf only: the share of the time the counters were enabled that they were

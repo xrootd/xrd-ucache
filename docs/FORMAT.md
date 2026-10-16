@@ -23,6 +23,8 @@ $UCACHE_DIR/                         (0700)
   stats/<stem>.trace.jsonl           # sampled IO trace, `trace = io` (docs/STATS.md)
   inuse/<hh>/<sha256(key)>           # in-use record of a file's maps, and its copies' faults
   sources                            # servers that failed (adaptive_federation; below)
+  roles                              # what each server was found to be (adaptive_federation =
+                                     #  auto; below)
   sources.lock                       # flock held while `sources` is written
   sources.new                        # transient during its rewrite
   names/<hh>/<sha256(name)>.to       # an entry's other name (logical_name_prefixes; below)
@@ -445,6 +447,26 @@ fault <site> <server host:port> <last proof> <first proof> <reason> <proofs>
   file read as no record.
 
 ## Sources that failed: `<dir>/sources`
+
+With `adaptive_federation = auto`, what each server a job asked was found to be
+(a redirector or not) is kept in `<cacheDir>/roles`, for the other processes of
+the cache, which read it at an open answered from a trusted entry (no network)
+and at an open of the origin within 10 minutes of the verdict. The same
+discipline as `<cacheDir>/sources` below: written whole to `roles.new` and
+renamed over `roles` under an exclusive `flock` of `roles.lock` (given up after
+about 100 ms), read without a lock, never fsynced; a file that cannot be read,
+or whose first line is not the header, reads as no verdicts.
+
+```
+ucache-roles 1
+role <host:port> <redirector|other> <saved at, wall-clock s> <what it said>
+```
+
+The server is lower-cased; what it said is the log's text (`manager (login:
+manager)`, `server (login)`), percent-encoded where it holds a space or a byte
+that is not printable, `-` for none. Only answers are kept, never "no answer". A
+line that does not parse is skipped; a verdict saved more than 30 days before is
+dropped at the next write; at most 4096 servers are kept, the newest first.
 
 With `adaptive_federation = on`, the servers the cache's processes remember as
 failed (USER_GUIDE.md), one small text file per cache, shared by all its

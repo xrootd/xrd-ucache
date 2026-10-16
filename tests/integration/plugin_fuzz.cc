@@ -744,7 +744,10 @@ int runOpenRefused(const char* url) {
                 mode);
     return 2;
   }
-  std::printf("%s: adaptive_federation %s, open_retries %d\n", mode, fed ? "on" : "off", retries);
+  // The label says the setting as given (unset: the default, auto); the checks below expect the
+  // switch on only with `on`, off otherwise (auto at the server the fault sends opens to is off).
+  std::printf("%s: adaptive_federation %s, open_retries %d\n", mode,
+              fed ? "on" : sw && *sw ? sw : "auto (the default)", retries);
   struct Handler : StrictOpenHandler {
     std::thread::id on;
     bool nullHosts = false;

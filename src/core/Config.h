@@ -223,6 +223,9 @@ struct Config {
   // left as they are, and check_origin_integrity is forced only for the files
   // it turns on. `off` reads every file as 1.4.0 did.
   FederationMode adaptiveFederation = FederationMode::kAuto; // UCACHE_ADAPTIVE_FEDERATION
+  // A value of adaptive_federation that is none of off/on/auto (or 1/0/true/false), and where it
+  // was found ("env says 'yes'"); empty when none. It was ignored; `doctor` reports it.
+  std::string badAdaptiveFederation;
   // The switch is on for every file (`on`).
   bool federationEverywhere() const { return adaptiveFederation == FederationMode::kOn; }
   // The switch may be on for some file of this process (`on` or `auto`).

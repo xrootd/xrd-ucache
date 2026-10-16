@@ -107,7 +107,7 @@ the consumers together.
  "entries": [{"key": "root://host:1094/path", "file_size": 0,
               "cached_bytes": 0, "page_size": 4096}],
  "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ... adaptive_federation=auto",
- "redirector_hosts": "cms-redirector.example.org"}
+ "redirector_hosts": "cms-redirector.example.org:1094"}
 ```
 
 Fields are added at the end of a line, never in the middle, and under names
@@ -311,12 +311,15 @@ ones included, so a run with caching disabled shows its origin failures too.
   file there, once per server and process (an open the cache answers from a
   trusted entry asks nothing); those found to be a redirector, which turns the
   switch on for their files; and those that gave no answer (an error, or none
-  within 5 s), whose files are read as with the switch off. The servers asked
+  within 5 s), whose files are read as with the switch off. A server is asked
+  again 10 minutes after its last outcome, at an open that needs it (each
+  counted). The servers asked
   and counted in neither are not redirectors (a data server, a proxy, an EOS
   instance).
 - `redirector_hosts` (a string, on the counter line after `run_settings`, only
-  when there is one) — with `auto`, the hosts (without the port) that reported
-  a redirector's role in this process, one space between them.
+  when there is one) — with `auto`, the servers (`host:port`, lower-cased) found
+  to be redirectors in this process (a forked child keeps its parent's), one
+  space between them.
 - `site_faults_marked`, `site_marks_cleared`, `copy_faults_marked`,
   `marked_copies_last` — with `adaptive_federation = on` (USER_GUIDE.md,
   "Remembering sources that failed"): servers marked in `<dir>/sources` (a
@@ -753,8 +756,9 @@ reading was re-reading, and what the cache disk was asked to do.
   `ucache summary`, `history` and `publish` take a file's origin from the
   host in the file's URL, as they always have, unless the run had
   `adaptive_federation = on` (its counter line's `run_settings` say so), or
-  `auto` and the file's URL names a host that reported a redirector's role
-  (the counter line's `redirector_hosts`): the switch was on for the file. For
+  `auto` and the file's URL names a server (host and port, 1094 when the URL
+  names none) found to be a redirector (the counter line's `redirector_hosts`):
+  the switch was on for the file. For
   such a file they take it from `data_server` when it names one, and from the
   host in the file's URL otherwise (files that read nothing from the origin):
   for a file opened through a redirector the origin is then the data server

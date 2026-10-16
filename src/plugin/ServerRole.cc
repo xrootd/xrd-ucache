@@ -89,6 +89,7 @@ bool ServerRoles::answer(const std::shared_ptr<Op>& op, bool answered, bool redi
     op->kind = !answered ? Kind::kNoAnswer : redirector ? Kind::kRedirector : Kind::kOther;
     op->role = role;
   }
+  op->doneUs = nowUs();
   op->cv.notify_all();
   return true;
 } catch (...) {
@@ -97,17 +98,25 @@ bool ServerRoles::answer(const std::shared_ptr<Op>& op, bool answered, bool redi
 
 ServerRoles::Decision ServerRoles::decide(
     const std::string& server, uint64_t boundMs, uint64_t waitMs, bool mayWait,
-    const std::function<bool(const std::shared_ptr<Op>&)>& start) noexcept {
+    const std::function<bool(const std::shared_ptr<Op>&)>& start, uint64_t renewMs) noexcept {
   Decision d;
   try {
-    std::shared_ptr<Op> op;
+    std::shared_ptr<Op> op, prev;
     {
       std::lock_guard<std::mutex> g(mu_);
       const auto it = ops_.find(server);
-      if (it != ops_.end()) {
+      bool stale = false;
+      if (it != ops_.end() && renewMs > 0) {
+        std::lock_guard<std::mutex> g2(it->second->mu);
+        stale = it->second->kind != Kind::kPending &&
+                nowUs() - it->second->doneUs > renewMs * 1000;
+      }
+      if (it != ops_.end() && !stale) {
         op = it->second;
       } else {
-        if (server.empty() || ops_.size() >= kRolesMax)
+        if (stale)
+          prev = it->second;
+        if (server.empty() || (!prev && ops_.size() >= kRolesMax))
           return d; // not asked: as with the switch off
         op = std::make_shared<Op>();
         op->untilUs = nowUs() + boundMs * 1000;
@@ -122,8 +131,8 @@ ServerRoles::Decision ServerRoles::decide(
         started = start && start(op);
       } catch (...) {
       }
-      if (!started)
-        answer(op, false, false, "the query could not be made");
+      if (!started && answer(op, false, false, "the query could not be made"))
+        d.ended = true;
     }
     std::unique_lock<std::mutex> lk(op->mu);
     if (op->kind == Kind::kPending && mayWait) {
@@ -137,8 +146,19 @@ ServerRoles::Decision ServerRoles::decide(
     if (op->kind == Kind::kPending && nowUs() >= op->untilUs) {
       op->kind = Kind::kNoAnswer;
       op->role = "no answer within " + std::to_string((op->boundMs + 999) / 1000) + " s";
+      op->doneUs = nowUs();
       op->cv.notify_all();
       d.ended = true;
+    }
+    // Renewing an outcome a caller that may not wait does not hold up: it takes the old one.
+    if (op->kind == Kind::kPending && prev) {
+      lk.unlock();
+      std::lock_guard<std::mutex> g(prev->mu);
+      d.kind = prev->kind;
+      d.role = prev->role;
+      d.op = op;
+      d.federation = prev->kind == Kind::kRedirector;
+      return d;
     }
     d.kind = op->kind;
     d.role = op->role;
@@ -148,6 +168,30 @@ ServerRoles::Decision ServerRoles::decide(
     d.federation = false;
   }
   return d;
+}
+
+bool ServerRoles::seed(const std::string& server, bool redirector, const std::string& role,
+                       uint64_t ageS) noexcept try {
+  std::lock_guard<std::mutex> g(mu_);
+  const auto it = ops_.find(server);
+  if (it != ops_.end()) {
+    std::lock_guard<std::mutex> g2(it->second->mu);
+    if (it->second->kind != Kind::kNoAnswer)
+      return false; // this process's own outcome, or a question in flight, stands
+  } else if (server.empty() || ops_.size() >= kRolesMax) {
+    return false;
+  }
+  auto op = std::make_shared<Op>();
+  op->kind = redirector ? Kind::kRedirector : Kind::kOther;
+  op->role = role;
+  op->saved = true;
+  const uint64_t now = nowUs();
+  const uint64_t age = std::min<uint64_t>(ageS, now / 1000000) * 1000000;
+  op->doneUs = now - age;
+  ops_[server] = op;
+  return true;
+} catch (...) {
+  return false;
 }
 
 ServerRoles::Decision ServerRoles::known(const std::string& server) const noexcept {
