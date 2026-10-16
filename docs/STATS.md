@@ -100,7 +100,7 @@ the consumers together.
  "open_check_bytes_kept": 0, "bad_entries_dropped": 0,
  "site_name_queries": 0, "site_names_missing": 0, "requests_parked_for_parse": 0,
  "site_faults_marked": 0, "site_marks_cleared": 0, "copy_faults_marked": 0,
- "marked_copies_last": 0, "role_queries": 0, "role_redirectors": 0, "role_unanswered": 0,
+ "marked_copies_last": 0, "hosts_avoided": 0, "role_queries": 0, "role_redirectors": 0, "role_unanswered": 0,
  "size_disagreements": 0, "name_size_mismatches": 0,
  "origin_checks_passed": 0, "origin_checks_failed": 0, "origin_checks_none": 0,
  "origin_checks_unjudged": 0, "origin_checks_not_examined": 0,
@@ -328,6 +328,13 @@ ones included, so a run with caching disabled shows its origin failures too.
   written, a repeat included), marks cleared by a success, copies proven
   missing (noted in the file's in-use record), and copies a regional
   redirector listed that were put after the others for a mark.
+- `hosts_avoided` — with `adaptive_federation = on` and host patterns in the
+  URL's `tried=` (USER_GUIDE.md, "Keeping reads away from some hosts"): copies
+  at a host a pattern matches, each refused once per open: an open that landed
+  there and was refused before anything was read, or a copy a regional
+  redirector listed that was not tried. Each has a `host_avoided` line in the
+  per-file record file (FORMAT.md). It is no failure count: none of these is in
+  `origin_open_failures` or `origin_failures_*`.
 
 `run_settings`, on the counter line, is the settings that decide how the
 origin is reached, as the plugin found them at load, one string:

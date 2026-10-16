@@ -1,6 +1,7 @@
 #include "OpenPolicy.h"
 
 #include "ReadRounding.h"
+#include "UrlKey.h"
 
 #include <algorithm>
 #include <cctype>
@@ -955,6 +956,17 @@ std::string withAdvice(const std::string& text, const std::string& advice, size_
   return (text.size() > room ? text.substr(0, room) : text) + join + advice;
 }
 
+std::string exclusionNameOf(const std::string& host) {
+  if (isIpv4(host) || isIpv6(host))
+    return std::string();
+  std::string name = host;
+  for (char& c : name)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  while (!name.empty() && name.back() == '.')
+    name.pop_back();
+  return name.find('.') == std::string::npos ? std::string() : name;
+}
+
 std::string exclusionName(const std::vector<Hop>& hops, int i) {
   if (i <= 0 || static_cast<size_t>(i) >= hops.size())
     return std::string();
@@ -1020,14 +1032,18 @@ bool atFailedSite(const SiteFailure& x, const std::string& host, const std::stri
 
 AfterFailure afterFailure(std::vector<SiteFailure>& failed, const SiteFailure& f, int maxSites,
                           bool spent) {
+  // A copy avoided for a tried= pattern is no failure of its site: it counts as no site, and
+  // another server of its site is no repeat of it (only the same server is).
   bool same = false;
-  for (const SiteFailure& x : failed)
-    same = same || sameSite(x, f);
+  if (f.avoided.empty())
+    for (const SiteFailure& x : failed)
+      same = same || (x.avoided.empty() && sameSite(x, f));
   const bool seen = listOpenFailure(failed, f);
   // The sites counted: one failure stands for each site, those of one site counted once.
   std::vector<const SiteFailure*> sites;
   for (const SiteFailure& x : failed)
-    if (std::none_of(sites.begin(), sites.end(), [&](const SiteFailure* s) { return sameSite(*s, x); }))
+    if (x.avoided.empty() &&
+        std::none_of(sites.begin(), sites.end(), [&](const SiteFailure* s) { return sameSite(*s, x); }))
       sites.push_back(&x);
   if (static_cast<int>(sites.size()) >= maxSites || spent)
     return AfterFailure::kStop;
@@ -1106,7 +1122,8 @@ std::vector<Location> orderLocations(const std::vector<Location>& listed,
     // the failed server's name is known; else by domains (atFailedSite).
     const std::string named = nameOf ? nameOf(server) : std::string();
     for (size_t i = 0; i < failed.size() && age == failed.size(); ++i)
-      if (lower(failed[i].server) == server || atFailedSite(failed[i], host, named))
+      if (failed[i].avoided.empty() && // an avoided copy is no failure of its site
+          (lower(failed[i].server) == server || atFailedSite(failed[i], host, named)))
         age = i;
     const bool refused = std::any_of(failed.begin(), failed.end(), [&](const SiteFailure& x) {
       return x.bad && lower(x.server) == server;
@@ -1143,6 +1160,43 @@ std::vector<std::string> exclusionNames(const std::vector<SiteFailure>& failed) 
   return out;
 }
 
+std::vector<std::string> avoidedNames(const std::vector<SiteFailure>& failed) {
+  std::vector<std::string> out;
+  for (const SiteFailure& x : failed)
+    if (!x.avoided.empty() && !x.name.empty() &&
+        std::find(out.begin(), out.end(), x.name) == out.end())
+      out.push_back(x.name);
+  return out;
+}
+
+int avoidedHop(const std::vector<Hop>& hops, const std::vector<std::string>& patterns,
+               std::string* pattern) {
+  if (patterns.empty())
+    return -1;
+  for (size_t k = hops.size(); k-- > 0;) {
+    if (hops[k].flags & kIsManager)
+      continue;
+    const std::string p = matchingPattern(patterns, hops[k].host);
+    if (!p.empty()) {
+      if (pattern)
+        *pattern = p;
+      return static_cast<int>(k);
+    }
+  }
+  return -1;
+}
+
+bool allAvoided(const std::vector<SiteFailure>& failed) {
+  bool any = false;
+  for (const SiteFailure& x : failed) {
+    if (!x.avoided.empty())
+      any = true;
+    else if (!x.notFound)
+      return false;
+  }
+  return any;
+}
+
 bool refusedBefore(const std::vector<SiteFailure>& failed, const std::string& server) {
   const auto lower = [](std::string s) {
     for (char& c : s)
@@ -1175,6 +1229,11 @@ void noteReadFailure(std::vector<SiteFailure>& failed, SiteFailure f, size_t kee
 bool failedBefore(const std::vector<SiteFailure>& failed, const SiteFailure& f) {
   const std::string host = f.server.substr(0, f.server.rfind(':'));
   for (const SiteFailure& x : failed) {
+    if (!x.avoided.empty()) { // an avoided copy is no failure of its site: its server alone
+      if (x.server == f.server)
+        return true;
+      continue;
+    }
     const bool named = !x.siteName.empty() && !f.siteName.empty();
     // By domain, an address is its own server alone (its "domain" is itself).
     if (x.server == f.server || (sameSite(x, f) && (named || domainOf(f) != host)))
@@ -1315,6 +1374,20 @@ std::string sitesFailedList(const std::vector<SiteFailure>& failed) {
 std::string allSitesFailedText(const std::string& file, const std::vector<SiteFailure>& failed) {
   const std::string out =
       "uCache: " + withoutQueries(file, 300) + ": no site could open it: " + sitesFailedList(failed);
+  return out.size() > kErrorTextMax ? out.substr(0, kErrorTextMax) : out;
+}
+
+std::string avoidedText(const std::string& file, const std::vector<SiteFailure>& failed) {
+  std::string out = "uCache: " + withoutQueries(file, 300) +
+                    ": every copy found is at a host the URL's tried= asks to avoid, and nothing "
+                    "was read there: ";
+  bool first = true;
+  for (const SiteFailure& x : failed) {
+    if (x.avoided.empty())
+      continue;
+    out += (first ? "" : "; ") + x.server + " (tried=" + x.avoided + ")";
+    first = false;
+  }
   return out.size() > kErrorTextMax ? out.substr(0, kErrorTextMax) : out;
 }
 

@@ -208,6 +208,50 @@ std::string withExclusions(const std::string& base, const std::vector<std::strin
 // written). Pure.
 std::vector<std::string> triedHosts(const std::string& url);
 
+// ---- Hosts to avoid, by pattern, in tried= ----------------------------------
+// A tried= entry that holds a '*' is a host pattern, not a host name: a glob on the full host
+// name, '*' standing for any run of characters (dots included), compared ignoring case. A
+// redirector compares tried= entries with whole host names only, so a pattern is applied by
+// uCache and never sent: where uCache's federation behaviour is on for the file, an open that
+// lands on a data server whose name matches is refused before anything is read there, and the
+// open is asked again with that server's own name in tried= (OpenPolicy.h avoidedHop).
+//
+// What a URL's tried= patterns are: `patterns`, in order of appearance, case-insensitive
+// duplicates dropped; `malformed`, the entries that hold a '*' and are not a host pattern
+// (hostPatternValid), which are ignored; and `url`, the URL with every such entry removed from
+// its tried= lists (a tried= left without an entry is removed; every other parameter is kept
+// byte for byte, in order). A URL without a pattern entry gives no pattern and itself. Pure.
+struct TriedPatterns {
+  std::vector<std::string> patterns;
+  std::vector<std::string> malformed;
+  std::string url;
+  bool any() const { return !patterns.empty() || !malformed.empty(); }
+};
+TriedPatterns splitTriedPatterns(const std::string& url);
+// At most this many patterns are taken from one URL (the rest are malformed), each at most
+// kMaxHostPatternBytes long.
+inline constexpr size_t kMaxHostPatterns = 32;
+inline constexpr size_t kMaxHostPatternBytes = 253;
+// Whether `p` is a host pattern: 1 to kMaxHostPatternBytes bytes of letters, digits, '.', '-',
+// '_', ':' (an IPv6 address) and '*', optionally in square brackets, holding at least one '*',
+// and not a host and a port ("*.x.org:1094": patterns are on the host only). `why` gets the reason
+// when it is not. Pure.
+bool hostPatternValid(const std::string& p, std::string* why = nullptr);
+// Whether `host` (as the client names it: a name, an IPv4 address, an IPv6 address with or without
+// brackets) matches the pattern `p`: '*' stands for any run of characters, everything else for
+// itself, ignoring case; the brackets of an IPv6 address and a final '.' of a name are not
+// compared. Pure.
+bool hostMatchesPattern(const std::string& p, const std::string& host);
+// The first of `patterns` that `host` matches, "" for none. Pure.
+std::string matchingPattern(const std::vector<std::string>& patterns, const std::string& host);
+// `url` with the host names `hosts` added to its tried= list after the hosts already there,
+// which are never dropped: the servers uCache refused for a pattern, which every later attempt
+// keeps naming. Duplicates (ignoring case) are dropped; of `hosts`, at most kMaxAvoidedNames are
+// kept, the newest, fewer when the list would pass 1024 bytes. A triedrc= stays as it is. Without
+// a host to add, `url` is returned unchanged. Pure.
+inline constexpr size_t kMaxAvoidedNames = 16;
+std::string withTriedHosts(const std::string& url, const std::vector<std::string>& hosts);
+
 // `url` opened at the server `hostPort` instead of its own: the URL's scheme,
 // user and path are kept, the host and port replaced. Every tried= and triedrc=
 // is dropped unless `keepTried`; other parameters (tokens, xrd.* options) are

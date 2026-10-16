@@ -503,6 +503,35 @@ The counters `open_failovers`, `opens_recovered`, `opens_failed_everywhere`,
 per-file record file has a line per attempt (FORMAT.md, routes `failover` and
 `candidate`).
 
+## The open fails: `every copy found is at a host the URL's tried= asks to avoid`
+
+The file's URL has a host pattern in `tried=` (an entry with a `*`, such as
+`tried=*.site-a.example`), and with `adaptive_federation` on for the file uCache
+keeps every read away from the hosts it matches (USER_GUIDE.md, "Keeping reads
+away from some hosts"). The error
+
+```
+uCache: <file>: every copy found is at a host the URL's tried= asks to avoid,
+and nothing was read there: <host>:<port> (tried=<pattern>); ...
+```
+
+means that every copy the redirector sent the open to, and every copy the
+regional redirector listed, is at a host the patterns match: the open was refused
+at each of them before anything was read, and no other copy was found. The job
+gets the error with the code a redirector gives for a file whose every holder
+`tried=` names (`[3011]`). It is not a failure of those servers: nothing of them
+is marked or counted as a failure, and `hosts_avoided` (STATS.md) counts each
+refusal; the per-file record file has a `host_avoided` line for each (FORMAT.md).
+To read the file, remove or narrow the pattern that matches its only copies
+(each host is named with the pattern it matched), or read it from a URL whose
+copies are elsewhere. A read of a file already open gets the same names in its
+`no copy could serve the read` error when the only copies left to move to are at
+matching hosts. A pattern that matches a redirector is ignored for it: a
+redirector is never refused. The log says, at `info`, each refusal
+(`<file>: <host>:<port> matches tried=<pattern>, a host to avoid: ...`), and once,
+as a warning, an entry with a `*` that is not a host pattern (it names a port, or
+holds a character no host name has), which is ignored and not sent.
+
 ## The open fails, and the error says uCache holds an earlier copy
 
 With `adaptive_federation = on`, once the freshness window of the cache's entry for a file

@@ -35,6 +35,7 @@
 #include "CopyGuard.h"
 #include "Executor.h"
 #include "OpenPolicy.h"
+#include "UrlKey.h"
 #include "XrdClTimeout.h"
 
 #include <XrdCl/XrdClFile.hh>
@@ -118,6 +119,16 @@ struct HandleState {
   bool cpuBlended = false;
   std::shared_ptr<CacheStore> store; // process-wide; null => never cache
   std::string url;
+  // The host patterns of the reader's tried= (UrlKey.h splitTriedPatterns), set at Open, with
+  // `url`, for a handle the cache serves whose URL holds any; null otherwise. Where the switch's
+  // behaviour is the file's (fed()), they are applied by uCache: no URL that carries them
+  // reaches a server (originUrl), and no copy at a host they match is read (avoiding()). With
+  // the switch off for the file the URL is sent as the reader wrote it, as before.
+  std::shared_ptr<const TriedPatterns> avoid;
+  bool avoiding() const { return avoid && !avoid->patterns.empty() && fed(); }
+  // The URL every open of the origin this handle makes starts from: the reader's, without its
+  // tried= patterns where they are uCache's to apply.
+  const std::string& originUrl() const { return avoid && fed() ? avoid->url : url; }
   // adaptive_federation for this handle's file: on for every handle with the
   // switch on; with `auto`, decided at Open from the role of the server the
   // URL names (ServerRole.h), before anything reads it, and never changed

@@ -266,3 +266,122 @@ TEST(UrlKey, UrlAtServerAndTriedHosts) {
   EXPECT_EQ(triedHosts("root://r/f?tried=A.x.org,b&tried=a.X.org,c&triedrc=resel"),
             (std::vector<std::string>{"A.x.org", "b", "c"}));
 }
+
+// Host patterns in tried=: a '*' entry is a glob on the full host name, applied by uCache.
+TEST(UrlKey, HostPatternMatching) {
+  EXPECT_TRUE(hostMatchesPattern("*.cern.ch", "eoscms-fst1.CERN.ch"));
+  EXPECT_TRUE(hostMatchesPattern("*.CERN.CH", "eoscms.cern.ch."));      // case, the root dot
+  EXPECT_FALSE(hostMatchesPattern("*.cern.ch", "cern.ch"));             // the dot is literal
+  EXPECT_FALSE(hostMatchesPattern("*.cern.ch", "cmsxrootd.fnal.gov"));
+  EXPECT_FALSE(hostMatchesPattern("*.cern.ch", "x.cern.ch.example.org")); // the whole name
+  EXPECT_TRUE(hostMatchesPattern("cms*.fnal.gov", "cmsxrootd.fnal.gov"));
+  EXPECT_TRUE(hostMatchesPattern("*xrootd*", "cmsxrootd.fnal.gov"));
+  EXPECT_TRUE(hostMatchesPattern("*", "anything.at.all"));
+  EXPECT_TRUE(hostMatchesPattern("a*b*c", "abc"));
+  EXPECT_TRUE(hostMatchesPattern("a*b*c", "aXbYbZc"));
+  EXPECT_FALSE(hostMatchesPattern("a*b*c", "aXbYcZ"));
+  // Addresses match as text; an IPv6 address with or without its brackets.
+  EXPECT_TRUE(hostMatchesPattern("127.0.0.*", "127.0.0.1"));
+  EXPECT_FALSE(hostMatchesPattern("127.0.0.*", "127.0.1.1"));
+  EXPECT_TRUE(hostMatchesPattern("2001:db8:*", "[2001:db8::7]"));
+  EXPECT_TRUE(hostMatchesPattern("[2001:db8:*]", "2001:db8::7"));
+  // Only '*' is special.
+  EXPECT_FALSE(hostMatchesPattern("a?c.org*", "abc.org"));
+  EXPECT_TRUE(hostMatchesPattern("a?c.org*", "a?c.org"));
+  EXPECT_FALSE(hostMatchesPattern("*.x.org", ""));
+  EXPECT_EQ(matchingPattern({"*.fnal.gov", "*.cern.ch"}, "a.cern.ch"), "*.cern.ch");
+  EXPECT_EQ(matchingPattern({"*.fnal.gov", "*.cern.ch"}, "a.infn.it"), "");
+  EXPECT_EQ(matchingPattern({}, "a.cern.ch"), "");
+}
+
+TEST(UrlKey, HostPatternValidity) {
+  std::string why;
+  EXPECT_TRUE(hostPatternValid("*.cern.ch"));
+  EXPECT_TRUE(hostPatternValid("*"));
+  EXPECT_TRUE(hostPatternValid("127.0.0.*"));
+  EXPECT_TRUE(hostPatternValid("[2001:db8:*]"));
+  EXPECT_TRUE(hostPatternValid("2001:db8::*"));
+  EXPECT_TRUE(hostPatternValid("x_y-*.org"));
+  EXPECT_FALSE(hostPatternValid("", &why));
+  EXPECT_FALSE(hostPatternValid("a.cern.ch", &why)) << "no '*': a host name";
+  EXPECT_FALSE(hostPatternValid("*.cern.ch:1094", &why));
+  EXPECT_NE(why.find("port"), std::string::npos) << why;
+  EXPECT_FALSE(hostPatternValid("*.cern.ch/x", &why));
+  EXPECT_FALSE(hostPatternValid("* .cern.ch", &why));
+  EXPECT_FALSE(hostPatternValid("[*.cern.ch", &why));
+  EXPECT_FALSE(hostPatternValid("*%2E", &why));
+  EXPECT_FALSE(hostPatternValid(std::string(254, '*'), &why));
+}
+
+TEST(UrlKey, SplitTriedPatterns) {
+  const std::string base = "root://g.x.org:1094//store/f.root";
+  // No pattern: the URL as it is.
+  auto tp = splitTriedPatterns(base + "?tried=a.x.org&triedrc=ioerr");
+  EXPECT_FALSE(tp.any());
+  EXPECT_EQ(tp.url, base + "?tried=a.x.org&triedrc=ioerr");
+  EXPECT_EQ(splitTriedPatterns(base).url, base);
+  EXPECT_FALSE(splitTriedPatterns(base + "?authz=a*b").any()) << "a '*' outside tried=";
+  EXPECT_EQ(splitTriedPatterns(base + "?authz=a*b").url, base + "?authz=a*b");
+  // Patterns only: tried= goes; every other parameter stays byte for byte, in order.
+  tp = splitTriedPatterns(base + "?authz=T&tried=*.cern.ch,*.fnal.gov&xrd.k=v");
+  EXPECT_EQ(tp.patterns, (std::vector<std::string>{"*.cern.ch", "*.fnal.gov"}));
+  EXPECT_TRUE(tp.malformed.empty());
+  EXPECT_EQ(tp.url, base + "?authz=T&xrd.k=v");
+  tp = splitTriedPatterns(base + "?tried=*.cern.ch");
+  EXPECT_EQ(tp.url, base);
+  // Mixed with exact names: the names stay where they were, in order; triedrc stays.
+  tp = splitTriedPatterns(base + "?tried=a.x.org,*.cern.ch,b.y.org&triedrc=enoent");
+  EXPECT_EQ(tp.patterns, (std::vector<std::string>{"*.cern.ch"}));
+  EXPECT_EQ(tp.url, base + "?tried=a.x.org,b.y.org&triedrc=enoent");
+  // Several tried= parameters, duplicates (ignoring case) once; one without patterns untouched.
+  tp = splitTriedPatterns(base + "?tried=*.CERN.ch&tried=c.z.org,,d&tried=*.cern.ch,e.z.org");
+  EXPECT_EQ(tp.patterns, (std::vector<std::string>{"*.CERN.ch"}));
+  EXPECT_EQ(tp.url, base + "?tried=c.z.org,,d&tried=e.z.org");
+  // A malformed entry is ignored and removed too.
+  tp = splitTriedPatterns(base + "?tried=*.cern.ch:1094,*.fnal.gov,x*/y");
+  EXPECT_EQ(tp.patterns, (std::vector<std::string>{"*.fnal.gov"}));
+  EXPECT_EQ(tp.malformed, (std::vector<std::string>{"*.cern.ch:1094", "x*/y"}));
+  EXPECT_EQ(tp.url, base);
+  EXPECT_TRUE(tp.any());
+  // At most kMaxHostPatterns patterns; the rest are malformed (ignored).
+  std::string many;
+  for (size_t i = 0; i < kMaxHostPatterns + 2; ++i)
+    many += (many.empty() ? "" : ",") + std::string("*.s") + std::to_string(i) + ".org";
+  tp = splitTriedPatterns(base + "?tried=" + many);
+  EXPECT_EQ(tp.patterns.size(), kMaxHostPatterns);
+  EXPECT_EQ(tp.malformed.size(), 2u);
+  // The cache key is the same with and without patterns (no CGI is part of a key).
+  const auto k1 = UrlKey::parse(base + "?tried=*.cern.ch,a.x.org&triedrc=ioerr");
+  const auto k2 = UrlKey::parse(base);
+  ASSERT_TRUE(k1 && k2);
+  EXPECT_EQ(k1->key, k2->key);
+  EXPECT_EQ(k1->hashHex, k2->hashHex);
+}
+
+TEST(UrlKey, WithTriedHosts) {
+  const std::string base = "root://g.x.org:1094//store/f.root";
+  EXPECT_EQ(withTriedHosts(base, {}), base);
+  EXPECT_EQ(withTriedHosts(base, {"A.cern.CH."}), base + "?tried=a.cern.ch");
+  // After the reader's hosts, which stay; the reason stays where it is.
+  EXPECT_EQ(withTriedHosts(base + "?tried=r.x.org&triedrc=enoent", {"a.cern.ch", "b.cern.ch"}),
+            base + "?tried=r.x.org,a.cern.ch,b.cern.ch&triedrc=enoent");
+  EXPECT_EQ(withTriedHosts(base + "?authz=T&tried=a.cern.ch", {"a.cern.ch"}),
+            base + "?authz=T&tried=a.cern.ch");
+  // Accumulated names count as the reader's for withExclusions: never dropped for newer ones.
+  std::vector<std::string> avoided;
+  for (int i = 1; i <= 6; ++i)
+    avoided.push_back("f" + std::to_string(i) + ".cern.ch");
+  const std::string acc = withTriedHosts(base, avoided);
+  EXPECT_EQ(withExclusions(acc, {"s1.x.org"}, "ioerr"),
+            base + "?tried=f1.cern.ch,f2.cern.ch,f3.cern.ch,f4.cern.ch,f5.cern.ch,f6.cern.ch,"
+                   "s1.x.org&triedrc=ioerr");
+  // At most kMaxAvoidedNames, the newest; within 1024 bytes.
+  avoided.clear();
+  for (size_t i = 0; i < kMaxAvoidedNames + 3; ++i)
+    avoided.push_back("f" + std::to_string(i) + ".cern.ch");
+  EXPECT_EQ(triedHosts(withTriedHosts(base, avoided)).size(), kMaxAvoidedNames);
+  EXPECT_EQ(triedHosts(withTriedHosts(base, avoided)).front(), "f3.cern.ch");
+  const std::string longReader(1000, 'r');
+  EXPECT_EQ(withTriedHosts(base + "?tried=" + longReader, {"aaaaaaaaaaaaaaa.x.org", "b.x.org"}),
+            base + "?tried=" + longReader + ",b.x.org");
+}

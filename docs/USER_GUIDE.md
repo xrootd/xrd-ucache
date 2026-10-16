@@ -735,7 +735,9 @@ it.
   left sends its own read with what it has (TROUBLESHOOTING.md).
 - **Servers to avoid (`?tried=`).** A reader can keep a redirector from
   sending it to a given server by adding `?tried=<full host name>` (a comma
-  separated list for several) to the file's URL. uCache honours it on every
+  separated list for several) to the file's URL. An entry with a `*` is a
+  host pattern that uCache applies itself, with `adaptive_federation` on
+  for the file (Configuration, "Keeping reads away from some hosts"). uCache honours it on every
   origin open it makes for that file, its own included: when a file opened
   from the cache needs bytes the cache does not hold, uCache opens the origin
   itself, and that open carries the same `tried=`. Write one `tried=` and
@@ -1304,6 +1306,49 @@ overruled (the marks are not sent to it). Server marks live in `<dir>/sources`
 and the copies marked (`site_faults_marked`, `site_marks_cleared`,
 `copy_faults_marked`, `marked_copies_last`, STATS.md). With the switch off
 nothing is marked or read.
+
+**Keeping reads away from some hosts (`tried=` patterns, part of `adaptive_federation`).**
+A redirector compares the entries of `tried=` with whole host names only, so a
+site's many servers cannot be named there in one entry. uCache can: an entry of
+`tried=` that holds a `*` is a pattern on the full host name, `*` standing for
+any run of characters (dots included), compared ignoring case. To read through
+a global redirector while keeping every read away from the servers of one site,
+and of a second one:
+
+```
+root://global-redirector.example//store/data/Run2024A/file.root?tried=*.site-a.example,*.site-b.example
+```
+
+With `adaptive_federation = on` (with `auto`, for a URL at a redirector) uCache
+applies the patterns itself and never sends them: no URL that reaches a server
+carries one. An open that lands on a data server whose name matches is refused
+there before anything is read of it, and asked again through the redirector with
+that server's own full name added to `tried=` (where a front end handed the open
+to the server, as EOS does, the front end's name, which is the one the
+redirector knows); the names added in one open accumulate, each kept for every
+later attempt of that open (at most 16 of them, the list at most 1024 bytes). The
+copies the regional redirector lists are passed over when their server matches,
+and a read that moves to another copy never moves to one that matches. A
+redirector is never refused for a pattern, whatever its name: it holds no copy.
+When every copy found is at a matching host, the open fails with an error that
+says so and names each of those servers with the pattern it matched
+(TROUBLESHOOTING.md); nothing is ever read at a matching host instead. A
+redirector that keeps sending the open to matching hosts ends it the same way
+after 8 refusals. Patterns and exact names mix in one list: the exact names are
+sent to the redirector as they are, the patterns are uCache's. An address is
+matched as it is written (`127.0.0.*`, `2001:db8:*`), and a host as the
+redirector names it in its redirect. A pattern is on the host only: an entry with a
+`*` that is not a host pattern (a port, `/`, `%` or a blank in it; longer than a
+host name can be) is ignored with one warning, and not sent either. Each refusal
+is recorded (a `host_avoided` line in the per-file records, FORMAT.md; the open's
+own line carries `avoided`) and counted (`hosts_avoided`, STATS.md), so a run can
+show that no byte came from a matching host (`data_servers` in the per-file
+records). A warm read is served from the cache as before and asks no server, and
+`tried=` is never part of the file's cache key, so one file read with and without
+patterns is one entry. With the switch off for the file (`off`, or `auto` with a
+URL straight at a data server), and for a file uCache passes straight through (a
+copy, a write, `UCACHE_DISABLE`), the URL is sent exactly as written, the patterns
+included, as without uCache: a redirector then avoids nothing for them.
 
 **Put the cache on local disk.** `dir` has **no default** — an unset cache
 location is a loud condition (`doctor` FAILs, the plugin passes through

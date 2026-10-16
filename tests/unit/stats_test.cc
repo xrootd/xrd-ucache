@@ -215,6 +215,7 @@ TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
   s.siteMarksCleared = 1;
   s.copyFaultsMarked = 5;
   s.markedCopiesLast = 6;
+  s.hostsAvoided = 11;
   s.originChecksPassed = 21;
   s.originChecksFailed = 22;
   s.originChecksNone = 23;
@@ -232,7 +233,7 @@ TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
         "\"offline_copies_skipped\":7", "\"open_check_bytes_kept\":8192",
         "\"bad_entries_dropped\":3", "\"site_name_queries\":9", "\"site_names_missing\":2", "\"requests_parked_for_parse\":7",
         "\"site_faults_marked\":4", "\"site_marks_cleared\":1", "\"copy_faults_marked\":5",
-        "\"marked_copies_last\":6", "\"role_queries\":3", "\"role_redirectors\":2",
+        "\"marked_copies_last\":6", "\"hosts_avoided\":11", "\"role_queries\":3", "\"role_redirectors\":2",
         "\"role_unanswered\":1",
         "\"origin_checks_passed\":21",
         "\"origin_checks_failed\":22", "\"origin_checks_none\":23",
@@ -270,6 +271,7 @@ TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
   EXPECT_EQ(t.siteMarksCleared, 2u);
   EXPECT_EQ(t.copyFaultsMarked, 10u);
   EXPECT_EQ(t.markedCopiesLast, 12u);
+  EXPECT_EQ(t.hostsAvoided, 22u);
   EXPECT_EQ(t.originChecksPassed, 42u);
   EXPECT_EQ(t.originChecksFailed, 44u);
   EXPECT_EQ(t.originChecksNone, 46u);

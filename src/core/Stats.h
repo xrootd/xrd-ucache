@@ -149,6 +149,9 @@ struct Stats {
   std::atomic<uint64_t> siteMarksCleared{0};
   std::atomic<uint64_t> copyFaultsMarked{0};
   std::atomic<uint64_t> markedCopiesLast{0};
+  // Copies at a host the URL's tried= asks to avoid, by pattern (adaptive_federation): opens
+  // that landed there and were refused before anything was read, and listed copies not tried.
+  std::atomic<uint64_t> hostsAvoided{0};
   // Replica tier (docs/STATS.md):
   // Of earlier releases' compact replicas, no longer made or served: always 0.
   std::atomic<uint64_t> replicaOpens{0};
@@ -341,7 +344,7 @@ struct StatsTotals {
            openDeadlineExpiries = 0, failoverLocates = 0, offlineCopiesSkipped = 0,
            openCheckBytesKept = 0, badEntriesDropped = 0, siteNameQueries = 0,
            siteNamesMissing = 0, requestsParkedForParse = 0, siteFaultsMarked = 0,
-           siteMarksCleared = 0, copyFaultsMarked = 0, markedCopiesLast = 0;
+           siteMarksCleared = 0, copyFaultsMarked = 0, markedCopiesLast = 0, hostsAvoided = 0;
   uint64_t roleQueries = 0, roleRedirectors = 0, roleUnanswered = 0;
   uint64_t originFailures[6] = {}; // client, site, notfound, data, expired, other
   // Histogram bucket sums (log2 µs), for CLI percentile rendering:

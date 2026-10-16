@@ -201,6 +201,7 @@ std::string Stats::toJsonBody() const {
   f("site_marks_cleared", siteMarksCleared);
   f("copy_faults_marked", copyFaultsMarked);
   f("marked_copies_last", markedCopiesLast);
+  f("hosts_avoided", hostsAvoided);
   os << "\"open_deadline_expiries\":" << openDeadlineExpiries.load(std::memory_order_relaxed);
   return os.str();
 }
@@ -352,6 +353,7 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.siteMarksCleared += extractU64(last, "site_marks_cleared");
     t.copyFaultsMarked += extractU64(last, "copy_faults_marked");
     t.markedCopiesLast += extractU64(last, "marked_copies_last");
+    t.hostsAvoided += extractU64(last, "hosts_avoided");
   }
   ::closedir(d);
   return t;

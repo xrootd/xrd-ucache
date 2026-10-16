@@ -633,6 +633,11 @@ struct AttemptView {
   // failure of the copy.
   RootHeaderVerdict header;
   bool headerFailed = false;
+  // A success whose copy is at a host the URL's tried= asks to avoid (HandleState::avoiding,
+  // OpenPolicy.h avoidedHop): that hop, and the pattern its host matched; -1 and "" otherwise.
+  // Nothing is read of such a copy: it is refused (afterAttempt).
+  int avoidHop = -1;
+  std::string avoidPattern;
 };
 // `f` is the File the attempt opened, or null for the handle's current one;
 // Stat(false) answers from the stat the open stored and sends no request, so
@@ -651,6 +656,8 @@ AttemptView viewOf(HandleState& st, const XRootDStatus& s, const HostList* hosts
   w.v = readChain(w.hops);
   if (!s.IsOK())
     return w;
+  if (st.avoiding())
+    w.avoidHop = avoidedHop(w.hops, st.avoid->patterns, &w.avoidPattern);
   struct Held {
     HandleState* st = nullptr;
     ~Held() {
@@ -1717,7 +1724,9 @@ void noteOriginOpenOrThrow(const OpenAttempt& a, const XRootDStatus* status, con
         noteSourceAnswer(st, named, /*opened=*/true);
     }
   }
-  if (ok && !server.empty() && a.route != OpenRoute::kRead) { // a move's is adopted, or not
+  // A copy at a host to avoid is refused (afterAttempt): never the handle's server.
+  if (ok && !server.empty() && a.route != OpenRoute::kRead && w.avoidHop < 0) {
+    // a move's is adopted, or not
     std::lock_guard<std::mutex> g(st.mu);
     st.dataServer = server;
     if (st.fed()) {
@@ -1760,6 +1769,8 @@ void noteOriginOpenOrThrow(const OpenAttempt& a, const XRootDStatus* status, con
             std::to_string(a.budgetS);
   if (!siteName.empty())
     line += ",\"sitename\":\"" + escapeForJson(siteName) + '"';
+  if (w.avoidHop >= 0) // refused for the pattern: nothing was read there
+    line += ",\"avoided\":\"" + escapeForJson(w.avoidPattern) + '"';
   line += "}\n";
   st.store->enqueueRecord(std::move(line));
 }
@@ -1852,6 +1863,27 @@ void noteSizeDisagreement(HandleState& st, const std::string& server, uint64_t s
 } catch (...) {
 }
 
+// A copy at a host the URL's tried= asks to avoid, at `server` (host:port; `host` is the host the
+// pattern matched), not read: counted (hosts_avoided), recorded as a `host_avoided` line, said once
+// at info level. `where`: "open" (an open landed there and was refused before anything was read)
+// or "listed" (a regional redirector listed it, and it was not tried).
+void noteAvoided(HandleState& st, const std::string& server, const std::string& pattern,
+                 const char* where) noexcept try {
+  if (st.store) {
+    st.store->stats().hostsAvoided.fetch_add(1, std::memory_order_relaxed);
+    std::string line = "{\"kind\":\"host_avoided\",\"v\":1,\"ts_ms\":" + std::to_string(wallMs());
+    line += ",\"file\":\"" + escapeForJson(recordFile(st.url)) + "\",\"server\":\"" +
+            escapeForJson(server) + "\",\"pattern\":\"" + escapeForJson(pattern) +
+            "\",\"where\":\"" + where + "\"}\n";
+    st.store->enqueueRecord(std::move(line));
+  }
+  UCACHE_INFO("%s: %s matches tried=%s, a host to avoid: %s", recordFile(st.url).c_str(),
+              server.c_str(), pattern.c_str(),
+              std::strcmp(where, "open") == 0 ? "the open is refused there, nothing read"
+                                              : "the listed copy there is not tried");
+} catch (...) {
+}
+
 // A copy refused for what it is, though its open succeeded: counted as a data failure of
 // `server`, recorded as an `origin_failure` line of op `open`, and put on the file's account
 // of its servers, as noteSizeDisagreement does.
@@ -1875,6 +1907,14 @@ void noteBadCopy(HandleState& st, const std::string& server, const std::string& 
     e = st.store->liveEntry(*key);
   dropEntryOfBadCopy(st, e, server);
 } catch (...) {
+}
+
+// The status of an open refused at a copy to avoid, with no other copy to try (the error that
+// names the copies replaces its text): what a redirector answers for a file whose every holder
+// tried= names.
+XRootDStatus avoidedStatus() {
+  return XRootDStatus(XrdCl::stError, XrdCl::errErrorResponse, kXR_NotFound,
+                      "the copy is at a host to avoid");
 }
 
 // One open's attempts, with adaptive_federation on, as one sequence
@@ -1916,17 +1956,20 @@ struct FailoverSeq {
   }
   // The URL of the next attempt, at another site: `base` with the failed
   // servers named in tried=. Counted.
+  // The servers refused for a tried= pattern are named in every attempt after them, as the
+  // reader's own tried= hosts are (UrlKey.h withTriedHosts): never dropped for newer names.
   std::string next(HandleState& st, const std::string& base) {
-    if (lastResort) { // the reader's own URL, nothing excluded, taken as it answers
-      excluded = false;
-      return base;
+    if (lastResort) { // the reader's own URL, nothing excluded but the hosts to avoid
+      const std::vector<std::string> avoidedHosts = avoidedNames(failed);
+      excluded = !avoidedHosts.empty();
+      return withTriedHosts(base, avoidedHosts);
     }
     const std::vector<std::string> names = exclusionNames(failed);
     excluded = !names.empty();
     ++failovers;
     if (st.store)
       st.store->stats().openFailovers.fetch_add(1, std::memory_order_relaxed);
-    return withExclusions(base, names, "ioerr");
+    return withExclusions(withTriedHosts(base, avoidedNames(failed)), names, "ioerr");
   }
   // The error the open ends with after `last`: once it has failed over, or a
   // bound stopped it, one naming every site that failed, counted and warned;
@@ -1938,11 +1981,29 @@ struct FailoverSeq {
                           bool forRead = false) const noexcept try {
     if (failed.empty())
       return last;
+    // Every copy found is at a host the URL's tried= asks to avoid: the error says so, and names
+    // them with their patterns, as a redirector says of a file whose every holder tried= names.
+    if (allAvoided(failed)) {
+      if (st.store)
+        st.store->stats().opensFailedEverywhere.fetch_add(1, std::memory_order_relaxed);
+      const std::string text = avoidedText(file, failed);
+      UCACHE_WARN("%s", text.c_str());
+      return XRootDStatus(XrdCl::stError, XrdCl::errErrorResponse, kXR_NotFound, text);
+    }
     // A refused copy is why the open failed, whatever the last attempt said: class data.
     const bool refused = std::any_of(failed.begin(), failed.end(),
                                      [](const SiteFailure& x) { return x.bad; });
-    XRootDStatus out(refused ? XrdCl::stError : last.status,
-                     refused ? XrdCl::errDataError : last.code, refused ? 0 : last.errNo,
+    // The last attempt landed on a copy to avoid (its status is a success): the open found no
+    // copy it may take, as a redirector says of a file whose every holder tried= names.
+    const bool lastAvoided =
+        !refused && last.IsOK() && std::any_of(failed.begin(), failed.end(), [](const SiteFailure& x) {
+          return !x.avoided.empty();
+        });
+    XRootDStatus out(refused || lastAvoided ? static_cast<uint16_t>(XrdCl::stError) : last.status,
+                     refused       ? static_cast<uint16_t>(XrdCl::errDataError)
+                     : lastAvoided ? static_cast<uint16_t>(XrdCl::errErrorResponse)
+                                   : last.code,
+                     refused ? 0u : lastAvoided ? static_cast<uint32_t>(kXR_NotFound) : last.errNo,
                      forRead ? noCopyServedText(file, failed) : allSitesFailedText(file, failed));
     if (st.store)
       st.store->stats().opensFailedEverywhere.fetch_add(1, std::memory_order_relaxed);
@@ -1984,6 +2045,7 @@ struct FailoverSeq {
   std::vector<SiteFailure> failed;
   bool excluded = false; // the current attempt names servers of ours
   int failovers = 0;
+  int avoidedCount = 0; // copies refused for a tried= pattern (kMaxAvoidedPerOpen)
   // A copy on tape was opened and passed over. When no other site then opens
   // the file, one last open of the reader's own URL is made (`lastResort`) and
   // taken as it answers, tape or not: a job that works without the cache must
@@ -2064,12 +2126,34 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     st.store->stats().openRetriesExhausted.fetch_add(1, std::memory_order_relaxed);
   if (!seq)
     return Next::kDone;
+  // A copy at a host the URL's tried= asks to avoid (AttemptView::avoidHop) is refused before
+  // anything is read of it, whatever else it is, and the open is asked again with its server's
+  // name in tried= (FailoverSeq::next). It is no failure of its server or site. Never taken, for
+  // want of memory either.
+  const bool avoided = ok && w.avoidHop >= 0;
   try {
     // A move takes no copy whose size it cannot read: the size the reader was shown is
     // what tells a copy from a damaged one.
-    const bool sizeDiffers =
-        ok && want && (w.size >= 0 ? static_cast<uint64_t>(w.size) != want : seq->read);
+    const bool sizeDiffers = ok && !avoided && want &&
+                             (w.size >= 0 ? static_cast<uint64_t>(w.size) != want : seq->read);
     SiteFailure f = siteFailure(w, s, hostPortOfUrl(sentUrl));
+    if (avoided) {
+      // Named as the hop whose host matched; in tried= by the name the redirector knows the
+      // server by (the chain's effective server: an EOS front end, a dCache door), else its own.
+      const std::string name = f.name;
+      setFailureHop(f, w, w.avoidHop);
+      if (!name.empty())
+        f.name = name;
+      f.avoided = w.avoidPattern;
+      f.error = "its host matches tried=" + w.avoidPattern +
+                ", a host to avoid: refused before anything was read";
+      ++seq->avoidedCount;
+      // Said, recorded and counted once per server and open (the redirector may send it back).
+      if (std::none_of(seq->failed.begin(), seq->failed.end(), [&f](const SiteFailure& x) {
+            return !x.avoided.empty() && x.server == f.server;
+          }))
+        noteAvoided(st, f.server, w.avoidPattern, "open");
+    }
     // The sites that failed are named as their servers named them, once known: the servers of
     // one site count as one wherever they failed.
     setSiteNames(seq->failed, siteNames());
@@ -2090,20 +2174,23 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     // of copies sends the open: it is refused again as it is, with no check made of it again
     // (RetryingOpenHandler reads nothing of it), and is neither recorded nor counted again (its
     // first refusal, or its read's failure, was); the error names it once.
-    const bool readBad = ok && !sizeDiffers && refusedBefore(seq->failed, f.server);
+    const bool readBad = ok && !avoided && !sizeDiffers && refusedBefore(seq->failed, f.server);
     // A copy with no bytes of a file named *.root is a bad copy, refused like one of another size.
-    const bool emptyRoot = ok && !sizeDiffers && !readBad && emptyRootCopy(st.url, w.size);
+    const bool emptyRoot =
+        ok && !avoided && !sizeDiffers && !readBad && emptyRootCopy(st.url, w.size);
     // A copy whose first bytes say it is bad (rootHeaderVerdict: cut short of its header's end,
     // too short for a header, not beginning as a ROOT file does, or answering them short); one
     // whose header was not read, or made no claim, is not refused for it.
-    const bool headerBad =
-        ok && !sizeDiffers && !readBad && !emptyRoot && w.header.kind == RootHeaderVerdict::kBad;
+    const bool headerBad = ok && !avoided && !sizeDiffers && !readBad && !emptyRoot &&
+                           w.header.kind == RootHeaderVerdict::kBad;
     const bool refused = emptyRoot || headerBad || readBad;
-    const bool bad = sizeDiffers || refused;
-    const bool offline =
-        ok && w.statFlags >= 0 && (static_cast<uint64_t>(w.statFlags) & xrdwire::kStatOffline);
-    const bool repeats = ok && seq->read && failedBefore(seq->failed, f);
-    if (sizeDiffers)
+    const bool bad = sizeDiffers || refused || avoided;
+    const bool offline = ok && !avoided && w.statFlags >= 0 &&
+                         (static_cast<uint64_t>(w.statFlags) & xrdwire::kStatOffline);
+    const bool repeats = ok && !avoided && seq->read && failedBefore(seq->failed, f);
+    if (avoided)
+      ; // its error is set above
+    else if (sizeDiffers)
       f.error = w.size < 0 ? std::string("its size could not be read")
                            : "it serves " + std::to_string(w.size) + " bytes, the cached file has " +
                                  std::to_string(want);
@@ -2121,15 +2208,17 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
       f.error = "reads from it stopped, and the redirector sent the open back";
     f.bad = refused;
     // The copy is refused and no other is tried: it goes on the list the error names, and is counted.
+    // A copy avoided for a tried= pattern is not a bad copy: neither counted nor recorded as one.
     const auto refuse = [&] {
       listOpenFailure(seq->failed, f);
-      if (!readBad)
+      if (!readBad && !avoided)
         noteBadCopy(st, f.server, f.error);
       return Next::kRefuse;
     };
-    if (seq->lastResort) // the last open: whatever it answers stands, but an empty ROOT file;
-      // a failed read of its checks that the client would have recovered is made once more
-      return refused ? refuse() : onceMore ? sameSource() : Next::kDone;
+    if (seq->lastResort) // the last open: whatever it answers stands, but an empty ROOT file
+      // or a copy to avoid; a failed read of its checks that the client would have recovered is
+      // made once more
+      return refused || avoided ? refuse() : onceMore ? sameSource() : Next::kDone;
     const bool onCandidate = seq->onCandidate;
     seq->onCandidate = false;
     seq->noteChain(w, s);
@@ -2152,6 +2241,10 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     AfterFailure af = AfterFailure::kStop;
     if (step != OpenStep::kFinal)
       af = afterFailure(seq->failed, f, failoverMaxSites(), seq->stopped());
+    // A redirector that keeps sending the open to hosts to avoid: the open ends, its error naming
+    // them.
+    if (avoided && seq->avoidedCount >= kMaxAvoidedPerOpen)
+      af = AfterFailure::kStop;
     const bool more = seq->ci < seq->cands.size() || (seq->sawOffline && !seq->lastResort);
     const bool locate = af != AfterFailure::kStop &&
                         (step == OpenStep::kLocate || af == AfterFailure::kRepeat) && canAsk &&
@@ -2163,7 +2256,7 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
         return Next::kDone;
     }
     if (!goOn) {
-      if (refused)
+      if (refused || avoided)
         return refuse();
       if (!ok && seq->sawOffline && !processExiting()) {
         seq->lastResort = true; // see FailoverSeq::sawOffline
@@ -2182,12 +2275,13 @@ Next afterAttempt(HandleState& st, const Config& cfg, FailoverSeq* seq, const XR
     } else if (refused && !readBad) {
       noteBadCopy(st, f.server, f.error);
     }
-    UCACHE_WARN("%s: %s (%s) could not open it (%s); trying another site",
-                recordFile(st.url).c_str(), f.server.c_str(), f.site.c_str(),
-                recordText(f.error, 300).c_str());
+    if (!avoided) // an avoided copy is said once, as it is refused (noteAvoided)
+      UCACHE_WARN("%s: %s (%s) could not open it (%s); trying another site",
+                  recordFile(st.url).c_str(), f.server.c_str(), f.site.c_str(),
+                  recordText(f.error, 300).c_str());
     return locate ? Next::kLocate : Next::kElsewhere;
   } catch (...) {
-    return Next::kDone;
+    return avoided ? Next::kRefuse : Next::kDone;
   }
 }
 
@@ -2354,6 +2448,33 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
     for (const Location& l : locateCopies(st, q, XrdCl::URL(base).GetPath()))
       if (!cached || hostPassesLists(cfg.allowHosts, cfg.denyHosts, l.host))
         listed.push_back(l);
+    // A listed copy at a host the URL's tried= asks to avoid is never tried (a redirector the
+    // regional lists is: it holds no copy itself, and where it sends the open is judged as any
+    // open's landing). Each goes on the sequence's list, so that the open's error names it and a
+    // redirector asked later is told its name.
+    if (st.avoiding()) {
+      std::vector<Location> keep;
+      for (const Location& l : listed) {
+        const std::string p =
+            l.manager ? std::string() : matchingPattern(st.avoid->patterns, l.host);
+        if (p.empty()) {
+          keep.push_back(l);
+          continue;
+        }
+        SiteFailure f;
+        f.server = (l.host.find(':') == std::string::npos ? l.host : "[" + l.host + "]") + ":" +
+                   std::to_string(l.port);
+        f.siteName = knownSiteName(f.server);
+        f.domain = siteIdentity(f.server, true, std::string());
+        f.site = f.siteName.empty() ? f.domain : f.siteName;
+        f.name = exclusionNameOf(l.host);
+        f.avoided = p;
+        f.error = "listed; its host matches tried=" + p + ", a host to avoid: not tried";
+        if (!listOpenFailure(q.failed, f))
+          noteAvoided(st, f.server, p, "listed");
+      }
+      listed.swap(keep);
+    }
     // A listed copy whose name is known already is left to the end when its site failed
     // (orderLocations); one whose name is not is asked for it at its turn, beside its stat, and left
     // to the end then (below). A copy never asked its state is never asked its name.
@@ -2428,8 +2549,9 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
       if (st.store)
         st.store->stats().openFailovers.fetch_add(1, std::memory_order_relaxed);
       q.excluded = c.manager && !exclusionNames(q.failed).empty();
-      return c.manager ? withExclusions(urlAtServer(base, server, true), exclusionNames(q.failed),
-                                        "ioerr")
+      return c.manager ? withExclusions(withTriedHosts(urlAtServer(base, server, true),
+                                                       avoidedNames(q.failed)),
+                                        exclusionNames(q.failed), "ioerr")
                        : where;
     }
     SiteFailure f;
@@ -2460,8 +2582,9 @@ std::string locateNext(HandleState& st, FailoverSeq& q, const std::string& base)
   }
   if (q.sawOffline && !q.lastResort && !processExiting()) {
     q.lastResort = true;
-    q.excluded = false;
-    return base;
+    const std::vector<std::string> avoidedHosts = avoidedNames(q.failed);
+    q.excluded = !avoidedHosts.empty();
+    return withTriedHosts(base, avoidedHosts); // the reader's URL, nothing but those excluded
   }
   return std::string();
 } catch (...) {
@@ -2790,6 +2913,10 @@ class RetryingOpenHandler : public ResponseHandler {
     a_.st = st_.get();
     a_.seq = gOpenSeq.fetch_add(1, std::memory_order_relaxed) + 1;
     a_.timeoutS = static_cast<int>(timeout);
+    // With the switch's behaviour the file's, the reader's tried= patterns are uCache's to apply
+    // and are never sent (HandleState::originUrl); otherwise the reader's URL as it is.
+    if (record && fed_)
+      url_ = st_->originUrl();
     source_ = url_;
     if (record && fed_) {
       seq_ = std::make_unique<FailoverSeq>(readerTimeoutS, timeout);
@@ -2856,8 +2983,10 @@ class RetryingOpenHandler : public ResponseHandler {
     AttemptView w = record_ ? viewOf(*st_, *s, h.get(), nullptr) : AttemptView();
     // With a sequence, a copy of a file named *.root is looked at before the reader is shown it
     // (an empty one is refused for its size alone), unless this open refused it already: then it is
-    // refused again as it is, with nothing read of it (afterAttempt).
-    if (seq_ && s->IsOK() && w.size > 0 && rootNamed(st_->url) && !refusedAlready(w, *s))
+    // refused again as it is, with nothing read of it (afterAttempt); so is a copy at a host the
+    // URL's tried= asks to avoid.
+    if (seq_ && s->IsOK() && w.size > 0 && rootNamed(st_->url) && w.avoidHop < 0 &&
+        !refusedAlready(w, *s))
       return checkHeader(std::move(s), std::move(r), std::move(h), std::move(w));
     finish(std::move(s), std::move(r), std::move(h), w, /*opened=*/false);
   }
@@ -3278,7 +3407,8 @@ class RetryingOpenHandler : public ResponseHandler {
         st_->confirmedSize.store(static_cast<uint64_t>(w.size), std::memory_order_relaxed);
       return false;
     }
-    lastStatus_ = n == Next::kRefuse
+    lastStatus_ = n == Next::kRefuse && w.avoidHop >= 0 ? avoidedStatus()
+                  : n == Next::kRefuse
                       ? XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, "the copy is refused")
                   : ok ? XRootDStatus(XrdCl::stError, XrdCl::errErrorResponse, kXR_FSError,
                                       "the copy there is on tape (offline)")
@@ -3895,7 +4025,10 @@ bool HandleState::ensureInnerOpen() {
   // tokens and xrd.* options pass through untouched. The relayed open (an
   // untrusted handle) sends the reader's URL verbatim, since there the inner
   // connection is the reader's own.
-  const std::string fillUrl = fo ? ownOpenUrl(url, failedHostsOf(*this)) : ownOpenUrl(url);
+  // With it on, the reader's tried= patterns are uCache's to apply and are never sent
+  // (originUrl).
+  const std::string fillUrl =
+      fo ? ownOpenUrl(originUrl(), failedHostsOf(*this)) : ownOpenUrl(url);
   XrdCl::File* f = inner.load();
   a.seq = gOpenSeq.fetch_add(1, std::memory_order_relaxed) + 1;
   // The reader of a trusted handle holds positions in the size it was shown.
@@ -3943,6 +4076,7 @@ bool HandleState::ensureInnerOpen() {
   // sequence. open_retries == 0 (default) skips the retries.
   Next n = Next::kDone;
   bool lastOpen = false;     // the last attempt's File is open (its checks' read may have failed)
+  bool lastAvoided = false;  // the last attempt's copy is at a host to avoid
   uint64_t lastConfirmed = 0; // the size the last attempt's checks confirmed, 0 for none
   for (int sourceAttempt = 1;; ++sourceAttempt) {
     const std::string sent = faultOpenUrl(source, ++lazyOpenAttempt);
@@ -3954,11 +4088,12 @@ bool HandleState::ensureInnerOpen() {
     // With adaptive_federation on and no size the copy must have, a copy of a file named *.root
     // passes the checks made at open before it is taken, as at the reader's open (not one this
     // open refused already: it is refused again as it is).
-    if (seq && fileOpen && !want && w.size > 0 && rootNamed(url) &&
+    if (seq && fileOpen && !want && w.size > 0 && rootNamed(url) && w.avoidHop < 0 &&
         !refusedBefore(seq->failed, siteFailure(w, ans.status, hostPortOfUrl(sent)).server))
       checkOwnOpen(*this, f, a, *seq, w, ans.status);
     n = afterAttempt(*this, cfg, seq ? &*seq : nullptr, ans.status, w, sent, sourceAttempt, want);
     lastOpen = fileOpen;
+    lastAvoided = w.avoidHop >= 0;
     lastConfirmed = w.header.kind == RootHeaderVerdict::kConfirmed && w.size > 0
                         ? static_cast<uint64_t>(w.size)
                         : 0;
@@ -4001,7 +4136,8 @@ bool HandleState::ensureInnerOpen() {
   if (abandoned(f, lastOpen))
     return false;
   if (n == Next::kRefuse) // refused for what the copy is, and no other to try: the open fails
-    s = XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, "the copy is refused");
+    s = lastAvoided ? avoidedStatus()
+                    : XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, "the copy is refused");
   if (s.IsOK() && want) {
     XrdCl::StatInfo* si = nullptr;
     const XRootDStatus ss = f->Stat(false, si);
@@ -4631,7 +4767,7 @@ using ReadAgain = std::function<XRootDStatus(XrdCl::File*, ResponseHandler*, uca
 // list of copies had nothing else to give).
 static bool moveTakes(const AttemptView& w, const XRootDStatus& s, const std::string& source,
                       uint64_t want, const std::vector<SiteFailure>& failed) {
-  return s.IsOK() && w.size >= 0 && static_cast<uint64_t>(w.size) == want &&
+  return s.IsOK() && w.avoidHop < 0 && w.size >= 0 && static_cast<uint64_t>(w.size) == want &&
          !refusedBefore(failed, siteFailure(w, s, hostPortOfUrl(source)).server);
 }
 
@@ -4646,8 +4782,8 @@ static bool moveInner(HandleState& st, std::vector<SiteFailure> failed, uint64_t
   seq.failed = std::move(failed);
   setSiteNames(seq.failed, siteNames());
   seq.budget = std::min(seq.budget, std::max(capS, 1));
-  const std::string base =
-      st.innerOpened ? ownOpenUrl(st.url, failedHostsOf(st)) : mergeTried(st.url);
+  const std::string base = st.innerOpened ? ownOpenUrl(st.originUrl(), failedHostsOf(st))
+                                          : mergeTried(st.originUrl());
   // A File is made outside mu (its constructor takes the client's fork lock, which a
   // thread that forks holds while it waits for threads that wait for mu). The reader's
   // properties set after the copy taken here are given to it where it is adopted.
@@ -6716,6 +6852,28 @@ namespace {
 // Once per process at INFO (silent at the default level), then at DEBUG: which
 // signal made a handle a copy. The URL is logged without its query, which can
 // carry a token.
+// A tried= entry with a '*' that is no host pattern is ignored (UrlKey.h hostPatternValid): said
+// once per process for each such entry (at most 64 are remembered).
+void warnMalformedPatterns(const TriedPatterns& tp) noexcept try {
+  if (tp.malformed.empty())
+    return;
+  static std::mutex* mu = new std::mutex;                          // never destroyed
+  static auto* said = new std::vector<std::string>;                // never destroyed
+  for (const std::string& m : tp.malformed) {
+    {
+      std::lock_guard<std::mutex> g(*mu);
+      if (std::find(said->begin(), said->end(), m) != said->end() || said->size() >= 64)
+        continue;
+      said->push_back(m);
+    }
+    std::string why = "more patterns than uCache takes from one URL";
+    hostPatternValid(m, &why);
+    UCACHE_WARN("tried=%s is not a host pattern (%s): ignored, and not sent to any server",
+                recordText(m, 120).c_str(), why.c_str());
+  }
+} catch (...) {
+}
+
 void noteCopier(CopySignal sig, const std::string& url) {
   static std::atomic<bool> said{false};
   const std::string where = url.substr(0, url.find('?'));
@@ -6772,6 +6930,17 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
       passthroughOnly_ = true;
       st_->store->stats().copierHandles.fetch_add(1, std::memory_order_relaxed);
       noteCopier(sig, url);
+    }
+  }
+  // The host patterns of the reader's tried= (UrlKey.h splitTriedPatterns): kept for a handle the
+  // cache serves, applied where the switch's behaviour is the file's (HandleState::avoid).
+  st_->avoid.reset();
+  if (!passthroughOnly_ && url.find("tried=") != std::string::npos) {
+    auto tp = std::make_shared<TriedPatterns>(splitTriedPatterns(url));
+    if (tp->any()) {
+      if (cfg.federationPossible())
+        warnMalformedPatterns(*tp);
+      st_->avoid = std::move(tp);
     }
   }
   // adaptive_federation = auto: the switch for this file, from the role of the server its URL
@@ -6877,7 +7046,9 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   if (!passthroughOnly_ && handler)
     h = watched = new ReaderOpenHandler(handler, st_, static_cast<int>(openTimeout));
   XrdCl::File* f = st_->inner.load();
-  const std::string openUrl = faultOpenUrl(url, 1); // test hook only; `url` in production
+  // test hook only; in production the reader's URL (without its tried= patterns where they are
+  // uCache's to apply)
+  const std::string openUrl = faultOpenUrl(passthroughOnly_ ? url : st_->originUrl(), 1);
   const bool fresh = firstOpenOn(*st_, f);
   const XRootDStatus s = f->Open(openUrl, flags, mode, h, openTimeout);
   if (s.IsOK())

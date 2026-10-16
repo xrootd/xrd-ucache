@@ -1946,3 +1946,110 @@ TEST(OpenPolicy, OwnOpenPending) {
   EXPECT_TRUE(ownOpenPending(true, false, true, true));
   EXPECT_FALSE(ownOpenPending(true, false, false, true));
 }
+
+// Hosts to avoid by tried= pattern: which hop of a chain is one, and how a sequence counts them.
+TEST(OpenPolicy, AvoidedHop) {
+  const std::vector<std::string> cern = {"*.cern.ch"};
+  std::string p;
+  // global -> regional -> data server: the data server matches.
+  std::vector<Hop> chain = {hop("g.cern.ch", kMeta, true), hop("r.infn.it", kManager),
+                            hop("fst1.cern.ch", kServer)};
+  EXPECT_EQ(avoidedHop(chain, cern, &p), 2);
+  EXPECT_EQ(p, "*.cern.ch");
+  // A redirector is never avoided, whatever its name.
+  chain = {hop("g.cern.ch", kMeta, true), hop("r.cern.ch", kManager), hop("d.fnal.gov", kServer)};
+  EXPECT_EQ(avoidedHop(chain, cern), -1);
+  // A data server that sent the open on (an EOS front end) matches too: the later one first.
+  chain = {hop("g.x.org", kMeta, true), hop("eoscms.cern.ch", kServer),
+           hop("p0612.cern.ch", kServer, false, "cap.sym=x&cap.msg=y")};
+  EXPECT_EQ(avoidedHop(chain, cern), 2);
+  EXPECT_EQ(avoidedHop(chain, {"eoscms*"}), 1);
+  // No pattern, or none matching: none.
+  EXPECT_EQ(avoidedHop(chain, {}), -1);
+  EXPECT_EQ(avoidedHop(chain, {"*.fnal.gov"}), -1);
+  // A direct URL at a data server that matches: that host (no other copy to go to).
+  EXPECT_EQ(avoidedHop({hop("d.cern.ch", kServer)}, cern), 0);
+  // Addresses match as text.
+  EXPECT_EQ(avoidedHop({hop("r.x.org", kManager), hop("127.0.0.1", kServer)}, {"127.0.0.*"}), 1);
+  EXPECT_EQ(exclusionNameOf("D.Cern.Ch."), "d.cern.ch");
+  EXPECT_EQ(exclusionNameOf("127.0.0.1"), "");
+  EXPECT_EQ(exclusionNameOf("2001:db8::1"), "");
+  EXPECT_EQ(exclusionNameOf("localhost"), "");
+}
+
+TEST(OpenPolicy, AvoidedCopiesInASequence) {
+  const auto avoidedAt = [](const char* server, const char* name) {
+    SiteFailure f;
+    f.server = server;
+    f.site = f.domain = siteOf(std::string(server).substr(0, std::string(server).rfind(':')));
+    f.name = name;
+    f.avoided = "*.cern.ch";
+    f.error = "its host matches tried=*.cern.ch";
+    return f;
+  };
+  std::vector<SiteFailure> failed;
+  // Each avoided server of one site is a new server, never a repeat of its site, and counts as
+  // no site: the open is asked again, the names accumulating.
+  for (int i = 1; i <= 6; ++i) {
+    const std::string s = "fst" + std::to_string(i) + ".cern.ch:1094";
+    EXPECT_EQ(afterFailure(failed, avoidedAt(s.c_str(), s.substr(0, s.find(':')).c_str()), 2, false),
+              AfterFailure::kRetry)
+        << i;
+  }
+  EXPECT_EQ(avoidedNames(failed).size(), 6u);
+  EXPECT_EQ(avoidedNames(failed).front(), "fst1.cern.ch");
+  EXPECT_EQ(exclusionNames(failed).size(), 6u);
+  // The same server again (an address masks nothing at a redirector): a repeat, the list asked.
+  EXPECT_EQ(afterFailure(failed, avoidedAt("fst1.cern.ch:1094", "fst1.cern.ch"), 2, false),
+            AfterFailure::kRepeat);
+  // A real failure at another server of that site is not a repeat of the avoided ones.
+  SiteFailure real;
+  real.server = "fst9.cern.ch:1094";
+  real.site = real.domain = "cern.ch";
+  real.error = "stalled";
+  EXPECT_EQ(afterFailure(failed, real, 2, false), AfterFailure::kRetry);
+  // ... and counts as a site: the bound of 2 sites is met with the next.
+  SiteFailure other = real;
+  other.server = "d.fnal.gov:1094";
+  other.site = other.domain = "fnal.gov";
+  EXPECT_EQ(afterFailure(failed, other, 2, false), AfterFailure::kStop);
+  // Nothing avoided: no names.
+  EXPECT_TRUE(avoidedNames({real, other}).empty());
+
+  // orderLocations: another server of an avoided server's site is an ordinary candidate.
+  Location l1;
+  l1.host = "fst2.cern.ch";
+  l1.port = 1094;
+  Location l2 = l1;
+  l2.host = "d.infn.it";
+  const auto order = orderLocations({l1, l2}, {}, {avoidedAt("fst1.cern.ch:1094", "fst1.cern.ch")});
+  ASSERT_EQ(order.size(), 2u);
+  EXPECT_EQ(order[0].host, "fst2.cern.ch");
+  // failedBefore: an avoided entry stands for its server alone.
+  SiteFailure same = real;
+  same.server = "fst2.cern.ch:1094";
+  EXPECT_FALSE(failedBefore({avoidedAt("fst1.cern.ch:1094", "fst1.cern.ch")}, same));
+  same.server = "fst1.cern.ch:1094";
+  EXPECT_TRUE(failedBefore({avoidedAt("fst1.cern.ch:1094", "fst1.cern.ch")}, same));
+
+  // allAvoided: at least one avoided copy, and every other failure a "not found".
+  SiteFailure nf;
+  nf.server = "r.infn.it:1094";
+  nf.site = nf.domain = "infn.it";
+  nf.notFound = true;
+  nf.error = "[ERROR] Server responded with an error: [3011] No servers are available";
+  EXPECT_TRUE(allAvoided({avoidedAt("a.cern.ch:1094", "a.cern.ch")}));
+  EXPECT_TRUE(allAvoided({avoidedAt("a.cern.ch:1094", "a.cern.ch"), nf,
+                          avoidedAt("b.cern.ch:1094", "b.cern.ch")}));
+  EXPECT_FALSE(allAvoided({nf}));
+  EXPECT_FALSE(allAvoided({}));
+  EXPECT_FALSE(allAvoided({avoidedAt("a.cern.ch:1094", "a.cern.ch"), real}));
+  const std::string text = avoidedText(
+      "root://g:1094//store/f.root", {avoidedAt("a.cern.ch:1094", "a.cern.ch"), nf,
+                                      avoidedAt("[2001:db8::1]:1094", "")});
+  EXPECT_EQ(text, "uCache: root://g:1094//store/f.root: every copy found is at a host the URL's "
+                  "tried= asks to avoid, and nothing was read there: a.cern.ch:1094 "
+                  "(tried=*.cern.ch); [2001:db8::1]:1094 (tried=*.cern.ch)");
+  std::vector<SiteFailure> lots(200, avoidedAt("a-long-name-of-a-server.cern.ch:1094", "x"));
+  EXPECT_LE(avoidedText("f", lots).size(), kErrorTextMax);
+}

@@ -518,6 +518,9 @@ std::string withAdvice(const std::string& text, const std::string& advice,
 // server reached with an EOS capability (behind an EOS front end, the front
 // end is the site's entry). Lower-cased.
 std::string exclusionName(const std::vector<Hop>& hops, int i);
+// The name tried= may carry for a data server named `host` (a listed copy): `host` lower-cased,
+// without a final '.', or "" for an address or a name without a dot. Pure.
+std::string exclusionNameOf(const std::string& host);
 
 // The open's budget, in seconds, read at its start: at most kFailoverMaxS, at
 // most the reader's own open timeout when it gave one, and short enough to end
@@ -557,6 +560,11 @@ struct SiteFailure {
   std::string siteName = std::string();
   std::string domain = std::string();
   bool notFound = false; // the server said the file is not there (a copy fault once proven)
+  // The copy is at a host the URL's tried= asks to avoid: the tried= pattern its host matches
+  // (UrlKey.h splitTriedPatterns), "" for none. Nothing is read there and it is never taken; it
+  // is not a failure of its server or site (never marked, never counted as a site, and the other
+  // servers of its site are tried as any other copy).
+  std::string avoided = std::string();
 };
 // Whether two failures are at one site: by their names when both servers gave one (two servers of
 // one domain that give different names are two sites), else by their domains (siteIdentity
@@ -661,6 +669,27 @@ void setSiteNames(std::vector<SiteFailure>& failed,
                   const std::function<std::string(const std::string&)>& nameOf);
 // The names of `failed` a retry's tried= carries, oldest first.
 std::vector<std::string> exclusionNames(const std::vector<SiteFailure>& failed);
+// Of those, the names of the copies avoided for a tried= pattern (SiteFailure::avoided), oldest
+// first: every later attempt of the open keeps naming them (UrlKey.h withTriedHosts).
+std::vector<std::string> avoidedNames(const std::vector<SiteFailure>& failed);
+// The hop of an open's chain that makes its copy one to avoid, -1 for none: the last hop that is
+// not a redirector (its login flags have no kIsManager) and whose host matches one of `patterns`,
+// looked for from the end of the chain (the data server that answered, then the data servers
+// that sent the open on to it: an EOS front end, a dCache door). A redirector is never avoided,
+// whatever its name. `pattern` gets the pattern it matched.
+int avoidedHop(const std::vector<Hop>& hops, const std::vector<std::string>& patterns,
+               std::string* pattern = nullptr);
+// At most this many copies of one open are refused for a tried= pattern: a redirector that keeps
+// sending the open to hosts to avoid ends it with the error that names them (avoidedText).
+inline constexpr int kMaxAvoidedPerOpen = 8;
+// Whether the open's failures say that every copy found is at a host to avoid: at least one
+// copy was avoided, and every other failure is a "not found" (a redirector with no other copy
+// to give, the servers named in tried= masked).
+bool allAvoided(const std::vector<SiteFailure>& failed);
+// The error such an open ends with: "uCache: <file>: every copy found is at a host the URL's
+// tried= asks to avoid, and nothing was read there: <server> (tried=<pattern>); ...", the whole
+// at most kErrorTextMax bytes.
+std::string avoidedText(const std::string& file, const std::vector<SiteFailure>& failed);
 // Whether `f` is a server `failed` lists, or a site it lists. Servers behind one
 // address are not one site: an address is its own server alone.
 bool failedBefore(const std::vector<SiteFailure>& failed, const SiteFailure& f);

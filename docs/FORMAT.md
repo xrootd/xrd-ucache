@@ -586,6 +586,11 @@ STATS.md).
   answer, so the first line of a server has none; a server that does not
   answer this attempt keeps the name it gave earlier). `site` stays the
   domain.
+- `"avoided"` at the end of the line, with host patterns in the URL's `tried=`
+  (USER_GUIDE.md, "Keeping reads away from some hosts"): the attempt's open
+  succeeded at a data server whose host matches that pattern, and the copy was
+  refused there before anything was read; its `status` is `ok`, and when no
+  other copy is found the open's last line has `outcome` `error`.
 
 An open the client refuses at once, before it reaches any server (the open
 call itself returns the error, and no answer comes), has a line as well:
@@ -657,6 +662,21 @@ time a server is marked in `<dir>/sources`:
   its own`; `count`: its failures in a row; `until_s`: when its mark ends (wall
   clock, seconds); `site`: the name the server gave, else its domain; `file`:
   the file whose request failed there.
+
+**`"kind":"host_avoided"`, v1** — with `adaptive_federation = on` and host
+patterns in the URL's `tried=`, one line each time a copy at a host a pattern
+matches is refused (once per server and open):
+
+```json
+{"kind":"host_avoided","v":1,"ts_ms":0,"file":"root://h:1094/p",
+ "server":"d.site-a.example:1094","pattern":"*.site-a.example","where":"open"}
+```
+
+- `server`: the copy's server, `host:port`, as the redirector named it (or as
+  the regional redirector listed it); `pattern`: the pattern its host matched,
+  as the URL wrote it; `where`: `open` (an open landed there and was refused
+  before anything was read) or `listed` (the regional redirector listed it, and it
+  was not tried). The `hosts_avoided` counter (STATS.md) counts these too.
 
 **`"kind":"copy_fault"`, v1** — with `adaptive_federation = on`, one line each
 time a copy is proven missing:

@@ -539,6 +539,165 @@ std::vector<std::string> triedHosts(const std::string& url) {
   return hosts;
 }
 
+namespace {
+// `s` lower-cased, without the square brackets around it and without a final '.'.
+std::string hostForMatch(std::string s) {
+  s = toLower(std::move(s));
+  if (s.size() >= 2 && s.front() == '[' && s.back() == ']')
+    s = s.substr(1, s.size() - 2);
+  while (!s.empty() && s.back() == '.')
+    s.pop_back();
+  return s;
+}
+// Glob matching where only '*' is special (any run, empty included). Both lower-cased already.
+bool globMatch(const std::string& p, const std::string& t) {
+  size_t pi = 0, ti = 0, star = std::string::npos, mark = 0;
+  while (ti < t.size()) {
+    if (pi < p.size() && p[pi] == '*') {
+      star = pi++;
+      mark = ti;
+    } else if (pi < p.size() && p[pi] == t[ti]) {
+      ++pi;
+      ++ti;
+    } else if (star != std::string::npos) {
+      pi = star + 1;
+      ti = ++mark;
+    } else {
+      return false;
+    }
+  }
+  while (pi < p.size() && p[pi] == '*')
+    ++pi;
+  return pi == p.size();
+}
+} // namespace
+
+bool hostPatternValid(const std::string& p, std::string* why) {
+  const auto no = [why](const char* w) {
+    if (why)
+      *why = w;
+    return false;
+  };
+  if (p.empty())
+    return no("it is empty");
+  if (p.size() > kMaxHostPatternBytes)
+    return no("it is longer than a host name can be");
+  std::string body = p;
+  if (body.size() >= 2 && body.front() == '[' && body.back() == ']')
+    body = body.substr(1, body.size() - 2);
+  if (body.find('*') == std::string::npos)
+    return no("it holds no '*'");
+  for (const char c : body) {
+    const unsigned char u = static_cast<unsigned char>(c);
+    if (!(std::isalnum(u) || c == '.' || c == '-' || c == '_' || c == ':' || c == '*'))
+      return no("it holds a character no host name has");
+  }
+  const size_t colon = body.find(':');
+  if (colon != std::string::npos && body.find(':', colon + 1) == std::string::npos &&
+      colon + 1 < body.size() &&
+      body.find_first_not_of("0123456789", colon + 1) == std::string::npos)
+    return no("it names a port; a pattern is on the host name only");
+  return true;
+}
+
+bool hostMatchesPattern(const std::string& p, const std::string& host) {
+  const std::string h = hostForMatch(host);
+  return !h.empty() && globMatch(hostForMatch(p), h);
+}
+
+std::string matchingPattern(const std::vector<std::string>& patterns, const std::string& host) {
+  for (const auto& p : patterns)
+    if (hostMatchesPattern(p, host))
+      return p;
+  return std::string();
+}
+
+TriedPatterns splitTriedPatterns(const std::string& url) {
+  TriedPatterns out;
+  out.url = url;
+  const auto q = url.find('?');
+  if (q == std::string::npos || url.find('*', q) == std::string::npos)
+    return out;
+  std::vector<std::string> params;
+  {
+    std::istringstream in(url.substr(q + 1));
+    std::string param;
+    while (std::getline(in, param, '&'))
+      params.push_back(param);
+  }
+  std::vector<std::string> seen;
+  bool changed = false;
+  std::string kept;
+  const auto add = [&kept](const std::string& p) { kept += (kept.empty() ? "" : "&") + p; };
+  for (const auto& param : params) {
+    if (param.empty())
+      continue;
+    if (cgiKey(param) != "tried" || cgiValue(param).find('*') == std::string::npos) {
+      add(param);
+      continue;
+    }
+    changed = true;
+    std::istringstream in(cgiValue(param));
+    std::string item, list;
+    while (std::getline(in, item, ',')) {
+      if (item.find('*') == std::string::npos) {
+        if (!item.empty())
+          list += (list.empty() ? "" : ",") + item;
+        continue;
+      }
+      const std::string lower = toLower(item);
+      if (std::find(seen.begin(), seen.end(), lower) != seen.end())
+        continue;
+      seen.push_back(lower);
+      if (hostPatternValid(item) && out.patterns.size() < kMaxHostPatterns)
+        out.patterns.push_back(item);
+      else
+        out.malformed.push_back(item);
+    }
+    if (!list.empty())
+      add("tried=" + list);
+  }
+  if (changed)
+    out.url = kept.empty() ? url.substr(0, q) : url.substr(0, q) + "?" + kept;
+  return out;
+}
+
+std::string withTriedHosts(const std::string& url, const std::vector<std::string>& hosts) {
+  std::vector<std::string> theirs;
+  (void)mergeTriedParams(url, /*dropReselection=*/false, /*keepReason=*/false, nullptr, &theirs);
+  std::vector<std::string> seen, mine;
+  for (const auto& h : theirs)
+    seen.push_back(toLower(h));
+  for (const auto& h : hosts) {
+    std::string name = toLower(h);
+    while (!name.empty() && name.back() == '.')
+      name.pop_back();
+    if (name.empty() || std::find(seen.begin(), seen.end(), name) != seen.end())
+      continue;
+    seen.push_back(name);
+    mine.push_back(name);
+  }
+  if (mine.size() > kMaxAvoidedNames) // the oldest go first
+    mine.erase(mine.begin(), mine.end() - kMaxAvoidedNames);
+  constexpr size_t kMaxBytes = 1024;
+  size_t bytes = 0; // the list's length, with a comma after each host
+  for (const auto& h : theirs)
+    bytes += h.size() + 1;
+  for (const auto& h : mine)
+    bytes += h.size() + 1;
+  while (!mine.empty() && bytes - 1 > kMaxBytes) {
+    bytes -= mine.front().size() + 1;
+    mine.erase(mine.begin());
+  }
+  if (mine.empty())
+    return url;
+  std::string list;
+  for (const auto& h : mine)
+    list += (list.empty() ? "" : ",") + h;
+  return mergeTriedParams(url + (url.find('?') == std::string::npos ? "?" : "&") + "tried=" + list,
+                          /*dropReselection=*/false, /*keepReason=*/true);
+}
+
 std::string urlAtServer(const std::string& url, const std::string& hostPort, bool keepTried) {
   const std::string u = keepTried ? url : stripCgiParams(url, {"tried", "triedrc"});
   const auto scheme = u.find("://");

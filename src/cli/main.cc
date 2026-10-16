@@ -423,7 +423,7 @@ void printStats(const StatsTotals& t) {
   if (t.openFailovers || t.opensFailedEverywhere || t.openDeadlineExpiries || t.failoverLocates ||
       t.offlineCopiesSkipped || t.openCheckBytesKept || t.badEntriesDropped ||
       t.siteNameQueries || t.siteFaultsMarked || t.copyFaultsMarked || t.markedCopiesLast ||
-      t.roleQueries) {
+      t.roleQueries || t.hostsAvoided) {
     row("open_failovers", t.openFailovers);
     row("opens_recovered", t.opensRecovered);
     row("opens_failed_everywhere", t.opensFailedEverywhere);
@@ -442,6 +442,7 @@ void printStats(const StatsTotals& t) {
     row("site_marks_cleared", t.siteMarksCleared);
     row("copy_faults_marked", t.copyFaultsMarked);
     row("marked_copies_last", t.markedCopiesLast);
+    row("hosts_avoided", t.hostsAvoided);
   }
 
   // The derived workflow picture — the divisions a human would do.
