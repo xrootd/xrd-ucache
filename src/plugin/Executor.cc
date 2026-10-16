@@ -1,10 +1,14 @@
 #include "Executor.h"
 
+#include "Log.h"
 #include "Stats.h"
 #include "UsableCpus.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <string>
+#include <system_error>
 #include <utility>
 
 namespace ucache {
@@ -34,19 +38,151 @@ std::mutex& buildMu() {
   delete fresh; // another thread made it first
   return *m;
 }
+// Threads that could not be started (std::thread throws std::system_error when the process may
+// not make one: an address-space limit, a limit on processes): counted here until the store's
+// counters exist (setFailureStats), then there too; said once per process at WARN.
+std::atomic<uint64_t> g_threadFailures{0};
+std::atomic<Stats*> g_failStats{nullptr};
+std::atomic<bool> g_failSaid{false};
+// Test hook UCACHE_TEST_THREAD_FAIL_AFTER=N (inert unless set, read at load; testSetThreadFailAfter
+// for unit tests): every thread creation of an Executor after the first N fails as if the process
+// could not make one.
+std::atomic<int64_t> g_failAfter{[] {
+  const char* v = ::getenv("UCACHE_TEST_THREAD_FAIL_AFTER");
+  return v ? static_cast<int64_t>(std::strtoll(v, nullptr, 10)) : int64_t(-1);
+}()};
+std::atomic<int64_t> g_threadsMade{0};
+
+// Starts `fn` on a detached thread; false (counted) when no thread could be made, `err` then
+// saying why.
+template <typename Fn>
+bool startThread(Fn&& fn, std::string& err) noexcept {
+  const char* why = nullptr;
+  try {
+    const int64_t limit = g_failAfter.load(std::memory_order_relaxed);
+    if (limit >= 0 && g_threadsMade.fetch_add(1, std::memory_order_relaxed) >= limit)
+      throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                              "test hook UCACHE_TEST_THREAD_FAIL_AFTER");
+    std::thread(std::forward<Fn>(fn)).detach(); // leaked with the core; see header
+    return true;
+  } catch (const std::system_error& e) {
+    try {
+      err = e.what();
+    } catch (...) {
+    }
+    why = "system_error";
+  } catch (...) {
+    why = "an exception";
+  }
+  try {
+    if (err.empty())
+      err = why;
+  } catch (...) {
+  }
+  g_threadFailures.fetch_add(1, std::memory_order_relaxed);
+  if (Stats* s = g_failStats.load(std::memory_order_acquire))
+    s->poolThreadFailures.fetch_add(1, std::memory_order_relaxed);
+  return false;
+}
+// Said once per process: the first pool short of threads.
+void sayThreadFailure(unsigned failed, unsigned want, const char* what, const std::string& err) {
+  if (g_failSaid.exchange(true))
+    return;
+  try {
+    UCACHE_WARN("could not start %u of %u %s: %s (an address-space or process limit?); the "
+                "pool's tasks run on the threads that started, on another pool, or on the thread "
+                "that asks (counted in pool_thread_failures)",
+                failed, want, what, err.c_str());
+  } catch (...) {
+  }
+}
+
+// Every pool core of the process, for the fallback of a pool that has no worker (cores are
+// leaked, so the pointers stay valid). Replaced, not unlocked, in a forked child, as buildMu.
+std::atomic<std::mutex*> g_coresMu{nullptr};
+std::mutex& coresMu() {
+  std::mutex* m = g_coresMu.load(std::memory_order_acquire);
+  if (m)
+    return *m;
+  auto* fresh = new std::mutex;
+  if (g_coresMu.compare_exchange_strong(m, fresh, std::memory_order_acq_rel))
+    return *fresh;
+  delete fresh;
+  return *m;
+}
+std::vector<void*>* g_cores = new std::vector<void*>; // leaked; under coresMu
 } // namespace
 
 // One fork generation's pool. Its threads capture the core, never the
 // Executor, so a core outlives nothing it depends on.
+//
+// A thread that cannot be started (std::thread throws when the process may make no more: an
+// address-space limit, a limit on processes) never fails the pool: its constructor keeps the
+// threads that started and throws nothing. A pool with no worker tries again to start one at a
+// post, at most once a second; while it has none, its tasks go to another pool of the process
+// that has workers, and when no pool has any, run on the calling thread. That is the last resort,
+// and safe there: no post is made with a lock held that a task takes (every post site was read
+// for it), and a process that can start no thread at all can do nothing else with the task. A
+// pool whose timer thread did not start has its workers serve the delayed tasks; with no worker
+// either, a delayed task goes to another pool's timer, or waits in the queue and runs at the
+// pool's next post (never lost).
 struct Executor::Core {
   Core(unsigned threads, uint64_t gen, const std::atomic<Stats*>* stats)
-      : gen(gen), stats(stats) {
-    for (unsigned i = 0; i < threads; ++i)
-      std::thread([this] { loop(); }).detach(); // leaked with the core; see header
-    std::thread([this] { timerLoop(); }).detach(); // one dedicated timer thread
+      : gen(gen), stats(stats), size(threads) {
+    std::string err;
+    for (unsigned i = 0; i < threads; ++i) {
+      if (!startThread([this] { loop(); }, err)) {
+        sayThreadFailure(threads - i, threads, "worker threads", err);
+        break; // the next ones would fail as well; a post tries again later
+      }
+      workers.fetch_add(1, std::memory_order_release);
+    }
+    timerOk.store(startThread([this] { timerLoop(); }, err), std::memory_order_release);
+    if (!timerOk.load(std::memory_order_relaxed))
+      sayThreadFailure(1, 1, "timer threads", err);
+    try {
+      std::lock_guard<std::mutex> g(coresMu());
+      g_cores->push_back(this);
+    } catch (...) {
+      // not a fallback for others then; it runs its own tasks as above
+    }
+  }
+
+  // A pool with no worker: try again to start one (at most once a second).
+  bool retryWorker() {
+    const uint64_t now = nowNs();
+    uint64_t last = lastTryNs.load(std::memory_order_relaxed);
+    if (now - last < 1000000000ull || !lastTryNs.compare_exchange_strong(last, now))
+      return workers.load(std::memory_order_acquire) > 0;
+    std::string err;
+    if (startThread([this] { loop(); }, err))
+      workers.fetch_add(1, std::memory_order_release);
+    if (!timerOk.load(std::memory_order_acquire) && startThread([this] { timerLoop(); }, err))
+      timerOk.store(true, std::memory_order_release);
+    return workers.load(std::memory_order_acquire) > 0;
+  }
+  // Another pool of this generation with a worker, for a pool that has none; null for none.
+  Core* fallback() {
+    std::lock_guard<std::mutex> g(coresMu());
+    for (void* p : *g_cores) {
+      Core* c = static_cast<Core*>(p);
+      if (c != this && c->gen == gen && c->workers.load(std::memory_order_acquire) > 0)
+        return c;
+    }
+    return nullptr;
   }
 
   void post(std::function<void()> task) {
+    if (workers.load(std::memory_order_acquire) == 0 && !retryWorker()) {
+      if (Core* other = fallback()) {
+        other->post(std::move(task));
+        return;
+      }
+      // No thread anywhere: the task, and any delayed task now due, run here.
+      runDueTimersHere();
+      task();
+      return;
+    }
     Stats* s = stats->load(std::memory_order_acquire);
     {
       std::lock_guard<std::mutex> g(mu);
@@ -63,11 +199,60 @@ struct Executor::Core {
 
   void postAfter(uint64_t delayMs, std::function<void()> task) {
     const uint64_t deadline = nowNs() + delayMs * 1000000ull;
-    {
-      std::lock_guard<std::mutex> g(tmu);
-      timers.push(Timed{deadline, std::move(task)});
+    if (!timerOk.load(std::memory_order_acquire))
+      (void)retryWorker();
+    if (timerOk.load(std::memory_order_acquire)) {
+      {
+        std::lock_guard<std::mutex> g(tmu);
+        timers.push(Timed{deadline, std::move(task)});
+      }
+      tcv.notify_one();
+      return;
     }
-    tcv.notify_one();
+    if (workers.load(std::memory_order_acquire) > 0) {
+      // No timer thread: the workers serve the delayed tasks (loop). Under mu, so that a worker
+      // that has just looked at the timers and is about to wait does not miss this one.
+      {
+        std::lock_guard<std::mutex> g(mu);
+        std::lock_guard<std::mutex> t(tmu);
+        timers.push(Timed{deadline, std::move(task)});
+      }
+      cv.notify_all();
+      return;
+    }
+    if (Core* other = fallback()) {
+      other->postAfter(delayMs, std::move(task));
+      return;
+    }
+    // No thread anywhere: kept, and run at a later post of this pool once due (runDueTimersHere).
+    std::lock_guard<std::mutex> g(tmu);
+    timers.push(Timed{deadline, std::move(task)});
+  }
+
+  // The delayed tasks now due, moved into the work queue; returns the next deadline, 0 for none.
+  // Under mu (the caller holds it).
+  uint64_t takeDueTimersLocked() {
+    std::lock_guard<std::mutex> t(tmu);
+    const uint64_t now = nowNs();
+    while (!timers.empty() && timers.top().deadlineNs <= now) {
+      queue.push_back(Task{std::move(const_cast<Timed&>(timers.top()).task), 0});
+      timers.pop();
+    }
+    return timers.empty() ? 0 : timers.top().deadlineNs;
+  }
+  // With no thread anywhere: the delayed tasks now due, run on the calling thread.
+  void runDueTimersHere() {
+    std::vector<std::function<void()>> due;
+    {
+      std::lock_guard<std::mutex> t(tmu);
+      const uint64_t now = nowNs();
+      while (!timers.empty() && timers.top().deadlineNs <= now) {
+        due.push_back(std::move(const_cast<Timed&>(timers.top()).task));
+        timers.pop();
+      }
+    }
+    for (auto& f : due)
+      f();
   }
 
   void loop() {
@@ -75,7 +260,24 @@ struct Executor::Core {
       Task task;
       {
         std::unique_lock<std::mutex> lk(mu);
-        cv.wait(lk, [this] { return !queue.empty(); });
+        for (;;) {
+          if (!timerOk.load(std::memory_order_acquire)) {
+            // No timer thread: the workers serve the delayed tasks.
+            const uint64_t next = takeDueTimersLocked();
+            if (!queue.empty())
+              break;
+            if (next) {
+              const uint64_t now = nowNs();
+              cv.wait_for(lk, std::chrono::nanoseconds(next > now ? next - now : 0));
+            } else {
+              cv.wait(lk);
+            }
+            continue;
+          }
+          if (!queue.empty())
+            break;
+          cv.wait(lk);
+        }
         task = std::move(queue.front());
         queue.pop_front();
       }
@@ -123,6 +325,10 @@ struct Executor::Core {
   };
   const uint64_t gen;
   const std::atomic<Stats*>* const stats; // the Executor's; it is never destroyed
+  const unsigned size;                    // the workers it was made for
+  std::atomic<unsigned> workers{0};       // the workers that started
+  std::atomic<bool> timerOk{false};       // the timer thread started
+  std::atomic<uint64_t> lastTryNs{0};     // the last try to start a worker (retryWorker)
   std::mutex mu;
   std::condition_variable cv;
   std::deque<Task> queue;
@@ -191,8 +397,27 @@ Executor& Executor::instance(unsigned threads) {
 
 uint64_t Executor::forkGeneration() { return g_gen.load(std::memory_order_acquire); }
 
+uint64_t Executor::threadStartFailures() { return g_threadFailures.load(std::memory_order_relaxed); }
+
+void Executor::setFailureStats(Stats* s) {
+  if (s && !g_failStats.exchange(s, std::memory_order_acq_rel))
+    s->poolThreadFailures.fetch_add(g_threadFailures.load(std::memory_order_relaxed),
+                                    std::memory_order_relaxed);
+}
+
+void Executor::testSetThreadFailAfter(int64_t n) {
+  g_threadsMade.store(0, std::memory_order_relaxed);
+  g_failAfter.store(n, std::memory_order_relaxed);
+}
+
+unsigned Executor::startedWorkers() {
+  Core* c = core();
+  return c->workers.load(std::memory_order_acquire);
+}
+
 void Executor::afterForkChild() {
   g_buildMu.store(new std::mutex, std::memory_order_release); // the old one: leaked
+  g_coresMu.store(new std::mutex, std::memory_order_release); // the old one: leaked
   g_gen.fetch_add(1, std::memory_order_acq_rel);
 }
 

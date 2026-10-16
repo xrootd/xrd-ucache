@@ -143,6 +143,7 @@ std::string Stats::toJsonBody() const {
   f("pool_tasks", poolTasks);
   f("pool_busy_us", poolBusyUs);
   f("pool_queue_high_water", poolQueueHighWater);
+  f("pool_thread_failures", poolThreadFailures);
   f("reader_wait_byte_us", readerWaitUs[0]);
   f("reader_wait_replica_us", readerWaitUs[1]);
   f("reader_wait_slots_us", readerWaitUs[2]);

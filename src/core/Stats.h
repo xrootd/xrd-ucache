@@ -203,6 +203,9 @@ struct Stats {
   std::atomic<uint64_t> poolTasks{0};
   std::atomic<uint64_t> poolBusyUs{0};
   std::atomic<uint64_t> poolQueueHighWater{0};
+  // Worker or timer threads of uCache's pools that could not be started (an address-space or
+  // process limit): their tasks ran on other threads.
+  std::atomic<uint64_t> poolThreadFailures{0};
   // How long reading threads waited on the cache (ReaderWait.h), per tier the
   // wait was charged to (ReaderWait::Tier: byte cache, an earlier release's
   // compact replica -- always 0 now --, slot store, origin), and how many

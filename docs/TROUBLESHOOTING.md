@@ -237,6 +237,18 @@ sidecar). **Your results are unaffected** — fail-open never serves wrong bytes
 it just skips caching for the affected reads. A steadily climbing count points at
 a sick cache filesystem (full, read-only, failing disk).
 
+## `could not start N of M worker threads` (an address-space or process limit)
+
+uCache starts a few pools of threads as a job needs them. Under a limit on the
+job's address space (`ulimit -v`, common on grid worker nodes: each thread
+reserves its stack, 8 MiB by default) or on its number of processes, a thread
+may not start. The job goes on: a pool short of threads has its work done by
+the threads that started, by another of uCache's pools, or, when none could
+start anywhere, by the thread that asked (which is then slower, never wrong).
+The line is said once per job, and `ucache stats` counts the threads that did
+not start (`pool_thread_failures`). Raise the limit (or lower the job's other
+threads, such as a numerical library's) to give uCache its threads back.
+
 ## A job stops making progress when the storage server goes away
 
 When the server a job reads from dies and stays down, the XRootD client keeps

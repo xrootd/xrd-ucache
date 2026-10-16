@@ -309,3 +309,83 @@ TEST(ExecutorFork, AGrandchildStartsOverToo) {
   });
   EXPECT_EQ(r, "ran");
 }
+
+// ------------------------------------------------- threads that cannot start
+// A pool whose threads cannot be started (std::thread throws: an address-space or process limit)
+// never throws and never loses a task (Executor.cc). The test hook makes every thread creation
+// after the first N fail.
+namespace {
+struct FailAfter {
+  explicit FailAfter(int64_t n) { Executor::testSetThreadFailAfter(n); }
+  ~FailAfter() { Executor::testSetThreadFailAfter(-1); }
+};
+} // namespace
+
+// Some workers started, the timer not: every posted task runs, and the delayed ones are served by
+// the workers.
+TEST(ExecutorThreads, SomeWorkersAndNoTimerRunEveryTask) {
+  auto& ex = *new Executor(4); // leaked, as every pool is
+  const uint64_t before = Executor::threadStartFailures();
+  {
+    FailAfter f(2);
+    EXPECT_NO_THROW(EXPECT_EQ(ex.startedWorkers(), 2u));
+  }
+  EXPECT_GE(Executor::threadStartFailures(), before + 2) << "two workers and the timer failed";
+  auto l = std::make_shared<Latch>();
+  for (int i = 0; i < 50; ++i)
+    ex.post([l] { l->bump(); });
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < 10; ++i)
+    ex.postAfter(100, [l] { l->bump(); });
+  EXPECT_TRUE(l->wait(60));
+  EXPECT_GE(std::chrono::steady_clock::now() - t0, std::chrono::milliseconds(95))
+      << "the delayed tasks waited for their deadline";
+  EXPECT_EQ(l->get(), 60);
+}
+
+// No worker at all: the tasks go to another pool of the process that has workers.
+TEST(ExecutorThreads, NoWorkerHandsTasksToAnotherPool) {
+  auto& helper = *new Executor(2);
+  ASSERT_GE(helper.startedWorkers(), 1u);
+  auto& ex = *new Executor(3);
+  {
+    FailAfter f(0);
+    EXPECT_NO_THROW(EXPECT_EQ(ex.startedWorkers(), 0u));
+    auto l = std::make_shared<Latch>();
+    for (int i = 0; i < 20; ++i)
+      ex.post([l] { l->bump(); });
+    ex.postAfter(50, [l] { l->bump(); });
+    EXPECT_TRUE(l->wait(21));
+    EXPECT_FALSE(ex.runsThisThread());
+  }
+  // Once threads can be made again, a post starts a worker (at most once a second).
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  auto l = std::make_shared<Latch>();
+  ex.post([l] { l->bump(); });
+  EXPECT_TRUE(l->wait(1));
+  EXPECT_GE(ex.startedWorkers(), 1u);
+}
+
+// No thread anywhere (a new fork generation, every creation failing): a task runs on the thread
+// that posts it, and a delayed one is kept and runs at a later post once due.
+TEST(ExecutorThreads, NoThreadAnywhereRunsOnTheCaller) {
+#ifdef UCACHE_FORK_SKIP
+  GTEST_SKIP() << "fork with threads under a sanitizer";
+#endif
+  const std::string r = inChild([] {
+    Executor::afterForkChild(); // a generation with no pool yet
+    Executor::testSetThreadFailAfter(0);
+    Executor ex(2);
+    const auto me = std::this_thread::get_id();
+    bool here = false;
+    ex.post([&here, me] { here = std::this_thread::get_id() == me; });
+    int late = 0;
+    ex.postAfter(50, [&late] { ++late; });
+    const int beforeDue = late;
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    ex.post([] {});
+    return std::string(here ? "inline" : "elsewhere") + " " + std::to_string(beforeDue) + " " +
+           std::to_string(late);
+  });
+  EXPECT_EQ(r, "inline 0 1");
+}

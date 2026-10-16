@@ -76,7 +76,7 @@ the consumers together.
  "slot_maps_made": 0, "slot_map_opens": 0, "slot_map_full": 0,
  "slot_crc_failures": 0, "slot_read_fallbacks": 0, "slot_pages_decoded": 0,
  "kept_reads": 0, "kept_read_bytes": 0,
- "pool_tasks": 0, "pool_busy_us": 0, "pool_queue_high_water": 0,
+ "pool_tasks": 0, "pool_busy_us": 0, "pool_queue_high_water": 0, "pool_thread_failures": 0,
  "reader_wait_byte_us": 0, "reader_wait_replica_us": 0, "reader_wait_slots_us": 0,
  "reader_wait_origin_us": 0, "reader_threads": 0,
  "replica_reads": 0, "replica_read_bytes": 0,
@@ -501,6 +501,12 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   its threads spent running them, the most tasks waiting at once, and how long
   each waited before a thread took it. A long queue wait with the threads busy
   the whole time means the pool, not the disk or the origin, sets the pace.
+- `pool_thread_failures` — threads of uCache's pools (workers and timers) that
+  could not be started, because the process may make no more (an address-space
+  limit, `ulimit -v`, or a limit on processes). Nothing fails for it: the work
+  of a pool short of threads runs on the threads that did start, on another
+  pool, or, when none could be started anywhere, on the thread that asked.
+  The first failure is said once at WARN.
 - `reader_wait_byte_us`, `reader_wait_replica_us`, `reader_wait_slots_us`,
   `reader_wait_origin_us`, `reader_threads` — how long the threads that read
   through the cache waited on it. For each reading thread, the time during

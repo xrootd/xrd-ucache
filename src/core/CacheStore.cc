@@ -525,8 +525,15 @@ std::vector<CacheStore::MetaScan> CacheStore::scanObjects(bool replicated, bool 
   if (nThreads > 1) {
     std::vector<std::thread> pool;
     pool.reserve(nThreads - 1);
-    for (size_t t = 1; t < nThreads; ++t)
-      pool.emplace_back(worker);
+    for (size_t t = 1; t < nThreads; ++t) {
+      // A thread that cannot be started (an address-space or process limit): the threads that
+      // did, and this one, do its share (the work is handed out from one counter).
+      try {
+        pool.emplace_back(worker);
+      } catch (...) {
+        break;
+      }
+    }
     worker();
     for (auto& t : pool)
       t.join();
@@ -1003,8 +1010,15 @@ CacheStore::CleanupReport CacheStore::cleanup(CleanupMode mode, uint64_t arg, bo
     if (nThreads > 1) {
       std::vector<std::thread> pool;
       pool.reserve(nThreads - 1);
-      for (size_t t = 1; t < nThreads; ++t)
-        pool.emplace_back(worker);
+      for (size_t t = 1; t < nThreads; ++t) {
+        // A thread that cannot be started (an address-space or process limit): the threads that
+        // did, and this one, do its share (the work is handed out from one counter).
+        try {
+          pool.emplace_back(worker);
+        } catch (...) {
+          break;
+        }
+      }
       worker();
       for (auto& t : pool)
         t.join();
@@ -1052,8 +1066,15 @@ void fanOut(size_t n, const std::function<void(size_t)>& body) {
   size_t hw = std::thread::hardware_concurrency();
   size_t nThreads = std::min({size_t(16), n, hw ? hw : size_t(1)});
   std::vector<std::thread> pool;
-  for (size_t t = 1; t < nThreads; ++t)
-    pool.emplace_back(worker);
+  for (size_t t = 1; t < nThreads; ++t) {
+    // A thread that cannot be started (an address-space or process limit): the threads that
+    // did, and this one, do its share (the work is handed out from one counter).
+    try {
+      pool.emplace_back(worker);
+    } catch (...) {
+      break;
+    }
+  }
   worker();
   for (auto& t : pool)
     t.join();

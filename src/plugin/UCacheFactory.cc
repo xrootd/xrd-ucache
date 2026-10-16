@@ -425,8 +425,10 @@ void initGlobals() {
   }
   Executor::instance(static_cast<unsigned>(
       gConfig->threads > 0 ? gConfig->threads : 0));
-  if (*gStore)
+  if (*gStore) {
     Executor::instance().setStats(&(*gStore)->stats());
+    Executor::setFailureStats(&(*gStore)->stats()); // threads that could not start, from now on
+  }
   if (*gStore && gConfig->metaFlushSeconds > 0)
     scheduleCheckpoint();
   // With logical names set, the entries cached before get their names once per cache and list of

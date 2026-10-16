@@ -281,12 +281,29 @@ struct Shard {
   std::unordered_map<HandleState*, std::shared_ptr<PrefetchHandle>> handles_;
   uint64_t jobs_ = 0;
 
+  // A shard whose thread could not be started (an address-space or process limit) predicts
+  // nothing: read-ahead is only ever an addition, and its jobs are dropped (a closing handle's
+  // waiter is released at once).
+  bool running_ = false;
   explicit Shard(Shared* sh) : sh_(sh) {
-    worker_ = std::thread([this] { loop(); });
-    worker_.detach();
+    try {
+      worker_ = std::thread([this] { loop(); });
+      worker_.detach();
+      running_ = true;
+    } catch (...) {
+      running_ = false;
+    }
   }
 
   void post(Job j) {
+    if (!running_) {
+      if (j.sync) {
+        std::lock_guard<std::mutex> g(j.sync->m);
+        j.sync->done = true;
+        j.sync->cv.notify_all();
+      }
+      return;
+    }
     Job superseded; // destroyed outside the lock, on the caller's thread
     Sync* orphaned = nullptr; // a waiter whose job we are about to throw away
     {

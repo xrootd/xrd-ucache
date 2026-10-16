@@ -9,6 +9,9 @@
 // first time it is used in the child. The parent's core is left behind in the
 // child, never run and never destroyed: its tasks are the parent's work.
 //
+// A thread that cannot be started never fails a pool or a post (see Executor.cc): its tasks run
+// on the threads that did start, on another pool, or on the calling thread.
+//
 // Thread-safety: fully thread-safe. Cores are intentionally leaked (threads
 // end with the process): joining at static destruction could deadlock against
 // XrdCl teardown.
@@ -61,6 +64,16 @@ class Executor {
   // Called from the plugin's fork child handler only (single-threaded): starts
   // a new generation. Takes no lock the parent may hold and creates no thread.
   static void afterForkChild();
+
+  // Threads an Executor could not start (std::thread threw: an address-space or process limit),
+  // in this process. A pool never fails for it (Executor.cc): its tasks run elsewhere.
+  static uint64_t threadStartFailures();
+  // The counters the failures are added to as well (pool_thread_failures), with those so far.
+  static void setFailureStats(Stats* s);
+  // Unit tests: every thread creation after the next `n` fails (n < 0: none); the count restarts.
+  static void testSetThreadFailAfter(int64_t n);
+  // The workers this executor's pool has started (builds the pool).
+  unsigned startedWorkers();
 
  private:
   struct Core;
