@@ -17,6 +17,7 @@
 #include "CpuCounters.h"
 #include "EntryNames.h"
 #include "Executor.h"
+#include "PluginSupport.h"
 #include "Log.h"
 #include "UCacheFile.h"
 #ifdef UCACHE_HAVE_PREFETCH
@@ -345,7 +346,7 @@ void scheduleCheckpoint() {
     coldCheckpoint(); // slot records still in memory go to their stores
 #endif
     scheduleCheckpoint();
-  });
+  }, /*housekeeping=*/true); // nobody waits for it: never run on a caller (Executor.h)
 }
 
 // fork(). A child has only the thread that forked: every pool, its queue and
@@ -428,6 +429,11 @@ void initGlobals() {
   if (*gStore) {
     Executor::instance().setStats(&(*gStore)->stats());
     Executor::setFailureStats(&(*gStore)->stats()); // threads that could not start, from now on
+  }
+  {
+    // A delayed task run on the calling thread (no pool thread anywhere) never sleeps on a client
+    // callback thread: the client's few workers deliver every answer.
+    Executor::setMayBlockProbe([] { return !onClientCallback(); });
   }
   if (*gStore && gConfig->metaFlushSeconds > 0)
     scheduleCheckpoint();

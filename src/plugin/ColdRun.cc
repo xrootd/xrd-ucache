@@ -2340,7 +2340,8 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
         Executor::instance().post([r2] { serveRequest(r2); });
       };
       if (req->entry->waitForInFlight(want, again)) {
-        Executor::instance().postAfter(10000, again); // a lost wakeup must not hang the read
+        // a lost wakeup must not hang the read (housekeeping: the wakeup is the real path)
+        Executor::instance().postAfter(10000, again, /*housekeeping=*/true);
         return;
       }
     }
@@ -3128,7 +3129,7 @@ void ColdFill::queueMap(uint64_t delayMs) {
       g_mapCv.notify_all();
   };
   if (delayMs)
-    mapPool().postAfter(delayMs, std::move(task));
+    mapPool().postAfter(delayMs, std::move(task), /*housekeeping=*/true);
   else
     mapPool().post(std::move(task));
 }

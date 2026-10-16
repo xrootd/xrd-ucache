@@ -111,6 +111,71 @@ std::mutex& coresMu() {
   return *m;
 }
 std::vector<void*>* g_cores = new std::vector<void*>; // leaked; under coresMu
+
+// Whether the calling thread may block (sleep out a delay) when a delayed task must run on it
+// (no thread anywhere): the plug-in sets a probe that says no on a client callback thread
+// (setMayBlockProbe); a thread of a pool of ours never may.
+std::atomic<bool (*)()> g_mayBlock{nullptr};
+bool callerMayBlock() {
+  if (tCore != nullptr)
+    return false;
+  bool (*probe)() = g_mayBlock.load(std::memory_order_acquire);
+  return !probe || probe();
+}
+// A delayed task run on the calling thread (no thread anywhere): the chain of delayed tasks it
+// posts runs in a loop of the outermost call, not by recursion.
+struct InlineDelayed {
+  uint64_t deadlineNs;
+  std::function<void()> task;
+};
+thread_local int tInlineDepth = 0;
+thread_local std::vector<InlineDelayed>* tInlinePending = nullptr;
+void runDelayedOnCaller(uint64_t deadlineNs, std::function<void()> task) {
+  if (tInlineDepth > 0) { // inside a delayed task run here: the outer loop runs it
+    if (!tInlinePending)
+      tInlinePending = new std::vector<InlineDelayed>; // per thread, leaked with it
+    tInlinePending->push_back(InlineDelayed{deadlineNs, std::move(task)});
+    return;
+  }
+  ++tInlineDepth;
+  InlineDelayed next{deadlineNs, std::move(task)};
+  for (;;) {
+    // A caller that may block waits until the deadline (a back-off it is waiting for anyway); one
+    // that may not (a client callback thread) runs the task at once: the delays are back-offs.
+    const uint64_t now = nowNs();
+    if (next.deadlineNs > now && callerMayBlock())
+      std::this_thread::sleep_for(std::chrono::nanoseconds(next.deadlineNs - now));
+    next.task(); // tasks must not throw (no exceptions cross the ABI)
+    if (!tInlinePending || tInlinePending->empty())
+      break;
+    auto it = std::min_element(tInlinePending->begin(), tInlinePending->end(),
+                               [](const InlineDelayed& a, const InlineDelayed& b) {
+                                 return a.deadlineNs < b.deadlineNs;
+                               });
+    next = std::move(*it);
+    tInlinePending->erase(it);
+  }
+  --tInlineDepth;
+}
+// A task that could not be queued for want of memory: run on the calling thread, said once.
+std::atomic<bool> g_noMemSaid{false};
+void sayNoMemory();
+void noteNoMemory() {
+  g_threadFailures.fetch_add(1, std::memory_order_relaxed);
+  if (Stats* s = g_failStats.load(std::memory_order_acquire))
+    s->poolThreadFailures.fetch_add(1, std::memory_order_relaxed);
+  sayNoMemory();
+}
+void sayNoMemory() {
+  if (g_noMemSaid.exchange(true))
+    return;
+  try {
+    UCACHE_WARN("a task of uCache's pools could not be queued for want of memory (an "
+                "address-space limit?): it ran on the thread that asked (counted in "
+                "pool_thread_failures)");
+  } catch (...) {
+  }
+}
 } // namespace
 
 // One fork generation's pool. Its threads capture the core, never the
@@ -124,8 +189,11 @@ std::vector<void*>* g_cores = new std::vector<void*>; // leaked; under coresMu
 // and safe there: no post is made with a lock held that a task takes (every post site was read
 // for it), and a process that can start no thread at all can do nothing else with the task. A
 // pool whose timer thread did not start has its workers serve the delayed tasks; with no worker
-// either, a delayed task goes to another pool's timer, or waits in the queue and runs at the
-// pool's next post (never lost).
+// either, a delayed task goes to another pool's timer, or, with no thread anywhere, runs on the
+// calling thread (after its delay when that thread may block, at once when it may not; a chain of
+// them as a loop, runDelayedOnCaller), except housekeeping, which waits in the queue and runs at the
+// pool's next post: nobody waits for it. A task that cannot be queued for want of memory runs on
+// the calling thread too.
 struct Executor::Core {
   Core(unsigned threads, uint64_t gen, const std::atomic<Stats*>* stats)
       : gen(gen), stats(stats), size(threads) {
@@ -184,20 +252,31 @@ struct Executor::Core {
       return;
     }
     Stats* s = stats->load(std::memory_order_acquire);
+    Task t{std::move(task), s ? nowNs() : 0};
+    bool queued = false;
     {
       std::lock_guard<std::mutex> g(mu);
-      queue.push_back(Task{std::move(task), s ? nowNs() : 0});
-      if (s) {
+      try {
+        queue.push_back(std::move(t)); // on failure (no memory) `t` is left as it was
+        queued = true;
+      } catch (...) {
+      }
+      if (queued && s) {
         const uint64_t n = queue.size();
         uint64_t hw = s->poolQueueHighWater.load(std::memory_order_relaxed);
         while (n > hw && !s->poolQueueHighWater.compare_exchange_weak(hw, n, std::memory_order_relaxed)) {
         }
       }
     }
+    if (!queued) { // no memory to queue it (an address-space limit): it runs here, said once
+      noteNoMemory();
+      t.fn();
+      return;
+    }
     cv.notify_one();
   }
 
-  void postAfter(uint64_t delayMs, std::function<void()> task) {
+  void postAfter(uint64_t delayMs, std::function<void()> task, bool housekeeping) {
     const uint64_t deadline = nowNs() + delayMs * 1000000ull;
     if (!timerOk.load(std::memory_order_acquire))
       (void)retryWorker();
@@ -221,10 +300,19 @@ struct Executor::Core {
       return;
     }
     if (Core* other = fallback()) {
-      other->postAfter(delayMs, std::move(task));
+      other->postAfter(delayMs, std::move(task), housekeeping);
       return;
     }
-    // No thread anywhere: kept, and run at a later post of this pool once due (runDueTimersHere).
+    // No thread anywhere. A back-off a caller is waiting for (an open retried, a move's next
+    // attempt) runs on the calling thread, after its delay when the caller may block, at once when
+    // it may not: kept for a later post, it would never run when nothing else posts (the reader
+    // blocked in its open). Housekeeping (the checkpoint, a parked read's insurance) is kept, and
+    // runs at a later post of this pool once due (runDueTimersHere): nobody waits for it, and run
+    // here it would hold up the caller (the checkpoint re-arms itself for good).
+    if (!housekeeping) {
+      runDelayedOnCaller(deadline, std::move(task));
+      return;
+    }
     std::lock_guard<std::mutex> g(tmu);
     timers.push(Timed{deadline, std::move(task)});
   }
@@ -368,7 +456,17 @@ Executor::Core* Executor::core() {
   return c;
 }
 
-void Executor::post(std::function<void()> task) { core()->post(std::move(task)); }
+void Executor::post(std::function<void()> task) {
+  Core* c = nullptr;
+  try {
+    c = core();
+  } catch (...) { // no memory for the pool (an address-space limit): the task runs here
+    noteNoMemory();
+    task();
+    return;
+  }
+  c->post(std::move(task));
+}
 
 // Never builds the pool: a question about a pool that has no threads yet starts none (each pool's
 // threads take address space, which a process under a limit on it needs for other work).
@@ -378,13 +476,24 @@ bool Executor::runsThisThread() {
          c->gen == g_gen.load(std::memory_order_acquire);
 }
 
-void Executor::postAfter(uint64_t delayMs, std::function<void()> task) {
+void Executor::postAfter(uint64_t delayMs, std::function<void()> task, bool housekeeping) {
   if (delayMs == 0) {
     post(std::move(task));
     return;
   }
-  core()->postAfter(delayMs, std::move(task));
+  Core* c = nullptr;
+  try {
+    c = core();
+  } catch (...) { // no memory for the pool: as with no thread anywhere
+    noteNoMemory();
+    if (!housekeeping)
+      runDelayedOnCaller(nowNs() + delayMs * 1000000ull, std::move(task));
+    return;
+  }
+  c->postAfter(delayMs, std::move(task), housekeeping);
 }
+
+void Executor::setMayBlockProbe(bool (*probe)()) { g_mayBlock.store(probe, std::memory_order_release); }
 
 Executor& Executor::instance(unsigned threads) {
   // One thread per read in flight, up to the CPUs this process may use: a

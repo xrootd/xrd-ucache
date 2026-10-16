@@ -367,7 +367,9 @@ TEST(ExecutorThreads, NoWorkerHandsTasksToAnotherPool) {
 }
 
 // No thread anywhere (a new fork generation, every creation failing): a task runs on the thread
-// that posts it, and a delayed one is kept and runs at a later post once due.
+// that posts it; a delayed one runs on it too, after its delay (the caller may block), with no
+// later post needed; a chain of delayed tasks runs as a loop, not by recursion; a caller that may
+// not block runs a delayed task at once; housekeeping is kept and runs at a later post once due.
 TEST(ExecutorThreads, NoThreadAnywhereRunsOnTheCaller) {
 #ifdef UCACHE_FORK_SKIP
   GTEST_SKIP() << "fork with threads under a sanitizer";
@@ -377,15 +379,44 @@ TEST(ExecutorThreads, NoThreadAnywhereRunsOnTheCaller) {
     Executor::testSetThreadFailAfter(0);
     Executor ex(2);
     const auto me = std::this_thread::get_id();
+    std::string out;
     bool here = false;
     ex.post([&here, me] { here = std::this_thread::get_id() == me; });
+    out += here ? "inline" : "elsewhere";
+    // A delayed task: on the caller, after its delay, before postAfter returns.
     int late = 0;
+    auto t0 = std::chrono::steady_clock::now();
     ex.postAfter(50, [&late] { ++late; });
-    const int beforeDue = late;
-    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    const auto ms = [&t0] {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - t0)
+          .count();
+    };
+    out += " delayed=" + std::to_string(late) + (ms() >= 45 ? " waited" : " early");
+    // A chain: each delayed task posts the next; they run in order, in a loop.
+    std::vector<int> order;
+    std::function<void(int)> step = [&](int i) {
+      order.push_back(i);
+      if (i < 3)
+        ex.postAfter(10, [&step, i] { step(i + 1); });
+    };
+    ex.postAfter(10, [&step] { step(1); });
+    out += " chain=" + std::to_string(order.size());
+    // A caller that may not block: at once.
+    Executor::setMayBlockProbe([] { return false; });
+    t0 = std::chrono::steady_clock::now();
+    int quick = 0;
+    ex.postAfter(400, [&quick] { ++quick; });
+    out += std::string(" quick=") + (quick == 1 && ms() < 300 ? "now" : "no");
+    Executor::setMayBlockProbe(nullptr);
+    // Housekeeping: kept, run at a later post once due.
+    int kept = 0;
+    ex.postAfter(30, [&kept] { ++kept; }, /*housekeeping=*/true);
+    const int keptBefore = kept;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     ex.post([] {});
-    return std::string(here ? "inline" : "elsewhere") + " " + std::to_string(beforeDue) + " " +
-           std::to_string(late);
+    out += " housekeeping=" + std::to_string(keptBefore) + "," + std::to_string(kept);
+    return out;
   });
-  EXPECT_EQ(r, "inline 0 1");
+  EXPECT_EQ(r, "inline delayed=1 waited chain=3 quick=now housekeeping=0,1");
 }

@@ -6153,7 +6153,7 @@ void redispatchRead(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> 
     Executor::instance().postAfter(
         parkedInsuranceMs(readerT, currentRequestTimeoutS(),
                           static_cast<int64_t>(nowUs() - std::min(startUs, nowUs()))),
-        [again] { again(FileEntry::FetchOutcome()); });
+        [again] { again(FileEntry::FetchOutcome()); }, /*housekeeping=*/true);
     return; // missed-endFetch insurance, and the end of its own time: parkedInsuranceMs
   }
   // Its own fetch, with what is left of its time (an armed handle's reads have their own
@@ -7865,7 +7865,7 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
     if (!entry->beginFetch(ws, we - ws, redispatch)) {
       Executor::instance().postAfter(
           parkedInsuranceMs(static_cast<int>(timeout), currentRequestTimeoutS(), 0),
-          [redispatch] { redispatch(FileEntry::FetchOutcome()); });
+          [redispatch] { redispatch(FileEntry::FetchOutcome()); }, /*housekeeping=*/true);
       return XRootDStatus(); // missed-endFetch insurance, and the end of its own time
     }
   }
@@ -8085,7 +8085,8 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
           });
     };
     if (entry->waitForInFlight(want, redispatch)) {
-      Executor::instance().postAfter(10000, redispatch); // the same insurance the single-read path keeps
+      // the same insurance the single-read path keeps (housekeeping: the wakeup is the real path)
+      Executor::instance().postAfter(10000, redispatch, /*housekeeping=*/true);
       return;
     }
   }
