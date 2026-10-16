@@ -729,12 +729,12 @@ struct Shard {
       // handler still holding the latter afterwards. The store outlives us.
       // The server that answered is named first, for the trace.
       // check_origin_integrity also needs it: a copy found bad later drops an entry given its bytes.
-      const std::string server = (stats_ && stats_->tracer) || globalConfig().checkOriginIntegrity
+      const std::string server = (stats_ && stats_->tracer) || checksOrigin(st_.get())
                                      ? answeredBy(*st_, hosts)
                                      : std::string();
       // check_origin_integrity: the file's map, taken before the handle is let go of.
       std::shared_ptr<const KeyMap> map;
-      const bool check = globalConfig().checkOriginIntegrity;
+      const bool check = checksOrigin(st_.get());
       if (check) {
         {
           std::lock_guard<std::mutex> g(st_->mu);

@@ -3,6 +3,11 @@
 Bump `MetaData::kFormatVersion` on ANY layout change; readers reject other
 versions (entry treated as absent and rebuilt).
 
+In this document "with `adaptive_federation = on`" means: for a file the
+switch is on for -- every file with `on`; with `auto`, the default, a file
+opened at a server that reports a redirector's role (USER_GUIDE.md, "Which
+files the switch is on for").
+
 ```
 $UCACHE_DIR/                         (0700)
   objects/<hh>/<sha256(key)>.data    # sparse data file, logical size = origin size

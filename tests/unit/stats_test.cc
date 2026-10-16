@@ -207,6 +207,9 @@ TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
   s.badEntriesDropped = 3;
   s.siteNameQueries = 9;
   s.siteNamesMissing = 2;
+  s.roleQueries = 3;
+  s.roleRedirectors = 2;
+  s.roleUnanswered = 1;
   s.requestsParkedForParse = 7;
   s.siteFaultsMarked = 4;
   s.siteMarksCleared = 1;
@@ -229,7 +232,8 @@ TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
         "\"offline_copies_skipped\":7", "\"open_check_bytes_kept\":8192",
         "\"bad_entries_dropped\":3", "\"site_name_queries\":9", "\"site_names_missing\":2", "\"requests_parked_for_parse\":7",
         "\"site_faults_marked\":4", "\"site_marks_cleared\":1", "\"copy_faults_marked\":5",
-        "\"marked_copies_last\":6",
+        "\"marked_copies_last\":6", "\"role_queries\":3", "\"role_redirectors\":2",
+        "\"role_unanswered\":1",
         "\"origin_checks_passed\":21",
         "\"origin_checks_failed\":22", "\"origin_checks_none\":23",
         "\"origin_checks_unjudged\":24", "\"origin_checks_not_examined\":25"})
@@ -258,6 +262,9 @@ TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
   EXPECT_EQ(t.badEntriesDropped, 6u);
   EXPECT_EQ(t.siteNameQueries, 18u);
   EXPECT_EQ(t.siteNamesMissing, 4u);
+  EXPECT_EQ(t.roleQueries, 6u);
+  EXPECT_EQ(t.roleRedirectors, 4u);
+  EXPECT_EQ(t.roleUnanswered, 2u);
   EXPECT_EQ(t.requestsParkedForParse, 14u);
   EXPECT_EQ(t.siteFaultsMarked, 8u);
   EXPECT_EQ(t.siteMarksCleared, 2u);

@@ -155,11 +155,14 @@ TEST(HistoryJson, OriginTimingsGoByDomainWhenPublishedAndByHostLocally) {
 // reads went to (the record's data_server), not the redirector's; a record
 // without one keeps the URL's host. Neither host is published, only domains.
 static std::vector<std::string> publishedOrigins(const std::string& runSettings,
-                                                 std::string* text = nullptr) {
+                                                 std::string* text = nullptr,
+                                                 const std::string& redirectors = "") {
   test::TempDir td;
   std::string counters = "{\"ts\":1100,\"pid\":1,\"opens\":2,\"origin_bytes\":10,\"served_bytes\":10";
   if (!runSettings.empty())
     counters += ",\"run_settings\":\"" + runSettings + "\"";
+  if (!redirectors.empty())
+    counters += ",\"redirector_hosts\":\"" + redirectors + "\"";
   counters += "}";
   writeLines(td.path(), "h-1-1000-0", {counters},
              {fileLine("root://redirector.example.org//store/a.root", 5000,
@@ -235,4 +238,19 @@ TEST(HistoryJson, AnOldRecordAddsOnlyWhatItCanSay) {
     EXPECT_EQ(num(r, "duration_s"), "100");
     EXPECT_EQ(r.str("kind"), "warm");
   }
+}
+
+// A run with adaptive_federation = auto: a file whose URL's host reported a
+// redirector's role (the run line's redirector_hosts) is published under its
+// data server's domain, as with the switch on; every other file under its
+// URL's, as with it off.
+TEST(HistoryJson, OriginsUnderAutoFollowTheRedirectorHosts) {
+  EXPECT_EQ(publishedOrigins("v1 check_origin_integrity=off adaptive_federation=auto", nullptr,
+                             "redirector.example.org"),
+            (std::vector<std::string>{"root://cern.ch", "root://fnal.gov", "rt root://cern.ch",
+                                      "rt root://fnal.gov"}));
+  EXPECT_EQ(publishedOrigins("v1 check_origin_integrity=off adaptive_federation=auto", nullptr,
+                             "other.example.org"),
+            (std::vector<std::string>{"root://cern.ch", "root://example.org", "rt root://cern.ch",
+                                      "rt root://example.org"}));
 }

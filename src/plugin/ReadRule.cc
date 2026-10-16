@@ -357,11 +357,11 @@ ReadRule::State ReadRule::observe(const std::vector<std::pair<uint64_t, uint64_t
     // The server of the parse's reads from the origin; none when the cache answered any of them
     // (they may be another copy's: no claim against a server, see keySeeksFor).
     const std::string from = src.fromCache ? std::string() : src.fetchedFrom;
-    if (fm.recordFailed && globalConfig().checkOriginIntegrity) // the copy shown bad, for the check
+    if (fm.recordFailed && checksOrigin(src.st.get())) // the copy shown bad, for the check
       keySeeksFor(src.st, src.entry, 0, &fm, from);
     if (fm.error.empty()) {
       map_ = std::make_unique<tp::ReadMap>(tp::ReadMap::fromTree(fm));
-      if (globalConfig().checkOriginIntegrity) // the key-position check's table, from this parse
+      if (checksOrigin(src.st.get())) // the key-position check's table, from this parse
         keySeeksFor(src.st, src.entry, 0, &fm, from);
     }
     // A ROOT file that holds neither a TTree nor an RNTuple (no tree, and the RNTuple's parse found

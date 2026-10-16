@@ -294,6 +294,10 @@ class CacheStore {
   // The run line's `run_settings` (docs/STATS.md), set once before any
   // thread that dumps stats exists; immutable afterwards.
   void setRunSettings(std::string s) { runSettings_ = std::move(s); }
+  // adaptive_federation = auto: a server (its host, without the port) that reported a redirector's
+  // role; the run line lists them as `redirector_hosts` (docs/STATS.md), so that a readout can tell
+  // the files the switch was on for. Thread-safe.
+  void noteRedirectorHost(const std::string& host);
 
   // The read footprint of one file, shared by every handle on it for as long
   // as this process lives. Both routes need that lifetime: a relayed file has
@@ -466,6 +470,7 @@ class CacheStore {
   std::mutex recMu_;
   std::deque<std::string> records_;
   std::map<std::string, uint32_t> recordCaps_;
+  std::set<std::string> redirectorHosts_; // under recMu_
   std::string runSettings_;
   // A forked child that has not claimed its own stats file yet (see
   // afterForkChild). Set in the child handler, cleared by ensureOwnIdentity.

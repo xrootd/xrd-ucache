@@ -19,6 +19,7 @@
 #include "Publish.h"
 #include "UrlKey.h"
 #include "../plugin/ClientSettings.h"
+#include "../plugin/ServerRole.h"
 #ifdef UCACHE_HAVE_TRANSPOSE
 #include "CacheSource.h"
 #include "RNTupleRewrite.h"
@@ -421,7 +422,8 @@ void printStats(const StatsTotals& t) {
   }
   if (t.openFailovers || t.opensFailedEverywhere || t.openDeadlineExpiries || t.failoverLocates ||
       t.offlineCopiesSkipped || t.openCheckBytesKept || t.badEntriesDropped ||
-      t.siteNameQueries || t.siteFaultsMarked || t.copyFaultsMarked || t.markedCopiesLast) {
+      t.siteNameQueries || t.siteFaultsMarked || t.copyFaultsMarked || t.markedCopiesLast ||
+      t.roleQueries) {
     row("open_failovers", t.openFailovers);
     row("opens_recovered", t.opensRecovered);
     row("opens_failed_everywhere", t.opensFailedEverywhere);
@@ -432,6 +434,9 @@ void printStats(const StatsTotals& t) {
     row("bad_entries_dropped", t.badEntriesDropped);
     row("site_name_queries", t.siteNameQueries);
     row("site_names_missing", t.siteNamesMissing);
+    row("role_queries", t.roleQueries);
+    row("role_redirectors", t.roleRedirectors);
+    row("role_unanswered", t.roleUnanswered);
     row("requests_parked_for_parse", t.requestsParkedForParse);
     row("site_faults_marked", t.siteFaultsMarked);
     row("site_marks_cleared", t.siteMarksCleared);
@@ -3649,8 +3654,12 @@ int cmdSettings(const Config& cfg) {
   std::printf("\n%-22s %-28s %s\n", "key", "value", "source");
   for (const auto& k : Config::knownKeys()) {
     auto it = cfg.sources.find(k.key);
-    std::printf("%-22s %-28s %s\n", k.key, cfg.valueOf(k.key).c_str(),
-                it == cfg.sources.end() ? "default" : it->second.c_str());
+    std::string source = it == cfg.sources.end() ? "default" : it->second;
+    // adaptive_federation = auto forces the check for the files it turns the switch on for.
+    if (std::string(k.key) == "check_origin_integrity" && !cfg.checkOriginIntegrity &&
+        cfg.adaptiveFederation == FederationMode::kAuto)
+      source += "; forced on by adaptive_federation = auto for files from a redirector";
+    std::printf("%-22s %-28s %s\n", k.key, cfg.valueOf(k.key).c_str(), source.c_str());
   }
   std::printf("\ncurrent values: `ucache set <key> <value>` / `ucache unset <key>` "
               "(state file, no conf edit);\ndefaults: edit the conf file by hand; "
@@ -3677,6 +3686,14 @@ int cmdSet(const Config& cfg, const char* key, const char* value) {
                "or UCACHE_DIR first\n",
                stderr);
     return 2;
+  }
+  if (k == "adaptive_federation") {
+    const std::string v = value;
+    if (v != "auto" && v != "on" && v != "off" && v != "1" && v != "0" && v != "true" &&
+        v != "false") {
+      std::fprintf(stderr, "set: adaptive_federation takes off, on or auto, not '%s'\n", value);
+      return 2;
+    }
   }
   if (k == "logical_name_prefixes") {
     // The words the conf reads as off (Config.cc falsy) are taken here too, and stored as "off".
@@ -4257,6 +4274,24 @@ void federationNote(const Config& cfg) {
       std::printf("         the last run had: %s\n", rs.c_str());
 }
 
+// adaptive_federation = auto: decided for each file at its open.
+void federationAutoNote(const Config& cfg) {
+  std::printf("  [NOTE] adaptive_federation = auto: each file is decided at its open. A job asks the\n"
+              "         server its URL names what it is, once per server (its login flags and, for one\n"
+              "         that says manager there, its role as `xrdfs <host> query config role` shows\n"
+              "         it; at most %d s): a redirector (a manager, meta manager or supervisor; a\n"
+              "         site's own redirector is one too) turns the switch on for the files opened\n"
+              "         there, with everything `on` does to a file, check_origin_integrity forced on\n"
+              "         for them included; any other server (a data server, an EOS instance, one that\n"
+              "         does not answer in time) leaves its files as with the switch off. The XRootD\n"
+              "         client's connection settings, which `on` changes for the whole job, are left\n"
+              "         as they are; `adaptive_federation = off` reads every file as uCache 1.4.0 did\n",
+              kRoleWaitS);
+  if (!cfg.cacheDir.empty())
+    if (const std::string rs = lastRunSettings(cfg.cacheDir + "/stats"); !rs.empty())
+      std::printf("         the last run had: %s\n", rs.c_str());
+}
+
 int cmdDoctor(const Config& cfg) {
   std::string conf = findUCacheConf();
   std::printf("ucache doctor\n  cache dir: %s\n  settings : %s\n  freshness: %s\n",
@@ -4328,8 +4363,10 @@ int cmdDoctor(const Config& cfg) {
                 "         the same job needs with no cache). If they run short, set recompress\n"
                 "         off and do not run `ucache recompress`; `ucache untranspose <url>`\n"
                 "         removes a file's replica while no job is reading it\n");
-  if (cfg.adaptiveFederation)
+  if (cfg.federationEverywhere())
     federationNote(cfg);
+  else if (cfg.adaptiveFederation == FederationMode::kAuto)
+    federationAutoNote(cfg);
 #ifdef UCACHE_HAVE_TRANSPOSE
   if (cfg.maxReadFraction == 0)
     std::printf("  [NOTE] max_read_fraction = 0: every ROOT file with a TTree or RNTuple is read\n"

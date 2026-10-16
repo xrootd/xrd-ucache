@@ -23,6 +23,9 @@ namespace ucache {
 
 enum class ValidateMode { kNone, kSize, kSizeMtime, kCksum };
 enum class FsyncMode { kOff, kData, kAll };
+// `adaptive_federation`: off, on for every file, or auto -- on for a file whose
+// URL's server reports a manager role (a redirector), off for every other file.
+enum class FederationMode : uint8_t { kOff, kOn, kAuto };
 
 struct Config {
   std::string cacheDir;                   // UCACHE_DIR / `dir =`; NO default:
@@ -203,7 +206,9 @@ struct Config {
   // before it is cached or served (the byte cache's fetches by the key position
   // of each basket); a block that fails is never kept or served, the read fails
   // with an error naming the copy and the reason, and the failure is reported.
-  // Forced on by `adaptive_federation = on` ("forced by adaptive_federation").
+  // Forced on by `adaptive_federation = on` ("forced by adaptive_federation");
+  // with `auto`, forced on for each file auto turns the switch on for, not here
+  // (HandleState::federation; checksOrigin in the plugin).
   // `recompress = on` does not force it: recompression checks every block it
   // converts by the block's own checksum whatever this says.
   bool checkOriginIntegrity = false;             // UCACHE_CHECK_ORIGIN_INTEGRITY
@@ -211,9 +216,17 @@ struct Config {
   // are set at load to values that give up on an unreachable server sooner
   // (connection window 31 s, 2 retries, error window 180 s), each only where
   // neither an XRD_* variable nor a client.conf has set it, and
-  // check_origin_integrity is forced on. Off by default: the client's settings
-  // are left as they are.
-  bool adaptiveFederation = false;               // UCACHE_ADAPTIVE_FEDERATION
+  // check_origin_integrity is forced on. `auto`, the default: the switch is
+  // decided for each file at its open, on when the server its URL names reports
+  // a manager role (asked once per server and process, ServerRole.h), off
+  // otherwise; the client's connection settings, which are the process's, are
+  // left as they are, and check_origin_integrity is forced only for the files
+  // it turns on. `off` reads every file as 1.4.0 did.
+  FederationMode adaptiveFederation = FederationMode::kAuto; // UCACHE_ADAPTIVE_FEDERATION
+  // The switch is on for every file (`on`).
+  bool federationEverywhere() const { return adaptiveFederation == FederationMode::kOn; }
+  // The switch may be on for some file of this process (`on` or `auto`).
+  bool federationPossible() const { return adaptiveFederation != FederationMode::kOff; }
   // `logical_name_prefixes` (no environment variable: it is a property of the
   // cache, and two processes keying one URL two ways would make two entries of
   // one file): a space-separated list, "off" by default (keys by URL). Set, a URL

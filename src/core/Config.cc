@@ -222,7 +222,9 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
   else if (k == "check_origin_integrity")
     c.checkOriginIntegrity = truthy(v);
   else if (k == "adaptive_federation")
-    c.adaptiveFederation = truthy(v);
+    c.adaptiveFederation = v == "auto"  ? FederationMode::kAuto
+                           : truthy(v) ? FederationMode::kOn
+                                       : FederationMode::kOff;
   else if (k == "logical_name_prefixes")
     c.logicalNamePrefixes = falsy(v) ? std::string("off") : v; // checked once, at the end
   else if (k == "mixed_maps")
@@ -343,7 +345,9 @@ void clampAndFinish(Config& c, bool explicitMax) {
   // Reading from more than one site is safe only when what arrives is checked:
   // a copy that differs from the file's own checksums is caught before it is
   // kept or served. Applied after every layer, so none can undo it.
-  if (c.adaptiveFederation && !c.checkOriginIntegrity) {
+  // With `auto` it is forced for each file the switch is on for, at the file's open
+  // (the plugin's checksOrigin), so the setting itself is left as it is here.
+  if (c.federationEverywhere() && !c.checkOriginIntegrity) {
     c.checkOriginIntegrity = true;
     c.sources["check_origin_integrity"] = "forced by adaptive_federation";
   }
@@ -503,9 +507,26 @@ bool Config::stateSettable(const std::string& key) {
 }
 
 std::string Config::setNote(const std::string& key, const std::string& value) const {
-  if (key == "check_origin_integrity" && falsy(value) && adaptiveFederation)
+  if (key == "check_origin_integrity" && falsy(value) && federationEverywhere())
     return "  the check stays on while adaptive_federation = on, which forces it on (`ucache "
            "settings` shows it)";
+  if (key == "check_origin_integrity" && falsy(value) &&
+      adaptiveFederation == FederationMode::kAuto)
+    return "  the check stays on for the files adaptive_federation = auto turns the switch on for "
+           "(those whose URL names a redirector): auto forces it on for them";
+  if (key == "adaptive_federation" && falsy(value))
+    return "  the switch is off for every file, as in uCache 1.4.0, where off was the default: no "
+           "open or read is made again at another site, and check_origin_integrity is not forced on "
+           "(the default, auto, does this for the files opened at a redirector)";
+  if (key == "adaptive_federation" && value == "auto")
+    return "  each file is decided at its open: the server its URL names is asked once per job what "
+           "it is (its login flags and, for one that says manager there, its configured role, as "
+           "`xrdfs <host> query config role` shows it; at most 5 s in all); a redirector (a manager, "
+           "a meta manager or a supervisor, a site's own redirector included) turns the switch on "
+           "for the files opened there, with everything `on` does to a file and "
+           "check_origin_integrity forced for them; any other server (a data server, an EOS "
+           "instance, whose role is none), or one that does not answer in time, leaves them as with "
+           "the switch off. The XRootD client's connection settings are left as they are";
   if (key == "adaptive_federation" && truthy(value))
     return "  the XRootD client's connection settings change too: connection window 31 s, "
            "connection retries 2, error window 180 s, each where no XRD_* variable or "
@@ -630,7 +651,7 @@ std::string Config::valueOf(const std::string& key) const {
   if (key == "check_origin_integrity")
     return onoff(checkOriginIntegrity);
   if (key == "adaptive_federation")
-    return onoff(adaptiveFederation);
+    return adaptiveFederation == FederationMode::kAuto ? "auto" : onoff(federationEverywhere());
   if (key == "logical_name_prefixes")
     return logicalNamePrefixes;
   if (key == "mixed_maps")

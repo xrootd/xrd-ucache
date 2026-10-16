@@ -133,6 +133,7 @@ void CacheStore::afterForkChild() {
     std::deque<std::string> records;
     std::map<std::string, uint32_t> recordCaps;
     std::set<std::string> removing;
+    std::set<std::string> redirectorHosts;
   };
   auto* left = new LeftBehind; // leaked on purpose
   new (&relayFpMu_) std::mutex;
@@ -145,6 +146,7 @@ void CacheStore::afterForkChild() {
   // The parent's queued record lines are the parent's to write.
   left->records.swap(records_);
   left->recordCaps.swap(recordCaps_);
+  left->redirectorHosts.swap(redirectorHosts_); // the child asks again for what it opens
   left->relayFp.swap(relayFp_);
   left->registry.swap(registry_);
   // A drop by key under way in a parent thread marks its key until its files are gone; that thread
@@ -161,6 +163,16 @@ void CacheStore::afterForkChild() {
   ReadFootprint::afterForkChild(); // the footprints left behind held the ranges counted
   cpu_.reopen();         // now, before the child starts a thread of its own
   forkStale_.store(true, std::memory_order_release);
+}
+
+void CacheStore::noteRedirectorHost(const std::string& host) {
+  try {
+    std::lock_guard<std::mutex> g(recMu_);
+    if (redirectorHosts_.size() < 256)
+      redirectorHosts_.insert(host);
+  } catch (...) {
+    // a readout's detail; never a reason for an open to fail
+  }
 }
 
 void CacheStore::ensureOwnIdentity() {
@@ -1476,6 +1488,16 @@ void CacheStore::dumpStats(bool finalDump) {
   // Appended at the end, as every newer field is.
   if (!runSettings_.empty())
     line << ",\"run_settings\":\"" << jsonEscape(runSettings_) << '"';
+  {
+    std::string hosts;
+    {
+      std::lock_guard<std::mutex> g(recMu_);
+      for (const auto& h : redirectorHosts_)
+        hosts += (hosts.empty() ? "" : " ") + h;
+    }
+    if (!hosts.empty())
+      line << ",\"redirector_hosts\":\"" << jsonEscape(hosts) << '"';
+  }
   line << "}\n";
   int fd = io_.open(statsPath_, O_WRONLY | O_CREAT, 0600);
   if (fd < 0)

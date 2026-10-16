@@ -77,7 +77,12 @@
 #                          uCache closes each copy it opened (the test client never closes its File)
 #   all refused            a, b and c refuse the file: Open() returns OK, one
 #                          completion, a failure that names all three servers
-#   switch off             the default: a refuses the file. On a alone, every open lands
+#   the default            adaptive_federation unset, which is auto: `ucache settings` says auto;
+#                          the regional reports a redirector's role, so the switch is on for
+#                          its files: on a, b and c, a refusing, every open succeeds (those
+#                          that landed on a made again elsewhere), and the regional was asked
+#                          its role once per process (role_queries, role_redirectors)
+#   switch off             adaptive_federation = off: a refuses the file. On a alone, every open lands
 #                          on a and fails; on a, b and c, the opens that landed on a fail
 #                          there and none is moved. The client sends no locate and the
 #                          regional logs none for the file; the positive controls are the
@@ -153,7 +158,7 @@
 #                          refuses the file): a Read and a PgRead each fail with that open's error,
 #                          which names the copies, and neither is given to the File that never
 #                          opened (neither gets the client's own answer there, "Invalid operation")
-#                          With the switch off (the default) each read gets that open's own error, the
+#                          With the switch off (set to off) each read gets that open's own error, the
 #                          server's refusal, naming no copies, and never "Invalid operation"; once the
 #                          copies are readable again, a later read (after the open's cool-down) is exact.
 #                          With the switch on, such a handle's own open makes the checks made at open
@@ -681,46 +686,60 @@ echo "$res" | grep -q 'no site could open it'; verdict "the error says no site c
 [ "$n" = 3 ]; verdict "it names all three servers ($n of 3)" $?
 records "$W/c9" | tail -1 | grep -q '"outcome":"error"'; verdict "the last record line says outcome error" $?
 
-echo; echo "=== the switch off, the default: a refuses the file"
-DEF=on
-[ -x "$BUILD/src/cli/ucache" ] && DEF=$(env -u UCACHE_ADAPTIVE_FEDERATION UCACHE_DIR="$W/c10s" "$BUILD/src/cli/ucache" settings 2>&1 | grep -i 'adaptive_federation' | head -1 | awk '{print $2}')
-echo "    the switch's default: $DEF"
-if [ "$DEF" = off ]; then
-  # First the file on a alone, which refuses it: every open lands on a (whatever the regional would choose among
-  # copies), is refused and fails. Then the file on a, b and c, a refusing: the regional chooses among them as it
-  # will (it went 30 opens without a in some runs), and each open that landed on a fails there, as it would without
-  # the cache, and no other is moved anywhere: the opens that failed are the refusals at a, one landing each.
-  FEDENV=()
-  L10A=/store/ci/f10a.bin
-  place $L10A a
-  chmod 000 "$W/data/a$L10A"
-  RL0A=$(regional_locates $L10A)
-  res=$(fuzz "$W/c10a" "$W/f10a.log" "root://127.0.0.1:$RX/$L10A" "$W/f.bin" 5 1 1 open-failover)
-  echo "$res" | tail -2 | sed 's/^/    /'
-  NRA=$(grep -c "\[127.0.0.1:$AX\] Handling error while processing kXR_open (file: $L10A,.*permission denied" "$W/f10a.log")
-  echo "$res" | grep -q '^open-failover: 5 open(s), 5 failed, 0 without exactly one completion$' && [ "$NRA" = 5 ]
-  verdict "the copy on a alone: each of 5 opens was refused at a and failed, one completion each: the refusal was felt and nothing failed over ($NRA refusals)" $?
-  [ "$(grep 'MsgHandler created' "$W/f10a.log" | grep -c 'kXR_locate ')" = 0 ] && [ "$(regional_locates $L10A)" = "$RL0A" ]
-  verdict "the copy on a alone: no kXR_locate in the client's log, none of the file in the regional's" $?
-  L10=/store/ci/f10.bin
-  place $L10 a b c
-  chmod 000 "$W/data/a$L10"
-  direct_read a $L10; r=$?; [ "$r" != 0 ]; verdict "a refuses the file" $?
-  RL0=$(regional_locates $L10)
-  res=$(fuzz "$W/c10" "$W/f10.log" "root://127.0.0.1:$RX/$L10" "$W/f.bin" 30 1 1 open-failover)
-  echo "$res" | tail -2 | sed 's/^/    /'
-  NF=$(echo "$res" | sed -n 's/^open-failover: 30 open(s), \([0-9]*\) failed, 0 without exactly one completion$/\1/p')
-  NR=$(grep -c "\[127.0.0.1:$AX\] Handling error while processing kXR_open (file: $L10,.*permission denied" "$W/f10.log")
-  NL=$(grep -c "Redirected from: root://127.0.0.1:$RX/*$L10 to: " "$W/f10.log")
-  [ -n "$NF" ] && [ "$NF" = "$NR" ] && [ "$NL" = 30 ]
-  verdict "the file on a, b and c: each open that landed on a failed there and none was moved ($NF failed, $NR refused at a, $NL landings for 30 opens)" $?
-  [ "$(grep 'MsgHandler created' "$W/f10.log" | grep -c 'kXR_locate ')" = 0 ]; verdict "no kXR_locate in the client's log" $?
-  [ "$(regional_locates $L10)" = "$RL0" ]; verdict "no locate of the file in the regional's log" $?
-  xfs 127.0.0.1:$RX locate $L10 >/dev/null 2>&1
-  [ "$(regional_locates $L10)" -gt "$RL0" ]; verdict "positive control: an xrdfs locate of the leg's own shows in the regional's log" $?
-else
-  echo "    the default is on: this leg's expectations follow the switch-on legs"
-fi
+echo; echo "=== the default, auto: through the regional, a redirector, the switch is on"
+DEF=auto
+[ -x "$BUILD/src/cli/ucache" ] && DEF=$(env -u UCACHE_ADAPTIVE_FEDERATION UCACHE_DIR="$W/c10s" "$BUILD/src/cli/ucache" settings 2>&1 | grep -i '^adaptive_federation' | head -1 | awk '{print $2}')
+[ "$DEF" = auto ]; verdict "the switch's default, as ucache settings shows it, is auto ($DEF)" $?
+# The file on a, b and c, a refusing; the reader leaves the switch unset. Each open that lands on a is made again
+# elsewhere (through the regional's list), so none fails; the regional's role was asked once per process.
+FEDENV=()
+L10D=/store/ci/f10d.bin
+place $L10D a b c
+chmod 000 "$W/data/a$L10D"
+res=$(fuzz "$W/c10d" "$W/f10d.log" "root://127.0.0.1:$RX/$L10D" "$W/f.bin" 30 1 1 open-failover)
+echo "$res" | tail -2 | sed 's/^/    /'
+NRD=$(grep -c "\[127.0.0.1:$AX\] Handling error while processing kXR_open (file: $L10D,.*permission denied" "$W/f10d.log")
+echo "    opens refused at a and made again elsewhere: $NRD (the regional chooses; it can pass a by)"
+echo "$res" | grep -q '^open-failover: clean$'
+verdict "the default: every one of 30 opens succeeded, one completion each, right bytes" $?
+RQ=$(counter "$W/c10d" role_queries); RR=$(counter "$W/c10d" role_redirectors)
+[ "$RQ" = 1 ] && [ "$RR" = 1 ]
+verdict "the default: the regional was asked once and found a redirector (role_queries $RQ, role_redirectors $RR)" $?
+
+echo; echo "=== the switch off (adaptive_federation = off): a refuses the file"
+# First the file on a alone, which refuses it: every open lands on a (whatever the regional would choose among
+# copies), is refused and fails. Then the file on a, b and c, a refusing: the regional chooses among them as it
+# will (it went 30 opens without a in some runs), and each open that landed on a fails there, as it would without
+# the cache, and no other is moved anywhere: the opens that failed are the refusals at a, one landing each.
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=off)
+L10A=/store/ci/f10a.bin
+place $L10A a
+chmod 000 "$W/data/a$L10A"
+RL0A=$(regional_locates $L10A)
+res=$(fuzz "$W/c10a" "$W/f10a.log" "root://127.0.0.1:$RX/$L10A" "$W/f.bin" 5 1 1 open-failover)
+echo "$res" | tail -2 | sed 's/^/    /'
+NRA=$(grep -c "\[127.0.0.1:$AX\] Handling error while processing kXR_open (file: $L10A,.*permission denied" "$W/f10a.log")
+echo "$res" | grep -q '^open-failover: 5 open(s), 5 failed, 0 without exactly one completion$' && [ "$NRA" = 5 ]
+verdict "the copy on a alone: each of 5 opens was refused at a and failed, one completion each: the refusal was felt and nothing failed over ($NRA refusals)" $?
+[ "$(grep 'MsgHandler created' "$W/f10a.log" | grep -c 'kXR_locate ')" = 0 ] && [ "$(regional_locates $L10A)" = "$RL0A" ]
+verdict "the copy on a alone: no kXR_locate in the client's log, none of the file in the regional's" $?
+L10=/store/ci/f10.bin
+place $L10 a b c
+chmod 000 "$W/data/a$L10"
+direct_read a $L10; r=$?; [ "$r" != 0 ]; verdict "a refuses the file" $?
+RL0=$(regional_locates $L10)
+res=$(fuzz "$W/c10" "$W/f10.log" "root://127.0.0.1:$RX/$L10" "$W/f.bin" 30 1 1 open-failover)
+echo "$res" | tail -2 | sed 's/^/    /'
+NF=$(echo "$res" | sed -n 's/^open-failover: 30 open(s), \([0-9]*\) failed, 0 without exactly one completion$/\1/p')
+NR=$(grep -c "\[127.0.0.1:$AX\] Handling error while processing kXR_open (file: $L10,.*permission denied" "$W/f10.log")
+NL=$(grep -c "Redirected from: root://127.0.0.1:$RX/*$L10 to: " "$W/f10.log")
+[ -n "$NF" ] && [ "$NF" = "$NR" ] && [ "$NL" = 30 ]
+verdict "the file on a, b and c: each open that landed on a failed there and none was moved ($NF failed, $NR refused at a, $NL landings for 30 opens)" $?
+[ "$(grep 'MsgHandler created' "$W/f10.log" | grep -c 'kXR_locate ')" = 0 ]; verdict "no kXR_locate in the client's log" $?
+[ "$(regional_locates $L10)" = "$RL0" ]; verdict "no locate of the file in the regional's log" $?
+xfs 127.0.0.1:$RX locate $L10 >/dev/null 2>&1
+[ "$(regional_locates $L10)" -gt "$RL0" ]; verdict "positive control: an xrdfs locate of the leg's own shows in the regional's log" $?
+
 echo; echo "=== reads: a failed origin read is read again at another site"
 head -c 8388608 /dev/urandom > "$W/f8.bin"; chmod 644 "$W/f8.bin"
 place8() { # LFN server... (8 MiB)
@@ -1212,7 +1231,7 @@ n=0; for p in $AX $BX $CX; do echo "$RES" | grep '^MSG read' | grep -q "(127.0.0
 ! echo "$RES" | grep -q 'Invalid operation'
 verdict "lost trust: no read got the client's answer for a File that never opened (Invalid operation): none was given to it" $?
 
-echo; echo "=== the same with the switch off (the default)"
+echo; echo "=== the same with the switch off (adaptive_federation = off)"
 # The same fault with adaptive_federation off: each request (a Read, a VectorRead, a Stat, an Fcntl, a Visa, then a
 # PgRead) gets the handle's own open's error, the server's refusal,
 # which is what the reader's open would have got without the cache; no copy is named and no other is tried. Then
@@ -1221,7 +1240,7 @@ echo; echo "=== the same with the switch off (the default)"
 L=/store/ci/degraded-off.root
 placew $L a b c
 DO="$W/c-degraded-off"
-FEDENV=(UCACHE_REVALIDATE_S=3600)
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=off UCACHE_REVALIDATE_S=3600)
 res=$(fuzz "$DO" "$W/degraded-off-fill.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
 echo "$res" | grep -q '^open-failover: clean$' && [ -n "$(find "$DO" -name '*.meta' -print -quit)" ] && [ -n "$(find "$DO" -name '*.val' -print -quit)" ]
 verdict "lost trust, switch off: the first run read the file and left its entry and its freshness marker" $?
@@ -1236,7 +1255,7 @@ cat > "$W/degraded-off-restore.sh" <<DEGSH
 for s in a b c; do chmod 666 "$W/data/\$s$L"; done
 DEGSH
 chmod 755 "$W/degraded-off.sh" "$W/degraded-off-restore.sh"
-FEDENV=(UCACHE_REVALIDATE_S=3600 UCACHE_CUT_CMD=$W/degraded-off.sh UCACHE_RESTORE_CMD=$W/degraded-off-restore.sh)
+FEDENV=(UCACHE_ADAPTIVE_FEDERATION=off UCACHE_REVALIDATE_S=3600 UCACHE_CUT_CMD=$W/degraded-off.sh UCACHE_RESTORE_CMD=$W/degraded-off-restore.sh)
 RES=$(fuzz "$DO" "$W/degraded-off.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 read-failover degradedoff)
 echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-600
 recs "$DO" open | tail -n +$((N0 + 1)) | sed 's/^/    rec: /' | cut -c1-230

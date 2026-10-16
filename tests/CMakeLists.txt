@@ -39,6 +39,7 @@ add_executable(ucache-unit-tests
   unit/fault_test.cc
   unit/open_retry_test.cc
   unit/open_policy_test.cc
+  unit/server_role_test.cc
   unit/root_check_test.cc
   unit/executor_test.cc
   unit/copyguard_test.cc
@@ -56,6 +57,7 @@ add_executable(ucache-unit-tests
   ${CMAKE_SOURCE_DIR}/src/plugin/OpenRetry.cc  # pure policy TU (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/OpenPolicy.cc # what an open's answer says (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/RootFormat.cc # a ROOT file's header and labels (pure parsing)
+  ${CMAKE_SOURCE_DIR}/src/plugin/ServerRole.cc # a server's role and the table of them (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/Executor.cc   # thread pool (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/OriginInFlight.cc # per-server read counts (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/cli/RunLog.cc        # run reader (pure file parsing)

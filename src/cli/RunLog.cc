@@ -1,6 +1,7 @@
 #include "RunLog.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
@@ -157,6 +158,20 @@ void loadCounters(const std::string& path, Run& r) {
   r.startMs = fieldU64(last, "start_ms");
   r.endMs = fieldU64(last, "ts_ms");
   r.runSettings = fieldStr(last, "run_settings");
+  {
+    std::string hosts = fieldStr(last, "redirector_hosts");
+    for (char& c : hosts)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    size_t at = 0;
+    while (at < hosts.size()) {
+      size_t end = hosts.find(' ', at);
+      if (end == std::string::npos)
+        end = hosts.size();
+      if (end > at)
+        r.redirectorHosts.insert(hosts.substr(at, end - at));
+      at = end + 1;
+    }
+  }
   {
     const std::string src = fieldStr(last, "counter_source");
     if (src == "perf" || src == "rusage")
@@ -358,9 +373,9 @@ bool recordsKeyedByName(const std::string& statsDir, const std::string& prefixes
   return found;
 }
 
-bool federationRun(const std::string& runSettings) {
+namespace {
+bool hasToken(const std::string& runSettings, const std::string& tok) {
   // Tokens are separated by single spaces (docs/STATS.md `run_settings`).
-  const std::string tok = "adaptive_federation=on";
   for (size_t at = runSettings.find(tok); at != std::string::npos;
        at = runSettings.find(tok, at + 1)) {
     const size_t end = at + tok.size();
@@ -369,6 +384,15 @@ bool federationRun(const std::string& runSettings) {
       return true;
   }
   return false;
+}
+} // namespace
+
+bool federationRun(const std::string& runSettings) {
+  return hasToken(runSettings, "adaptive_federation=on");
+}
+
+bool federationAutoRun(const std::string& runSettings) {
+  return hasToken(runSettings, "adaptive_federation=auto");
 }
 
 std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiveDir,
@@ -450,8 +474,16 @@ std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiv
     // line) -- names the host the file was asked of, the host of its URL.
     // A record keyed by a logical name (lfn:) has no host in its key: it names its data server,
     // whatever adaptive_federation said.
-    const bool byServer = federationRun(r.runSettings);
+    // A run with adaptive_federation = auto names the data server for the files of a URL whose host
+    // reported a redirector's role (its counter line's `redirector_hosts`), and the URL's host for
+    // the others, the switch off for them.
+    const bool byServerAll = federationRun(r.runSettings);
+    const bool autoRun = federationAutoRun(r.runSettings);
     for (const auto& [k, f] : r.files) {
+      std::string lowHost = f.urlHost;
+      for (char& c : lowHost)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      const bool byServer = byServerAll || (autoRun && r.redirectorHosts.count(lowHost));
       const bool named = k.compare(0, 4, "lfn:") == 0 && f.urlHost.empty();
       const std::string h = (byServer || named) && !f.dataServer.empty() ? f.dataServer
                             : !f.urlHost.empty()                   ? f.urlHost

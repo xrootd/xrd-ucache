@@ -134,6 +134,11 @@ struct Stats {
   // (none configured, an error, no answer in time): those servers' site is their domain.
   std::atomic<uint64_t> siteNameQueries{0};
   std::atomic<uint64_t> siteNamesMissing{0};
+  // adaptive_federation = auto: servers asked for their role, those that reported a redirector's
+  // (the switch on for their files), and those that gave none (an error, no answer in time).
+  std::atomic<uint64_t> roleQueries{0};
+  std::atomic<uint64_t> roleRedirectors{0};
+  std::atomic<uint64_t> roleUnanswered{0};
   // Requests made where no move may be waited for (a client callback thread), before their handle
   // had the file's map, made again on the open-wait pool (adaptive_federation).
   std::atomic<uint64_t> requestsParkedForParse{0};
@@ -334,6 +339,7 @@ struct StatsTotals {
            openCheckBytesKept = 0, badEntriesDropped = 0, siteNameQueries = 0,
            siteNamesMissing = 0, requestsParkedForParse = 0, siteFaultsMarked = 0,
            siteMarksCleared = 0, copyFaultsMarked = 0, markedCopiesLast = 0;
+  uint64_t roleQueries = 0, roleRedirectors = 0, roleUnanswered = 0;
   uint64_t originFailures[6] = {}; // client, site, notfound, data, expired, other
   // Histogram bucket sums (log2 µs), for CLI percentile rendering:
   std::vector<uint64_t> histHitRead, histOriginRt, histOpen, histReplicaRead, histFlushWrite,

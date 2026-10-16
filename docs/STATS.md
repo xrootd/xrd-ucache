@@ -8,6 +8,11 @@ human-readable summary of these same numbers. This file is for reading the raw
 JSON, or building tooling on it. The user guide's monitoring section explains
 how to read the printed summary.
 
+In this document "with `adaptive_federation = on`" means: for a file the
+switch is on for -- every file with `on`; with `auto`, the default, a file
+opened at a server that reports a redirector's role (USER_GUIDE.md, "Which
+files the switch is on for").
+
 ## Which number answers which question
 
 | question | look at |
@@ -95,13 +100,14 @@ the consumers together.
  "open_check_bytes_kept": 0, "bad_entries_dropped": 0,
  "site_name_queries": 0, "site_names_missing": 0, "requests_parked_for_parse": 0,
  "site_faults_marked": 0, "site_marks_cleared": 0, "copy_faults_marked": 0,
- "marked_copies_last": 0,
+ "marked_copies_last": 0, "role_queries": 0, "role_redirectors": 0, "role_unanswered": 0,
  "size_disagreements": 0, "name_size_mismatches": 0,
  "origin_checks_passed": 0, "origin_checks_failed": 0, "origin_checks_none": 0,
  "origin_checks_unjudged": 0, "origin_checks_not_examined": 0,
  "entries": [{"key": "root://host:1094/path", "file_size": 0,
               "cached_bytes": 0, "page_size": 4096}],
- "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ... adaptive_federation=off"}
+ "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ... adaptive_federation=auto",
+ "redirector_hosts": "cms-redirector.example.org"}
 ```
 
 Fields are added at the end of a line, never in the middle, and under names
@@ -298,6 +304,19 @@ ones included, so a run with caching disabled shows its origin failures too.
   process (again 5 minutes after a query that got no answer), and the asks
   that gave no name (none configured, an error, or no answer within 5 s):
   such a server's site is its domain.
+- `role_queries`, `role_redirectors`, `role_unanswered` — with
+  `adaptive_federation = auto` (the default; USER_GUIDE.md, "Which files the
+  switch is on for"): servers asked what they are (their login flags, and for
+  one that says manager there its configured role), at the first open of a
+  file there, once per server and process (an open the cache answers from a
+  trusted entry asks nothing); those found to be a redirector, which turns the
+  switch on for their files; and those that gave no answer (an error, or none
+  within 5 s), whose files are read as with the switch off. The servers asked
+  and counted in neither are not redirectors (a data server, a proxy, an EOS
+  instance).
+- `redirector_hosts` (a string, on the counter line after `run_settings`, only
+  when there is one) — with `auto`, the hosts (without the port) that reported
+  a redirector's role in this process, one space between them.
 - `site_faults_marked`, `site_marks_cleared`, `copy_faults_marked`,
   `marked_copies_last` — with `adaptive_federation = on` (USER_GUIDE.md,
   "Remembering sources that failed"): servers marked in `<dir>/sources` (a
@@ -311,10 +330,10 @@ origin is reached, as the plugin found them at load, one string:
 `v1 check_origin_integrity=on|off`, then `xrdcl.<name>=<value>/<source>` for
 the XRootD client's `ConnectionWindow`, `ConnectionRetry`, `StreamErrorWindow`,
 `RequestTimeout`, `StreamTimeout` and `TimeoutResolution`, then
-`adaptive_federation=on|off`. The source is `env` when the `XRD_<NAME>`
+`adaptive_federation=on|off|auto`. The source is `env` when the `XRD_<NAME>`
 variable is set, `default` when the value is the client's built-in one, and
 `client` when it differs and no variable is set (a `client.conf`, or the
-application). With `adaptive_federation = on`, the first three say `ucache`
+application). With `adaptive_federation = on` (not `auto`), the first three say `ucache`
 when uCache set them (USER_GUIDE.md), `kept` when uCache kept the value of an
 `XRD_<NAME>` variable instead or the client refused uCache's write, and
 `client` when it kept a `client.conf` value. With `logical_name_prefixes` set
@@ -733,8 +752,10 @@ reading was re-reading, and what the cache disk was asked to do.
 
   `ucache summary`, `history` and `publish` take a file's origin from the
   host in the file's URL, as they always have, unless the run had
-  `adaptive_federation = on` (its counter line's `run_settings` say so). For
-  such a run they take it from `data_server` when it names one, and from the
+  `adaptive_federation = on` (its counter line's `run_settings` say so), or
+  `auto` and the file's URL names a host that reported a redirector's role
+  (the counter line's `redirector_hosts`): the switch was on for the file. For
+  such a file they take it from `data_server` when it names one, and from the
   host in the file's URL otherwise (files that read nothing from the origin):
   for a file opened through a redirector the origin is then the data server
   the reads went to, and `history --json` and `publish` show that server's

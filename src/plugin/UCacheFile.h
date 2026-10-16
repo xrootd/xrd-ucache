@@ -118,6 +118,16 @@ struct HandleState {
   bool cpuBlended = false;
   std::shared_ptr<CacheStore> store; // process-wide; null => never cache
   std::string url;
+  // adaptive_federation for this handle's file: on for every handle with the
+  // switch on; with `auto`, decided at Open from the role of the server the
+  // URL names (ServerRole.h), before anything reads it, and never changed
+  // after; off otherwise. Read wherever the switch's behaviour is the file's
+  // (fed()). A forked child keeps the parent's decision for a handle it
+  // inherits.
+  std::atomic<bool> federation{false};
+  bool fed() const { return federation.load(std::memory_order_relaxed); }
+  // With `auto`: set once the open has decided `federation`.
+  std::atomic<bool> fedDecided{false};
   // The timeout the reader gave its Open (0 = the client's default): with
   // adaptive_federation on, the cache's own opens of this handle honour a
   // shorter one (OpenPolicy.h openDeadlineS); with it off it is unused, and
@@ -655,6 +665,12 @@ XrdCl::XRootDStatus originCheckRefused(HandleState& st, ServerTally* tally, cons
 
 // Process-wide config/store accessors (UCacheFactory.cc).
 const Config& globalConfig();
+// check_origin_integrity for the file of handle `st`: the setting, or forced by
+// adaptive_federation for a file the switch is on for (every file with `on`,
+// the files from a redirector with `auto`). Null `st`: the setting alone.
+inline bool checksOrigin(const HandleState* st) {
+  return globalConfig().checkOriginIntegrity || (st && st->fed());
+}
 std::shared_ptr<CacheStore> globalStore();
 // XrdCl's RequestTimeout as the plugin found it at load: what an origin
 // request given no timeout of its own is allowed.

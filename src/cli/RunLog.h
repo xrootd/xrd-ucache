@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,9 @@ struct Run {
   // The origin settings the run had (docs/STATS.md `run_settings`), from the
   // last counter line; empty on records written before it existed.
   std::string runSettings;
+  // adaptive_federation = auto: the hosts that reported a redirector's role in this run (the
+  // counter line's `redirector_hosts`), lower-cased.
+  std::set<std::string> redirectorHosts;
   // perf only: the share of the time the counters were enabled that they were
   // actually counting, over the whole run -- from the last counter line, like
   // the counts, which are already scaled up by it. Negative when that line
@@ -382,6 +386,9 @@ bool recordsKeyedByName(const std::string& statsDir, const std::string& prefixes
 // Whether a run's `run_settings` (docs/STATS.md) say adaptive_federation was
 // on. False for an empty string: a record written before the field existed.
 bool federationRun(const std::string& runSettings);
+// Whether they say adaptive_federation = auto (the switch on for the files of
+// the hosts the run line lists in `redirector_hosts`).
+bool federationAutoRun(const std::string& runSettings);
 
 // What the cache bought, measured against a BASELINE run -- the same work done
 // once with the cache out of the loop (UCACHE_DISABLE=1), which the plugin

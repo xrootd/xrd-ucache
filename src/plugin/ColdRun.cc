@@ -653,8 +653,10 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   cf->cacheDir = cfg.cacheDir;
   cf->entry = entry;
   cf->keepOriginals = cfg.recompressKeepOriginals;
-  cf->checkConverted = cfg.recompress || cfg.checkOriginIntegrity;
-  cf->checkAll = cfg.checkOriginIntegrity;
+  // check_origin_integrity as the handle that makes the slot run has it (forced for a file
+  // adaptive_federation is on for): a store shared by handles of other decisions keeps this one's.
+  cf->checkConverted = cfg.recompress || checksOrigin(st.get());
+  cf->checkAll = checksOrigin(st.get());
   cf->inUseSeconds = cfg.inUseSeconds;
   cf->fsync = cfg.fsync != FsyncMode::kOff;
   cf->rule = ReadRule::forFile(key.key, size);

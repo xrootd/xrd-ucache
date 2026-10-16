@@ -76,6 +76,7 @@ function(ucache_add_plugin target include_dir library suffix)
     OpenRetry.cc
     OriginInFlight.cc
     RootFormat.cc
+    ServerRole.cc
     UCacheFactory.cc
     UCacheFile.cc
   )

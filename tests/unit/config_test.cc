@@ -57,6 +57,11 @@ TEST(Config, Defaults) {
   EXPECT_FALSE(c.recompressKeepOriginals); // a converted basket is not also kept
   EXPECT_TRUE(c.cacheDir.empty()); // deliberately NO default cache dir
   EXPECT_TRUE(c.sources.empty());  // nothing explicitly set anywhere
+  // adaptive_federation is auto by default: on for the files of a redirector, decided per file;
+  // the check is not forced for the process.
+  EXPECT_EQ(c.adaptiveFederation, FederationMode::kAuto);
+  EXPECT_EQ(c.valueOf("adaptive_federation"), "auto");
+  EXPECT_FALSE(c.checkOriginIntegrity);
 }
 
 TEST(Config, ParsesEverything) {
@@ -224,14 +229,15 @@ TEST(Config, AdaptiveFederationForcesTheIntegrityCheck) {
   EnvGuard g;
   {
     Config c = Config::fromEnv();
-    EXPECT_FALSE(c.adaptiveFederation);
-    EXPECT_EQ(c.valueOf("adaptive_federation"), "off");
+    EXPECT_TRUE(c.federationPossible()) << "auto by default";
+    EXPECT_FALSE(c.federationEverywhere());
+    EXPECT_EQ(c.valueOf("adaptive_federation"), "auto");
     EXPECT_EQ(c.sources.count("adaptive_federation"), 0u);
   }
   std::map<std::string, std::string> conf = {{"adaptive_federation", "on"}};
   {
     Config c = Config::fromEnv(&conf);
-    EXPECT_TRUE(c.adaptiveFederation);
+    EXPECT_TRUE(c.federationEverywhere());
     EXPECT_EQ(c.valueOf("adaptive_federation"), "on");
     EXPECT_EQ(c.sources.at("adaptive_federation"), "conf");
     EXPECT_TRUE(c.checkOriginIntegrity);
@@ -241,7 +247,7 @@ TEST(Config, AdaptiveFederationForcesTheIntegrityCheck) {
   ::setenv("UCACHE_ADAPTIVE_FEDERATION", "1", 1);
   {
     Config c = Config::fromEnv(&conf);
-    EXPECT_TRUE(c.adaptiveFederation);
+    EXPECT_TRUE(c.federationEverywhere());
     EXPECT_EQ(c.sources.at("adaptive_federation"), "env");
     EXPECT_TRUE(c.checkOriginIntegrity) << "no layer undoes the forcing";
     EXPECT_EQ(c.sources.at("check_origin_integrity"), "forced by adaptive_federation");
@@ -262,19 +268,68 @@ TEST(Config, AdaptiveFederationForcesTheIntegrityCheck) {
   ::setenv("UCACHE_ADAPTIVE_FEDERATION", "off", 1);
   {
     Config c = Config::fromEnv();
-    EXPECT_FALSE(c.adaptiveFederation);
+    EXPECT_FALSE(c.federationPossible());
     EXPECT_FALSE(c.checkOriginIntegrity);
   }
+}
+
+// adaptive_federation = auto: from the conf, the env or the state file; the
+// check is not forced for the process (it is per file), and `settings` says so.
+TEST(Config, AdaptiveFederationAuto) {
+  EnvGuard g;
+  std::map<std::string, std::string> conf = {{"adaptive_federation", "auto"}};
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_EQ(c.adaptiveFederation, FederationMode::kAuto);
+    EXPECT_FALSE(c.federationEverywhere());
+    EXPECT_TRUE(c.federationPossible());
+    EXPECT_EQ(c.valueOf("adaptive_federation"), "auto");
+    EXPECT_EQ(c.sources.at("adaptive_federation"), "conf");
+    EXPECT_FALSE(c.checkOriginIntegrity) << "forced per file, not for the process";
+    EXPECT_EQ(c.valueOf("check_origin_integrity"), "off");
+    EXPECT_EQ(c.sources.count("check_origin_integrity"), 0u) << "`settings` says what auto forces";
+  }
+  conf = {{"adaptive_federation", "auto"}, {"check_origin_integrity", "on"}};
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_TRUE(c.checkOriginIntegrity);
+    EXPECT_EQ(c.sources.at("check_origin_integrity"), "conf");
+  }
+  conf = {{"adaptive_federation", "on"}};
+  ::setenv("UCACHE_ADAPTIVE_FEDERATION", "auto", 1);
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_EQ(c.adaptiveFederation, FederationMode::kAuto) << "the environment wins";
+    EXPECT_EQ(c.sources.at("adaptive_federation"), "env");
+    EXPECT_FALSE(c.checkOriginIntegrity);
+  }
+  ::setenv("UCACHE_ADAPTIVE_FEDERATION", "bogus", 1);
+  {
+    Config c = Config::fromEnv();
+    EXPECT_EQ(c.adaptiveFederation, FederationMode::kOff) << "a value it does not know is off";
+  }
+  ::unsetenv("UCACHE_ADAPTIVE_FEDERATION");
+  conf = {{"adaptive_federation", "auto"}};
+  Config a = Config::fromEnv(&conf);
+  const std::string note = a.setNote("check_origin_integrity", "off");
+  EXPECT_NE(note.find("auto forces it on for them"), std::string::npos) << note;
+  Config plain = Config::fromEnv();
+  const std::string set = plain.setNote("adaptive_federation", "auto");
+  EXPECT_NE(set.find("query config role"), std::string::npos) << set;
+  EXPECT_NE(set.find("a site's own redirector included"), std::string::npos) << set;
+  EXPECT_EQ(set.find("connection window 31 s"), std::string::npos) << set;
 }
 
 // The notes `ucache set` prints: turning the check off while a switch forces it
 // says it stays on, and turning the switch on names the client settings.
 TEST(Config, SetNotes) {
   EnvGuard g;
-  Config plain = Config::fromEnv();
+  std::map<std::string, std::string> offConf = {{"adaptive_federation", "off"}};
+  Config plain = Config::fromEnv(&offConf);
   EXPECT_EQ(plain.setNote("check_origin_integrity", "off"), "");
   EXPECT_EQ(plain.setNote("check_origin_integrity", "on"), "");
-  EXPECT_EQ(plain.setNote("adaptive_federation", "off"), "");
+  const std::string swOff = plain.setNote("adaptive_federation", "off");
+  EXPECT_NE(swOff.find("as in uCache 1.4.0"), std::string::npos) << swOff;
   const std::string on = plain.setNote("adaptive_federation", "on");
   EXPECT_NE(on.find("connection window 31 s"), std::string::npos) << on;
   EXPECT_NE(on.find("connection retries 2"), std::string::npos) << on;
@@ -290,7 +345,7 @@ TEST(Config, SetNotes) {
   EXPECT_NE(off.find("stays on while adaptive_federation = on"), std::string::npos) << off;
   EXPECT_EQ(fed.setNote("check_origin_integrity", "on"), "");
 
-  conf = {{"recompress", "on"}};
+  conf = {{"recompress", "on"}, {"adaptive_federation", "off"}};
   Config rec = Config::fromEnv(&conf);
   EXPECT_EQ(rec.setNote("check_origin_integrity", "false"), "")
       << "recompress = on does not force the check: turning it off needs no note";

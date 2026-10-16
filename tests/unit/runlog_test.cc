@@ -572,6 +572,11 @@ TEST(Signature, FederationRunReadsTheSwitchFromRunSettings) {
   EXPECT_FALSE(federationRun(kSettingsOff));
   EXPECT_FALSE(federationRun(""));
   EXPECT_FALSE(federationRun("v1 adaptive_federation=online"));
+  EXPECT_FALSE(federationRun("v1 adaptive_federation=auto"));
+  EXPECT_TRUE(federationAutoRun("v1 adaptive_federation=auto"));
+  EXPECT_TRUE(federationAutoRun("v1 adaptive_federation=auto logical_names=on/abcdef01"));
+  EXPECT_FALSE(federationAutoRun("v1 adaptive_federation=automatic"));
+  EXPECT_FALSE(federationAutoRun(kSettingsOn));
   EXPECT_FALSE(federationRun("v1 xadaptive_federation=on"));
 }
 

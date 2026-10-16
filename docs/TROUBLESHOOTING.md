@@ -6,6 +6,11 @@ activation (whichever way you configured it), and prints `[ OK ]` / `[WARN]` /
 the whole chain dynamically (cold + warm pass; warm must be origin-free).
 Most issues below map to one of their lines.
 
+In this document "with `adaptive_federation = on`" means: for a file the
+switch is on for -- every file with `on`; with `auto`, the default, a file
+opened at a server that reports a redirector's role (USER_GUIDE.md, "Which
+files the switch is on for").
+
 To see what uCache does, turn on debug messages the way you would for the
 XRootD client: `XRD_LOGLEVEL=Debug XRD_LOGFILE=/tmp/xrd.log <your job>` puts
 uCache's messages (topic `UCache`) beside the client's. Or
@@ -306,12 +311,40 @@ Through a redirector, an open that passes the deadline at one site is made
 again at another (next entry); the warning is then followed by
 `trying another site`.
 
-With the switch off (the default) there is no deadline: the job's own open
+With the switch off for the file (`adaptive_federation = off`, or with the
+default, `auto`, a file whose URL names a server that is not a redirector)
+there is no deadline: the job's own open
 passes the job's own timeout, or none, exactly as without uCache, and the opens
 uCache makes of the origin carry none (they wait for the client's
 `RequestTimeout`), so the client's own
 recovery (at a redirector, going on to another server after a connection
 fails) has all the time it has without uCache.
+
+## Is the switch on for my files? (`adaptive_federation = auto`)
+
+With the default, `auto`, the switch is on for a file whose URL names a
+redirector and off for every other (USER_GUIDE.md, "Which files the switch is
+on for"). `log = info` (or `XRD_LOGLEVEL=Info`) names what each server said,
+once per job: `adaptive_federation = auto: <host:port> reports the role
+'manager (login: manager)', a redirector's: the files opened there are read
+with the switch on`, or `... not a redirector's ...`, or `... gave no role (no
+answer within 5 s) ...`. `ucache stats` counts them (`role_queries`,
+`role_redirectors`, `role_unanswered`).
+
+- **A site's own redirector turns it on.** It says `manager` as a federation's
+  redirectors do: it too sends opens to several servers. Set
+  `adaptive_federation = off` to read every file as uCache 1.4.0 did.
+- **An EOS instance leaves it off.** EOS says `manager` at login but `none` as
+  its configured role, and uCache takes the configured role.
+- **The first open of a job waited about 5 s.** The server the URL names did
+  not answer the question in time (it was stopped or overloaded); the switch is off for its files for the rest of the job, and
+  later opens there do not wait again. An open the cache answers from a trusted
+  entry never asks.
+- **A warm job reads with the switch off.** A job whose opens are all answered
+  from trusted entries asks no server, and the switch is off for those handles
+  (a handle the cache answers does not reach the network for its open). It
+  takes the switch on for a server this job has already found to be a
+  redirector.
 
 ## One server refuses or fails and stops the job
 
@@ -606,7 +639,7 @@ meanwhile), that read opens the file at an origin, with the failover of an open.
 fails at every copy, each read and `Stat` of the file gets that open's error, which names the
 copies (`no copy could serve the read: ...`), and nothing is sent to an origin on the file
 until an open succeeds: the first read after a second opens it again. With
-`adaptive_federation` off (the default) the same holds, with no other copy tried: each read
+the switch off for the file (`off`, or a file `auto` leaves off) the same holds, with no other copy tried: each read
 and `Stat` gets the error the origin gave that open (for example `permission denied`), the
 one a job without uCache would have got at its open. (In uCache 1.4.0 and earlier, such
 reads got the XRootD client's `[ERROR] Invalid operation`, and a page read there could

@@ -715,7 +715,8 @@ int runInnerRace(const char* url, const char* local, uint64_t cycles, int racers
 // as any connection failure does; the second, of a second handle in the same
 // process, is the one refused at once.
 //
-// With adaptive_federation off (the default) a handle the cache serves answers
+// With adaptive_federation off (or auto, the default, when the URL names a
+// server that is not a redirector) a handle the cache serves answers
 // as the client does without uCache: the first open's failure comes through its
 // handler (once, with a host list, on another thread than the one in Open), and
 // the second Open returns the error itself, with no completion ever after. With

@@ -246,7 +246,9 @@ const char* gClientSettingSource[kClientSettingCount] = {nullptr, nullptr, nullp
 // the client's behaviour is the program's, and stays so. Runs before the first
 // connection: a connection copies these values when it is created.
 void applyClientSettings(const Config& cfg) {
-  if (!cfg.adaptiveFederation || cfg.disable || cfg.cacheDir.empty() ||
+  // Only with `on`: these are the process's, and with `auto` a file the switch is off for must
+  // be read as with it off.
+  if (!cfg.federationEverywhere() || cfg.disable || cfg.cacheDir.empty() ||
       (cfg.copyDetect && copyProgramSignal() != CopySignal::kNone))
     return;
   XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv();
@@ -319,7 +321,9 @@ std::string runSettings(const Config& cfg) {
       gRequestTimeoutS.store(v, std::memory_order_relaxed);
   }
   out += " adaptive_federation=";
-  out += cfg.adaptiveFederation ? "on" : "off";
+  out += cfg.adaptiveFederation == FederationMode::kAuto ? "auto"
+         : cfg.federationEverywhere()                     ? "on"
+                                                          : "off";
   // With logical_name_prefixes set: files are keyed by logical name, and a hash of the prefixes that
   // name them (two runs keyed by different prefixes key one file two ways). No token when unset.
   if (cfg.keys.logical())
@@ -453,9 +457,12 @@ void initGlobals() {
   UCACHE_INFO("xrd-ucache plugin initialized (dir=%s page=%u disable=%d)",
               gConfig->cacheDir.c_str(), gConfig->pageSize, gConfig->disable ? 1 : 0);
 #ifndef UCACHE_HAVE_COLDRUN
-  if (gConfig->checkOriginIntegrity)
-    UCACHE_INFO("check_origin_integrity is on, but this build has no codec libraries: nothing "
-                "fetched is checked, and what is fetched is kept as without the setting");
+  if (gConfig->checkOriginIntegrity || gConfig->federationPossible())
+    UCACHE_INFO("check_origin_integrity is on%s, but this build has no codec libraries: nothing "
+                "fetched is checked, and what is fetched is kept as without the setting",
+                gConfig->checkOriginIntegrity ? ""
+                                              : " (adaptive_federation = auto, for the files "
+                                                "from a redirector)");
   if (gConfig->maxReadFraction == 0)
     UCACHE_WARN("max_read_fraction = 0, but this build has no codec libraries: it cannot read a "
                 "file's records, so no file is read straight from the origin and every file's "

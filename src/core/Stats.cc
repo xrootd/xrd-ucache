@@ -192,6 +192,9 @@ std::string Stats::toJsonBody() const {
   f("bad_entries_dropped", badEntriesDropped);
   f("site_name_queries", siteNameQueries);
   f("site_names_missing", siteNamesMissing);
+  f("role_queries", roleQueries);
+  f("role_redirectors", roleRedirectors);
+  f("role_unanswered", roleUnanswered);
   f("requests_parked_for_parse", requestsParkedForParse);
   f("site_faults_marked", siteFaultsMarked);
   f("site_marks_cleared", siteMarksCleared);
@@ -340,6 +343,9 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.badEntriesDropped += extractU64(last, "bad_entries_dropped");
     t.siteNameQueries += extractU64(last, "site_name_queries");
     t.siteNamesMissing += extractU64(last, "site_names_missing");
+    t.roleQueries += extractU64(last, "role_queries");
+    t.roleRedirectors += extractU64(last, "role_redirectors");
+    t.roleUnanswered += extractU64(last, "role_unanswered");
     t.requestsParkedForParse += extractU64(last, "requests_parked_for_parse");
     t.siteFaultsMarked += extractU64(last, "site_faults_marked");
     t.siteMarksCleared += extractU64(last, "site_marks_cleared");
