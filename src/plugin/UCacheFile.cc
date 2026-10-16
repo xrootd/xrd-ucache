@@ -973,10 +973,23 @@ void endRole(const std::shared_ptr<ServerRoles::Op>& op, const std::string& serv
              const std::shared_ptr<CacheStore>& store) noexcept try {
   ServerRoles::Kind kind;
   std::string role;
+  bool kept = false;
   {
     std::lock_guard<std::mutex> g(op->mu);
     kind = op->kind;
     role = op->role;
+    kept = op->kept;
+  }
+  // A renewal that got no answer: the earlier answer stands (and its saved verdict is left as it
+  // is); counted as no answer, and tried again after a short pause.
+  if (kept) {
+    if (store)
+      store->stats().roleUnanswered.fetch_add(1, std::memory_order_relaxed);
+    UCACHE_INFO("adaptive_federation = auto: %s gave no answer when asked again: its earlier role "
+                "'%s' stands (%s)",
+                server.c_str(), role.c_str(),
+                kind == ServerRoles::Kind::kRedirector ? "a redirector's" : "not a redirector's");
+    return;
   }
   // An answer (never "no answer") is saved for the other processes of the cache, off this thread.
   if ((kind == ServerRoles::Kind::kRedirector || kind == ServerRoles::Kind::kOther) && store &&
@@ -1147,9 +1160,10 @@ bool mayWaitForMove(); // below
 //    (ServerVerdicts.h), whatever its age; with neither, the file is not decided yet (`decided`
 //    false): it is decided before its first access to the origin (decideFederationLate).
 //  - kAsk (an open of the origin, or the first access of an undecided handle): what this process
-//    knows, unless it is older than the renewal age (kRoleRenewS: an answer, a saved verdict, no
-//    answer alike); else a verdict saved less than that age ago; else the server is asked (bounded,
-//    ServerRole.h), and what it answers is saved for the other processes of the cache.
+//    knows, else the verdict saved in the cache directory, unless it is older than the renewal age
+//    (kRoleRenewS: an answer, a saved verdict, no answer alike), when the server is asked again
+//    (bounded, ServerRole.h); with no outcome at all the server is asked. A new answer is saved for
+//    the other processes of the cache; a renewal that gets no answer keeps the earlier answer.
 enum class RoleAsk : uint8_t { kAsk, kKnownOnly };
 struct FedDecision {
   bool on = false;
@@ -1176,11 +1190,16 @@ static void seedSavedRole(const std::string& server, uint64_t maxAgeS) noexcept 
   const uint64_t age = now > r.savedS ? now - r.savedS : 0;
   if (age > maxAgeS)
     return;
-  if (roleTable().roles->seed(server, r.redirector, r.role, age))
+  if (roleTable().roles->seed(server, r.redirector, r.role, age)) {
+    // A redirector's saved verdict counts for the readouts as an asked one (redirector_hosts).
+    if (r.redirector)
+      if (const auto store = globalStore())
+        store->noteRedirectorHost(server);
     UCACHE_DEBUG("adaptive_federation = auto: %s taken as %s from the cache's saved verdicts (%s, "
                  "%llu s old)",
                  server.c_str(), r.redirector ? "a redirector" : "not a redirector", r.role.c_str(),
                  static_cast<unsigned long long>(age));
+  }
 } catch (...) {
 }
 static FedDecision autoFederation(const std::string& url, bool relayOnly, RoleAsk how,
@@ -1217,8 +1236,10 @@ static FedDecision autoFederation(const std::string& url, bool relayOnly, RoleAs
                                "the origin");
     return out;
   }
+  // A saved verdict, whatever its age: younger than the renewal age it is taken as it is; older,
+  // it is renewed (asked again), and stands when the renewal gets no answer.
   if (!roles.known(server).op)
-    seedSavedRole(server, gRoleRenewS);
+    seedSavedRole(server, kRoleSavedForgetS);
   const std::string fsUrl = proto + "://" +
                             (u.GetUserName().empty() ? std::string() : u.GetUserName() + "@") +
                             u.GetHostName() + ":" + std::to_string(u.GetPort()) + "/";
@@ -1240,6 +1261,8 @@ static FedDecision autoFederation(const std::string& url, bool relayOnly, RoleAs
                url.c_str(),
                d.kind == ServerRoles::Kind::kPending ? "no answer yet" : d.role.c_str());
   out.on = d.federation;
+  // No outcome yet (a caller that may not wait, the question out): not decided.
+  out.decided = d.kind != ServerRoles::Kind::kPending;
   return out;
 } catch (...) {
   return FedDecision();
@@ -1260,6 +1283,15 @@ void HandleState::decideFederationLate() noexcept try {
     return;
   const FedDecision d =
       autoFederation(url, false, RoleAsk::kAsk, readerOpenTimeoutS.load(), store);
+  if (!d.decided) {
+    // A thread that may not wait, the question out: the handle stays undecided, and the request
+    // that asked keeps nothing it fetches (fedUndecided: served, never stored). The next access
+    // decides, once the answer is in or from a thread that may wait.
+    UCACHE_DEBUG("adaptive_federation = auto: %s still undecided (its server's answer is not in "
+                 "yet): this request keeps nothing it fetches",
+                 recordFile(url).c_str());
+    return;
+  }
   federation.store(d.on, std::memory_order_relaxed);
   if (!d.on) {
     std::lock_guard<std::mutex> p(propMu);
@@ -1267,10 +1299,12 @@ void HandleState::decideFederationLate() noexcept try {
     readerProps.clear();
   }
   fedDecided.store(true, std::memory_order_release);
+  fedUndecided.store(false, std::memory_order_release);
   UCACHE_DEBUG("adaptive_federation = auto: %s for %s, decided at its first access to the origin",
                d.on ? "on" : "off", recordFile(url).c_str());
 } catch (...) {
   fedDecided.store(true, std::memory_order_release); // off, as a failed decision is
+  fedUndecided.store(false, std::memory_order_release);
 }
 
 namespace {
@@ -5807,6 +5841,7 @@ class MissReadHandler : public ResponseHandler {
         t0_(t0), gateLen_(gateLen), on_(f), readerT_(readerT),
         inflight_(st_->store ? &st_->store->stats() : nullptr, issueServer(*st_, f)) {
     noteWaitTier(user_, ReaderWait::kOrigin);
+    undecided_ = st_->fedUndecided.load(std::memory_order_acquire);
   }
 
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
@@ -5996,6 +6031,10 @@ class MissReadHandler : public ResponseHandler {
     // refcount teardown (keeps TSan exact and the lifetime obvious); the user's bytes were copied
     // out of it above. Nothing of it is kept when its edge failed the check (parked readers then
     // fetch for themselves).
+    // adaptive_federation = auto, a handle still undecided when this was issued (fedUndecided):
+    // served, never kept.
+    if (undecided_)
+      keepNone = true;
     persistPages(st_, entry_, wireOff_, std::move(wireBuf_), keepNone ? 0 : got, gateLen_);
     complete(user_, okStatus(), chunkResponse(userOff_, userLen_, userBuf_));
     delete this;
@@ -6026,6 +6065,9 @@ class MissReadHandler : public ResponseHandler {
   int readerT_;
   OriginInFlight inflight_; // the origin read this handler waits for
   uint64_t arrivedUs_ = 0;  // when its answer arrived (the check may run later)
+  // adaptive_federation = auto: the handle was undecided when this was issued (fedUndecided):
+  // what it fetches is served and never kept.
+  bool undecided_ = false;
 };
 
 // Issue the rounded wire read for a single-Read miss, honoring the test-only
@@ -6202,6 +6244,7 @@ class MissVReadHandler : public ResponseHandler {
         direct_(std::move(direct)), on_(f), readerT_(readerT),
         inflight_(st_->store ? &st_->store->stats() : nullptr, issueServer(*st_, f)) {
     noteWaitTier(user_, ReaderWait::kOrigin);
+    undecided_ = st_->fedUndecided.load(std::memory_order_acquire);
   }
 
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
@@ -6380,7 +6423,7 @@ class MissVReadHandler : public ResponseHandler {
                           wireTraceFields(server, inflight_.t0, inflight_.nc));
     }
     st_->noteCacheOk();
-    if (keepNone)
+    if (keepNone || undecided_) // undecided_: as MissReadHandler::finish
       wire_.clear(); // served, and nothing of this answer is kept
     if (direct_) {
       noteDirectBytes(st_, entry_, directBytes);
@@ -6464,6 +6507,9 @@ class MissVReadHandler : public ResponseHandler {
   int readerT_;             // the reader's own timeout of the request, 0 for none
   OriginInFlight inflight_; // the origin read this handler waits for
   uint64_t arrivedUs_ = 0;  // when its answer arrived (the check may run later)
+  // adaptive_federation = auto: the handle was undecided when this was issued (fedUndecided):
+  // what it fetches is served and never kept.
+  bool undecided_ = false;
 };
 
 // Rounded [start,end) for a chunk; the rule and why it is not optional are in
@@ -6740,8 +6786,10 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
     const FedDecision d = autoFederation(url, passthroughOnly_,
                                          knownOnly ? RoleAsk::kKnownOnly : RoleAsk::kAsk,
                                          static_cast<int>(timeout), st_->store);
-    if (!d.decided)
-      return; // off until then, its properties recorded as with the switch on
+    if (!d.decided && knownOnly) { // off until then, its properties recorded as with the switch on
+      st_->fedUndecided.store(true, std::memory_order_release);
+      return;
+    }
     st_->federation.store(d.on, std::memory_order_relaxed);
     if (!d.on) {
       std::lock_guard<std::mutex> p(st_->propMu);

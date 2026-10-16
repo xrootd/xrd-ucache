@@ -313,7 +313,8 @@ ones included, so a run with caching disabled shows its origin failures too.
   switch on for their files; and those that gave no answer (an error, or none
   within 5 s), whose files are read as with the switch off. A server is asked
   again 10 minutes after its last outcome, at an open that needs it (each
-  counted). The servers asked
+  counted); a renewal that gets no answer is counted in `role_unanswered` and
+  leaves the earlier answer standing. The servers asked
   and counted in neither are not redirectors (a data server, a proxy, an EOS
   instance).
 - `redirector_hosts` (a string, on the counter line after `run_settings`, only

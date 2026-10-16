@@ -75,6 +75,22 @@ RoleVerdict roleVerdict(uint32_t flags, bool roleAnswered, const std::string& ro
   return v;
 }
 
+namespace {
+// The end of `op` (under its lock) with no answer (`why`): kNoAnswer, or, for a renewal of an
+// answer, that earlier answer kept (Op::kept).
+void endWithoutAnswer(ServerRoles::Op& op, const std::string& why) {
+  if (op.prevKind == ServerRoles::Kind::kRedirector || op.prevKind == ServerRoles::Kind::kOther) {
+    op.kind = op.prevKind;
+    op.role = op.prevRole;
+    op.saved = op.prevSaved;
+    op.kept = true;
+  } else {
+    op.kind = ServerRoles::Kind::kNoAnswer;
+    op.role = why;
+  }
+}
+} // namespace
+
 bool ServerRoles::answer(const std::shared_ptr<Op>& op, bool answered, bool redirector,
                          const std::string& role) noexcept try {
   if (!op)
@@ -83,10 +99,11 @@ bool ServerRoles::answer(const std::shared_ptr<Op>& op, bool answered, bool redi
   if (op->kind != Kind::kPending)
     return false;
   if (nowUs() > op->untilUs) { // came after the bound, which no open had seen run out yet
-    op->kind = Kind::kNoAnswer;
-    op->role = "no answer within " + std::to_string((op->boundMs + 999) / 1000) + " s";
+    endWithoutAnswer(*op, "no answer within " + std::to_string((op->boundMs + 999) / 1000) + " s");
+  } else if (!answered) {
+    endWithoutAnswer(*op, role);
   } else {
-    op->kind = !answered ? Kind::kNoAnswer : redirector ? Kind::kRedirector : Kind::kOther;
+    op->kind = redirector ? Kind::kRedirector : Kind::kOther;
     op->role = role;
   }
   op->doneUs = nowUs();
@@ -108,8 +125,9 @@ ServerRoles::Decision ServerRoles::decide(
       bool stale = false;
       if (it != ops_.end() && renewMs > 0) {
         std::lock_guard<std::mutex> g2(it->second->mu);
+        const uint64_t ageMs = it->second->kept ? std::min(renewMs, kRoleKeptRetryMs) : renewMs;
         stale = it->second->kind != Kind::kPending &&
-                nowUs() - it->second->doneUs > renewMs * 1000;
+                nowUs() - it->second->doneUs > ageMs * 1000;
       }
       if (it != ops_.end() && !stale) {
         op = it->second;
@@ -121,6 +139,12 @@ ServerRoles::Decision ServerRoles::decide(
         op = std::make_shared<Op>();
         op->untilUs = nowUs() + boundMs * 1000;
         op->boundMs = boundMs;
+        if (prev) { // a renewal: an answer it renews stands until a new answer replaces it
+          std::lock_guard<std::mutex> g2(prev->mu);
+          op->prevKind = prev->kind;
+          op->prevRole = prev->role;
+          op->prevSaved = prev->saved;
+        }
         ops_[server] = op;
         d.asked = true;
       }
@@ -144,8 +168,7 @@ ServerRoles::Decision ServerRoles::decide(
     }
     // The query's own bound is over with no answer: that is its outcome, whoever sees it first.
     if (op->kind == Kind::kPending && nowUs() >= op->untilUs) {
-      op->kind = Kind::kNoAnswer;
-      op->role = "no answer within " + std::to_string((op->boundMs + 999) / 1000) + " s";
+      endWithoutAnswer(*op, "no answer within " + std::to_string((op->boundMs + 999) / 1000) + " s");
       op->doneUs = nowUs();
       op->cv.notify_all();
       d.ended = true;

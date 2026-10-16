@@ -54,6 +54,9 @@ inline constexpr int kRoleWaitS = 5;
 // The most servers whose role is kept; a server beyond it is not asked, and
 // its files are read as with the switch off.
 inline constexpr size_t kRolesMax = 4096;
+// After a renewal that got no answer and kept the earlier answer, the renewal is tried again at
+// an open made this long after it (or after the renewal age, when that is shorter).
+inline constexpr uint64_t kRoleKeptRetryMs = 60 * 1000;
 // The longest role kept from an answer.
 inline constexpr size_t kRoleMaxLen = 64;
 
@@ -105,6 +108,13 @@ class ServerRoles {
     uint64_t boundMs = 0; // the query's bound, from its start
     uint64_t doneUs = 0;  // when it ended (steady clock); for a saved verdict, when it was saved
     bool saved = false;   // the verdict was read from the cache directory, not asked here
+    // A renewal of an answer (kRedirector or kOther): that answer, kept when the renewal gets
+    // none (an error, or no answer within the bound). `kept` then says so: the outcome is the
+    // earlier answer, and the renewal is tried again after a short pause (kRoleKeptRetryMs).
+    Kind prevKind = Kind::kPending;
+    std::string prevRole;
+    bool prevSaved = false;
+    bool kept = false;
   };
   // What decide() found for one open.
   struct Decision {
@@ -127,7 +137,8 @@ class ServerRoles {
   // that may not: a failure is an open read as with the switch off.
   // `renewMs` > 0: an outcome older than that (an answer, a saved verdict, or no
   // answer) is asked again; a caller that may not wait meanwhile takes the old
-  // outcome.
+  // outcome. A renewal of an answer that gets no answer keeps the earlier answer
+  // (Op::kept): only a new answer replaces an answer.
   Decision decide(const std::string& server, uint64_t boundMs, uint64_t waitMs, bool mayWait,
                   const std::function<bool(const std::shared_ptr<Op>&)>& start,
                   uint64_t renewMs = 0) noexcept;

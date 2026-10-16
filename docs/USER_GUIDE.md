@@ -833,7 +833,9 @@ exactly as with the switch off; an answer that comes after the 5 s changes
 nothing for the opens that went on without it. A server that gave no answer is
 asked again at an open made 10 minutes later or more, and a verdict, an answer
 of this job's or a saved one, is renewed (asked again) at an open of the origin
-made 10 minutes or more after it. A federation's top
+made 10 minutes or more after it. Only a new answer replaces a verdict: a
+renewal that gets none (the redirector slow or down just then) leaves the
+earlier answer standing, and is tried again a minute later. A federation's top
 redirector (CMS's global one says `meta manager`) and a regional one
 (`manager`) turn it on; so does **a site's own redirector**, which also says
 `manager`: it too sends opens to several servers. To read every file as with
@@ -853,7 +855,10 @@ asked. When neither knows the server (an entry filled by uCache 1.4.0, or with
 the switch off), the file is decided at its first access to the origin -- its
 first read the cache does not hold, or the cache's own open of the origin:
 the server is asked then (the same 5 s at most), before that read is made, and
-the reads the cache holds never wait for it. So the second pass of a job, which
+the reads the cache holds never wait for it. A read made where uCache may not
+wait (from inside the completion of another read) while the answer is not in
+yet leaves the file undecided: that read is served, nothing it fetches is kept,
+and a later read decides. So the second pass of a job, which
 reads other parts of files a first pass cached, has the protections for what it
 fetches. A handle that only relays (a write, a copy, the cache disabled) is not
 asked for: the switch is off for it. A handle a forked child inherits keeps the

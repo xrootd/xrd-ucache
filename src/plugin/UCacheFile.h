@@ -131,6 +131,10 @@ struct HandleState {
   // its first access to the origin (decideFederationLate).
   std::atomic<bool> fedDecided{false};
   std::mutex lateFedMu; // serializes decideFederationLate
+  // With `auto`: the handle is undecided (a trusted open whose server is not known here nor saved)
+  // and so far no access to the origin could decide it (one from a thread that may not wait, while
+  // the question was out): what its misses fetch meanwhile is served and never kept.
+  std::atomic<bool> fedUndecided{false};
   void decideFederationLate() noexcept;
   // The timeout the reader gave its Open (0 = the client's default): with
   // adaptive_federation on, the cache's own opens of this handle honour a

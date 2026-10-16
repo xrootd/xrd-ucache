@@ -370,3 +370,47 @@ TEST(ServerVerdicts, SaveFindAndParse) {
   EXPECT_TRUE(parseRoles("ucache-roles 2\nrole x:1 redirector 5 -\n").empty());
   EXPECT_EQ(serializeRoles(parsed), "ucache-roles 1\nrole x:1 redirector 5 meta%20manager\n");
 }
+
+// A renewal of an answer that gets no answer keeps the earlier answer (and is
+// said as such, `ended`); only a new answer replaces it. Renewed again after a
+// short pause.
+TEST(ServerRole, RenewalWithoutAnswerKeepsTheAnswer) {
+  ServerRoles roles;
+  auto red = [](const std::shared_ptr<ServerRoles::Op>& op) {
+    return ServerRoles::answer(op, true, true, "manager (login: manager)");
+  };
+  EXPECT_TRUE(roles.decide("g.example:1094", 5000, 5000, true, red, 50).federation);
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  auto never = [](const std::shared_ptr<ServerRoles::Op>&) { return true; };
+  const uint64_t t0 = ServerRoles::nowUs();
+  auto d = roles.decide("g.example:1094", 100, 5000, true, never, 50);
+  EXPECT_GE(msSince(t0), 90u);
+  EXPECT_TRUE(d.asked);
+  EXPECT_TRUE(d.ended);
+  EXPECT_TRUE(d.federation) << "the earlier answer stands";
+  EXPECT_EQ(d.kind, ServerRoles::Kind::kRedirector);
+  ASSERT_TRUE(d.op);
+  EXPECT_TRUE(d.op->kept);
+  // An error answer to a renewal keeps it too.
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  auto err = [](const std::shared_ptr<ServerRoles::Op>& op) {
+    return ServerRoles::answer(op, false, false, "[ERROR] Socket timeout");
+  };
+  d = roles.decide("g.example:1094", 5000, 5000, true, err, 50);
+  EXPECT_TRUE(d.federation);
+  // A new answer replaces it.
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  auto other = [](const std::shared_ptr<ServerRoles::Op>& op) {
+    return ServerRoles::answer(op, true, false, "server (login)");
+  };
+  d = roles.decide("g.example:1094", 5000, 5000, true, other, 50);
+  EXPECT_FALSE(d.federation);
+  EXPECT_FALSE(d.op->kept);
+  // A saved verdict renewed without an answer stands as well.
+  ServerRoles r2;
+  EXPECT_TRUE(r2.seed("s.example:1094", true, "manager", 3600));
+  d = r2.decide("s.example:1094", 100, 5000, true, never, 1000);
+  EXPECT_TRUE(d.federation);
+  EXPECT_TRUE(d.op->kept);
+  EXPECT_TRUE(d.op->saved);
+}

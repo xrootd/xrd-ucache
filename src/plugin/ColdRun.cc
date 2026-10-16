@@ -655,6 +655,12 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   cf->keepOriginals = cfg.recompressKeepOriginals;
   // check_origin_integrity as the handle that makes the slot run has it (forced for a file
   // adaptive_federation is on for): a store shared by handles of other decisions keeps this one's.
+  // KNOWN LIMIT (adaptive_federation = auto): a handle a trusted open left undecided (its server
+  // neither known in the process nor saved in <dir>/roles) is set up here before its decision,
+  // which comes at its first access to the origin; its slot run keeps checkAll false, so the
+  // baskets it fetches get no key-position check (with recompress = on each converted block is
+  // still checked by its own checksum). To be fixed -- decide before the slot run is set up, on a
+  // thread that may wait -- before recompress = on is a default or recommended setting.
   cf->checkConverted = cfg.recompress || checksOrigin(st.get());
   cf->checkAll = checksOrigin(st.get());
   cf->inUseSeconds = cfg.inUseSeconds;
