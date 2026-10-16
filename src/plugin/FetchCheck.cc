@@ -19,7 +19,8 @@ Executor& decodePool() {
   // an LZMA dictionary of 64 MiB of address space among them (ROOT's LZMA level 9), and a reader
   // run under a limit on its address space must not lose it to them.
   static Executor* pool = new Executor(
-      std::max(1u, std::min(usableCpus(), kMaxDecodeThreads))); // leaked, as the executor
+      std::max(1u, std::min(usableCpus(), kMaxDecodeThreads)), "uc-decode",
+      "uc-decode-timer"); // leaked, as the executor; its threads start as work needs them
   return *pool;
 }
 

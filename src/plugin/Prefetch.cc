@@ -287,7 +287,10 @@ struct Shard {
   bool running_ = false;
   explicit Shard(Shared* sh) : sh_(sh) {
     try {
-      worker_ = std::thread([this] { loop(); });
+      worker_ = std::thread([this] {
+        Executor::nameThisThread("uc-prefetch");
+        loop();
+      });
       worker_.detach();
       running_ = true;
     } catch (...) {

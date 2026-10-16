@@ -528,14 +528,14 @@ int failoverMaxSites() {
 // pool that serves cache hits and persists (Executor::instance). Built at first use, as
 // that one is: a fork finds no thread.
 Executor& moveExecutor() {
-  static Executor* exec = new Executor(4);
+  static Executor* exec = new Executor(4, "uc-move", "uc-move-timer");
   return *exec;
 }
 // The pool that gives a read its answer once its move is over: the read issued again, or the
 // failure handed to the reader's handler, which may block. Apart from the moves, so that an
 // answer never waits behind a move that is stalled.
 Executor& deliverExecutor() {
-  static Executor* exec = new Executor(2);
+  static Executor* exec = new Executor(2, "uc-deliver", "uc-deliver-tmr");
   return *exec;
 }
 // The pool on which the requests parked while a reader's open was in flight (adaptive_federation
@@ -543,7 +543,7 @@ Executor& deliverExecutor() {
 // set the handle up, which waits for the cache's disk and may read the file's own records from the
 // origin: not for a client callback thread, nor for the pools above. Built at first use.
 Executor& openWaitExecutor() {
-  static Executor* exec = new Executor(4);
+  static Executor* exec = new Executor(4, "uc-openwait", "uc-openwait-tmr");
   return *exec;
 }
 // UCACHE_TEST_OFFLINE_HOSTS=host:port,... (inert unless set): the stat an open

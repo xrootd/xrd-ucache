@@ -33,7 +33,11 @@ struct Stats;
 
 class Executor {
  public:
-  explicit Executor(unsigned threads);
+  // `threads`: the most workers it starts (one at first, one more at a post that finds none idle);
+  // `name`, `timerName`: its threads' names (at most 15 characters, as `top -H` shows them).
+  explicit Executor(unsigned threads, const char* name = "uc-pool", const char* timerName = "uc-timer");
+  // Names the calling thread (at most 15 characters kept).
+  static void nameThisThread(const char* name);
 
   void post(std::function<void()> task);
 
@@ -54,7 +58,7 @@ class Executor {
   // Process-wide instance, sized per UCACHE_THREADS (0 = the CPUs this process
   // may use: usableCpus()).
   static Executor& instance(unsigned threads = 0);
-  // The number of worker threads this executor runs.
+  // The most worker threads this executor runs (it starts them as work needs them).
   unsigned threads() const { return threads_; }
   // Whether the calling thread is one of this executor's workers (of the current fork
   // generation's pool).
@@ -87,6 +91,8 @@ class Executor {
   Core* core(); // this generation's core, built on first use
 
   const unsigned threads_;
+  const char* const name_;
+  const char* const timerName_;
   std::atomic<Core*> core_{nullptr};
   std::atomic<Stats*> stats_{nullptr};
 };

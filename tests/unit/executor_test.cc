@@ -254,7 +254,7 @@ TEST(ExecutorFork, APoolStartsNoThreadUntilItIsUsed) {
   Executor lazy(3);
   EXPECT_EQ(threadCount(), before);
   warm(lazy);
-  EXPECT_EQ(threadCount(), before + 4); // three workers and the timer, at first use
+  EXPECT_EQ(threadCount(), before + 1); // one worker at first use; more as work needs them
 }
 
 TEST(ExecutorFork, TheParentsQueuedWorkStaysInTheParent) {
@@ -321,16 +321,13 @@ struct FailAfter {
 };
 } // namespace
 
-// Some workers started, the timer not: every posted task runs, and the delayed ones are served by
-// the workers.
-TEST(ExecutorThreads, SomeWorkersAndNoTimerRunEveryTask) {
+// One worker started, the timer and every further worker not: every posted task runs, and the
+// delayed ones are served by the worker.
+TEST(ExecutorThreads, AWorkerAndNoTimerRunEveryTask) {
   auto& ex = *new Executor(4); // leaked, as every pool is
   const uint64_t before = Executor::threadStartFailures();
-  {
-    FailAfter f(2);
-    EXPECT_NO_THROW(EXPECT_EQ(ex.startedWorkers(), 2u));
-  }
-  EXPECT_GE(Executor::threadStartFailures(), before + 2) << "two workers and the timer failed";
+  FailAfter f(1);
+  EXPECT_NO_THROW(EXPECT_EQ(ex.startedWorkers(), 1u));
   auto l = std::make_shared<Latch>();
   for (int i = 0; i < 50; ++i)
     ex.post([l] { l->bump(); });
@@ -341,6 +338,34 @@ TEST(ExecutorThreads, SomeWorkersAndNoTimerRunEveryTask) {
   EXPECT_GE(std::chrono::steady_clock::now() - t0, std::chrono::milliseconds(95))
       << "the delayed tasks waited for their deadline";
   EXPECT_EQ(l->get(), 60);
+  EXPECT_GE(Executor::threadStartFailures(), before + 1) << "the timer (and growth) failed";
+  EXPECT_EQ(ex.startedWorkers(), 1u);
+}
+
+// A pool starts one worker and grows only when a post finds none idle, up to its size.
+TEST(ExecutorThreads, WorkersStartAsWorkNeedsThem) {
+  auto& ex = *new Executor(4);
+  EXPECT_EQ(ex.startedWorkers(), 1u) << "one worker at first";
+  // One task at a time: one worker is enough.
+  for (int i = 0; i < 20; ++i) {
+    auto l = std::make_shared<Latch>();
+    ex.post([l] { l->bump(); });
+    ASSERT_TRUE(l->wait(1));
+  }
+  EXPECT_LE(ex.startedWorkers(), 2u);
+  // Six tasks that all block until released: the pool grows to its size, no further.
+  auto gate = std::make_shared<Latch>();
+  auto running = std::make_shared<Latch>();
+  for (int i = 0; i < 6; ++i)
+    ex.post([gate, running] {
+      running->bump();
+      gate->wait(1, 10000);
+    });
+  EXPECT_TRUE(running->wait(4));
+  EXPECT_EQ(ex.startedWorkers(), 4u);
+  gate->bump();
+  EXPECT_TRUE(running->wait(6));
+  EXPECT_EQ(ex.startedWorkers(), 4u);
 }
 
 // No worker at all: the tasks go to another pool of the process that has workers.

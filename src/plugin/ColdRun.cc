@@ -93,7 +93,7 @@ constexpr size_t kPartItems = 512;
 // CPU-bound and as many as the reader has threads, and a hit must not queue
 // behind them. Leaked like the executor (threads end with the process).
 Executor& convertPool() {
-  static Executor* pool = new Executor(std::max(2u, usableCpus()));
+  static Executor* pool = new Executor(std::max(2u, usableCpus()), "uc-convert", "uc-convert-tmr");
   return *pool;
 }
 
@@ -2474,7 +2474,7 @@ namespace {
 // another process's commit, and nothing that serves reads may wait on that.
 // Leaked like the other pools.
 Executor& commitPool() {
-  static Executor* pool = new Executor(2);
+  static Executor* pool = new Executor(2, "uc-commit", "uc-commit-timer");
   return *pool;
 }
 
@@ -2483,7 +2483,7 @@ Executor& commitPool() {
 // records waiting pass their cap and conversions are served without being
 // kept -- read from the origin again by the next pass.
 Executor& mapPool() {
-  static Executor* pool = new Executor(2);
+  static Executor* pool = new Executor(2, "uc-map", "uc-map-timer");
   return *pool;
 }
 

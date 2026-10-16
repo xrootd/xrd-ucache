@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <pthread.h>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <system_error>
@@ -53,17 +55,21 @@ std::atomic<int64_t> g_failAfter{[] {
 }()};
 std::atomic<int64_t> g_threadsMade{0};
 
-// Starts `fn` on a detached thread; false (counted) when no thread could be made, `err` then
+// Starts `fn` on a detached thread named `name` (at most 15 characters: what `top -H` and
+// /proc/<pid>/task/<tid>/comm show); false (counted) when no thread could be made, `err` then
 // saying why.
 template <typename Fn>
-bool startThread(Fn&& fn, std::string& err) noexcept {
+bool startThread(Fn&& fn, std::string& err, const char* name) noexcept {
   const char* why = nullptr;
   try {
     const int64_t limit = g_failAfter.load(std::memory_order_relaxed);
     if (limit >= 0 && g_threadsMade.fetch_add(1, std::memory_order_relaxed) >= limit)
       throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
                               "test hook UCACHE_TEST_THREAD_FAIL_AFTER");
-    std::thread(std::forward<Fn>(fn)).detach(); // leaked with the core; see header
+    std::thread([f = std::forward<Fn>(fn), name]() mutable {
+      Executor::nameThisThread(name);
+      f();
+    }).detach(); // leaked with the core; see header
     return true;
   } catch (const std::system_error& e) {
     try {
@@ -195,19 +201,23 @@ void sayNoMemory() {
 // pool's next post: nobody waits for it. A task that cannot be queued for want of memory runs on
 // the calling thread too.
 struct Executor::Core {
-  Core(unsigned threads, uint64_t gen, const std::atomic<Stats*>* stats)
-      : gen(gen), stats(stats), size(threads) {
+  // A pool starts one worker, and starts another at a post that finds none idle, up to `threads`
+  // (each thread takes address space: its stack, and a malloc arena once it runs a task; a process
+  // under a limit on it must not lose it to threads it never needs). Its timer thread starts at its
+  // first delayed task: most pools never have one.
+  Core(unsigned threads, uint64_t gen, const std::atomic<Stats*>* stats, const char* name,
+       const char* timerName)
+      : gen(gen), stats(stats), size(threads), name(name), timerName(timerName) {
     std::string err;
-    for (unsigned i = 0; i < threads; ++i) {
-      if (!startThread([this] { loop(); }, err)) {
-        sayThreadFailure(threads - i, threads, "worker threads", err);
-        break; // the next ones would fail as well; a post tries again later
+    if (threads > 0) {
+      starting = spawned = 1; // no thread runs yet: no lock needed
+      if (startThread([this] { loop(); }, err, name)) {
+        workers.fetch_add(1, std::memory_order_release);
+      } else {
+        starting = spawned = 0;
+        sayThreadFailure(threads, threads, "worker threads", err); // a post tries again later
       }
-      workers.fetch_add(1, std::memory_order_release);
     }
-    timerOk.store(startThread([this] { timerLoop(); }, err), std::memory_order_release);
-    if (!timerOk.load(std::memory_order_relaxed))
-      sayThreadFailure(1, 1, "timer threads", err);
     try {
       std::lock_guard<std::mutex> g(coresMu());
       g_cores->push_back(this);
@@ -223,11 +233,61 @@ struct Executor::Core {
     if (now - last < 1000000000ull || !lastTryNs.compare_exchange_strong(last, now))
       return workers.load(std::memory_order_acquire) > 0;
     std::string err;
-    if (startThread([this] { loop(); }, err))
+    {
+      std::lock_guard<std::mutex> g(mu);
+      ++starting;
+      ++spawned;
+    }
+    if (startThread([this] { loop(); }, err, name)) {
       workers.fetch_add(1, std::memory_order_release);
-    if (!timerOk.load(std::memory_order_acquire) && startThread([this] { timerLoop(); }, err))
-      timerOk.store(true, std::memory_order_release);
+    } else {
+      std::lock_guard<std::mutex> g(mu);
+      --starting;
+      --spawned;
+    }
     return workers.load(std::memory_order_acquire) > 0;
+  }
+  // The timer thread, started at the first delayed task (tried again at most once a second). On
+  // failure the workers serve the delayed tasks (loop).
+  void ensureTimer() {
+    if (timerOk.load(std::memory_order_acquire))
+      return;
+    const uint64_t now = nowNs();
+    uint64_t last = lastTimerTryNs.load(std::memory_order_relaxed);
+    if ((last && now - last < 1000000000ull) || !lastTimerTryNs.compare_exchange_strong(last, now))
+      return;
+    std::string err;
+    if (startThread([this] { timerLoop(); }, err, timerName))
+      timerOk.store(true, std::memory_order_release);
+    else
+      sayThreadFailure(1, 1, "timer threads", err);
+  }
+  // Whether the tasks waiting outnumber the workers idle or on their way, and the pool may start
+  // one more (below its size; not within a second of a failure to start one): then it is counted
+  // as on its way, and the caller starts it (grow) once it has let go of mu. Under mu.
+  bool wantMoreLocked() {
+    if (queue.size() <= idle + starting || spawned >= size ||
+        nowNs() - lastGrowFailNs.load(std::memory_order_relaxed) <= 1000000000ull)
+      return false;
+    ++starting;
+    ++spawned;
+    return true;
+  }
+  // One more worker (wantMoreLocked said so).
+  void grow() {
+    std::string err;
+    const bool ok = startThread([this] { loop(); }, err, name);
+    if (!ok) {
+      std::lock_guard<std::mutex> g(mu);
+      --starting;
+      --spawned;
+    }
+    if (ok) {
+      workers.fetch_add(1, std::memory_order_release);
+      return;
+    }
+    lastGrowFailNs.store(nowNs(), std::memory_order_relaxed);
+    sayThreadFailure(size - workers.load(std::memory_order_acquire), size, "worker threads", err);
   }
   // Another pool of this generation with a worker, for a pool that has none; null for none.
   Core* fallback() {
@@ -254,6 +314,7 @@ struct Executor::Core {
     Stats* s = stats->load(std::memory_order_acquire);
     Task t{std::move(task), s ? nowNs() : 0};
     bool queued = false;
+    bool more = false;
     {
       std::lock_guard<std::mutex> g(mu);
       try {
@@ -261,6 +322,8 @@ struct Executor::Core {
         queued = true;
       } catch (...) {
       }
+      // More tasks waiting than workers idle or on their way: one more, up to the pool's size.
+      more = queued && wantMoreLocked();
       if (queued && s) {
         const uint64_t n = queue.size();
         uint64_t hw = s->poolQueueHighWater.load(std::memory_order_relaxed);
@@ -274,12 +337,15 @@ struct Executor::Core {
       return;
     }
     cv.notify_one();
+    if (more)
+      grow();
   }
 
   void postAfter(uint64_t delayMs, std::function<void()> task, bool housekeeping) {
     const uint64_t deadline = nowNs() + delayMs * 1000000ull;
-    if (!timerOk.load(std::memory_order_acquire))
+    if (workers.load(std::memory_order_acquire) == 0)
       (void)retryWorker();
+    ensureTimer();
     if (timerOk.load(std::memory_order_acquire)) {
       {
         std::lock_guard<std::mutex> g(tmu);
@@ -344,8 +410,14 @@ struct Executor::Core {
   }
 
   void loop() {
+    {
+      std::lock_guard<std::mutex> g(mu);
+      if (starting > 0)
+        --starting; // this worker is in its loop: counted among the idle from now on
+    }
     for (;;) {
       Task task;
+      bool more = false;
       {
         std::unique_lock<std::mutex> lk(mu);
         for (;;) {
@@ -354,21 +426,30 @@ struct Executor::Core {
             const uint64_t next = takeDueTimersLocked();
             if (!queue.empty())
               break;
+            ++idle;
             if (next) {
               const uint64_t now = nowNs();
               cv.wait_for(lk, std::chrono::nanoseconds(next > now ? next - now : 0));
             } else {
               cv.wait(lk);
             }
+            --idle;
             continue;
           }
           if (!queue.empty())
             break;
+          ++idle;
           cv.wait(lk);
+          --idle;
         }
         task = std::move(queue.front());
         queue.pop_front();
+        // Tasks still waiting with no one free for them (a burst, or tasks that wait for one
+        // another): the next worker is started here, so growth goes on without a further post.
+        more = wantMoreLocked();
       }
+      if (more)
+        grow();
       Stats* s = task.postedNs ? stats->load(std::memory_order_acquire) : nullptr;
       const uint64_t start = s ? nowNs() : 0;
       // Marked when a task runs, not when the thread starts: this library is loaded at run time,
@@ -413,7 +494,14 @@ struct Executor::Core {
   };
   const uint64_t gen;
   const std::atomic<Stats*>* const stats; // the Executor's; it is never destroyed
-  const unsigned size;                    // the workers it was made for
+  const unsigned size;                    // the most workers it starts
+  const char* const name;                 // its threads' name
+  const char* const timerName;            // its timer thread's
+  unsigned idle = 0;                      // workers waiting for a task; under mu
+  unsigned starting = 0;                  // workers started and not yet in their loop; under mu
+  unsigned spawned = 0;                   // workers started or being started; under mu
+  std::atomic<uint64_t> lastGrowFailNs{0}; // the last failure to start one more
+  std::atomic<uint64_t> lastTimerTryNs{0}; // the last try to start the timer thread
   std::atomic<unsigned> workers{0};       // the workers that started
   std::atomic<bool> timerOk{false};       // the timer thread started
   std::atomic<uint64_t> lastTryNs{0};     // the last try to start a worker (retryWorker)
@@ -438,7 +526,20 @@ struct Executor::Core {
 // function-local static would otherwise hold that static's guard while it
 // starts threads, and a child forked in that window would wait on the guard
 // for good.
-Executor::Executor(unsigned threads) : threads_(threads) {}
+Executor::Executor(unsigned threads, const char* name, const char* timerName)
+    : threads_(threads), name_(name), timerName_(timerName) {}
+
+void Executor::nameThisThread(const char* name) {
+  if (!name || !*name)
+    return;
+  char buf[16];
+  std::snprintf(buf, sizeof buf, "%s", name); // at most 15 characters
+#if defined(__APPLE__)
+  pthread_setname_np(buf);
+#else
+  pthread_setname_np(pthread_self(), buf);
+#endif
+}
 
 Executor::Core* Executor::core() {
   const uint64_t gen = g_gen.load(std::memory_order_acquire);
@@ -451,7 +552,7 @@ Executor::Core* Executor::core() {
     return c;
   // The previous generation's core is left as it is: in a child, nothing
   // runs it and nothing may destroy it (its tasks capture the parent's state).
-  c = new Core(threads_, gen, &stats_);
+  c = new Core(threads_, gen, &stats_, name_, timerName_);
   core_.store(c, std::memory_order_release);
   return c;
 }
@@ -500,7 +601,8 @@ Executor& Executor::instance(unsigned threads) {
   // reader thread waits for its read, so these threads take no CPU from one
   // that is working, and the work posted here (slot-store reads and decodes,
   // first-pass requests) blocks.
-  static Executor* exec = new Executor(threads ? threads : std::max(1u, usableCpus()));
+  static Executor* exec =
+      new Executor(threads ? threads : std::max(1u, usableCpus()), "uc-pool", "uc-pool-timer");
   return *exec;
 }
 

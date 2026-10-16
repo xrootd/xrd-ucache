@@ -449,6 +449,7 @@ void initGlobals() {
     const KeyRules rules = gConfig->keys;
     try {
       std::thread([dir, rules] {
+        Executor::nameThisThread("uc-names");
         (void)nameCachedEntries(dir, rules, [] { return processExiting(); });
       }).detach();
     } catch (...) {
