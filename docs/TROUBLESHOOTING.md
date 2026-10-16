@@ -343,6 +343,10 @@ with the switch on`, or `... not a redirector's ...`, or `... gave no role (no
 answer within 5 s) ...`. `ucache stats` counts them (`role_queries`,
 `role_redirectors`, `role_unanswered`).
 
+- **A host pattern in the URL's `tried=` turns it on** for that file, at its open,
+  whatever server the URL names, and no role is asked (USER_GUIDE.md, "Keeping
+  reads away from some hosts"); only `adaptive_federation = off` leaves such a URL
+  as it is.
 - **A site's own redirector turns it on.** It says `manager` as a federation's
   redirectors do: it too sends opens to several servers. Set
   `adaptive_federation = off` to read every file as uCache 1.4.0 did.

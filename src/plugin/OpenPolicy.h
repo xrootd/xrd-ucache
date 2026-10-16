@@ -841,8 +841,9 @@ inline bool ownOpenPending(bool trustedAtOpen, bool opened, bool federation, boo
 // What follows a failed origin read of an armed handle. This is every status the
 // client's own recovery of a read handles, which is off on such a handle, and
 // more: the stream and connection errors, an expired request, and a server's
-// report of a fault of its own or of its storage. Final: a request no other site
-// would answer differently, and a corrupted answer (14), which is the integrity
+// report of a fault of its own or of its storage, and a server's redirect of the read
+// that the client was told not to follow (a handle with hosts to avoid follows none once
+// open). Final: a request no other site would answer differently, and a corrupted answer (14), which is the integrity
 // check's to decide.
 enum class ReadStep : uint8_t { kFinal, kMove };
 ReadStep readStep(int code, int errNo);

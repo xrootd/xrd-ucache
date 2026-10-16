@@ -823,6 +823,8 @@ TEST(OpenPolicy, ReadStepClasses) {
                    kErrStreamDisconnect, kErrConnectionError, kErrInvalidSession, kErrTlsError,
                    kErrOperationExpired, 207})
     EXPECT_EQ(readStep(code, 0), ReadStep::kMove) << code;
+  // A server's redirect of the read, not followed (a handle with hosts to avoid): another copy.
+  EXPECT_EQ(readStep(kErrRedirect, 0), ReadStep::kMove);
   // A server's report of a fault of its own, its storage or its credentials.
   for (int errNo : {3004, kXrFSError, kXrIOError, 3008, kXrNotAuthorized, kXrNotFound,
                     kXrServerError, kXrNoServer, kXrOverloaded, 3034})

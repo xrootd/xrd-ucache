@@ -816,7 +816,9 @@ overriding your defaults. Common keys:
 Sizes accept `k`/`m`/`g`/`t` suffixes.
 
 **Which files the switch is on for (`adaptive_federation = auto`, the default).**
-With `auto`, uCache asks the server a file's URL names what it is, at the
+A file whose URL has a host pattern in `tried=` has it on, at its open, and no
+server is asked ("Keeping reads away from some hosts", below). For any other
+file, with `auto`, uCache asks the server a file's URL names what it is, at the
 first open of a file there, once per server (host and port) and job, and waits
 for the answers at most 5 s in all (or the job's own open timeout, when
 shorter). It asks first for the flags every XRootD server gives at login
@@ -1319,17 +1321,29 @@ and of a second one:
 root://global-redirector.example//store/data/Run2024A/file.root?tried=*.site-a.example,*.site-b.example
 ```
 
-With `adaptive_federation = on` (with `auto`, for a URL at a redirector) uCache
-applies the patterns itself and never sends them: no URL that reaches a server
-carries one. An open that lands on a data server whose name matches is refused
+A URL with a host pattern turns `adaptive_federation` on for its file under the
+default `auto`, at its open, whatever server the URL names and without asking it
+its role: the reader asked for hosts to be avoided, and only the switch's
+behaviour avoids them (with `on`, it is on anyway). uCache then applies the
+patterns itself and never sends them: no URL that reaches a server carries one. An open that lands on a data server whose name matches is refused
 there before anything is read of it, and asked again through the redirector with
 that server's own full name added to `tried=` (where a front end handed the open
 to the server, as EOS does, the front end's name, which is the one the
 redirector knows); the names added in one open accumulate, each kept for every
 later attempt of that open (at most 16 of them, the list at most 1024 bytes). The
 copies the regional redirector lists are passed over when their server matches,
-and a read that moves to another copy never moves to one that matches. A
+and a read that moves to another copy never moves to one that matches. The
+client's own recovery of a read is off on every file with a pattern (it would
+open the file again through the redirector, which may send it to a matching
+host): a read that fails moves as above, or fails. For the same reason the
+client follows no server's redirect of a read once the file is open: such a
+read moves to another copy, judged as an open's landing is, or fails. A
 redirector is never refused for a pattern, whatever its name: it holds no copy.
+A storage front end that hands opens to its own servers (EOS) is a redirector:
+its servers are the data servers, so a pattern that matches only the front
+end's name (`eoscms*`) blocks nothing; one that matches its servers' names
+(`*.cern.ch` for EOS at CERN) blocks it, and the front end's name is the one
+added to `tried=`.
 When every copy found is at a matching host, the open fails with an error that
 says so and names each of those servers with the pattern it matched
 (TROUBLESHOOTING.md); nothing is ever read at a matching host instead. A
@@ -1345,10 +1359,12 @@ own line carries `avoided`) and counted (`hosts_avoided`, STATS.md), so a run ca
 show that no byte came from a matching host (`data_servers` in the per-file
 records). A warm read is served from the cache as before and asks no server, and
 `tried=` is never part of the file's cache key, so one file read with and without
-patterns is one entry. With the switch off for the file (`off`, or `auto` with a
-URL straight at a data server), and for a file uCache passes straight through (a
-copy, a write, `UCACHE_DISABLE`), the URL is sent exactly as written, the patterns
-included, as without uCache: a redirector then avoids nothing for them.
+patterns is one entry. With `adaptive_federation = off`, and for a file uCache
+passes straight through (a copy made with a copy tool such as `xrdcp`, a write,
+`UCACHE_DISABLE`), the URL is sent exactly as written, the patterns included, as
+without uCache: a redirector then avoids nothing for them. So a run that must
+keep away from some hosts neither sets `off` nor copies its inputs through uCache
+(or sets `copy_detect = off`, so that a copy is read as any job's read is).
 
 **Put the cache on local disk.** `dir` has **no default** — an unset cache
 location is a loud condition (`doctor` FAILs, the plugin passes through

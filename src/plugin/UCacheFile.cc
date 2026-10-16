@@ -3006,6 +3006,8 @@ class RetryingOpenHandler : public ResponseHandler {
     if (ended(*s, h, w, /*sent=*/true, /*fresh=*/false, opened))
       return;
     keepOpenBytes(w); // the reader is given this copy: what its checks read waits for the entry
+    if (seq_) // the copy is taken: with hosts to avoid, no redirect of a request on it is followed
+      st_->noRedirectsOnceOpen(st_->inner.load());
     answered();
     // Transparent on success: forward exactly what we got.
     real_->HandleResponseWithHosts(s.release(), r.release(), h ? h.release() : new HostList());
@@ -4200,7 +4202,9 @@ bool HandleState::ensureInnerOpen() {
     }
   }
   innerOpenOk = s.IsOK();
+  ownOpenFailed.store(!innerOpenOk && fo, std::memory_order_release);
   if (innerOpenOk) {
+    noRedirectsOnceOpen(f);
     if (seq && lastConfirmed) // the checks made at this open confirmed the copy's size
       confirmedSize.store(lastConfirmed, std::memory_order_relaxed);
     innerOpened = true; // success latches; failure only arms the cool-down
@@ -4257,8 +4261,11 @@ XrdCl::XRootDStatus HandleState::missError() {
 // adaptive_federation off, once a handle trusted at Open has lost its trust; with it on, also
 // before.
 static bool ownOpenPending(const HandleState& st) {
+  // ... and, with it on, once one of the cache's own opens failed and none succeeded since
+  // (HandleState::ownOpenFailed: a forked child's open afresh of a handle never trusted).
   return ucache::ownOpenPending(st.trustedAtOpen.load(std::memory_order_acquire), st.innerOpened,
-                                st.fed(), st.cacheOnly);
+                                st.fed(), st.cacheOnly) ||
+         (st.fed() && !st.innerOpened && st.ownOpenFailed.load(std::memory_order_acquire));
 }
 
 XrdCl::File* HandleState::acquireInner() {
@@ -4853,6 +4860,7 @@ static bool moveInner(HandleState& st, std::vector<SiteFailure> failed, uint64_t
   for (; props < st.readerProps.size(); ++props)
     f->SetProperty(st.readerProps[props].first, st.readerProps[props].second);
   recoveryOff(*f);
+  st.noRedirectsOnceOpen(f.get());
   st.leftSources.emplace_back(st.inner.load(), st.source); // a late read on it names its copy
   st.retired.push_back(std::move(st.innerOwned));
   st.innerOwned = std::move(f);
@@ -6952,6 +6960,16 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // before its open of the origin.
   const bool autoMode = cfg.adaptiveFederation == FederationMode::kAuto;
   auto decideFederation = [&](bool knownOnly) {
+    // A URL whose tried= holds a host pattern asks for hosts to be avoided, which only the switch's
+    // behaviour does: on for the file, at once, whatever its server is and whether or not it
+    // answers the role question (none is asked).
+    if (st_->avoid && !st_->avoid->patterns.empty()) {
+      st_->federation.store(true, std::memory_order_relaxed);
+      st_->fedDecided.store(true, std::memory_order_release);
+      UCACHE_DEBUG("adaptive_federation = auto: on for %s (its tried= names hosts to avoid)",
+                   recordFile(url).c_str());
+      return;
+    }
     const FedDecision d = autoFederation(url, passthroughOnly_,
                                          knownOnly ? RoleAsk::kKnownOnly : RoleAsk::kAsk,
                                          static_cast<int>(timeout), st_->store);
@@ -6999,6 +7017,8 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
     const bool fresh = key && !key->joined && cacheFresh(*key, cfg.cacheDir, cfg.revalidateSeconds);
     if (fresh && autoMode)
       decideFederation(/*knownOnly=*/true);
+    if (fresh && st_->avoiding()) // the File the lazy open will open: as below
+      recoveryOff(*st_->inner.load());
     if (fresh && !dropCutWarmEntry(*key, url, cfg, *st_->store, st_->fed())) {
       {
         std::lock_guard<std::mutex> g(st_->mu);
@@ -7019,6 +7039,11 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   }
   if (autoMode && !st_->fedDecided.load(std::memory_order_acquire))
     decideFederation(/*knownOnly=*/false); // an open of the origin: decided now
+  // Hosts to avoid: the client's own recovery of a read (an open of the file again through the
+  // redirector, which may land on such a host) is off on every File of the handle, armed or not
+  // (HandleState::recoveryIsOff).
+  if (st_->avoiding())
+    recoveryOff(*st_->inner.load());
   // The cache entry is created lazily on the first read (ensureEntry). With
   // open-retry enabled (opt-in) wrap the app handler so a TRANSIENT open failure
   // is retried on a fresh inner file (Case A); write-opens and
@@ -8586,6 +8611,10 @@ bool UCacheFile::SetProperty(const std::string& name, const std::string& value) 
   // On an armed handle the reader cannot turn the client's read recovery back
   // on: the handle's own reads depend on it being off.
   if (recovery && st_->recoveryIsOff())
+    return true;
+  // With hosts to avoid, an open File follows no redirect (noRedirectsOnceOpen): the reader cannot
+  // turn that back on.
+  if (name == "FollowRedirects" && st_->avoiding() && st_->inner.load()->IsOpen())
     return true;
   const bool ok = st_->inner.load()->SetProperty(name, value);
   if (recovery && st_->recoveryIsOff()) // armed while this was set

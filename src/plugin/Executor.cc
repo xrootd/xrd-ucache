@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <pthread.h>
+#include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -226,8 +227,18 @@ struct Executor::Core {
     }
   }
 
+  // Whether this pool is not the current process's current generation's: one a forked child
+  // inherited (built in the parent, before the child started its pools over, or with no start
+  // over at all). Such a pool starts no thread and runs nothing: its tasks capture the parent's
+  // state, and its counts (workers, idle) are the parent's, whose threads the child does not
+  // have. Asked only where a thread would be started, or a task run on the caller.
+  bool foreign() const {
+    return ::getpid() != pid || gen != g_gen.load(std::memory_order_acquire);
+  }
   // A pool with no worker: try again to start one (at most once a second).
   bool retryWorker() {
+    if (foreign())
+      return false;
     const uint64_t now = nowNs();
     uint64_t last = lastTryNs.load(std::memory_order_relaxed);
     if (now - last < 1000000000ull || !lastTryNs.compare_exchange_strong(last, now))
@@ -250,7 +261,7 @@ struct Executor::Core {
   // The timer thread, started at the first delayed task (tried again at most once a second). On
   // failure the workers serve the delayed tasks (loop).
   void ensureTimer() {
-    if (timerOk.load(std::memory_order_acquire))
+    if (timerOk.load(std::memory_order_acquire) || foreign())
       return;
     const uint64_t now = nowNs();
     uint64_t last = lastTimerTryNs.load(std::memory_order_relaxed);
@@ -267,7 +278,7 @@ struct Executor::Core {
   // as on its way, and the caller starts it (grow) once it has let go of mu. Under mu.
   bool wantMoreLocked() {
     if (queue.size() <= idle + starting || spawned >= size ||
-        nowNs() - lastGrowFailNs.load(std::memory_order_relaxed) <= 1000000000ull)
+        nowNs() - lastGrowFailNs.load(std::memory_order_relaxed) <= 1000000000ull || foreign())
       return false;
     ++starting;
     ++spawned;
@@ -294,14 +305,14 @@ struct Executor::Core {
     std::lock_guard<std::mutex> g(coresMu());
     for (void* p : *g_cores) {
       Core* c = static_cast<Core*>(p);
-      if (c != this && c->gen == gen && c->workers.load(std::memory_order_acquire) > 0)
+      if (c != this && c->gen == gen && !c->foreign() && c->workers.load(std::memory_order_acquire) > 0)
         return c;
     }
     return nullptr;
   }
 
   void post(std::function<void()> task) {
-    if (workers.load(std::memory_order_acquire) == 0 && !retryWorker()) {
+    if (workers.load(std::memory_order_acquire) == 0 && !retryWorker() && !foreign()) {
       if (Core* other = fallback()) {
         other->post(std::move(task));
         return;
@@ -363,6 +374,11 @@ struct Executor::Core {
         timers.push(Timed{deadline, std::move(task)});
       }
       cv.notify_all();
+      return;
+    }
+    if (foreign()) { // kept, never run (see foreign)
+      std::lock_guard<std::mutex> t(tmu);
+      timers.push(Timed{deadline, std::move(task)});
       return;
     }
     if (Core* other = fallback()) {
@@ -493,6 +509,7 @@ struct Executor::Core {
     uint64_t postedNs = 0; // 0: not accounted (no stats when it was posted)
   };
   const uint64_t gen;
+  const pid_t pid = ::getpid();           // the process that built it (foreign)
   const std::atomic<Stats*>* const stats; // the Executor's; it is never destroyed
   const unsigned size;                    // the most workers it starts
   const char* const name;                 // its threads' name

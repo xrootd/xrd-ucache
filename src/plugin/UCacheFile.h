@@ -249,11 +249,27 @@ struct HandleState {
   // recovery being off asks this, never one of the flags: a File the client puts in its Error
   // state in a forked child (the handle's own reopen stands in for it), a reader's setting of the
   // recovery (kept off), a File made again (configureInner), a read's time (originTimeout).
+  // A handle whose URL names hosts to avoid (avoiding()) has it off too, armed or not: the
+  // client's recovery opens the file again through the redirector, which may send it to such a
+  // host; a read that fails there moves (armed) or fails.
   bool recoveryIsOff() const {
     return moveOnReads.load(std::memory_order_relaxed) ||
            moveSlotReads.load(std::memory_order_relaxed) ||
-           setupMoves.load(std::memory_order_relaxed);
+           setupMoves.load(std::memory_order_relaxed) || avoiding();
   }
+  // With hosts to avoid: once a File of the handle is open, the client is told not to follow a
+  // server's redirect of a request on it (a read sent elsewhere would reach a host nobody
+  // judged); such a request fails with errRedirect, and moves (OpenPolicy.h readStep) or fails.
+  void noRedirectsOnceOpen(XrdCl::File* f) const {
+    if (f && avoiding())
+      f->SetProperty("FollowRedirects", "false");
+  }
+  // With adaptive_federation on: one of the cache's own opens of the origin (ensureInnerOpen)
+  // failed for this handle and none has succeeded since: its File is not open, so no request is
+  // given to it, each gets that open's error and the next after the cool-down opens it again (the
+  // same as a trusted handle's, ownOpenPending). A forked child's open afresh of a handle that was
+  // never trusted is one such.
+  std::atomic<bool> ownOpenFailed{false};
   bool viaRedirector = false;
   // Under mu: the server and site the current File was opened at; where reads
   // of the handle failed, the 3 newest (the next open names them in tried= and

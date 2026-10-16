@@ -1333,7 +1333,10 @@ ReadStep readStep(int code, int errNo) {
   static constexpr int kCodes[] = {
       kErrInternal,       kErrSocketError,    kErrSocketTimeout,    kErrSocketDisconnected,
       kErrPollerError,    kErrSocketOptError, kErrStreamDisconnect, kErrConnectionError,
-      kErrInvalidSession, kErrTlsError,       kErrOperationExpired, kErrOperationInterrupted};
+      kErrInvalidSession, kErrTlsError,       kErrOperationExpired, kErrOperationInterrupted,
+      // a server's redirect of the read, not followed (a handle with hosts to avoid follows none
+      // once open): another copy is taken, judged as any open's landing
+      kErrRedirect};
   static constexpr int kServer[] = {kXrFileNotOpen,   kXrFSError,    kXrIOError,     kXrNoMemory,
                                     kXrNotAuthorized, kXrNotFound,   kXrServerError, kXrNoServer,
                                     kXrOverloaded,    kXrReqTimedOut};
