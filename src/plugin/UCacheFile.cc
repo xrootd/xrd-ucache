@@ -4202,7 +4202,13 @@ bool HandleState::ensureInnerOpen() {
     }
   }
   innerOpenOk = s.IsOK();
-  ownOpenFailed.store(!innerOpenOk && fo, std::memory_order_release);
+  // (with the switch off: a forked child's open afresh of a handle not trusted at Open, and every
+  // later one of that handle until one succeeds)
+  ownOpenFailed.store(!innerOpenOk &&
+                          (fo || ownOpenFailed.load(std::memory_order_acquire) ||
+                           (a.route == OpenRoute::kFork &&
+                            !trustedAtOpen.load(std::memory_order_acquire))),
+                      std::memory_order_release);
   if (innerOpenOk) {
     noRedirectsOnceOpen(f);
     if (seq && lastConfirmed) // the checks made at this open confirmed the copy's size
@@ -4261,11 +4267,12 @@ XrdCl::XRootDStatus HandleState::missError() {
 // adaptive_federation off, once a handle trusted at Open has lost its trust; with it on, also
 // before.
 static bool ownOpenPending(const HandleState& st) {
-  // ... and, with it on, once one of the cache's own opens failed and none succeeded since
-  // (HandleState::ownOpenFailed: a forked child's open afresh of a handle never trusted).
+  // ... and once one of the cache's own opens failed and none succeeded since
+  // (HandleState::ownOpenFailed: with it off, a forked child's open afresh of a handle not
+  // trusted at Open).
   return ucache::ownOpenPending(st.trustedAtOpen.load(std::memory_order_acquire), st.innerOpened,
                                 st.fed(), st.cacheOnly) ||
-         (st.fed() && !st.innerOpened && st.ownOpenFailed.load(std::memory_order_acquire));
+         (!st.innerOpened && st.ownOpenFailed.load(std::memory_order_acquire));
 }
 
 XrdCl::File* HandleState::acquireInner() {

@@ -264,11 +264,12 @@ struct HandleState {
     if (f && avoiding())
       f->SetProperty("FollowRedirects", "false");
   }
-  // With adaptive_federation on: one of the cache's own opens of the origin (ensureInnerOpen)
-  // failed for this handle and none has succeeded since: its File is not open, so no request is
-  // given to it, each gets that open's error and the next after the cool-down opens it again (the
-  // same as a trusted handle's, ownOpenPending). A forked child's open afresh of a handle that was
-  // never trusted is one such.
+  // One of the cache's own opens of the origin (ensureInnerOpen) failed for this handle and none
+  // has succeeded since: its File is not open, so no request is given to it, each gets that open's
+  // error and the next after the cool-down opens it again (the same as a trusted handle's,
+  // ownOpenPending). With adaptive_federation on, any such open; with it off, only a forked
+  // child's open afresh of a handle that was not trusted at Open (whose File is otherwise given
+  // every request it makes: a trusted handle's are ownOpenPending's, as before).
   std::atomic<bool> ownOpenFailed{false};
   bool viaRedirector = false;
   // Under mu: the server and site the current File was opened at; where reads
