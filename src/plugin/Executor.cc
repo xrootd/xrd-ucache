@@ -17,9 +17,9 @@
 namespace ucache {
 
 // Every object at namespace scope here is constant-initialized (a literal, nullptr, a constexpr
-// constructor), never computed by a dynamic initializer: the plug-in can be called from XrdCl's
+// constructor), never computed by a dynamic initializer: the plugin can be called from XrdCl's
 // static initialization before this library's own dynamic initializers have run (a program that
-// loads the plug-in itself, which pulls in XrdCl as its dependency), and the pools are used then.
+// loads the plugin itself, which pulls in XrdCl as its dependency), and the pools are used then.
 namespace {
 uint64_t nowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -144,7 +144,7 @@ std::vector<void*>& coresLocked() { // under coresMu; throws std::bad_alloc only
 }
 
 // Whether the calling thread may block (sleep out a delay) when a delayed task must run on it
-// (no thread anywhere): the plug-in sets a probe that says no on a client callback thread
+// (no thread anywhere): the plugin sets a probe that says no on a client callback thread
 // (setMayBlockProbe); a thread of a pool of ours never may.
 std::atomic<bool (*)()> g_mayBlock{nullptr};
 bool callerMayBlock() {
@@ -441,7 +441,11 @@ struct Executor::Core {
   }
   // With no thread anywhere: the delayed tasks due now, run on the calling thread one at a time
   // (nothing allocated: this path must work when nothing else does). Those a task adds are due
-  // later than `now`, so the loop ends.
+  // later than `now`, so the loop ends. The rest of the due timers stay queued while one runs, so
+  // a task that posts (post -> the path with no thread -> here) runs the next due timer inside
+  // its own post: nesting that is bounded, each level having popped one timer before it goes
+  // deeper (at most the number of timers due, plus one), and safe by the rule that no post is
+  // made holding a lock that a task takes.
   void runDueTimersHere() {
     const uint64_t now = nowNs();
     for (;;) {

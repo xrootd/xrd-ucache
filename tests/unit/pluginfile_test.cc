@@ -80,3 +80,17 @@ TEST(PluginFile, RecognisesItsOwnName) {
   EXPECT_FALSE(isUCachePluginName("/opt/libXrdClUCache/libOther.so"));
   EXPECT_FALSE(isUCachePluginName(""));
 }
+
+// doctor reads the client's version from `xrdcp --version`; a client that could not load a plugin
+// prints its warning first, and the version must still be found (the plugin load test depends on it).
+TEST(PluginFile, ClientVersionLineSkipsWarningsBeforeIt) {
+  EXPECT_EQ(clientVersionLine("v5.8.3\n"), "v5.8.3");
+  EXPECT_EQ(clientVersionLine("[2026-10-17 10:00:00 +0200][Warning][PlugInMgr] Unable to load "
+                              "plugin: /x/libXrdClUCache-5.so: cannot open shared object file\n"
+                              "v5.8.3\n"),
+            "v5.8.3");
+  EXPECT_EQ(clientVersionLine("warning\r\nv6.0.0-rc1\r\n"), "v6.0.0-rc1");
+  EXPECT_EQ(clientVersionLine("no version here\nnor here, v5 alone\n"), "");
+  EXPECT_EQ(clientVersionLine(""), "");
+  EXPECT_EQ(clientVersionLine("v5.6.4"), "v5.6.4") << "no newline at the end";
+}

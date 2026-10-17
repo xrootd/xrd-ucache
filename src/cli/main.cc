@@ -3938,18 +3938,31 @@ std::string pluginDeclaredVersion(const std::string& so) {
 }
 // The XRootD client actually present in this environment — the one that would
 // load (or refuse) the plugin. `xrdcp` ships with the client and tracks its
-// version. "" if unavailable/unparseable.
+// version. It is run with no plugin of the user's (XRD_PLUGIN unset, the
+// plugin conf directory an empty one), so that a plugin it cannot load, the
+// very case the load test below is for, cannot put a warning where the version
+// is read. "" if unavailable/unparseable.
 std::string ambientClientVersion() {
-  FILE* p = ::popen("xrdcp --version 2>&1", "r");
-  if (!p)
-    return "";
-  char buf[256] = {0};
-  size_t n = std::fread(buf, 1, sizeof buf - 1, p);
-  ::pclose(p);
-  buf[n] = '\0';
-  int v[3];
-  return parseXrdVersion(buf, v) ? std::string(buf).substr(0, std::string(buf).find_first_of("\r\n"))
-                                 : "";
+  std::string tmp = "/tmp";
+  if (const char* t = ::getenv("TMPDIR"); t && *t)
+    tmp = t;
+  std::string dir = tmp + "/ucache-doctor-XXXXXX";
+  const bool made = ::mkdtemp(&dir[0]) != nullptr;
+  const std::string cmd =
+      made && dir.find('\'') == std::string::npos
+          ? "env -u XRD_PLUGIN XRD_PLUGINCONFDIR='" + dir + "' xrdcp --version 2>&1"
+          : std::string("env -u XRD_PLUGIN XRD_PLUGINCONFDIR=/nonexistent xrdcp --version 2>&1");
+  std::string out;
+  if (FILE* p = ::popen(cmd.c_str(), "r")) {
+    char buf[4096];
+    size_t n;
+    while (out.size() < 65536 && (n = std::fread(buf, 1, sizeof buf, p)) > 0)
+      out.append(buf, n);
+    ::pclose(p);
+  }
+  if (made)
+    ::rmdir(dir.c_str());
+  return clientVersionLine(out);
 }
 // The XRootD client in this environment, and the plugin file it would open.
 PluginPick pickPlugin(const std::string& conf) {

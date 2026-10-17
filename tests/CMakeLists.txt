@@ -111,9 +111,11 @@ add_executable(ucache-executor-early-test unit/executor_early_test.cc
                                           ${CMAKE_SOURCE_DIR}/src/plugin/Executor.cc)
 target_include_directories(ucache-executor-early-test PRIVATE ${CMAKE_SOURCE_DIR}/src/plugin)
 target_link_libraries(ucache-executor-early-test PRIVATE ucache-core)
-add_test(NAME executor-early-init COMMAND ucache-executor-early-test)
-set_tests_properties(executor-early-init PROPERTIES TIMEOUT 60
-                     ENVIRONMENT_MODIFICATION "UCACHE_TEST_THREAD_FAIL_AFTER=unset:")
+# Unset through `cmake -E env` (ENVIRONMENT_MODIFICATION needs CMake 3.22; the minimum is 3.20).
+add_test(NAME executor-early-init
+         COMMAND ${CMAKE_COMMAND} -E env --unset=UCACHE_TEST_THREAD_FAIL_AFTER
+                 $<TARGET_FILE:ucache-executor-early-test>)
+set_tests_properties(executor-early-init PROPERTIES TIMEOUT 60)
 add_test(NAME executor-early-init-no-threads COMMAND ucache-executor-early-test)
 set_tests_properties(executor-early-init-no-threads PROPERTIES TIMEOUT 60
                      ENVIRONMENT "UCACHE_TEST_THREAD_FAIL_AFTER=0")

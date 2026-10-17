@@ -52,7 +52,7 @@ class Executor {
   // once when it may not), except housekeeping, which is kept and runs at a later post.
   void postAfter(uint64_t delayMs, std::function<void()> task, bool housekeeping = false);
   // Whether the calling thread may block, for the delayed tasks run on it (see postAfter): the
-  // plug-in says no on a client callback thread. Null: any thread of no pool of ours may.
+  // plugin says no on a client callback thread. Null: any thread of no pool of ours may.
   static void setMayBlockProbe(bool (*probe)());
 
   // Process-wide instance, sized per UCACHE_THREADS (0 = the CPUs this process

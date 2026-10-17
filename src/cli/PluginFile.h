@@ -21,6 +21,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdio>
 #include <functional>
 #include <string>
 #include <utility>
@@ -97,6 +98,27 @@ inline std::string plainPluginName(const std::string& lib) {
 inline bool isUCachePluginName(const std::string& lib) {
   const size_t slash = lib.rfind('/');
   return lib.compare(slash == std::string::npos ? 0 : slash + 1, 14, "libXrdClUCache") == 0;
+}
+
+// The line of `xrdcp --version` output that carries the client's version (the
+// first line holding vX.Y.Z), or "" when none does. The client prints its own
+// warnings, a plugin it could not load among them, before that line, so the
+// first line is not always the version.
+inline std::string clientVersionLine(const std::string& out) {
+  size_t at = 0;
+  while (at < out.size()) {
+    size_t end = out.find_first_of("\r\n", at);
+    if (end == std::string::npos)
+      end = out.size();
+    const std::string line = out.substr(at, end - at);
+    for (size_t v = line.find('v'); v != std::string::npos; v = line.find('v', v + 1)) {
+      int a = 0, b = 0, c = 0;
+      if (v + 1 < line.size() && std::sscanf(line.c_str() + v + 1, "%d.%d.%d", &a, &b, &c) == 3)
+        return line;
+    }
+    at = end + 1;
+  }
+  return "";
 }
 
 } // namespace ucache
