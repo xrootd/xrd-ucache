@@ -220,6 +220,7 @@ TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
   s.originChecksFailed = 22;
   s.originChecksNone = 23;
   s.originChecksUnjudged = 24;
+  s.originChecksSkipped = 26;
   s.originChecksNotExamined = 25;
   const std::string body = s.toJsonBody();
   for (const char* f :
@@ -237,7 +238,8 @@ TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
         "\"role_unanswered\":1",
         "\"origin_checks_passed\":21",
         "\"origin_checks_failed\":22", "\"origin_checks_none\":23",
-        "\"origin_checks_unjudged\":24", "\"origin_checks_not_examined\":25"})
+        "\"origin_checks_unjudged\":24", "\"origin_checks_not_examined\":25",
+        "\"origin_checks_skipped\":26"})
     EXPECT_NE(body.find(f), std::string::npos) << f;
   EXPECT_EQ(("{" + body + "}").find(",}"), std::string::npos);
   test::TempDir td;
@@ -276,6 +278,7 @@ TEST(StatsAggregate, OriginOpenAndFailureCountersRoundTrip) {
   EXPECT_EQ(t.originChecksFailed, 44u);
   EXPECT_EQ(t.originChecksNone, 46u);
   EXPECT_EQ(t.originChecksUnjudged, 48u);
+  EXPECT_EQ(t.originChecksSkipped, 52u);
   EXPECT_EQ(t.originChecksNotExamined, 50u);
   EXPECT_EQ(t.histOriginOpen, (std::vector<uint64_t>{0, 0, 0, 0, 0, 0, 0, 0, 0, 2}));
   EXPECT_EQ(t.opens, 4u) << "no new counter collides with an older one's name";

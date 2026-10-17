@@ -2,6 +2,7 @@
 
 #include "Executor.h"
 #include "FetchCheck.h"
+#include "KeySeekList.h"
 #include "Log.h"
 #include "OriginSource.h"
 #include "ParseEnd.h"
@@ -56,9 +57,10 @@ std::atomic<bool> g_warned{false};
 
 // The key-seek tables (keySeeksFor), oldest first, one per file entry: a file
 // changed at the origin has a new entry, so a table never outlives the bytes it
-// was parsed from. The lock is never held across a parse, so no handle waits
-// for another's. Lock order: a rule's lock, then this one.
-constexpr size_t kMaxKeySeekTables = 32;
+// was parsed from. A table stays while its entry is alive, and is let go once
+// the entry is gone (KeySeekList.h, which says why and what it costs). The lock
+// is never held across a parse, so no handle waits for another's. Lock order: a
+// rule's lock, then this one.
 // After a parse that a failed origin read stopped, no other for this long: a
 // failing origin costs one parse attempt a second, not one a miss. The same
 // for the rule's own parse with a limit of 0 (ReadRule::observe).
@@ -138,9 +140,8 @@ keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEn
   if (!t) {
     t = std::make_shared<KeySeekTable>();
     t->entry = entry;
+    dropUnusedKeySeekTables(tables()); // those of entries gone since the last new one
     tables().push_back(t);
-    if (tables().size() > kMaxKeySeekTables)
-      tables().pop_front();
   }
   // A map that shows its copy bad is parsed again for another copy, at most once a second.
   const bool again = t->seeks && !t->seeks->bad.empty() && current &&

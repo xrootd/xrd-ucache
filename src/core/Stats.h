@@ -186,6 +186,9 @@ struct Stats {
   std::atomic<uint64_t> originChecksNone{0};
   // parts of a fetch the check could not judge (a decode job out of memory): served, never kept
   std::atomic<uint64_t> originChecksUnjudged{0};
+  // fetches the check could not be made on, the file's map not to be had (its parse failed or
+  // threw): served unchecked, never kept
+  std::atomic<uint64_t> originChecksSkipped{0};
   // baskets a first pass's conversion did not decode (a codec not converted): their check not made
   std::atomic<uint64_t> originChecksNotExamined{0};
   std::atomic<uint64_t> coldReplicaConvertUs{0};        // time spent converting, summed over threads
@@ -334,8 +337,8 @@ struct StatsTotals {
            coldReplicaFiles = 0, coldReplicaInBytes = 0, coldReplicaOutBytes = 0,
            coldReplicaBaskets = 0, coldReplicaBasketsKept = 0, coldReplicaConvertUs = 0,
            originChecksPassed = 0, originChecksFailed = 0, originChecksNone = 0,
-           originChecksUnjudged = 0, originChecksNotExamined = 0, coldReplicaDeclined = 0,
-           coldReplicaSkipped = 0,
+           originChecksUnjudged = 0, originChecksSkipped = 0, originChecksNotExamined = 0,
+           coldReplicaDeclined = 0, coldReplicaSkipped = 0,
            slotMapsMade = 0, slotMapOpens = 0, slotMapFull = 0, replicaReadBytes = 0,
            relayBytes = 0, readvChunks = 0, readvCalls = 0, readvMixed = 0, flushRuns = 0,
            flushRunBytes = 0, bufferStalls = 0, bufferStallUs = 0;

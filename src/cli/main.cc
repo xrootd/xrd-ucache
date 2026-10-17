@@ -396,12 +396,14 @@ void printStats(const StatsTotals& t) {
   if (t.nameSizeMismatches) // only a cache with logical names counts them
     row("name_size_mismatches", t.nameSizeMismatches);
   if (t.originChecksPassed || t.originChecksFailed || t.originChecksNone ||
-      t.originChecksUnjudged || t.originChecksNotExamined) {
+      t.originChecksUnjudged || t.originChecksSkipped || t.originChecksNotExamined) {
     row("origin_checks_passed", t.originChecksPassed);
     row("origin_checks_failed", t.originChecksFailed);
     row("origin_checks_none", t.originChecksNone);
     if (t.originChecksUnjudged)
       row("origin_checks_unjudged", t.originChecksUnjudged);
+    if (t.originChecksSkipped)
+      row("origin_checks_skipped", t.originChecksSkipped);
     if (t.originChecksNotExamined)
       row("origin_checks_not_examined", t.originChecksNotExamined);
   }

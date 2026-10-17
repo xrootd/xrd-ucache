@@ -6141,6 +6141,8 @@ class MissReadHandler : public ResponseHandler {
     // the cache. (A build without the codec libraries makes no map and checks nothing: it keeps
     // what it fetches, as without the setting.)
     keepNone = !m && checksOrigin(st_.get());
+    if (keepNone)
+      noteServedUnchecked(*st_);
     if (m) {
       std::string why;
       countChecks(*st_, v);
@@ -6504,6 +6506,8 @@ class MissVReadHandler : public ResponseHandler {
     bool keepNone = false;
 #ifdef UCACHE_HAVE_COLDRUN
     keepNone = !m && checksOrigin(st_.get()); // as MissReadHandler::finish
+    if (keepNone)
+      noteServedUnchecked(*st_);
     if (m) {
       countChecks(*st_, v);
       std::vector<std::pair<uint64_t, uint64_t>> asked;
@@ -6746,6 +6750,26 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
 }
 
 } // namespace
+
+void noteServedUnchecked(HandleState& st) noexcept try {
+  if (st.store)
+    st.store->stats().originChecksSkipped.fetch_add(1, std::memory_order_relaxed);
+  // Once per file and process: the names said so far, kept for the process's life (leaked, as
+  // detached threads may still use them at exit), at most 4096 of them.
+  static auto* mu = new std::mutex;
+  static auto* said = new std::unordered_set<std::string>;
+  const std::string file = recordFile(st.url);
+  {
+    std::lock_guard<std::mutex> g(*mu);
+    if (said->size() >= 4096 || !said->insert(file).second)
+      return;
+  }
+  UCACHE_WARN("%s: a fetch from the origin was served unchecked and not kept: the file's map for "
+              "check_origin_integrity could not be made (a read of its records failed, or its "
+              "parse ran out of memory); a later miss makes it again (origin_checks_skipped)",
+              file.c_str());
+} catch (...) {
+}
 
 #ifdef UCACHE_HAVE_COLDRUN
 XRootDStatus originCheckRefused(HandleState& st, ServerTally* tally, const char* op, uint64_t pos,

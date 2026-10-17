@@ -103,7 +103,7 @@ the consumers together.
  "marked_copies_last": 0, "hosts_avoided": 0, "role_queries": 0, "role_redirectors": 0, "role_unanswered": 0,
  "size_disagreements": 0, "name_size_mismatches": 0,
  "origin_checks_passed": 0, "origin_checks_failed": 0, "origin_checks_none": 0,
- "origin_checks_unjudged": 0, "origin_checks_not_examined": 0,
+ "origin_checks_unjudged": 0, "origin_checks_skipped": 0, "origin_checks_not_examined": 0,
  "entries": [{"key": "root://host:1094/path", "file_size": 0,
               "cached_bytes": 0, "page_size": 4096}],
  "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ... failover=on",
@@ -431,7 +431,14 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   content checksum, ROOT's old algorithm). `origin_checks_unjudged` counts the parts of such a
   fetch the check could not judge (a decoding job that ran out of memory): their bytes are
   served, as without the check, but nothing of that fetch is kept, and read-ahead stages none of
-  it (shown only when not 0). `origin_checks_failed` counts the baskets of such a fetch that the reader asked for
+  it (shown only when not 0). `origin_checks_skipped` counts the fetches from the origin (a
+  byte-cache miss, single or vector, or the original bytes of a file in uCache's own layout)
+  that could not be checked at all because the file's map could not be made: a read of the
+  file's records failed (another is made a second later or more, at the next miss), or the
+  parse ran out of memory. Such a fetch is served unchecked, as without the setting, and nothing
+  of it is kept; the first one of a file in a process is also said in the log, as a warning
+  naming the file (shown only when not 0). Read-ahead made while the map is not known stages
+  nothing and is not counted here. `origin_checks_failed` counts the baskets of such a fetch that the reader asked for
   whose key does not say they sit where the tree's record puts them, whose length differs from
   the one that record gives them where it changes ROOT's reading (the file map), or whose data
   fails its own checksum or does not decode; and, as one each, the reads a copy answered of the

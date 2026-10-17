@@ -47,6 +47,7 @@ add_executable(ucache-unit-tests
   unit/history_json_test.cc
   unit/readfootprint_test.cc
   unit/origin_inflight_test.cc
+  unit/keyseek_list_test.cc
   unit/publish_test.cc
   unit/pluginfile_test.cc
   ${CMAKE_SOURCE_DIR}/src/plugin/Announce.cc  # pure identity strings (no XrdCl)

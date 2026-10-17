@@ -680,7 +680,9 @@ the first request that decides `max_read_fraction` reads the records (and waits 
 those reads), the file's other first requests wait for its decision, as they did for the reads. On a file whose reads
 move, the client's own recovery is off, so a connection lost during those reads fails them: the
 file's reads are then served unchecked, and nothing of them kept, until a read a second later
-or more reads the records again.
+or more reads the records again. Each fetch served so counts in `origin_checks_skipped`
+(STATS.md), and the first one of a file in a process is said in the log, as a warning naming
+the file ("served unchecked and not kept").
 
 A file shown in uCache's own layout (`recompress = on`) bounds its fetches by the read
 deadline (5 minutes, within the client's `RequestTimeout`) and by the job's own timeout of the

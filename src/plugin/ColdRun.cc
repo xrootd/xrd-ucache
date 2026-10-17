@@ -1837,8 +1837,12 @@ class PartHandler : public ResponseHandler {
       if (req_->checkMap)
         checkOriginalPieces(req_, std::move(origs), server, wire_.empty() ? 0 : wire_.front().off,
                             bytes, on_);
-      else // not checked (the setting off, or no map could be made): kept only with the setting off
+      else {
+        // Not checked (the setting off, or no map could be made): kept only with the setting off.
+        if (req_->cf->checkAll)
+          noteServedUnchecked(*req_->st);
         serveOriginalPieces(req_, origs, !req_->cf->checkAll);
+      }
     }
     req_->done();
     delete this;

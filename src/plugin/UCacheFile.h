@@ -698,6 +698,11 @@ XrdCl::XRootDStatus originCheckRefused(HandleState& st, ServerTally* tally, cons
                                        uint64_t pos, uint32_t n, uint64_t spanOff,
                                        uint64_t spanLen, const std::string& server,
                                        const std::string& why);
+// A fetch from the origin with the check on whose file map could not be had (its parse failed,
+// threw, or a failed read stopped it within the last second): it is served unchecked and nothing
+// of it is kept. Counted (origin_checks_skipped) and said once per file and process, as a
+// warning. Throws nothing.
+void noteServedUnchecked(HandleState& st) noexcept;
 
 // Process-wide config/store accessors (UCacheFactory.cc).
 const Config& globalConfig();
