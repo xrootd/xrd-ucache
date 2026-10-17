@@ -261,36 +261,41 @@ TEST(LogicalNames, FreshnessOfAnEntryByName) {
   EXPECT_EQ(c.validateFor(byUrl), ValidateMode::kSizeMtime);
   c.validate = ValidateMode::kCksum;
   EXPECT_EQ(c.validateFor(byName), ValidateMode::kCksum);
-  // An entry by name opened again with another mtime is adopted, not started again.
-  TempDir td;
-  RealIO io;
-  Config sc;
-  sc.cacheDir = td.path();
-  sc.validate = ValidateMode::kSizeMtime;
-  {
-    CacheStore store(io, sc);
-    store.disableStatsDump();
-    auto e = store.open(byName, 100000, /*mtime=*/111);
-    ASSERT_TRUE(e);
-    std::vector<uint8_t> page(4096, 7);
-    e->writePages(0, page.size(), page.data());
-    e->flushAll();
-  }
-  {
-    CacheStore store(io, sc);
-    store.disableStatsDump();
-    auto e = store.open(byName, 100000, /*mtime=*/222);
-    ASSERT_TRUE(e);
-    EXPECT_GT(e->cachedBytes(), 0u); // kept
-    auto u = store.open(byUrl, 100000, 111);
-    ASSERT_TRUE(u);
-  }
-  {
-    CacheStore store(io, sc);
-    store.disableStatsDump();
-    auto u = store.open(byUrl, 100000, 222); // a URL key still checks its mtime
-    ASSERT_TRUE(u);
-    EXPECT_EQ(u->cachedBytes(), 0u);
+  // An entry by name opened again with another mtime is adopted, not started again. With
+  // Linux's default page and macOS's (16 KiB): a page shorter than the store's is not kept.
+  for (const uint32_t pageSize : {4096u, 16384u}) {
+    SCOPED_TRACE(pageSize);
+    TempDir td;
+    RealIO io;
+    Config sc;
+    sc.cacheDir = td.path();
+    sc.validate = ValidateMode::kSizeMtime;
+    sc.pageSize = pageSize;
+    {
+      CacheStore store(io, sc);
+      store.disableStatsDump();
+      auto e = store.open(byName, 100000, /*mtime=*/111);
+      ASSERT_TRUE(e);
+      std::vector<uint8_t> page(sc.pageSize, 7); // one whole page of the store's
+      e->writePages(0, page.size(), page.data());
+      e->flushAll();
+    }
+    {
+      CacheStore store(io, sc);
+      store.disableStatsDump();
+      auto e = store.open(byName, 100000, /*mtime=*/222);
+      ASSERT_TRUE(e);
+      EXPECT_GT(e->cachedBytes(), 0u); // kept
+      auto u = store.open(byUrl, 100000, 111);
+      ASSERT_TRUE(u);
+    }
+    {
+      CacheStore store(io, sc);
+      store.disableStatsDump();
+      auto u = store.open(byUrl, 100000, 222); // a URL key still checks its mtime
+      ASSERT_TRUE(u);
+      EXPECT_EQ(u->cachedBytes(), 0u);
+    }
   }
 }
 
