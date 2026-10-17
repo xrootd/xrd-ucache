@@ -16,6 +16,10 @@
 
 namespace ucache {
 
+// Every object at namespace scope here is constant-initialized (a literal, nullptr, a constexpr
+// constructor), never computed by a dynamic initializer: the plug-in can be called from XrdCl's
+// static initialization before this library's own dynamic initializers have run (a program that
+// loads the plug-in itself, which pulls in XrdCl as its dependency), and the pools are used then.
 namespace {
 uint64_t nowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -47,14 +51,26 @@ std::mutex& buildMu() {
 std::atomic<uint64_t> g_threadFailures{0};
 std::atomic<Stats*> g_failStats{nullptr};
 std::atomic<bool> g_failSaid{false};
-// Test hook UCACHE_TEST_THREAD_FAIL_AFTER=N (inert unless set, read at load; testSetThreadFailAfter
-// for unit tests): every thread creation of an Executor after the first N fails as if the process
-// could not make one.
-std::atomic<int64_t> g_failAfter{[] {
-  const char* v = ::getenv("UCACHE_TEST_THREAD_FAIL_AFTER");
-  return v ? static_cast<int64_t>(std::strtoll(v, nullptr, 10)) : int64_t(-1);
-}()};
+// Test hook UCACHE_TEST_THREAD_FAIL_AFTER=N (inert unless set; testSetThreadFailAfter for unit
+// tests): every thread creation of an Executor after the first N fails as if the process could not
+// make one. Constant-initialized to "not read yet" and read at the first thread started: a value
+// computed by a dynamic initializer would still be zero (fail them all) when the plugin is called
+// from XrdCl's static initialization, before this library's own initializers have run.
+constexpr int64_t kFailAfterUnread = -2;
+std::atomic<int64_t> g_failAfter{kFailAfterUnread};
 std::atomic<int64_t> g_threadsMade{0};
+int64_t failAfter() {
+  int64_t v = g_failAfter.load(std::memory_order_relaxed);
+  if (v != kFailAfterUnread)
+    return v;
+  const char* e = ::getenv("UCACHE_TEST_THREAD_FAIL_AFTER");
+  const int64_t read = e ? static_cast<int64_t>(std::strtoll(e, nullptr, 10)) : int64_t(-1);
+  const int64_t limit = read < 0 ? int64_t(-1) : read; // a negative value: inert
+  // A value set meanwhile (testSetThreadFailAfter) wins.
+  if (g_failAfter.compare_exchange_strong(v, limit, std::memory_order_relaxed))
+    return limit;
+  return v;
+}
 
 // Starts `fn` on a detached thread named `name` (at most 15 characters: what `top -H` and
 // /proc/<pid>/task/<tid>/comm show); false (counted) when no thread could be made, `err` then
@@ -63,7 +79,7 @@ template <typename Fn>
 bool startThread(Fn&& fn, std::string& err, const char* name) noexcept {
   const char* why = nullptr;
   try {
-    const int64_t limit = g_failAfter.load(std::memory_order_relaxed);
+    const int64_t limit = failAfter();
     if (limit >= 0 && g_threadsMade.fetch_add(1, std::memory_order_relaxed) >= limit)
       throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
                               "test hook UCACHE_TEST_THREAD_FAIL_AFTER");
@@ -105,7 +121,10 @@ void sayThreadFailure(unsigned failed, unsigned want, const char* what, const st
 }
 
 // Every pool core of the process, for the fallback of a pool that has no worker (cores are
-// leaked, so the pointers stay valid). Replaced, not unlocked, in a forked child, as buildMu.
+// leaked, so the pointers stay valid). The lock is replaced, not unlocked, in a forked child, as
+// buildMu, and the list with it (a parent thread may have been changing it at the fork; the
+// parent's cores are of no use to the child). Both constant-initialized and made at first use,
+// as buildMu.
 std::atomic<std::mutex*> g_coresMu{nullptr};
 std::mutex& coresMu() {
   std::mutex* m = g_coresMu.load(std::memory_order_acquire);
@@ -117,7 +136,12 @@ std::mutex& coresMu() {
   delete fresh;
   return *m;
 }
-std::vector<void*>* g_cores = new std::vector<void*>; // leaked; under coresMu
+std::vector<void*>* g_cores = nullptr; // leaked; under coresMu
+std::vector<void*>& coresLocked() { // under coresMu; throws std::bad_alloc only
+  if (!g_cores)
+    g_cores = new std::vector<void*>;
+  return *g_cores;
+}
 
 // Whether the calling thread may block (sleep out a delay) when a delayed task must run on it
 // (no thread anywhere): the plug-in sets a probe that says no on a client callback thread
@@ -221,7 +245,7 @@ struct Executor::Core {
     }
     try {
       std::lock_guard<std::mutex> g(coresMu());
-      g_cores->push_back(this);
+      coresLocked().push_back(this);
     } catch (...) {
       // not a fallback for others then; it runs its own tasks as above
     }
@@ -300,13 +324,18 @@ struct Executor::Core {
     lastGrowFailNs.store(nowNs(), std::memory_order_relaxed);
     sayThreadFailure(size - workers.load(std::memory_order_acquire), size, "worker threads", err);
   }
-  // Another pool of this generation with a worker, for a pool that has none; null for none.
-  Core* fallback() {
-    std::lock_guard<std::mutex> g(coresMu());
-    for (void* p : *g_cores) {
-      Core* c = static_cast<Core*>(p);
-      if (c != this && c->gen == gen && !c->foreign() && c->workers.load(std::memory_order_acquire) > 0)
-        return c;
+  // Another pool of this generation with a worker, for a pool that has none; null for none (also
+  // when the list cannot be read for want of memory: the task then runs on the caller).
+  Core* fallback() noexcept {
+    try {
+      std::lock_guard<std::mutex> g(coresMu());
+      for (void* p : coresLocked()) {
+        Core* c = static_cast<Core*>(p);
+        if (c && c != this && c->gen == gen && !c->foreign() &&
+            c->workers.load(std::memory_order_acquire) > 0)
+          return c;
+      }
+    } catch (...) {
     }
     return nullptr;
   }
@@ -410,19 +439,23 @@ struct Executor::Core {
     }
     return timers.empty() ? 0 : timers.top().deadlineNs;
   }
-  // With no thread anywhere: the delayed tasks now due, run on the calling thread.
+  // With no thread anywhere: the delayed tasks due now, run on the calling thread one at a time
+  // (nothing allocated: this path must work when nothing else does). Those a task adds are due
+  // later than `now`, so the loop ends.
   void runDueTimersHere() {
-    std::vector<std::function<void()>> due;
-    {
-      std::lock_guard<std::mutex> t(tmu);
-      const uint64_t now = nowNs();
-      while (!timers.empty() && timers.top().deadlineNs <= now) {
-        due.push_back(std::move(const_cast<Timed&>(timers.top()).task));
+    const uint64_t now = nowNs();
+    for (;;) {
+      std::function<void()> f;
+      {
+        std::lock_guard<std::mutex> t(tmu);
+        if (timers.empty() || timers.top().deadlineNs > now)
+          return;
+        f = std::move(const_cast<Timed&>(timers.top()).task);
         timers.pop();
       }
+      if (f)
+        f();
     }
-    for (auto& f : due)
-      f();
   }
 
   void loop() {
@@ -635,7 +668,7 @@ void Executor::setFailureStats(Stats* s) {
 
 void Executor::testSetThreadFailAfter(int64_t n) {
   g_threadsMade.store(0, std::memory_order_relaxed);
-  g_failAfter.store(n, std::memory_order_relaxed);
+  g_failAfter.store(n < 0 ? int64_t(-1) : n, std::memory_order_relaxed);
 }
 
 unsigned Executor::startedWorkers() {
@@ -646,6 +679,7 @@ unsigned Executor::startedWorkers() {
 void Executor::afterForkChild() {
   g_buildMu.store(new std::mutex, std::memory_order_release); // the old one: leaked
   g_coresMu.store(new std::mutex, std::memory_order_release); // the old one: leaked
+  g_cores = nullptr; // the parent's list: leaked; the child's is made at its first pool
   g_gen.fetch_add(1, std::memory_order_acq_rel);
 }
 

@@ -106,6 +106,20 @@ if (TARGET ucache-transpose) # learner + seek-width + hole-verification contract
   target_include_directories(ucache-unit-tests PRIVATE ${UCACHE_LZMA_INC} ${UCACHE_ZSTD_INC})
 endif()
 
+# An Executor used from another translation unit's static initialization, before Executor.cc's
+# own initializers have run (a plain program: nothing may run before its early object). Twice:
+# with the thread test hook unset (inert), and at 0 (no thread anywhere: tasks run on the caller).
+add_executable(ucache-executor-early-test unit/executor_early_test.cc
+                                          ${CMAKE_SOURCE_DIR}/src/plugin/Executor.cc)
+target_include_directories(ucache-executor-early-test PRIVATE ${CMAKE_SOURCE_DIR}/src/plugin)
+target_link_libraries(ucache-executor-early-test PRIVATE ucache-core)
+add_test(NAME executor-early-init COMMAND ucache-executor-early-test)
+set_tests_properties(executor-early-init PROPERTIES TIMEOUT 60
+                     ENVIRONMENT_MODIFICATION "UCACHE_TEST_THREAD_FAIL_AFTER=unset:")
+add_test(NAME executor-early-init-no-threads COMMAND ucache-executor-early-test)
+set_tests_properties(executor-early-init-no-threads PROPERTIES TIMEOUT 60
+                     ENVIRONMENT "UCACHE_TEST_THREAD_FAIL_AFTER=0")
+
 add_executable(ucache-crash-harness crash/crash_harness.cc
                                     ${CMAKE_SOURCE_DIR}/src/cli/RunLog.cc) # records mode's reader
 target_include_directories(ucache-crash-harness PRIVATE ${CMAKE_SOURCE_DIR}/src/cli)
