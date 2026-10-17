@@ -1,3 +1,8 @@
+// GCC 11 reports a read of zero bytes in std::vector::insert of this file's constant test bytes
+// (-Wstringop-overread, a false report that later GCCs do not make).
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 11
+#pragma GCC diagnostic ignored "-Wstringop-overread"
+#endif
 // The origin-integrity checks on compressed objects and basket key headers,
 // pinned against blocks ROOT itself wrote: a check that is wrong but
 // self-consistent would pass our own round trip and still fail on real data.

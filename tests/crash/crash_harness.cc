@@ -214,7 +214,11 @@ bool isKindLine(const std::string& l) { return l.find("\"kind\":") != std::strin
 uint64_t verifyRecords(const std::string& dir, bool quiet = false, bool drained = false) {
   FILE* const err = quiet ? nullptr : stderr;
   const auto say = [err](const char* fmt, auto... a) {
-    if (err)
+    if (!err)
+      return;
+    if constexpr (sizeof...(a) == 0)
+      std::fputs(fmt, err); // a message with no arguments is no format
+    else
       std::fprintf(err, fmt, a...);
   };
   const std::string statsDir = dir + "/stats";
