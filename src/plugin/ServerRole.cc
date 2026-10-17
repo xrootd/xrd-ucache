@@ -125,7 +125,10 @@ ServerRoles::Decision ServerRoles::decide(
       bool stale = false;
       if (it != ops_.end() && renewMs > 0) {
         std::lock_guard<std::mutex> g2(it->second->mu);
-        const uint64_t ageMs = it->second->kept ? std::min(renewMs, kRoleKeptRetryMs) : renewMs;
+        // An answer kept by a renewal that got none, and a server that never answered, are asked
+        // again after a short pause; an answer, at the renewal age.
+        const bool shortRetry = it->second->kept || it->second->kind == Kind::kNoAnswer;
+        const uint64_t ageMs = shortRetry ? std::min(renewMs, kRoleKeptRetryMs) : renewMs;
         stale = it->second->kind != Kind::kPending &&
                 nowUs() - it->second->doneUs > ageMs * 1000;
       }

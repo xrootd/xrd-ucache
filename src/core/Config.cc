@@ -537,8 +537,9 @@ std::string Config::setNote(const std::string& key, const std::string& value) co
            "files opened there: an open or read that fails at one copy is made again at another, "
            "copies are checked, and check_origin_integrity is forced for them; a file at any other "
            "server (a data server, an EOS instance, whose role is none), or one that does not "
-           "answer in time, has nothing to fail over to and is read as with failover off. The "
-           "XRootD client's connection settings are left as they are";
+           "answer in time, has nothing to fail over to and is read as with failover off (a URL "
+           "whose tried= carries a host pattern, such as tried=*.example.org, has failover "
+           "wherever it points). The XRootD client's connection settings are left as they are";
   if (key == "max_read_fraction" && !value.empty() &&
       value.find_first_not_of('0') == std::string::npos)
     return "  every ROOT file with a TTree or RNTuple is read straight from the origin and the "

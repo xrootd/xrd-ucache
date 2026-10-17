@@ -356,8 +356,8 @@ redirector's ...`, or `... gave no role (no answer within 5 s) ...`.
   its configured role, and uCache takes the configured role.
 - **The first open of a job waited about 5 s.** The server the URL names did
   not answer the question in time (it was stopped or overloaded); failover does
-  not apply to its files for the rest of the job, and later opens there do not
-  wait again. An open the cache answers from a trusted entry never asks.
+  not apply to its files until it is asked again, at an open a minute later or
+  more, and opens in between do not wait. An open the cache answers from a trusted entry never asks.
 - **A warm job asks no server at its opens.** An open answered from a trusted
   entry takes the verdict this job or an earlier one found (`<dir>/roles`);
   with none, the file is decided at its first read the cache does not hold

@@ -3658,7 +3658,7 @@ int cmdSettings(const Config& cfg) {
     // failover forces the check for the files it applies to.
     if (std::string(k.key) == "check_origin_integrity" && !cfg.checkOriginIntegrity &&
         cfg.failover)
-      source += "; forced on by failover for files from a redirector";
+      source += "; forced on by failover for files from a redirector or with tried= patterns";
     std::printf("%-22s %-28s %s\n", k.key, cfg.valueOf(k.key).c_str(), source.c_str());
   }
   std::printf("\ncurrent values: `ucache set <key> <value>` / `ucache unset <key>` "
@@ -4354,7 +4354,8 @@ int cmdDoctor(const Config& cfg) {
   }
   if (const std::string old = oldFailoverName(cfg, conf); !old.empty())
     std::printf("  [WARN] adaptive_federation (%s) is now called failover (on or off; on means "
-                "what auto meant): the old name is ignored\n",
+                "what auto meant): the old name is ignored; `ucache unset adaptive_federation` "
+                "removes it from the state file\n",
                 old.c_str());
   // The prefixes are meant for the cache (its state file, read by every job): set in a conf only,
   // a job run with another conf keys the files another way. Each still finds an entry by its URL

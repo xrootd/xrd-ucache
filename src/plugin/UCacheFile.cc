@@ -7034,7 +7034,11 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
       decideFederation(/*knownOnly=*/true);
     if (fresh && st_->avoiding()) // the File the lazy open will open: as below
       recoveryOff(*st_->inner.load());
-    if (fresh && !dropCutWarmEntry(*key, url, cfg, *st_->store, st_->fed())) {
+    // Undecided (no verdict known yet, decided at the first origin access) is judged as on: the check
+    // reads only the cache, and an entry filled from a cut copy by an earlier release or with
+    // failover off must not be served as is until a decision that a fully cached file never needs.
+    if (fresh && !dropCutWarmEntry(*key, url, cfg, *st_->store,
+                                   st_->fed() || st_->fedUndecided.load(std::memory_order_acquire))) {
       {
         std::lock_guard<std::mutex> g(st_->mu);
         st_->cacheOnly = true;

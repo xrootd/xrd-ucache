@@ -848,7 +848,7 @@ below included, `check_origin_integrity` too.
 Anything else, an error, or no answer in time leaves the files of that server
 exactly as with failover off; an answer that comes after the 5 s changes
 nothing for the opens that went on without it. A server that gave no answer is
-asked again at an open made 10 minutes later or more, and a verdict, an answer
+asked again at an open made a minute later or more, and a verdict, an answer
 of this job's or a saved one, is renewed (asked again) at an open of the origin
 made 10 minutes or more after it. Only a new answer replaces a verdict: a
 renewal that gets none (the redirector slow or down just then) leaves the

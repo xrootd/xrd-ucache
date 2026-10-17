@@ -53,8 +53,9 @@ inline constexpr int kRoleWaitS = 5;
 // The most servers whose role is kept; a server beyond it is not asked, and
 // its files are read as with the switch off.
 inline constexpr size_t kRolesMax = 4096;
-// After a renewal that got no answer and kept the earlier answer, the renewal is tried again at
-// an open made this long after it (or after the renewal age, when that is shorter).
+// After a renewal that got no answer and kept the earlier answer, and after a question that never
+// got an answer, the server is asked again at an open made this long after it (or after the renewal
+// age, when that is shorter).
 inline constexpr uint64_t kRoleKeptRetryMs = 60 * 1000;
 // The longest role kept from an answer.
 inline constexpr size_t kRoleMaxLen = 64;
