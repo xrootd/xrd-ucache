@@ -57,8 +57,9 @@ std::atomic<bool> g_warned{false};
 
 // The key-seek tables (keySeeksFor), oldest first, one per file entry: a file
 // changed at the origin has a new entry, so a table never outlives the bytes it
-// was parsed from. A table stays while its entry is alive, and is let go once
-// the entry is gone (KeySeekList.h, which says why and what it costs). The lock
+// was parsed from. A table stays while its entry is alive, and is let go at the
+// next lookup or new table after the entry is gone (KeySeekList.h, which says why
+// and what it costs). The lock
 // is never held across a parse, so no handle waits for another's. Lock order: a
 // rule's lock, then this one.
 // After a parse that a failed origin read stopped, no other for this long: a
@@ -235,6 +236,7 @@ KeySeeksBuilt keySeeksBuilt(const std::shared_ptr<FileEntry>& entry, std::functi
   if (!entry)
     return b;
   std::lock_guard<std::mutex> g(tablesMu());
+  dropUnusedKeySeekTables(tables()); // those of entries gone since: a lookup lets them go too
   for (const auto& x : tables())
     if (!x->entry.owner_before(entry) && !entry.owner_before(x->entry)) {
       b.map = x->seeks;

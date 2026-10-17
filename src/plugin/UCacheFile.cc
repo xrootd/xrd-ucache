@@ -4569,6 +4569,13 @@ static void withKeyMap(const std::shared_ptr<HandleState>& st,
     if (b.parked)
       return;
     m = b.map;
+    // The handle keeps the map it found, as openBytesMap does: its relayed reads (a read moved to
+    // another copy, a direct read) are checked against the handle's own map, never the list.
+    if (m) {
+      std::lock_guard<std::mutex> g(st->mu);
+      if (!st->keySeeks)
+        st->keySeeks = m;
+    }
   }
   if (!m) {
     go(nullptr, transpose::FetchVerdict());
@@ -5438,7 +5445,23 @@ struct RelayHandler : XrdCl::ResponseHandler {
     ClientCallback inClientCallback; // PluginSupport.h
     arrivedUs = nowUs();
 #ifdef UCACHE_HAVE_COLDRUN
-    // check_origin_integrity: decoding (a basket's data) runs on the executor (withKeyMap).
+    // check_origin_integrity: decoding (a basket's data) runs on the executor (withKeyMap). A
+    // handle armed while another handle was making the file's map holds none yet: it takes the
+    // list's (keySeeksBuilt), never waiting here, so its relayed reads are checked too.
+    if (s && s->IsOK() && r && checksOrigin(st.get()) && !keySeeksOf(*st)) {
+      std::shared_ptr<FileEntry> e;
+      {
+        std::lock_guard<std::mutex> g(st->mu);
+        e = st->entry;
+      }
+      if (e) {
+        if (std::shared_ptr<const KeyMap> m = keySeeksBuilt(e, nullptr).map) {
+          std::lock_guard<std::mutex> g(st->mu);
+          if (!st->keySeeks)
+            st->keySeeks = m;
+        }
+      }
+    }
     if (s && s->IsOK() && r && checksOrigin(st.get()) && keySeeksOf(*st)) {
       const std::vector<FetchPiece> pieces = answerPieces(r);
       if (!pieces.empty()) {
