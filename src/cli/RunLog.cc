@@ -388,12 +388,8 @@ bool hasToken(const std::string& runSettings, const std::string& tok) {
 }
 } // namespace
 
-bool federationRun(const std::string& runSettings) {
-  return hasToken(runSettings, "adaptive_federation=on");
-}
-
-bool federationAutoRun(const std::string& runSettings) {
-  return hasToken(runSettings, "adaptive_federation=auto");
+bool failoverRun(const std::string& runSettings) {
+  return hasToken(runSettings, "failover=on");
 }
 
 std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiveDir,
@@ -466,22 +462,17 @@ std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiv
     // Identity: which files this run opened, and where they came from.
     r.sig = signatureOf(r.files);
     r.readSig = readSignatureOf(r.files);
-    // Where the bytes came from. A run with adaptive_federation on (its
-    // run_settings say so) names the data server a record names, which for a
-    // file opened through a redirector is the server it sent the reads to, or
-    // for a file that read nothing from the origin the host the file was asked
-    // of. Every other run -- the switch off, or a record that does not say
-    // (written before run_settings existed, or a run killed before its counter
-    // line) -- names the host the file was asked of, the host of its URL.
-    // A record keyed by a logical name (lfn:) has no host in its key: it names its data server,
-    // whatever adaptive_federation said.
-    // A run with adaptive_federation = auto names the data server for the files of a URL whose host
-    // reported a redirector's role (its counter line's `redirector_hosts`), and the URL's host for
-    // the others, the switch off for them.
-    const bool byServerAll = federationRun(r.runSettings);
-    const bool autoRun = federationAutoRun(r.runSettings);
+    // Where the bytes came from. A run with failover on (its run_settings say so) names the
+    // data server a record names for the files of a URL whose host reported a redirector's role
+    // (its counter line's `redirector_hosts`): for a file opened through a redirector the server
+    // it sent the reads to, or for a file that read nothing from the origin the host the file was
+    // asked of. Every other file -- failover off, or a record that does not say (written before
+    // run_settings existed, or a run killed before its counter line) -- names the host the file
+    // was asked of, the host of its URL. A record keyed by a logical name (lfn:) has no host in
+    // its key: it names its data server, whatever failover said.
+    const bool failover = failoverRun(r.runSettings);
     for (const auto& [k, f] : r.files) {
-      const bool byServer = byServerAll || (autoRun && r.redirectorHosts.count(hostPortOf(k)));
+      const bool byServer = failover && r.redirectorHosts.count(hostPortOf(k));
       const bool named = k.compare(0, 4, "lfn:") == 0 && f.urlHost.empty();
       const std::string h = (byServer || named) && !f.dataServer.empty() ? f.dataServer
                             : !f.urlHost.empty()                   ? f.urlHost

@@ -16,7 +16,6 @@ add_executable(ucache-unit-tests
   unit/sha256_test.cc
   unit/config_test.cc
   unit/announce_test.cc
-  unit/client_settings_test.cc
   unit/copydetect_test.cc
   unit/log_test.cc
   unit/iobackend_test.cc
@@ -51,7 +50,6 @@ add_executable(ucache-unit-tests
   unit/publish_test.cc
   unit/pluginfile_test.cc
   ${CMAKE_SOURCE_DIR}/src/plugin/Announce.cc  # pure identity strings (no XrdCl)
-  ${CMAKE_SOURCE_DIR}/src/plugin/ClientSettings.cc # the connection-settings rule (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/CopyDetect.cc # copy tools and copy engines (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/CopyGuard.cc  # the truncated-copy guard (pure policy)
   ${CMAKE_SOURCE_DIR}/src/plugin/OpenRetry.cc  # pure policy TU (no XrdCl)

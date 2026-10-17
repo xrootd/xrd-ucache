@@ -222,27 +222,24 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.recompressKeepOriginals = truthy(v);
   else if (k == "check_origin_integrity")
     c.checkOriginIntegrity = truthy(v);
-  else if (k == "adaptive_federation") {
-    // off, on or auto, in any case (and the words the other switches take: 1/true, 0/false). Any
-    // other value is refused: the layer below governs (the default, auto, when none sets it), and
-    // `doctor` names the value.
+  else if (k == "failover") {
+    // on or off, in any case (and the words the other switches take: 1/true, 0/false). Any other
+    // value is refused: the layer below governs (the default, on, when none sets it), and `doctor`
+    // names the value.
     std::string lv = v;
     for (char& ch : lv)
       ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    if (lv == "auto") {
-      c.adaptiveFederation = FederationMode::kAuto;
-    } else if (truthy(lv)) {
-      c.adaptiveFederation = FederationMode::kOn;
+    if (truthy(lv)) {
+      c.failover = true;
     } else if (falsy(lv)) {
-      c.adaptiveFederation = FederationMode::kOff;
+      c.failover = false;
     } else {
-      c.badAdaptiveFederation = std::string(src) + " says '" + v + "'";
+      c.badFailover = std::string(src) + " says '" + v + "'";
       static auto* mu = new std::mutex;
       static auto* warned = new std::set<std::string>;
       std::lock_guard<std::mutex> g(*mu);
-      if (warned->insert(c.badAdaptiveFederation).second)
-        UCACHE_WARN("%s: adaptive_federation=%s invalid (off, on or auto); ignored", src,
-                    v.c_str());
+      if (warned->insert(c.badFailover).second)
+        UCACHE_WARN("%s: failover=%s invalid (on or off); ignored", src, v.c_str());
       return false; // the layer below still governs, and `settings` must say so
     }
   }
@@ -363,17 +360,12 @@ void clampAndFinish(Config& c, bool explicitMax) {
   c.budgetAuto = !explicitMax;
   // Recompression checks every block it converts by the block's own checksum
   // whatever this setting says (ColdRun.cc), so it does not force it.
-  // Reading from more than one site is safe only when what arrives is checked:
+  // Reading from more than one copy is safe only when what arrives is checked:
   // a copy that differs from the file's own checksums is caught before it is
-  // kept or served. Applied after every layer, so none can undo it.
-  // With `auto` it is forced for each file the switch is on for, at the file's open
-  // (the plugin's checksOrigin), so the setting itself is left as it is here.
-  if (c.federationEverywhere() && !c.checkOriginIntegrity) {
-    c.checkOriginIntegrity = true;
-    c.sources["check_origin_integrity"] = "forced by adaptive_federation";
-  }
+  // kept or served. Failover forces it for each file it applies to, at the file's
+  // open (the plugin's checksOrigin), so the setting itself is left as it is here.
   // The key rules, from the final values. Logical names whenever
-  // logical_name_prefixes is set, whatever adaptive_federation says; a list that
+  // logical_name_prefixes is set, whatever failover says; a list that
   // is not valid leaves keys by URL, warned once per process (the settings are
   // loaded more than once).
   c.keys = KeyRules(c.keepCgi, /*logical=*/true, c.logicalNamePrefixes);
@@ -474,7 +466,7 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"recompress", "UCACHE_RECOMPRESS"},
       {"recompress_keep_originals", "UCACHE_RECOMPRESS_KEEP_ORIGINALS"},
       {"check_origin_integrity", "UCACHE_CHECK_ORIGIN_INTEGRITY"},
-      {"adaptive_federation", "UCACHE_ADAPTIVE_FEDERATION"},
+      {"failover", "UCACHE_FAILOVER"},
       {"logical_name_prefixes", nullptr},
       {"mixed_maps", "UCACHE_MIXED_MAPS"},
       {"recompress_codecs", "UCACHE_RECOMPRESS_CODECS"},
@@ -528,36 +520,25 @@ bool Config::stateSettable(const std::string& key) {
 }
 
 std::string Config::setNote(const std::string& key, const std::string& value) const {
-  if (key == "check_origin_integrity" && falsy(value) && federationEverywhere())
-    return "  the check stays on while adaptive_federation = on, which forces it on (`ucache "
-           "settings` shows it)";
-  if (key == "check_origin_integrity" && falsy(value) &&
-      adaptiveFederation == FederationMode::kAuto)
-    return "  the check stays on for the files adaptive_federation = auto turns the switch on for "
-           "(those whose URL names a redirector): auto forces it on for them";
-  if (key == "adaptive_federation" && falsy(value))
-    return "  the switch is off for every file, as in uCache 1.4.0, where off was the default: no "
-           "open or read is made again at another site, and check_origin_integrity is not forced on "
-           "(the default, auto, does this for the files opened at a redirector)";
-  if (key == "adaptive_federation" && value == "auto")
+  if (key == "check_origin_integrity" && falsy(value) && failover)
+    return "  the check stays on for the files failover applies to (those whose URL names a "
+           "redirector, or carries a host pattern in tried=): failover forces it on for them";
+  std::string lv = value; // failover takes its words in any case
+  for (char& ch : lv)
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  if (key == "failover" && falsy(lv))
+    return "  every file is read as in uCache 1.4.0: no open or read is made again at another "
+           "copy, and check_origin_integrity is not forced on";
+  if (key == "failover" && truthy(lv))
     return "  each file is decided at its open: the server its URL names is asked once per job what "
            "it is (its login flags and, for one that says manager there, its configured role, as "
            "`xrdfs <host> query config role` shows it; at most 5 s in all); a redirector (a manager, "
-           "a meta manager or a supervisor, a site's own redirector included) turns the switch on "
-           "for the files opened there, with everything `on` does to a file and "
-           "check_origin_integrity forced for them; any other server (a data server, an EOS "
-           "instance, whose role is none), or one that does not answer in time, leaves them as with "
-           "the switch off. The XRootD client's connection settings are left as they are";
-  if (key == "adaptive_federation" && truthy(value))
-    return "  the XRootD client's connection settings change too: connection window 31 s, "
-           "connection retries 2, error window 180 s, each where no XRD_* variable or "
-           "client.conf sets it; every read open of a cached file gets a 60 s deadline; "
-           "a file opened through a redirector has the client's own read recovery turned off and a "
-           "time limit of 5 minutes for each read, and a read that fails is made again at another site; "
-           "an open of a ROOT file checks its header, list and labels (a few small reads at a cold "
-           "open), and each server is asked once for its site's name; servers and copies that "
-           "failed are remembered in <dir>/sources (`ucache sources` lists them); "
-           "check_origin_integrity is forced on";
+           "a meta manager or a supervisor, a site's own redirector included) has failover for the "
+           "files opened there: an open or read that fails at one copy is made again at another, "
+           "copies are checked, and check_origin_integrity is forced for them; a file at any other "
+           "server (a data server, an EOS instance, whose role is none), or one that does not "
+           "answer in time, has nothing to fail over to and is read as with failover off. The "
+           "XRootD client's connection settings are left as they are";
   if (key == "max_read_fraction" && !value.empty() &&
       value.find_first_not_of('0') == std::string::npos)
     return "  every ROOT file with a TTree or RNTuple is read straight from the origin and the "
@@ -671,8 +652,8 @@ std::string Config::valueOf(const std::string& key) const {
     return onoff(recompressKeepOriginals);
   if (key == "check_origin_integrity")
     return onoff(checkOriginIntegrity);
-  if (key == "adaptive_federation")
-    return adaptiveFederation == FederationMode::kAuto ? "auto" : onoff(federationEverywhere());
+  if (key == "failover")
+    return onoff(failover);
   if (key == "logical_name_prefixes")
     return logicalNamePrefixes;
   if (key == "mixed_maps")

@@ -319,7 +319,7 @@ ReadRule::State ReadRule::observe(const std::vector<std::pair<uint64_t, uint64_t
   // Waited for, not skipped: the requests of one fill arrive together, and a
   // request not seen would leave its branches out of the share. The holder
   // parses once (the file's records, normally in the byte cache already) and
-  // is otherwise a few lookups. With adaptive_federation on, a read of the
+  // is otherwise a few lookups. With failover on, a read of the
   // parse that fails at its copy may move the handle (parseReadMoves) while
   // mu_ is held: the file's other first requests wait for that too, as for the
   // parse's reads; the move takes no lock of the rule's. A request on the pool

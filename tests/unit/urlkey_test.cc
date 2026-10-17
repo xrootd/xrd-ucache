@@ -160,7 +160,7 @@ TEST(UrlKey, OwnOpenUrl) {
   EXPECT_EQ(own("authz=TOK&triedrc=enoent&xrd.k=v"), base + "?authz=TOK&triedrc=enoent&xrd.k=v");
 }
 
-// With adaptive_federation on, of the hosts in a reselection request the cache's
+// With failover on, of the hosts in a reselection request the cache's
 // own open keeps exactly those this process saw fail for the file, and sends
 // them with triedrc=ioerr; the others (servers the reader reads from without
 // trouble) and the resel go.

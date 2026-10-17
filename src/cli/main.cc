@@ -18,7 +18,6 @@
 #include "DiskBench.h"
 #include "Publish.h"
 #include "UrlKey.h"
-#include "../plugin/ClientSettings.h"
 #include "../plugin/ServerRole.h"
 #ifdef UCACHE_HAVE_TRANSPOSE
 #include "CacheSource.h"
@@ -90,7 +89,7 @@ void usage() {
       "                    are holding up across runs, versions and machines\n"
       "  status            cache location, budget, usage, and aggregated stats\n"
       "  sources           the servers and copies this cache remembers as failed\n"
-      "                    (adaptive_federation): marked servers and sites, copies\n"
+      "                    (failover): marked servers and sites, copies\n"
       "                    proven missing; each is tried after the others\n"
       "  bench [PATH ...] [--size SZ] [--measurement-duration S] [--threads N]\n"
       "                    [--block KB] [--fill k=v,...] [--cache-path]\n"
@@ -1476,7 +1475,7 @@ static const char* const kPublishHint =
     "publish    : `ucache publish` — a report with recommendations from this history;\n"
     "             paths, hostnames and file names never leave the machine (docs/PUBLISH.md)";
 
-// `ucache sources`: the sources this cache's processes remember as failed (adaptive_federation):
+// `ucache sources`: the sources this cache's processes remember as failed (failover):
 // the servers marked in <dir>/sources, the sites counted as marked, and the copies proven missing
 // in the files' in-use records. Pure file reads. UCACHE_TEST_CLOCK_OFFSET_S moves the clock, as
 // it does the plug-in's.
@@ -3656,10 +3655,10 @@ int cmdSettings(const Config& cfg) {
   for (const auto& k : Config::knownKeys()) {
     auto it = cfg.sources.find(k.key);
     std::string source = it == cfg.sources.end() ? "default" : it->second;
-    // adaptive_federation = auto forces the check for the files it turns the switch on for.
+    // failover forces the check for the files it applies to.
     if (std::string(k.key) == "check_origin_integrity" && !cfg.checkOriginIntegrity &&
-        cfg.adaptiveFederation == FederationMode::kAuto)
-      source += "; forced on by adaptive_federation = auto for files from a redirector";
+        cfg.failover)
+      source += "; forced on by failover for files from a redirector";
     std::printf("%-22s %-28s %s\n", k.key, cfg.valueOf(k.key).c_str(), source.c_str());
   }
   std::printf("\ncurrent values: `ucache set <key> <value>` / `ucache unset <key>` "
@@ -3688,13 +3687,12 @@ int cmdSet(const Config& cfg, const char* key, const char* value) {
                stderr);
     return 2;
   }
-  if (k == "adaptive_federation") {
+  if (k == "failover") {
     std::string v = value;
     for (char& c : v)
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (v != "auto" && v != "on" && v != "off" && v != "1" && v != "0" && v != "true" &&
-        v != "false") {
-      std::fprintf(stderr, "set: adaptive_federation takes off, on or auto, not '%s'\n", value);
+    if (v != "on" && v != "off" && v != "1" && v != "0" && v != "true" && v != "false") {
+      std::fprintf(stderr, "set: failover takes on or off, not '%s'\n", value);
       return 2;
     }
   }
@@ -4251,48 +4249,44 @@ std::string lastRunSettings(const std::string& statsDir) {
   return newest ? newest->runSettings : "";
 }
 
-// adaptive_federation = on: what a job started from this shell will run with.
-// The CLI has no XRootD client, so a client.conf value is not seen here; the
-// last run's own record says what a job really had.
-void federationNote(const Config& cfg) {
-  std::string predicted;
-  for (int i = 0; i < kClientSettingCount; ++i) {
-    const ClientSetting& s = kClientSettings[i];
-    const char* v = ::getenv(s.envName);
-    predicted += std::string(i ? ", " : "") + s.name + " " +
-                 (v ? std::string(v) + " (" + s.envName + ", kept)"
-                    : std::to_string(s.federationValue));
-  }
-  std::printf("  [NOTE] adaptive_federation = on: jobs from this shell set the XRootD client's\n"
-              "         %s,\n"
-              "         except where a client.conf sets one; a file opened through a redirector also has\n"
-              "         the client's own read recovery turned off and a time limit of 5 minutes for each read\n"
-              "         (a read that fails is made again at another site); an open of a ROOT file checks\n"
-              "         its header, list and labels (a few small reads at a cold open), each server is asked\n"
-              "         once for its site's name, and servers and copies that failed are remembered in\n"
-              "         <dir>/sources (`ucache sources`)\n",
-              predicted.c_str());
+// failover = on: decided for each file at its open.
+void failoverNote(const Config& cfg) {
+  std::printf("  [NOTE] failover = on: it applies only where there is another copy to fail over to.\n"
+              "         A job asks the server a file's URL names what it is, once per server (its login\n"
+              "         flags and, for one that says manager there, its role as `xrdfs <host> query\n"
+              "         config role` shows it; at most %d s): a redirector (a manager, meta manager or\n"
+              "         supervisor; a site's own redirector is one too) has failover for the files\n"
+              "         opened there (an open or read that fails at one copy is made again at another,\n"
+              "         copies are checked, check_origin_integrity is forced on for them); a URL with a\n"
+              "         host pattern in tried= has it too; a file at any other server (a data server,\n"
+              "         an EOS instance, one that does not answer in time) is read as with failover\n"
+              "         off. The XRootD client's connection settings are left as they are;\n"
+              "         `failover = off` reads every file as uCache 1.4.0 did\n",
+              kRoleWaitS);
   if (!cfg.cacheDir.empty())
     if (const std::string rs = lastRunSettings(cfg.cacheDir + "/stats"); !rs.empty())
       std::printf("         the last run had: %s\n", rs.c_str());
 }
 
-// adaptive_federation = auto: decided for each file at its open.
-void federationAutoNote(const Config& cfg) {
-  std::printf("  [NOTE] adaptive_federation = auto: each file is decided at its open. A job asks the\n"
-              "         server its URL names what it is, once per server (its login flags and, for one\n"
-              "         that says manager there, its role as `xrdfs <host> query config role` shows\n"
-              "         it; at most %d s): a redirector (a manager, meta manager or supervisor; a\n"
-              "         site's own redirector is one too) turns the switch on for the files opened\n"
-              "         there, with everything `on` does to a file, check_origin_integrity forced on\n"
-              "         for them included; any other server (a data server, an EOS instance, one that\n"
-              "         does not answer in time) leaves its files as with the switch off. The XRootD\n"
-              "         client's connection settings, which `on` changes for the whole job, are left\n"
-              "         as they are; `adaptive_federation = off` reads every file as uCache 1.4.0 did\n",
-              kRoleWaitS);
-  if (!cfg.cacheDir.empty())
-    if (const std::string rs = lastRunSettings(cfg.cacheDir + "/stats"); !rs.empty())
-      std::printf("         the last run had: %s\n", rs.c_str());
+// Where the setting `failover` was called `adaptive_federation` (development builds before 1.5.0):
+// the places that still name the old key, for doctor's one line. The parser warns of it as of any
+// unknown key; this says what it became.
+std::string oldFailoverName(const Config& cfg, const std::string& conf) {
+  std::string where;
+  auto add = [&where](const std::string& w) { where += (where.empty() ? "" : ", ") + w; };
+  auto sets = [](const std::string& path) {
+    for (const auto& e : readStateEntries(path))
+      if (e.first == "adaptive_federation")
+        return true;
+    return false;
+  };
+  if (!conf.empty() && sets(conf))
+    add(conf);
+  if (!cfg.cacheDir.empty() && sets(Config::statePath(cfg.cacheDir)))
+    add(Config::statePath(cfg.cacheDir));
+  if (const char* v = ::getenv("UCACHE_ADAPTIVE_FEDERATION"); v && *v)
+    add("UCACHE_ADAPTIVE_FEDERATION in the environment");
+  return where;
 }
 
 int cmdDoctor(const Config& cfg) {
@@ -4330,21 +4324,25 @@ int cmdDoctor(const Config& cfg) {
     problems += cacheSpaceProbe(cfg.cacheDir, unit);
   }
   // The prefixes of logical names are the cache's: a list that is not valid keys
-  // every file by its URL, whatever adaptive_federation says.
+  // every file by its URL, whatever failover says.
   if (!cfg.keys.prefixesValid()) {
     std::printf("  [FAIL] logical_name_prefixes '%s' is not valid (%s): files are keyed by their "
                 "URL; `ucache set logical_name_prefixes '<prefix> ...'` (or off)\n",
                 cfg.logicalNamePrefixes.c_str(), cfg.keys.prefixesError().c_str());
     ++problems;
   }
-  // A value of adaptive_federation that none of the words names was ignored: the job runs with the
-  // value of the layer below (the default, auto, when none sets it).
-  if (!cfg.badAdaptiveFederation.empty()) {
-    std::printf("  [FAIL] adaptive_federation: %s, which is not off, on or auto: it is ignored, and "
-                "jobs run with %s; set one of the three\n",
-                cfg.badAdaptiveFederation.c_str(), cfg.valueOf("adaptive_federation").c_str());
+  // A value of failover that none of the words names was ignored: the job runs with the value of
+  // the layer below (the default, on, when none sets it).
+  if (!cfg.badFailover.empty()) {
+    std::printf("  [FAIL] failover: %s, which is not on or off: it is ignored, and jobs run with "
+                "%s; set one of the two\n",
+                cfg.badFailover.c_str(), cfg.valueOf("failover").c_str());
     ++problems;
   }
+  if (const std::string old = oldFailoverName(cfg, conf); !old.empty())
+    std::printf("  [WARN] adaptive_federation (%s) is now called failover (on or off; on means "
+                "what auto meant): the old name is ignored\n",
+                old.c_str());
   // The prefixes are meant for the cache (its state file, read by every job): set in a conf only,
   // a job run with another conf keys the files another way. Each still finds an entry by its URL
   // (EntryNames.h), but a file the other job caches first is cached twice.
@@ -4374,10 +4372,8 @@ int cmdDoctor(const Config& cfg) {
                 "         the same job needs with no cache). If they run short, set recompress\n"
                 "         off and do not run `ucache recompress`; `ucache untranspose <url>`\n"
                 "         removes a file's replica while no job is reading it\n");
-  if (cfg.federationEverywhere())
-    federationNote(cfg);
-  else if (cfg.adaptiveFederation == FederationMode::kAuto)
-    federationAutoNote(cfg);
+  if (cfg.failover)
+    failoverNote(cfg);
 #ifdef UCACHE_HAVE_TRANSPOSE
   if (cfg.maxReadFraction == 0)
     std::printf("  [NOTE] max_read_fraction = 0: every ROOT file with a TTree or RNTuple is read\n"

@@ -36,7 +36,7 @@ struct OriginSource : transpose::Source {
   std::string fetchedFrom; // the server of its last read from the origin ("" for none)
   bool fromCache = false;  // a read was answered from the cache (whose bytes may be another copy's)
   XrdTimeout timeout = 0;  // of each read from the origin (0: the client's default)
-  // adaptive_federation: a failed read moves the handle to another copy and is made again there
+  // failover: a failed read moves the handle to another copy and is made again there
   // (parseReadMoves), for a parse that runs on the reader's own thread; its time counts from
   // `startUs`. Off for a parse on the executor, which never waits for a move.
   bool mayMove = false;

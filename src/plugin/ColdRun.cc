@@ -183,7 +183,7 @@ class ColdFill : public tp::StoreMaps, public std::enable_shared_from_this<ColdF
   // job with neither that fills the unfilled slots of a store made earlier keeps such a block as
   // stored and serves it, and the reader's own decoder finds the damage, as without the cache.
   bool checkConverted = false;
-  // check_origin_integrity on (forced by adaptive_federation): every basket wholly in a fetch from
+  // check_origin_integrity on (forced by failover): every basket wholly in a fetch from
   // the origin is checked by the byte path's rule, whatever recompress says and whatever its codec:
   // the original bytes outside the converted baskets (checkOriginalPieces), and a basket of a
   // converted branch the conversion did not decode (convertOne). A converted basket is decoded once,
@@ -654,8 +654,8 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   cf->entry = entry;
   cf->keepOriginals = cfg.recompressKeepOriginals;
   // check_origin_integrity as the handle that makes the slot run has it (forced for a file
-  // adaptive_federation is on for): a store shared by handles of other decisions keeps this one's.
-  // KNOWN LIMIT (adaptive_federation = auto): a handle a trusted open left undecided (its server
+  // failover is on for): a store shared by handles of other decisions keeps this one's.
+  // KNOWN LIMIT (failover): a handle a trusted open left undecided (its server
   // neither known in the process nor saved in <dir>/roles) is set up here before its decision,
   // which comes at its first access to the origin; its slot run keeps checkAll false, so the
   // baskets it fetches get no key-position check (with recompress = on each converted block is
@@ -919,7 +919,7 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   std::atomic<bool> refused{false}; // read in an invalid map's range: asking again cannot help
   // Bytes the origin sent failed their own checksum: the same source would send
   // the same bytes, so the read is not asked again (another source is a matter
-  // for adaptive_federation).
+  // for failover).
   std::atomic<bool> checkFailed{false};
   // The File the fetch whose failure failed the request was issued on (fail's `on`): the copy
   // that failure is held against when the request moves (moveSlotRequest). Null when the failure
@@ -1254,7 +1254,7 @@ void ColdRequest::finish() {
     for (uint32_t i : claimed)
       if (!std::binary_search(done.begin(), done.end(), i))
         cf->abandon(i);
-    // adaptive_federation: a fetch that failed in a way another copy may not share, or whose bytes
+    // failover: a fetch that failed in a way another copy may not share, or whose bytes
     // failed a check, moves the handle to another copy, as a byte-path read moves, and the request
     // is served again from the start there (its addresses, the layout's, never change).
     if (!refused.load()) {

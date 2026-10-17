@@ -57,10 +57,10 @@ TEST(Config, Defaults) {
   EXPECT_FALSE(c.recompressKeepOriginals); // a converted basket is not also kept
   EXPECT_TRUE(c.cacheDir.empty()); // deliberately NO default cache dir
   EXPECT_TRUE(c.sources.empty());  // nothing explicitly set anywhere
-  // adaptive_federation is auto by default: on for the files of a redirector, decided per file;
-  // the check is not forced for the process.
-  EXPECT_EQ(c.adaptiveFederation, FederationMode::kAuto);
-  EXPECT_EQ(c.valueOf("adaptive_federation"), "auto");
+  // failover is on by default: it applies to the files of a redirector, decided per file; the
+  // check is not forced for the process.
+  EXPECT_TRUE(c.failover);
+  EXPECT_EQ(c.valueOf("failover"), "on");
   EXPECT_FALSE(c.checkOriginIntegrity);
 }
 
@@ -223,156 +223,119 @@ TEST(Config, CheckOriginIntegrityNotForcedByRecompress) {
   }
 }
 
-// adaptive_federation: off by default, set from the conf or its env twin, and
-// it forces check_origin_integrity on (recompress does not).
-TEST(Config, AdaptiveFederationForcesTheIntegrityCheck) {
+// failover: on by default, set from the conf or its env twin; it never forces
+// check_origin_integrity for the process (that is per file, in the plugin), and
+// neither does recompress.
+TEST(Config, FailoverForcesNothingForTheProcess) {
   EnvGuard g;
   {
     Config c = Config::fromEnv();
-    EXPECT_TRUE(c.federationPossible()) << "auto by default";
-    EXPECT_FALSE(c.federationEverywhere());
-    EXPECT_EQ(c.valueOf("adaptive_federation"), "auto");
-    EXPECT_EQ(c.sources.count("adaptive_federation"), 0u);
-  }
-  std::map<std::string, std::string> conf = {{"adaptive_federation", "on"}};
-  {
-    Config c = Config::fromEnv(&conf);
-    EXPECT_TRUE(c.federationEverywhere());
-    EXPECT_EQ(c.valueOf("adaptive_federation"), "on");
-    EXPECT_EQ(c.sources.at("adaptive_federation"), "conf");
-    EXPECT_TRUE(c.checkOriginIntegrity);
-    EXPECT_EQ(c.sources.at("check_origin_integrity"), "forced by adaptive_federation");
-  }
-  conf = {{"check_origin_integrity", "off"}};
-  ::setenv("UCACHE_ADAPTIVE_FEDERATION", "1", 1);
-  {
-    Config c = Config::fromEnv(&conf);
-    EXPECT_TRUE(c.federationEverywhere());
-    EXPECT_EQ(c.sources.at("adaptive_federation"), "env");
-    EXPECT_TRUE(c.checkOriginIntegrity) << "no layer undoes the forcing";
-    EXPECT_EQ(c.sources.at("check_origin_integrity"), "forced by adaptive_federation");
-  }
-  conf = {{"recompress", "on"}};
-  {
-    Config c = Config::fromEnv(&conf);
-    EXPECT_TRUE(c.checkOriginIntegrity);
-    EXPECT_EQ(c.sources.at("check_origin_integrity"), "forced by adaptive_federation")
-        << "recompress = on forces nothing";
-  }
-  conf = {{"check_origin_integrity", "on"}};
-  {
-    Config c = Config::fromEnv(&conf);
-    EXPECT_EQ(c.sources.at("check_origin_integrity"), "conf")
-        << "a check already on is not relabelled";
-  }
-  ::setenv("UCACHE_ADAPTIVE_FEDERATION", "off", 1);
-  {
-    Config c = Config::fromEnv();
-    EXPECT_FALSE(c.federationPossible());
+    EXPECT_TRUE(c.failover) << "on by default";
+    EXPECT_EQ(c.valueOf("failover"), "on");
+    EXPECT_EQ(c.sources.count("failover"), 0u);
     EXPECT_FALSE(c.checkOriginIntegrity);
   }
-}
-
-// adaptive_federation = auto: from the conf, the env or the state file; the
-// check is not forced for the process (it is per file), and `settings` says so.
-TEST(Config, AdaptiveFederationAuto) {
-  EnvGuard g;
-  std::map<std::string, std::string> conf = {{"adaptive_federation", "auto"}};
+  std::map<std::string, std::string> conf = {{"failover", "on"}};
   {
     Config c = Config::fromEnv(&conf);
-    EXPECT_EQ(c.adaptiveFederation, FederationMode::kAuto);
-    EXPECT_FALSE(c.federationEverywhere());
-    EXPECT_TRUE(c.federationPossible());
-    EXPECT_EQ(c.valueOf("adaptive_federation"), "auto");
-    EXPECT_EQ(c.sources.at("adaptive_federation"), "conf");
+    EXPECT_TRUE(c.failover);
+    EXPECT_EQ(c.sources.at("failover"), "conf");
     EXPECT_FALSE(c.checkOriginIntegrity) << "forced per file, not for the process";
-    EXPECT_EQ(c.valueOf("check_origin_integrity"), "off");
-    EXPECT_EQ(c.sources.count("check_origin_integrity"), 0u) << "`settings` says what auto forces";
+    EXPECT_EQ(c.sources.count("check_origin_integrity"), 0u);
   }
-  conf = {{"adaptive_federation", "auto"}, {"check_origin_integrity", "on"}};
+  conf = {{"failover", "on"}, {"check_origin_integrity", "on"}};
   {
     Config c = Config::fromEnv(&conf);
     EXPECT_TRUE(c.checkOriginIntegrity);
     EXPECT_EQ(c.sources.at("check_origin_integrity"), "conf");
   }
-  conf = {{"adaptive_federation", "on"}};
-  ::setenv("UCACHE_ADAPTIVE_FEDERATION", "auto", 1);
+  conf = {{"recompress", "on"}};
   {
     Config c = Config::fromEnv(&conf);
-    EXPECT_EQ(c.adaptiveFederation, FederationMode::kAuto) << "the environment wins";
-    EXPECT_EQ(c.sources.at("adaptive_federation"), "env");
-    EXPECT_FALSE(c.checkOriginIntegrity);
+    EXPECT_FALSE(c.checkOriginIntegrity) << "recompress = on forces nothing";
   }
-  // Any case of off/on/auto; a value it does not know is ignored (the layer below governs, the
-  // default when none sets it) and recorded for doctor.
-  for (const char* v : {"Auto", "AUTO", "auto"}) {
-    ::setenv("UCACHE_ADAPTIVE_FEDERATION", v, 1);
-    Config c = Config::fromEnv();
-    EXPECT_EQ(c.adaptiveFederation, FederationMode::kAuto) << v;
-    EXPECT_TRUE(c.badAdaptiveFederation.empty()) << v;
-  }
-  for (const char* v : {"ON", "True", "1"}) {
-    ::setenv("UCACHE_ADAPTIVE_FEDERATION", v, 1);
-    EXPECT_EQ(Config::fromEnv().adaptiveFederation, FederationMode::kOn) << v;
-  }
-  for (const char* v : {"OFF", "False", "0"}) {
-    ::setenv("UCACHE_ADAPTIVE_FEDERATION", v, 1);
-    EXPECT_EQ(Config::fromEnv().adaptiveFederation, FederationMode::kOff) << v;
-  }
-  for (const char* v : {"bogus", "yes", "enabled", "autoo"}) {
-    ::setenv("UCACHE_ADAPTIVE_FEDERATION", v, 1);
-    Config c = Config::fromEnv();
-    EXPECT_EQ(c.adaptiveFederation, FederationMode::kAuto) << v << ": ignored, the default holds";
-    EXPECT_EQ(c.valueOf("adaptive_federation"), "auto") << v;
-    EXPECT_EQ(c.sources.count("adaptive_federation"), 0u) << v;
-    EXPECT_NE(c.badAdaptiveFederation.find(v), std::string::npos) << c.badAdaptiveFederation;
-  }
+  conf = {{"failover", "on"}};
+  ::setenv("UCACHE_FAILOVER", "off", 1);
   {
-    std::map<std::string, std::string> offConf = {{"adaptive_federation", "off"}};
-    ::setenv("UCACHE_ADAPTIVE_FEDERATION", "yes", 1);
-    Config c = Config::fromEnv(&offConf);
-    EXPECT_EQ(c.adaptiveFederation, FederationMode::kOff) << "the layer below (the conf) governs";
-    EXPECT_EQ(c.sources.at("adaptive_federation"), "conf");
-    EXPECT_FALSE(c.badAdaptiveFederation.empty());
+    Config c = Config::fromEnv(&conf);
+    EXPECT_FALSE(c.failover) << "the environment wins";
+    EXPECT_EQ(c.valueOf("failover"), "off");
+    EXPECT_EQ(c.sources.at("failover"), "env");
   }
-  ::unsetenv("UCACHE_ADAPTIVE_FEDERATION");
-  conf = {{"adaptive_federation", "auto"}};
-  Config a = Config::fromEnv(&conf);
-  const std::string note = a.setNote("check_origin_integrity", "off");
-  EXPECT_NE(note.find("auto forces it on for them"), std::string::npos) << note;
-  Config plain = Config::fromEnv();
-  const std::string set = plain.setNote("adaptive_federation", "auto");
-  EXPECT_NE(set.find("query config role"), std::string::npos) << set;
-  EXPECT_NE(set.find("a site's own redirector included"), std::string::npos) << set;
-  EXPECT_EQ(set.find("connection window 31 s"), std::string::npos) << set;
 }
 
-// The notes `ucache set` prints: turning the check off while a switch forces it
-// says it stays on, and turning the switch on names the client settings.
+// failover takes on/off in any case and the words the other switches take (1/true, 0/false);
+// any other value -- `auto` among them, a value of development builds -- is ignored (the layer
+// below governs, the default when none sets it) and recorded for doctor. The old name is not a
+// setting: the parser calls it unknown, as any key it does not know.
+TEST(Config, FailoverValues) {
+  EnvGuard g;
+  for (const char* v : {"ON", "On", "on", "True", "1"}) {
+    ::setenv("UCACHE_FAILOVER", v, 1);
+    Config c = Config::fromEnv();
+    EXPECT_TRUE(c.failover) << v;
+    EXPECT_TRUE(c.badFailover.empty()) << v;
+  }
+  for (const char* v : {"OFF", "Off", "False", "0"}) {
+    ::setenv("UCACHE_FAILOVER", v, 1);
+    Config c = Config::fromEnv();
+    EXPECT_FALSE(c.failover) << v;
+    EXPECT_TRUE(c.badFailover.empty()) << v;
+  }
+  for (const char* v : {"bogus", "yes", "auto", "enabled"}) {
+    std::map<std::string, std::string> offConf = {{"failover", "off"}};
+    ::setenv("UCACHE_FAILOVER", v, 1);
+    Config d = Config::fromEnv();
+    EXPECT_TRUE(d.failover) << v << ": ignored, the default holds";
+    EXPECT_EQ(d.sources.count("failover"), 0u) << v;
+    EXPECT_NE(d.badFailover.find(v), std::string::npos) << d.badFailover;
+    Config c = Config::fromEnv(&offConf);
+    EXPECT_FALSE(c.failover) << v << ": the layer below (the conf) governs";
+    EXPECT_EQ(c.sources.at("failover"), "conf");
+    EXPECT_FALSE(c.badFailover.empty());
+  }
+  ::unsetenv("UCACHE_FAILOVER");
+  {
+    std::map<std::string, std::string> old = {{"adaptive_federation", "off"}};
+    ::setenv("UCACHE_ADAPTIVE_FEDERATION", "off", 1);
+    Config c = Config::fromEnv(&old);
+    EXPECT_TRUE(c.failover) << "the old name sets nothing";
+    EXPECT_EQ(c.sources.count("adaptive_federation"), 0u);
+    EXPECT_EQ(c.valueOf("adaptive_federation"), "?");
+    EXPECT_FALSE(Config::stateSettable("adaptive_federation"));
+    EXPECT_EQ(Config::retiredReason("adaptive_federation"), nullptr) << "never released: no alias";
+    ::unsetenv("UCACHE_ADAPTIVE_FEDERATION");
+  }
+}
+
+// The notes `ucache set` prints: turning the check off while failover is on says
+// it stays on for the files failover applies to; setting failover says what it
+// does, and never names client connection settings (they are left alone).
 TEST(Config, SetNotes) {
   EnvGuard g;
-  std::map<std::string, std::string> offConf = {{"adaptive_federation", "off"}};
+  std::map<std::string, std::string> offConf = {{"failover", "off"}};
   Config plain = Config::fromEnv(&offConf);
   EXPECT_EQ(plain.setNote("check_origin_integrity", "off"), "");
   EXPECT_EQ(plain.setNote("check_origin_integrity", "on"), "");
-  const std::string swOff = plain.setNote("adaptive_federation", "off");
+  const std::string swOff = plain.setNote("failover", "off");
   EXPECT_NE(swOff.find("as in uCache 1.4.0"), std::string::npos) << swOff;
-  const std::string on = plain.setNote("adaptive_federation", "on");
-  EXPECT_NE(on.find("connection window 31 s"), std::string::npos) << on;
-  EXPECT_NE(on.find("connection retries 2"), std::string::npos) << on;
-  EXPECT_NE(on.find("error window 180 s"), std::string::npos) << on;
-  EXPECT_NE(on.find("60 s deadline"), std::string::npos) << on;
-  EXPECT_NE(on.find("check_origin_integrity is forced on"), std::string::npos) << on;
-  EXPECT_EQ(plain.setNote("adaptive_federation", "1"), on);
+  EXPECT_EQ(plain.setNote("failover", "OFF"), swOff);
+  const std::string on = plain.setNote("failover", "on");
+  EXPECT_NE(on.find("query config role"), std::string::npos) << on;
+  EXPECT_NE(on.find("a site's own redirector included"), std::string::npos) << on;
+  EXPECT_NE(on.find("nothing to fail over to"), std::string::npos) << on;
+  EXPECT_EQ(on.find("connection window 31 s"), std::string::npos) << on;
+  EXPECT_EQ(on.find("federation"), std::string::npos) << on;
+  EXPECT_EQ(plain.setNote("failover", "1"), on);
+  EXPECT_EQ(plain.setNote("failover", "On"), on);
   EXPECT_EQ(plain.setNote("recompress", "off"), "");
 
-  std::map<std::string, std::string> conf = {{"adaptive_federation", "on"}};
-  Config fed = Config::fromEnv(&conf);
+  Config fed = Config::fromEnv();
   const std::string off = fed.setNote("check_origin_integrity", "off");
-  EXPECT_NE(off.find("stays on while adaptive_federation = on"), std::string::npos) << off;
+  EXPECT_NE(off.find("failover forces it on for them"), std::string::npos) << off;
   EXPECT_EQ(fed.setNote("check_origin_integrity", "on"), "");
 
-  conf = {{"recompress", "on"}, {"adaptive_federation", "off"}};
+  std::map<std::string, std::string> conf = {{"recompress", "on"}, {"failover", "off"}};
   Config rec = Config::fromEnv(&conf);
   EXPECT_EQ(rec.setNote("check_origin_integrity", "false"), "")
       << "recompress = on does not force the check: turning it off needs no note";

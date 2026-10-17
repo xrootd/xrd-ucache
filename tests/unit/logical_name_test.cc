@@ -217,7 +217,7 @@ TEST(LogicalNames, StoredKeysMapThroughTheRules) {
 }
 
 // The settings: the prefixes have no environment variable (a property of the cache); off by
-// default; set, they key by name whatever adaptive_federation says, and the switch alone keys
+// default; set, they key by name whatever failover says, and failover alone keys
 // nothing by name; the list is shown as held.
 TEST(LogicalNames, Settings) {
   for (const auto& k : Config::knownKeys()) {
@@ -230,11 +230,11 @@ TEST(LogicalNames, Settings) {
   EXPECT_EQ(c.valueOf("logical_name_prefixes"), "off");
   EXPECT_FALSE(c.keys.logical());
   EXPECT_EQ(c.keys.key("root://h//store/mc/a.root")->key, UrlKey::parse("root://h//store/mc/a.root")->key);
-  c = configOf({{"adaptive_federation", "on"}}); // the switch alone: keys by URL, as before
+  c = configOf({{"failover", "on"}}); // failover alone: keys by URL, as before
   EXPECT_FALSE(c.keys.logical());
   EXPECT_EQ(c.keys.key("root://h//store/mc/a.root")->key, UrlKey::parse("root://h//store/mc/a.root")->key);
   for (const char* sw : {"off", "on"}) { // set, the prefixes name files with the switch off or on
-    c = configOf({{"adaptive_federation", sw}, {"logical_name_prefixes", kCms}});
+    c = configOf({{"failover", sw}, {"logical_name_prefixes", kCms}});
     EXPECT_TRUE(c.keys.logical()) << sw;
     EXPECT_EQ(c.keys.key("root://h//store/mc/a.root")->key, "lfn:/store/mc/a.root") << sw;
   }
@@ -331,11 +331,11 @@ TEST(LogicalNames, ReadoutsFollowTheRecordsAndKeepOrigins) {
   };
   TempDir td;
   write(td.path(), 1, "root://cmsxrootd.fnal.gov:1094/store/mc/a.root",
-        "v1 check_origin_integrity=off adaptive_federation=off");
+        "v1 check_origin_integrity=off failover=off");
   const KeyRules off = cms(false);
   ASSERT_EQ(off.prefixesHash().size(), 8u);
   write(td.path(), 2, "lfn:/store/mc/a.root",
-        "v1 check_origin_integrity=on adaptive_federation=on logical_names=on/" + off.prefixesHash());
+        "v1 check_origin_integrity=on failover=on logical_names=on/" + off.prefixesHash());
   EXPECT_TRUE(recordsKeyedByName(td.path(), off.prefixesHash()));
   EXPECT_FALSE(recordsKeyedByName(td.path(), "00000000"));
   const auto runs = loadRuns(td.path(), "", &off);
@@ -346,21 +346,21 @@ TEST(LogicalNames, ReadoutsFollowTheRecordsAndKeepOrigins) {
   const ucache::Run& byUrl = runs[0].pid == 1 ? runs[0] : runs[1];
   EXPECT_EQ(byUrl.originHosts.count("cmsxrootd.fnal.gov"), 1u); // its origin is kept
   TempDir td2;
-  write(td2.path(), 1, "root://cmsxrootd.fnal.gov:1094/store/mc/a.root", "v1 adaptive_federation=off");
-  write(td2.path(), 2, "root://eoscms.cern.ch:1094/eos/cms/store/mc/a.root", "v1 adaptive_federation=off");
+  write(td2.path(), 1, "root://cmsxrootd.fnal.gov:1094/store/mc/a.root", "v1 failover=off");
+  write(td2.path(), 2, "root://eoscms.cern.ch:1094/eos/cms/store/mc/a.root", "v1 failover=off");
   EXPECT_FALSE(recordsKeyedByName(td2.path(), off.prefixesHash()));
   const auto plain = loadRuns(td2.path(), "", &off);
   ASSERT_EQ(plain.size(), 2u);
   EXPECT_NE(plain[0].sig, plain[1].sig); // nothing keyed by name, the switch off: as written
-  EXPECT_TRUE(keyedByName("v1 adaptive_federation=on logical_names=on/abcdef01"));
-  EXPECT_FALSE(keyedByName("v1 adaptive_federation=on logical_names=off"));
-  EXPECT_EQ(nameHashOf("v1 adaptive_federation=on logical_names=on/abcdef01"), "abcdef01");
+  EXPECT_TRUE(keyedByName("v1 failover=on logical_names=on/abcdef01"));
+  EXPECT_FALSE(keyedByName("v1 failover=on logical_names=off"));
+  EXPECT_EQ(nameHashOf("v1 failover=on logical_names=on/abcdef01"), "abcdef01");
   // Records of a run keyed by other prefixes are read as written: they do not join these
   // prefixes' names, and alone they do not make the readout map anything.
   TempDir td3;
-  write(td3.path(), 1, "root://cmsxrootd.fnal.gov:1094/store/mc/a.root", "v1 adaptive_federation=off");
+  write(td3.path(), 1, "root://cmsxrootd.fnal.gov:1094/store/mc/a.root", "v1 failover=off");
   write(td3.path(), 2, "root://eoscms.cern.ch:1094/eos/cms/store/mc/a.root",
-        "v1 adaptive_federation=on logical_names=on/deadbeef");
+        "v1 failover=on logical_names=on/deadbeef");
   const auto other = loadRuns(td3.path(), "", &off);
   ASSERT_EQ(other.size(), 2u);
   EXPECT_NE(other[0].sig, other[1].sig);
@@ -370,12 +370,12 @@ TEST(LogicalNames, ReadoutsFollowTheRecordsAndKeepOrigins) {
   const ucache::Run& byOther = mixed[0].pid == 2 ? mixed[0] : mixed[1];
   EXPECT_EQ(byOther.files.count("root://eoscms.cern.ch:1094/eos/cms/store/mc/a.root"), 1u);
   // A record keyed by name has no host in its key: its origin is the data server it names, with
-  // adaptive_federation off too (logical names do not depend on it).
+  // failover off too (logical names do not depend on it).
   TempDir td4;
   {
     const std::string stem = td4.path() + "/host-7-1000-0";
     std::ofstream(stem + ".jsonl") << "{\"ts\":2000,\"pid\":7,\"opens\":1,\"run_settings\":\"v1 "
-                                      "adaptive_federation=off logical_names=on/"
+                                      "failover=off logical_names=on/"
                                    << on.prefixesHash() << "\"}\n";
     std::ofstream(stem + ".files.jsonl")
         << "{\"ts\":2000,\"key\":\"lfn:/store/mc/a.root\",\"opens\":1,\"wire_bytes\":10,"

@@ -20,20 +20,20 @@
 #
 #   sent back              the file is on b and c, and c refuses it; a new file each
 #                          time, one open, until the regional sends the retry back to
-#                          c. With adaptive_federation on every open succeeds, the
+#                          c. With failover on every open succeeds, the
 #                          client sends a locate, the regional logs it,
 #                          failover_locates counts it, and the open that was sent
 #                          back is made at b: an attempt of route candidate
 #   empty copy             the file is a ROOT file named *.root, two servers hold it and the third
 #                          holds it empty (a, b and c in turn); a new file each time, one open,
 #                          until an open landed on the empty copy first.
-#                          With adaptive_federation on that copy is refused (a ROOT file is never
+#                          With failover on that copy is refused (a ROOT file is never
 #                          empty), the open goes on to a copy with bytes, the reader gets the
 #                          file's own bytes, and the records show the empty copy's size 0, a
 #                          failed attempt of op open, class data, and the copy that was taken
 #   cut short              the file is named *.root, a holds its first bytes (the header, which says
 #                          where the file ends, is intact), b holds all of it and c is empty. With
-#                          adaptive_federation on, the open that lands on a reads the first 300
+#                          failover on, the open that lands on a reads the first 300
 #                          bytes of the copy, finds the size it reports smaller than the end the
 #                          header states, and goes on to a copy that is whole; the reader is shown
 #                          the whole size; the records show the copy's size, a failed attempt of op
@@ -77,19 +77,19 @@
 #                          uCache closes each copy it opened (the test client never closes its File)
 #   all refused            a, b and c refuse the file: Open() returns OK, one
 #                          completion, a failure that names all three servers
-#   the default            adaptive_federation unset, which is auto: `ucache settings` says auto;
-#                          the regional reports a redirector's role, so the switch is on for
+#   the default            failover unset, which is on: `ucache settings` says on;
+#                          the regional reports a redirector's role, so failover applies to
 #                          its files: on a, b and c, a refusing, every open succeeds (those
 #                          that landed on a made again elsewhere), and the regional was asked
 #                          its role once per process (role_queries, role_redirectors)
-#   switch off             adaptive_federation = off: a refuses the file. On a alone, every open lands
+#   switch off             failover = off: a refuses the file. On a alone, every open lands
 #                          on a and fails; on a, b and c, the opens that landed on a fail
 #                          there and none is moved. The client sends no locate and the
 #                          regional logs none for the file; the positive controls are the
 #                          first leg's client log and an xrdfs locate of the leg's own
 #   reads                  a read whose origin read is made to fail (UCACHE_TEST_READ_FAIL_N,
 #                          and _KIND for where and how) is read again at another site,
-#                          with adaptive_federation on, and answered with the file's own
+#                          with failover on, and answered with the file's own
 #                          bytes, once: misses (a Read, then a VectorRead), relayed reads
 #                          (a PgRead, a VectorRead into one buffer), reads the client
 #                          refuses at once, eight failures of threads at one handle (also
@@ -291,7 +291,7 @@ echo; echo "=== an open sent back to the server that refused it"
 # regional's first answer is c, it sends the retry to c again (a name that cannot be
 # masked), and the open goes on to a server the regional lists. Up to 120 files (about 7 are
 # needed on average, and the leg stops at the first).
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
+FEDENV=(UCACHE_FAILOVER=on)
 got=0 allok=1
 for i in $(seq 120); do
   L=/store/ci/f5-$i.bin
@@ -359,7 +359,7 @@ copies_closed() {
 echo; echo "=== an empty copy of a file named *.root is refused"
 # Up to 60 files, the empty copy on a, b and c in turn (the regional may prefer a server when all
 # three hold the file), until an open landed on it first.
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
+FEDENV=(UCACHE_FAILOVER=on)
 others() { case $1 in a) echo b c ;; b) echo a c ;; c) echo a b ;; esac; }
 got=0 allok=1
 for i in $(seq 60); do
@@ -381,7 +381,7 @@ if [ "$got" != 0 ]; then
 fi
 
 echo; echo "=== a copy of a file named *.root that is cut short of its header's end is refused"
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
+FEDENV=(UCACHE_FAILOVER=on)
 got=0 allok=1
 for i in $(seq 60); do
   L=/store/ci/cut-$i.root
@@ -431,7 +431,7 @@ echo; echo "=== the header read fails: the reader's open gets exactly one comple
 # reader's open gets one completion, through the handler's HandleResponseWithHosts, with a host list.
 L=/store/ci/hf-all.root
 placew $L a b c
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=99)
+FEDENV=(UCACHE_FAILOVER=on UCACHE_TEST_HEADER_FAIL_N=99)
 res=$(fuzz "$W/c19" "$W/f19.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-denied)
 echo "$res" | sed 's/^/    /' | cut -c1-700
 records "$W/c19" | sed 's/^/    rec: /' | cut -c1-230
@@ -446,7 +446,7 @@ CC=$(copies_closed "$W/f19.log")
 for kind in error short; do
   L=/store/ci/hf-one-$kind.root
   placew $L a b c
-  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=$kind)
+  FEDENV=(UCACHE_FAILOVER=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=$kind)
   res=$(fuzz "$W/c20-$kind" "$W/f20-$kind.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
   echo "$res" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-300
   records "$W/c20-$kind" | sed 's/^/    rec: /' | cut -c1-230
@@ -469,7 +469,7 @@ done
 # checks turn the recovery off, so it reads false while their reads are in flight, and the reader's true after.
 L=/store/ci/prop-race.root
 placew $L a b c
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_PROP_DELAY_MS=2000 UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay)
+FEDENV=(UCACHE_FAILOVER=on UCACHE_TEST_PROP_DELAY_MS=2000 UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay)
 res=$(fuzz "$W/c24" "$W/f24.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-property-race)
 echo "$res" | sed 's/^/    /' | cut -c1-300
 echo "$res" | grep -q '^open-property-race: clean$'; verdict "a setting made as the checks at open begin: ReadRecovery false during their reads, the reader's true after, one completion" $?
@@ -480,7 +480,7 @@ echo "$res" | grep -q '^open-property-race: clean$'; verdict "a setting made as 
 # the entry (open_check_bytes_kept), never left waiting in memory.
 L=/store/ci/stat-during.root
 placew $L a b c
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay)
+FEDENV=(UCACHE_FAILOVER=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay)
 res=$(fuzz "$W/c25" "$W/f25.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-stat-during-checks)
 echo "$res" | sed 's/^/    /' | cut -c1-300
 echo "$res" | grep -q '^open-stat-during-checks: clean$'; verdict "a Stat made while the checks at open run waits for the open's answer: the file's size, no earlier than 4.5 s after the open was issued; one completion; the read of the header exact" $?
@@ -495,7 +495,7 @@ K=$(counter "$W/c25" open_check_bytes_kept)
 # and fails once; the Stat then fails too (the client's own answer for a File that is not open).
 L=/store/ci/stat-during-cut.root
 cutw $L a b c
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay)
+FEDENV=(UCACHE_FAILOVER=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay)
 res=$(fuzz "$W/c25c" "$W/f25c.log" "root://127.0.0.1:$RX/$L" "$W/fixw-cut.bin" 1 1 1 open-stat-during-checks cut)
 echo "$res" | sed 's/^/    /' | cut -c1-300
 echo "$res" | grep -q '^open-stat-during-checks: clean$'
@@ -510,7 +510,7 @@ verdict "every copy cut: the checks' first read was the late one, the open's cop
 # file's size, and the file's first 300 bytes.
 L=/store/ci/park-from-callback.root
 placew $L a b c
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay)
+FEDENV=(UCACHE_FAILOVER=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_KIND=delay)
 res=$(fuzz "$W/c25p" "$W/f25p.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-park-from-callback)
 echo "$res" | sed 's/^/    /' | cut -c1-600
 echo "$res" | grep -q '^CALLS at-once$'
@@ -520,7 +520,7 @@ verdict "the Stat and the Read made from the callback are answered once each, af
 grep -qE 'MsgHandler created.*kXR_read \(handle: 0x[0-9a-f]*, offset: 0, size: 300\)' "$W/f25p.log" &&
   [ "$(records "$W/c25p" | wc -l)" = 1 ] && records "$W/c25p" | grep -q '"status":"ok"'
 verdict "the checks' first read was the late one, and the open succeeded at its first attempt (the fault was in place)" $?
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on) # the cases below have no header fault
+FEDENV=(UCACHE_FAILOVER=on) # the cases below have no header fault
 
 echo; echo "=== a copy that is zeros at the file's size is refused"
 head -c "$FIXW_SIZE" /dev/zero > "$W/fixw-zero.bin"
@@ -610,9 +610,9 @@ CC=$(copies_closed "$W/f22.log")
 # the read of the list fails at the first copy: a failed copy, the open goes on
 L=/store/ci/dmg-listread.root
 placew $L a b c
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_STAGE=list)
+FEDENV=(UCACHE_FAILOVER=on UCACHE_TEST_HEADER_FAIL_N=1 UCACHE_TEST_HEADER_FAIL_STAGE=list)
 res=$(fuzz "$W/c23" "$W/f23.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
+FEDENV=(UCACHE_FAILOVER=on)
 echo "$res" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-300
 records "$W/c23" | sed 's/^/    rec: /' | cut -c1-230
 records "$W/c23" | head -1 | grep -q '"code":108,' && [ "$(nheader "$W/f23.log")" = 2 ]
@@ -636,7 +636,7 @@ verdict "one attempt, ok, at a copy of $LONG_SIZE bytes (its header says $FIXW_S
 [ "$(confirmed "$W/c18")" = 0 ]; verdict "the size is not confirmed (bit 2 of the sidecar's flags is clear)" $?
 
 echo; echo "=== every copy of a file named *.root is empty: one error naming the copies"
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
+FEDENV=(UCACHE_FAILOVER=on)
 L12=/store/ci/ee.root
 place $L12 a b c
 for s in a b c; do : > "$W/data/$s$L12"; done
@@ -686,10 +686,10 @@ echo "$res" | grep -q 'no site could open it'; verdict "the error says no site c
 [ "$n" = 3 ]; verdict "it names all three servers ($n of 3)" $?
 records "$W/c9" | tail -1 | grep -q '"outcome":"error"'; verdict "the last record line says outcome error" $?
 
-echo; echo "=== the default, auto: through the regional, a redirector, the switch is on"
-DEF=auto
-[ -x "$BUILD/src/cli/ucache" ] && DEF=$(env -u UCACHE_ADAPTIVE_FEDERATION UCACHE_DIR="$W/c10s" "$BUILD/src/cli/ucache" settings 2>&1 | grep -i '^adaptive_federation' | head -1 | awk '{print $2}')
-[ "$DEF" = auto ]; verdict "the switch's default, as ucache settings shows it, is auto ($DEF)" $?
+echo; echo "=== the default, on: through the regional, a redirector, failover applies"
+DEF=on
+[ -x "$BUILD/src/cli/ucache" ] && DEF=$(env -u UCACHE_FAILOVER UCACHE_DIR="$W/c10s" "$BUILD/src/cli/ucache" settings 2>&1 | grep -i '^failover' | head -1 | awk '{print $2}')
+[ "$DEF" = on ]; verdict "failover's default, as ucache settings shows it, is on ($DEF)" $?
 # The file on a, b and c, a refusing; the reader leaves the switch unset. Each open that lands on a is made again
 # elsewhere (through the regional's list), so none fails; the regional's role was asked once per process.
 FEDENV=()
@@ -706,12 +706,12 @@ RQ=$(counter "$W/c10d" role_queries); RR=$(counter "$W/c10d" role_redirectors)
 [ "$RQ" = 1 ] && [ "$RR" = 1 ]
 verdict "the default: the regional was asked once and found a redirector (role_queries $RQ, role_redirectors $RR)" $?
 
-echo; echo "=== the switch off (adaptive_federation = off): a refuses the file"
+echo; echo "=== the switch off (failover = off): a refuses the file"
 # First the file on a alone, which refuses it: every open lands on a (whatever the regional would choose among
 # copies), is refused and fails. Then the file on a, b and c, a refusing: the regional chooses among them as it
 # will (it went 30 opens without a in some runs), and each open that landed on a fails there, as it would without
 # the cache, and no other is moved anywhere: the opens that failed are the refusals at a, one landing each.
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=off)
+FEDENV=(UCACHE_FAILOVER=off)
 L10A=/store/ci/f10a.bin
 place $L10A a
 chmod 000 "$W/data/a$L10A"
@@ -765,7 +765,7 @@ rf() {
   local l=/store/ci/rf-$c-${kind:-x}$tag.bin
   place8 $l a b c
   RFC="$W/c-rf-$c-${kind:-x}$tag"
-  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=$sw UCACHE_TEST_READ_FAIL_N=$n ${kind:+UCACHE_TEST_READ_FAIL_KIND=$kind} "${RFX[@]}")
+  FEDENV=(UCACHE_FAILOVER=$sw UCACHE_TEST_READ_FAIL_N=$n ${kind:+UCACHE_TEST_READ_FAIL_KIND=$kind} "${RFX[@]}")
   RES=$(fuzz "$RFC" "$W/rf-$c-${kind:-x}$tag.log" "root://$RFHOST:$RX/$l" "$W/f8.bin" 1 1 1 read-failover $c)
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-220
   SV=($(echo "$RES" | sed -n 's/^SERVERS //p' | pnorm))       # as ports (pnorm), as FL and MV
@@ -899,7 +899,7 @@ zr() {
   n=$(echo "$l" | tr / _)
   RFC="$W/c-zr$n"
   ZRLOG="$W/zr$n.log"
-  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=$sw UCACHE_CHECK_ORIGIN_INTEGRITY=on ${land:+UCACHE_ZERO_CMD=$cmd ZERO_LFN=$l} "${ZREXTRA[@]}")
+  FEDENV=(UCACHE_FAILOVER=$sw UCACHE_CHECK_ORIGIN_INTEGRITY=on ${land:+UCACHE_ZERO_CMD=$cmd ZERO_LFN=$l} "${ZREXTRA[@]}")
   [ "$land" = landref ] && FEDENV+=(UCACHE_TEST_LOCATE_REFRESH=1)
   RES=$(fuzz "$RFC" "$W/zr$n.log" "root://127.0.0.1:$RX/$l" "$FIX" 1 1 1 read-failover $c)
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-220
@@ -1102,7 +1102,7 @@ ct() {
   n=$(echo "$l" | tr / _)
   placew $l a b c
   RFC="$W/c-ct$n"
-  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on ${script:+UCACHE_CUT_CMD=$W/$script.sh CUT_LFN=$l})
+  FEDENV=(UCACHE_FAILOVER=on ${script:+UCACHE_CUT_CMD=$W/$script.sh CUT_LFN=$l})
   RES=$(fuzz "$RFC" "$W/ct$n.log" "root://127.0.0.1:$RX/$l" "$FIXW" 1 1 1 read-failover $c)
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-300
   SV=($(echo "$RES" | sed -n 's/^SERVERS //p' | pnorm))
@@ -1173,7 +1173,7 @@ case \$1 in $AX) s=a ;; $BX) s=b ;; $CX) s=c ;; *) exit 1 ;; esac
 cp "$FIXW" "$W/data/\$s$L"
 RESTSH
 chmod 755 "$W/restore.sh"
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_TEST_READ_FAIL_N=3 UCACHE_TEST_READ_FAIL_AFTER=1 UCACHE_TEST_READ_FAIL_KIND=leftdata UCACHE_CUT_CMD=$W/cut.sh CUT_LFN=$L UCACHE_RESTORE_CMD=$W/restore.sh)
+FEDENV=(UCACHE_FAILOVER=on UCACHE_TEST_READ_FAIL_N=3 UCACHE_TEST_READ_FAIL_AFTER=1 UCACHE_TEST_READ_FAIL_KIND=leftdata UCACHE_CUT_CMD=$W/cut.sh CUT_LFN=$L UCACHE_RESTORE_CMD=$W/restore.sh)
 RES=$(fuzz "$RFC" "$W/ct-leftdata.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 read-failover leftdata)
 echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-300
 LD=($(echo "$RES" | sed -n 's/^LEFTDATA //p' | pnorm))
@@ -1196,7 +1196,7 @@ echo; echo "=== a handle that lost its trust, whose own open then fails at every
 L=/store/ci/degraded.root
 placew $L a b c
 DC="$W/c-degraded"
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_REVALIDATE_S=3600)
+FEDENV=(UCACHE_FAILOVER=on UCACHE_REVALIDATE_S=3600)
 res=$(fuzz "$DC" "$W/degraded-fill.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
 echo "$res" | grep -q '^open-failover: clean$' && [ -n "$(find "$DC" -name '*.meta' -print -quit)" ] && [ -n "$(find "$DC" -name '*.val' -print -quit)" ]
 verdict "lost trust: the first run read the file and left its entry and its freshness marker" $?
@@ -1207,7 +1207,7 @@ find "$DC" -name '*.meta' -delete
 for s in a b c; do chmod 000 "$W/data/\$s$L"; done
 DEGSH
 chmod 755 "$W/degraded.sh"
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_REVALIDATE_S=3600 UCACHE_CUT_CMD=$W/degraded.sh)
+FEDENV=(UCACHE_FAILOVER=on UCACHE_REVALIDATE_S=3600 UCACHE_CUT_CMD=$W/degraded.sh)
 RES=$(fuzz "$DC" "$W/degraded.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 read-failover degraded)
 echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-600
 recs "$DC" open | tail -n +$((N0 + 1)) | sed 's/^/    rec: /' | cut -c1-230
@@ -1231,8 +1231,8 @@ n=0; for p in $AX $BX $CX; do echo "$RES" | grep '^MSG read' | grep -q "(127.0.0
 ! echo "$RES" | grep -q 'Invalid operation'
 verdict "lost trust: no read got the client's answer for a File that never opened (Invalid operation): none was given to it" $?
 
-echo; echo "=== the same with the switch off (adaptive_federation = off)"
-# The same fault with adaptive_federation off: each request (a Read, a VectorRead, a Stat, an Fcntl, a Visa, then a
+echo; echo "=== the same with the switch off (failover = off)"
+# The same fault with failover off: each request (a Read, a VectorRead, a Stat, an Fcntl, a Visa, then a
 # PgRead) gets the handle's own open's error, the server's refusal,
 # which is what the reader's open would have got without the cache; no copy is named and no other is tried. Then
 # the test makes the copies readable again (UCACHE_RESTORE_CMD), and after the open's cool-down (a second) a Read
@@ -1240,7 +1240,7 @@ echo; echo "=== the same with the switch off (adaptive_federation = off)"
 L=/store/ci/degraded-off.root
 placew $L a b c
 DO="$W/c-degraded-off"
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=off UCACHE_REVALIDATE_S=3600)
+FEDENV=(UCACHE_FAILOVER=off UCACHE_REVALIDATE_S=3600)
 res=$(fuzz "$DO" "$W/degraded-off-fill.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
 echo "$res" | grep -q '^open-failover: clean$' && [ -n "$(find "$DO" -name '*.meta' -print -quit)" ] && [ -n "$(find "$DO" -name '*.val' -print -quit)" ]
 verdict "lost trust, switch off: the first run read the file and left its entry and its freshness marker" $?
@@ -1255,7 +1255,7 @@ cat > "$W/degraded-off-restore.sh" <<DEGSH
 for s in a b c; do chmod 666 "$W/data/\$s$L"; done
 DEGSH
 chmod 755 "$W/degraded-off.sh" "$W/degraded-off-restore.sh"
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=off UCACHE_REVALIDATE_S=3600 UCACHE_CUT_CMD=$W/degraded-off.sh UCACHE_RESTORE_CMD=$W/degraded-off-restore.sh)
+FEDENV=(UCACHE_FAILOVER=off UCACHE_REVALIDATE_S=3600 UCACHE_CUT_CMD=$W/degraded-off.sh UCACHE_RESTORE_CMD=$W/degraded-off-restore.sh)
 RES=$(fuzz "$DO" "$W/degraded-off.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 read-failover degradedoff)
 echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-600
 recs "$DO" open | tail -n +$((N0 + 1)) | sed 's/^/    rec: /' | cut -c1-230
@@ -1283,7 +1283,7 @@ DREC=$(recs "$DO" open | tail -n +$((N0 + 1)))
 echo "$DREC" | head -1 | grep -q '"route":"degraded","status":"error","code":400,"errno":3010,' &&
   echo "$DREC" | tail -1 | grep -q '"route":"degraded","status":"ok"' && [ "$(echo "$DREC" | grep -c '"route":"failover"\|"route":"candidate"')" = 0 ]
 verdict "lost trust, switch off: the records show the handle's own open refused (route degraded, 400/3010), made again once the copies were readable (ok), and no failover" $?
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
+FEDENV=(UCACHE_FAILOVER=on)
 
 echo; echo "=== a trusted handle's own open: an Fcntl or a Visa first, another version at every copy"
 # A handle opened trusting its entry (a freshness window) is given an Fcntl (a Visa) before its first read: the
@@ -1299,14 +1299,14 @@ for kind in fcntl visa; do
   L=/store/ci/own-$kind.root
   placew $L a b c
   OC="$W/c-own-$kind"
-  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_REVALIDATE_S=3600)
+  FEDENV=(UCACHE_FAILOVER=on UCACHE_REVALIDATE_S=3600)
   res=$(fuzz "$OC" "$W/own-$kind-fill.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
   echo "$res" | grep -q '^open-failover: clean$' && [ -n "$(find "$OC" -name '*.val' -print -quit)" ]
   verdict "own $kind: the first run read the file and left its entry and its freshness marker" $?
   N0=$(recs "$OC" open | wc -l)
   printf '#!/bin/sh\nfor s in a b c; do cp "%s" "%s/data/$s%s"; chmod 666 "%s/data/$s%s"; done\n' "$W/fixw-other.bin" "$W" "$L" "$W" "$L" > "$W/own-$kind.sh"
   chmod 755 "$W/own-$kind.sh"
-  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_REVALIDATE_S=3600 UCACHE_CUT_CMD=$W/own-$kind.sh)
+  FEDENV=(UCACHE_FAILOVER=on UCACHE_REVALIDATE_S=3600 UCACHE_CUT_CMD=$W/own-$kind.sh)
   RES=$(fuzz "$OC" "$W/own-$kind.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 read-failover own$kind)
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-400
   echo "$RES" | grep -q "^read-failover own$kind: clean$"
@@ -1326,7 +1326,7 @@ for kind in cut whole; do
   L=/store/ci/degraded-$kind.root
   placew $L a b c
   DK="$W/c-degraded-$kind"
-  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_REVALIDATE_S=3600)
+  FEDENV=(UCACHE_FAILOVER=on UCACHE_REVALIDATE_S=3600)
   res=$(fuzz "$DK" "$W/degraded-$kind-fill.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 open-failover)
   echo "$res" | grep -q '^open-failover: clean$' && [ -n "$(find "$DK" -name '*.val' -print -quit)" ]
   verdict "degraded $kind: the first run read the file and left its entry and its freshness marker" $?
@@ -1337,7 +1337,7 @@ for kind in cut whole; do
     [ "$kind" = cut ] && echo "for s in a b c; do cp \"$W/fixw-cut.bin\" \"$W/data/\$s$L\"; done"
   } > "$W/degraded-$kind.sh"
   chmod 755 "$W/degraded-$kind.sh"
-  FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on UCACHE_REVALIDATE_S=3600 UCACHE_CUT_CMD=$W/degraded-$kind.sh)
+  FEDENV=(UCACHE_FAILOVER=on UCACHE_REVALIDATE_S=3600 UCACHE_CUT_CMD=$W/degraded-$kind.sh)
   RES=$(fuzz "$DK" "$W/degraded-$kind.log" "root://127.0.0.1:$RX/$L" "$FIXW" 1 1 1 read-failover degraded$kind)
   echo "$RES" | grep -v '^PASS' | sed 's/^/    /' | cut -c1-400
   recs "$DK" open | tail -n +$((N0 + 1)) | sed 's/^/    rec: /' | cut -c1-230
@@ -1355,7 +1355,7 @@ for kind in cut whole; do
   NH=$(grep -cE 'MsgHandler created.*kXR_read \(handle: 0x[0-9a-f]*, offset: 0, size: 300\)' "$W/degraded-$kind.log")
   [ "$NH" -ge 1 ]; verdict "degraded $kind: the handle's own open read the copy's first 300 bytes, the checks made at open ($NH)" $?
 done
-FEDENV=(UCACHE_ADAPTIVE_FEDERATION=on)
+FEDENV=(UCACHE_FAILOVER=on)
 
 echo; echo "=== logical names: one file through two servers is one entry"
 # The plugin's conf with the prefixes; the same random reads (one seed) through a, then b.

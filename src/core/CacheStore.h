@@ -294,7 +294,7 @@ class CacheStore {
   // The run line's `run_settings` (docs/STATS.md), set once before any
   // thread that dumps stats exists; immutable afterwards.
   void setRunSettings(std::string s) { runSettings_ = std::move(s); }
-  // adaptive_federation = auto: a server (host:port, lower-cased) found to be a redirector; the run
+  // failover: a server (host:port, lower-cased) found to be a redirector; the run
   // line lists them as `redirector_hosts` (docs/STATS.md), so that a readout can tell the files the
   // switch was on for. A forked child keeps its parent's. Thread-safe.
   void noteRedirectorHost(const std::string& host);

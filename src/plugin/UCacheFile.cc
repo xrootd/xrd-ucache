@@ -491,7 +491,7 @@ const int gTestOpenDeadlineS = [] {
 const int gReadDeadlineS = readDeadlineS(::getenv("UCACHE_TEST_READ_DEADLINE_S"));
 
 // The per-request timeout of a read open of a cached handle (OpenPolicy.h).
-// The deadline is part of adaptive_federation: with the switch off, the
+// The deadline is part of failover: with the switch off, the
 // reader's own open passes the reader's own timeout unchanged (0 = the
 // client's RequestTimeout), and the cache's own opens pass none (0), as they
 // did before there was a deadline (openAndWait). Without the switch there is no other
@@ -509,7 +509,7 @@ ucache::XrdTimeout openDeadline(bool fed, int readerTimeoutS) {
   return static_cast<ucache::XrdTimeout>(openDeadlineS(own, gTestOpenDeadlineS));
 }
 
-// ---- Opening a file at another site (adaptive_federation on) -------------
+// ---- Opening a file at another site (failover on) -------------
 // UCACHE_TEST_FAILOVER_MAX_S and UCACHE_TEST_FAILOVER_MAX_SITES replace the
 // time and site bounds of a sequence of attempts, for tests; read at load,
 // like the deadline's.
@@ -519,6 +519,15 @@ int envAtLoad(const char* name) {
 }
 const int gTestFailoverMaxS = envAtLoad("UCACHE_TEST_FAILOVER_MAX_S");
 const int gTestFailoverMaxSites = envAtLoad("UCACHE_TEST_FAILOVER_MAX_SITES");
+// TEST HOOK, inert unless set: UCACHE_TEST_FAILOVER_FORCE=1 (read at load) gives every file of the
+// process failover's protections, whatever server its URL names and with no role question, while
+// failover is on; with failover off it does nothing. For tests that read one server as if a
+// redirector had sent them there; users have one meaning of the setting, decided per file.
+const bool gTestFailoverForce = envAtLoad("UCACHE_TEST_FAILOVER_FORCE") > 0;
+// Failover is decided for each file at its open (the role of its URL's server, tried= patterns).
+bool failoverDecides() { return globalConfig().failover && !gTestFailoverForce; }
+// Every file has it from its handle's creation (the test hook).
+bool failoverForced() { return globalConfig().failover && gTestFailoverForce; }
 int failoverMaxSites() {
   return gTestFailoverMaxSites > 0 ? gTestFailoverMaxSites : kFailoverMaxSites;
 }
@@ -538,7 +547,7 @@ Executor& deliverExecutor() {
   static Executor* exec = new Executor(2, "uc-deliver", "uc-deliver-tmr");
   return *exec;
 }
-// The pool on which the requests parked while a reader's open was in flight (adaptive_federation
+// The pool on which the requests parked while a reader's open was in flight (failover
 // on) are made again, or answered, once it has answered (releaseOpenWaiters). Making one again may
 // set the handle up, which waits for the cache's disk and may read the file's own records from the
 // origin: not for a client callback thread, nor for the pools above. Built at first use.
@@ -615,7 +624,7 @@ struct OpenAttempt {
   uint64_t t0 = 0;  // issued, steady µs
   uint64_t endUs = 0; // answered, when the record is written after something else was waited for
   int timeoutS = 0; // the request's own timeout; 0 = XrdCl's default
-  // With adaptive_federation on, set on the last attempt of a sequence: how
+  // With failover on, set on the last attempt of a sequence: how
   // the open ended ("ok" or "error") and the sequence's budget.
   const char* outcome = nullptr;
   int budgetS = 0;
@@ -694,10 +703,10 @@ AttemptView viewOf(HandleState& st, const XRootDStatus& s, const HostList* hosts
 
 SiteFailure siteFailure(const AttemptView& w, const XRootDStatus& s, const std::string& sentTo);
 
-// ---- Site names (adaptive_federation) ---------------------------------------
+// ---- Site names (failover) ---------------------------------------
 // The site a server is at, as the server names it (OpenPolicy.h siteNameOfAnswer): asked of it
 // once per process, by a query of its configuration value "sitename", as CMSSW's XRootD adaptor
-// asks it. Asked only with adaptive_federation on: of the server an open attempt reached when it
+// asks it. Asked only with failover on: of the server an open attempt reached when it
 // answered (siteFailure's server), and of each copy a regional redirector lists for a failover
 // (locateNext). Asks of one server are coalesced; a query is made on the executor, never on a
 // client callback thread (a FileSystem made or destroyed there can hang a fork), and nothing on
@@ -840,7 +849,7 @@ class SiteNameHandler : public ResponseHandler {
 // Asks the server `server` (host:port) for its site name, unless it was asked already (or its
 // query failed less than kSiteNameRetryS ago). Never blocks; throws nothing.
 void askSiteName(const std::shared_ptr<CacheStore>& store, const std::string& server) noexcept try {
-  if (!globalConfig().federationPossible() || server.empty() || server == "the origin" ||
+  if (!globalConfig().failover || server.empty() || server == "the origin" ||
       processExiting())
     return;
   const std::string key = serverKey(server);
@@ -895,9 +904,9 @@ void askSiteName(const std::shared_ptr<CacheStore>& store, const std::string& se
 } catch (...) {
 }
 // The site name the server `server` (host:port) gave, "" when none is known (not asked, asked
-// and not answered yet, or it gave none). With adaptive_federation off, always "".
+// and not answered yet, or it gave none). With failover off, always "".
 std::string knownSiteName(const std::string& server) noexcept try {
-  if (!globalConfig().federationPossible())
+  if (!globalConfig().failover)
     return std::string();
   const auto op = siteNameOp(server);
   if (!op)
@@ -910,7 +919,7 @@ std::string knownSiteName(const std::string& server) noexcept try {
 // knownSiteName, after waiting at most `ms` for a query of `server` in flight to end. Blocks:
 // never called on a client callback thread.
 std::string awaitSiteName(const std::string& server, int64_t ms) noexcept try {
-  const auto op = globalConfig().federationPossible() ? siteNameOp(server) : nullptr;
+  const auto op = globalConfig().failover ? siteNameOp(server) : nullptr;
   if (!op)
     return std::string();
   std::unique_lock<std::mutex> lk(op->mu);
@@ -931,7 +940,7 @@ void siteNamesInit() {
   ::pthread_atfork(nullptr, nullptr, [] { siteNameTable() = SiteNameTable(); });
 }
 
-// ---- adaptive_federation = auto: the role of the server a URL names (ServerRole.h) ----------
+// ---- failover: the role of the server a URL names (ServerRole.h) ----------
 // Asked once per server (host:port, lower-cased, as the URL names it) and process, at the first
 // open of a file there: its login flags (FileSystem::Protocol), and for one whose flags say
 // redirector its configured role (the configuration query "role"), on the same FileSystem; the
@@ -992,7 +1001,7 @@ void endRole(const std::shared_ptr<ServerRoles::Op>& op, const std::string& serv
   if (kept) {
     if (store)
       store->stats().roleUnanswered.fetch_add(1, std::memory_order_relaxed);
-    UCACHE_INFO("adaptive_federation = auto: %s gave no answer when asked again: its earlier role "
+    UCACHE_INFO("failover: %s gave no answer when asked again: its earlier role "
                 "'%s' stands (%s)",
                 server.c_str(), role.c_str(),
                 kind == ServerRoles::Kind::kRedirector ? "a redirector's" : "not a redirector's");
@@ -1016,18 +1025,18 @@ void endRole(const std::shared_ptr<ServerRoles::Op>& op, const std::string& serv
       store->stats().roleRedirectors.fetch_add(1, std::memory_order_relaxed);
       store->noteRedirectorHost(server);
     }
-    UCACHE_INFO("adaptive_federation = auto: %s reports the role '%s', a redirector's: the files "
-                "opened there are read with the switch on",
+    UCACHE_INFO("failover: %s reports the role '%s', a redirector's: the files opened there "
+                "have failover",
                 server.c_str(), role.c_str());
   } else if (kind == ServerRoles::Kind::kOther) {
-    UCACHE_INFO("adaptive_federation = auto: %s reports the role '%s', not a redirector's: the "
-                "files opened there are read as with the switch off",
+    UCACHE_INFO("failover: %s reports the role '%s', not a redirector's: the files opened "
+                "there are read as with failover off",
                 server.c_str(), role.empty() ? "(none it could name)" : role.c_str());
   } else if (kind == ServerRoles::Kind::kNoAnswer) {
     if (store)
       store->stats().roleUnanswered.fetch_add(1, std::memory_order_relaxed);
-    UCACHE_INFO("adaptive_federation = auto: %s gave no role (%s): the files opened there are "
-                "read as with the switch off",
+    UCACHE_INFO("failover: %s gave no role (%s): the files opened there are read as with "
+                "failover off",
                 server.c_str(), role.c_str());
   }
 } catch (...) {
@@ -1130,7 +1139,7 @@ bool startRoleQuery(const std::shared_ptr<ServerRoles::Op>& op, const std::strin
                     int timeoutS) {
   if (store)
     store->stats().roleQueries.fetch_add(1, std::memory_order_relaxed);
-  UCACHE_DEBUG("adaptive_federation = auto: asking %s for its role", server.c_str());
+  UCACHE_DEBUG("failover: asking %s for its role", server.c_str());
   Executor::instance().postAfter(gRoleDelayMs, [op, server, url, store, timeoutS] {
     try {
       if (processExiting()) {
@@ -1157,7 +1166,7 @@ bool startRoleQuery(const std::shared_ptr<ServerRoles::Op>& op, const std::strin
 
 bool mayWaitForMove(); // below
 
-// adaptive_federation = auto: whether the switch is on for the file at `url` (HandleState::
+// failover: whether the switch is on for the file at `url` (HandleState::
 // federation), from what its server is. A handle that only relays (`relayOnly`: a write open, a
 // copy, the cache disabled or without a directory) is not asked for: nothing of the switch is for
 // it. A URL that is not root:// or roots:// (xroot, xroots) names no XRootD server to ask. Never
@@ -1202,7 +1211,7 @@ static void seedSavedRole(const std::string& server, uint64_t maxAgeS) noexcept 
     if (r.redirector)
       if (const auto store = globalStore())
         store->noteRedirectorHost(server);
-    UCACHE_DEBUG("adaptive_federation = auto: %s taken as %s from the cache's saved verdicts (%s, "
+    UCACHE_DEBUG("failover: %s taken as %s from the cache's saved verdicts (%s, "
                  "%llu s old)",
                  server.c_str(), r.redirector ? "a redirector" : "not a redirector", r.role.c_str(),
                  static_cast<unsigned long long>(age));
@@ -1236,7 +1245,7 @@ static FedDecision autoFederation(const std::string& url, bool relayOnly, RoleAs
     out.decided = k.op && (k.kind == ServerRoles::Kind::kRedirector ||
                            k.kind == ServerRoles::Kind::kOther);
     out.on = out.decided && k.federation;
-    UCACHE_DEBUG("adaptive_federation = auto: %s for %s, a trusted entry's open (%s)",
+    UCACHE_DEBUG("failover: %s for %s, a trusted entry's open (%s)",
                  !out.decided ? "undecided" : out.on ? "on" : "off", url.c_str(),
                  out.decided ? k.role.c_str()
                              : "its server not known here: decided at the file's first access to "
@@ -1264,7 +1273,7 @@ static FedDecision autoFederation(const std::string& url, bool relayOnly, RoleAs
       gRoleRenewS * 1000);
   if (d.ended) // this open saw the bound run out, or the query could not be made: said here
     endRole(d.op, server, store);
-  UCACHE_DEBUG("adaptive_federation = auto: %s for %s (%s)", d.federation ? "on" : "off",
+  UCACHE_DEBUG("failover: %s for %s (%s)", d.federation ? "on" : "off",
                url.c_str(),
                d.kind == ServerRoles::Kind::kPending ? "no answer yet" : d.role.c_str());
   out.on = d.federation;
@@ -1282,8 +1291,7 @@ static FedDecision autoFederation(const std::string& url, bool relayOnly, RoleAs
 // meanwhile are forgotten, as at an open that decides off. Lock order: innerOpenMu (when the caller
 // holds it), lateFedMu, propMu, mu.
 void HandleState::decideFederationLate() noexcept try {
-  if (fedDecided.load(std::memory_order_acquire) ||
-      globalConfig().adaptiveFederation != FederationMode::kAuto)
+  if (fedDecided.load(std::memory_order_acquire) || !failoverDecides())
     return;
   std::lock_guard<std::mutex> g(lateFedMu);
   if (fedDecided.load(std::memory_order_acquire))
@@ -1294,7 +1302,7 @@ void HandleState::decideFederationLate() noexcept try {
     // A thread that may not wait, the question out: the handle stays undecided, and the request
     // that asked keeps nothing it fetches (fedUndecided: served, never stored). The next access
     // decides, once the answer is in or from a thread that may wait.
-    UCACHE_DEBUG("adaptive_federation = auto: %s still undecided (its server's answer is not in "
+    UCACHE_DEBUG("failover: %s still undecided (its server's answer is not in "
                  "yet): this request keeps nothing it fetches",
                  recordFile(url).c_str());
     return;
@@ -1307,7 +1315,7 @@ void HandleState::decideFederationLate() noexcept try {
   }
   fedDecided.store(true, std::memory_order_release);
   fedUndecided.store(false, std::memory_order_release);
-  UCACHE_DEBUG("adaptive_federation = auto: %s for %s, decided at its first access to the origin",
+  UCACHE_DEBUG("failover: %s for %s, decided at its first access to the origin",
                d.on ? "on" : "off", recordFile(url).c_str());
 } catch (...) {
   fedDecided.store(true, std::memory_order_release); // off, as a failed decision is
@@ -1316,7 +1324,7 @@ void HandleState::decideFederationLate() noexcept try {
 
 namespace {
 
-// ---- Remembering sources that failed (adaptive_federation) -------------------
+// ---- Remembering sources that failed (failover) -------------------
 // Site-fault memory (SourceMarks.h): a server that stalled while other sites answered normally, or
 // that answered with a fault of its own, is marked in <cacheDir>/sources, shared by every process
 // of the cache; copy faults (InUse.h): a copy proven missing, in the file's in-use record. Both only
@@ -1709,7 +1717,7 @@ void noteOriginOpenOrThrow(const OpenAttempt& a, const XRootDStatus* status, con
     server = refusedAt;
     host = server.substr(0, server.rfind(':'));
   }
-  // With adaptive_federation on, the server the attempt is held against (siteFailure's), when it
+  // With failover on, the server the attempt is held against (siteFailure's), when it
   // answered, is asked for its site name; the record carries the name once it is known.
   std::string siteName;
   if (st.fed()) {
@@ -1917,7 +1925,7 @@ XRootDStatus avoidedStatus() {
                       "the copy is at a host to avoid");
 }
 
-// One open's attempts, with adaptive_federation on, as one sequence
+// One open's attempts, with failover on, as one sequence
 // (OpenPolicy.h): its time budget, read at its start, the sites that failed,
 // and what the next attempt names in tried=. Used by one driver at a time: the
 // reader's open handler, or the thread that runs the cache's own open.
@@ -2081,7 +2089,7 @@ enum class Next : uint8_t {
 // The attempt answered `s` (`w`: its reading), the `sourceAttempt`-th at its
 // source, sent to `sentUrl`; `want`: the size the cache holds (0: none). A
 // transient failure is retried at the same source first (open_retries), while
-// the sequence `seq` may issue more (null: adaptive_federation off); then,
+// the sequence `seq` may issue more (null: failover off); then,
 // with `seq`, an outcome another site may not share -- a success of another
 // size, an empty ROOT file or one on tape, included -- goes elsewhere. A copy of
 // another size, or on tape, that no other site replaces is kept: that is how an open ends
@@ -2645,7 +2653,7 @@ class ReaderOpenHandler : public ResponseHandler {
   // will come. The attempt is recorded here (when `fresh`: the first open
   // issued on its File), and the error is the reader's answer, returned from
   // Open as the client returns it: the reader's handler is never called. This
-  // handler is used with adaptive_federation off only (with it on, a cached
+  // handler is used with failover off only (with it on, a cached
   // file's open goes through RetryingOpenHandler, which answers a refusal
   // through the reader's handler).
   void refused(const XRootDStatus& status, const std::string& url, bool fresh) {
@@ -2709,7 +2717,7 @@ struct OpenAnswer {
   bool unfinished = false;
 };
 // Opens `f` for reading with `timeout` (0: the client's request timeout, as
-// with adaptive_federation off) and waits for the answer, as the synchronous
+// with failover off) and waits for the answer, as the synchronous
 // open did; an error XrdCl returns at once, when no answer will come, is
 // returned as it is. `netS` > 0 bounds the wait: an answer that has not come
 // that long after the request's own timeout would have ended it is taken as an
@@ -2887,7 +2895,7 @@ void releaseOpenWaiters(const std::shared_ptr<HandleState>& st,
 // FRESH inner file (a failed open is terminal on the object):
 //  - open_retries: a TRANSIENT failure is tried again at the same source, with
 //    full-jitter backoff;
-//  - with adaptive_federation on, an open through a redirector that failed at
+//  - with failover on, an open through a redirector that failed at
 //    one site in a way another site may not share is made again through the
 //    redirector, with the servers that failed named in tried= (OpenPolicy.h),
 //    within one time budget and a bound on the sites; a success is taken
@@ -2930,7 +2938,7 @@ class RetryingOpenHandler : public ResponseHandler {
   // Issue the first attempt on the ctor-created inner file. Always returns stOK:
   // `real_` will receive exactly one completion (after a retry, or a forwarded
   // failure), so the XrdCl sync wrapper waits for our handler instead of
-  // short-circuiting on a sync error. With adaptive_federation on, for a handle
+  // short-circuiting on a sync error. With failover on, for a handle
   // the cache serves, what follows a sync error is posted, so that the reader is
   // never answered from inside Open. With it off, it is decided here, as
   // open_retries has always done it: a retry is scheduled on the work pool, and
@@ -3415,7 +3423,7 @@ class RetryingOpenHandler : public ResponseHandler {
                   : ok ? XRootDStatus(XrdCl::stError, XrdCl::errErrorResponse, kXR_FSError,
                                       "the copy there is on tape (offline)")
                        : s;
-    // With adaptive_federation on, the reader's failure carries the last hosts there were; with it
+    // With failover on, the reader's failure carries the last hosts there were; with it
     // off, an empty host list, as open_retries has always given it.
     if (record_ && h && fed_)
       lastHosts_ = std::move(h);
@@ -3463,7 +3471,7 @@ class RetryingOpenHandler : public ResponseHandler {
   // for its copy) and is closed without waiting. If the handle shut down,
   // forward the last failure.
   void doRetry(bool elsewhere, bool closeOld, bool locate) {
-    // With adaptive_federation on, once the exit handler has begun nothing more is issued. With it
+    // With failover on, once the exit handler has begun nothing more is issued. With it
     // off a retry is issued as open_retries always issued it.
     const bool exiting = fed_ && processExiting();
     const std::shared_ptr<HandleState> st = st_; // once sent, `this` may be gone
@@ -3512,7 +3520,7 @@ class RetryingOpenHandler : public ResponseHandler {
   void forwardFailure() {
     // Once it has failed over, an error naming every site that failed.
     XRootDStatus out = seq_ ? seq_->finalError(*st_, recordFile(st_->url), lastStatus_) : lastStatus_;
-    // With adaptive_federation on, no copy passed: when the cache holds an earlier copy of the
+    // With failover on, no copy passed: when the cache holds an earlier copy of the
     // file, and every copy was refused by a check or could not be reached (never for a file that is
     // not there, a refusal to authorize, or a request rejected for what it asks: staleAdviceAfter),
     // the error says so, and how to read it without asking an origin. The entry is left as it is.
@@ -3540,7 +3548,7 @@ class RetryingOpenHandler : public ResponseHandler {
   ResponseHandler* real_;
   const Config& cfg_;
   const bool record_; // a handle the cache serves: its attempts are recorded
-  // adaptive_federation for this handle's file (HandleState::fed), as at the reader's open.
+  // failover for this handle's file (HandleState::fed), as at the reader's open.
   const bool fed_;
   int attempt_ = 0;
   int sourceAttempt_ = 0; // attempts at the current source
@@ -3561,7 +3569,7 @@ class RetryingOpenHandler : public ResponseHandler {
   std::optional<Held> held_;
   std::string source_;  // the URL of the current source's attempts
   std::string sentUrl_; // the URL the last attempt was sent with
-  // With adaptive_federation on: the sequence, and the reader's URL as every
+  // With failover on: the sequence, and the reader's URL as every
   // retry elsewhere starts from it.
   std::unique_ptr<FailoverSeq> seq_;
   std::string base_;
@@ -3776,7 +3784,7 @@ static uint64_t heldBytes(const UrlKey& key, const Config& cfg, const MetaData& 
   }
   return held;
 }
-// The advice of an open that failed with adaptive_federation on (OpenPolicy.h staleEntryAdvice):
+// The advice of an open that failed with failover on (OpenPolicy.h staleEntryAdvice):
 // the cache holds an entry of the file that a job with a longer freshness window would be served,
 // as Open trusts one (cacheFresh) and ensureEntry sets it up: the allow and deny lists let the cache
 // cache the file, its freshness marker says when it was last confirmed at an origin, and its
@@ -3814,7 +3822,7 @@ bool cacheFresh(const UrlKey& key, const std::string& cacheDir, int revalidateSe
 }
 
 // A warm entry made before the checks at open existed, at an open that would trust it (cacheFresh),
-// with adaptive_federation on: an entry of a file named *.root whose sidecar carries no confirmed size
+// with failover on: an entry of a file named *.root whose sidecar carries no confirmed size
 // (made by an earlier release, or with the switch off) is judged by the header it holds, against the
 // size it holds (storedEntryCut). One whose header states an end past that size was filled from a cut
 // copy: it is dropped (CacheStore::dropEntry), and the open goes on as a cold one, with the checks at
@@ -4022,7 +4030,7 @@ bool HandleState::ensureInnerOpen() {
   // reselection request (triedrc ending in "resel", which a client sends to get
   // a second server beside the ones it uses) is not passed on: inheriting it
   // pushed these opens onto servers this host could not reach, on every
-  // re-attempt. With adaptive_federation on, the servers of such a request
+  // re-attempt. With failover on, the servers of such a request
   // that this process saw fail for the file stay avoided (UrlKey.h). Auth
   // tokens and xrd.* options pass through untouched. The relayed open (an
   // untrusted handle) sends the reader's URL verbatim, since there the inner
@@ -4037,13 +4045,13 @@ bool HandleState::ensureInnerOpen() {
   // A source of another size is another copy of the file -- a damaged or
   // truncated one, or the file rewritten -- and its bytes must not complete
   // this entry. The open already returns the source's stat.
-  // With adaptive_federation on, a forked child's open afresh of a handle whose reader was shown
+  // With failover on, a forked child's open afresh of a handle whose reader was shown
   // the size its own open answered (and that has no trusted entry's) must find that size again.
   const uint64_t want = expectedOriginSize.load(std::memory_order_relaxed)
                             ? expectedOriginSize.load(std::memory_order_relaxed)
                             : fo ? readerOpenSize.load(std::memory_order_relaxed)
                                  : 0;
-  // With adaptive_federation on, the attempts are one sequence (FailoverSeq):
+  // With failover on, the attempts are one sequence (FailoverSeq):
   // each has the open deadline, or what is left of the budget when that is
   // less; an answer that never comes is waited for a few seconds past its
   // timeout; and an outcome another site may not share is tried again through
@@ -4087,7 +4095,7 @@ bool HandleState::ensureInnerOpen() {
     reached = ans.hosts && !ans.hosts->empty() ? hostPortOf(ans.hosts->back().url) : std::string();
     AttemptView w = viewOf(*this, ans.status, ans.hosts.get(), f);
     const bool fileOpen = ans.status.IsOK(); // still so when a read of the checks fails
-    // With adaptive_federation on and no size the copy must have, a copy of a file named *.root
+    // With failover on and no size the copy must have, a copy of a file named *.root
     // passes the checks made at open before it is taken, as at the reader's open (not one this
     // open refused already: it is refused again as it is).
     if (seq && fileOpen && !want && w.size > 0 && rootNamed(url) && w.avoidHop < 0 &&
@@ -4169,7 +4177,7 @@ bool HandleState::ensureInnerOpen() {
       if (!marker.empty())
         RealIO::instance().unlink(marker);
       lazyOpenError = XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, msg);
-      // With adaptive_federation on the sequence may have tried several copies, each of another
+      // With failover on the sequence may have tried several copies, each of another
       // size: the read's error names every one of them, this one included, with its size.
       if (seq && !seq->failed.empty()) {
         SiteFailure last;
@@ -4264,7 +4272,7 @@ XrdCl::XRootDStatus HandleState::missError() {
 }
 
 // Whether the handle's File is still to be opened by the cache's own open (OpenPolicy.h): with
-// adaptive_federation off, once a handle trusted at Open has lost its trust; with it on, also
+// failover off, once a handle trusted at Open has lost its trust; with it on, also
 // before.
 static bool ownOpenPending(const HandleState& st) {
   // ... and once one of the cache's own opens failed and none succeeded since
@@ -4753,7 +4761,7 @@ static void noteVectorRequest(const std::shared_ptr<HandleState>& st,
 }
 
 // ---- Moving the reads of a handle to another site --------------------------
-// (adaptive_federation on, an armed handle: OpenPolicy.h armedForReads.) A read
+// (failover on, an armed handle: OpenPolicy.h armedForReads.) A read
 // that fails in a way another site may not share (readStep) waits, with its
 // reader's handler held, for the handle's origin file to be opened at another
 // site, and is issued again there in full. One move serves every read that fails
@@ -5720,7 +5728,7 @@ void HandleState::shutdownInner(bool leak) {
   // still be live, so this is where the replaced Files can go too. (A lazy
   // open the cache itself is running on another thread is not waited for
   // here; that holds for the current File as much as for the replaced ones.
-  // With adaptive_federation on, the current File is then left undestroyed:
+  // With failover on, the current File is then left undestroyed:
   // that open is waiting for its answer.)
   std::unique_ptr<XrdCl::File> dead;
   std::vector<std::unique_ptr<XrdCl::File>> old;
@@ -5790,7 +5798,7 @@ std::unique_ptr<XrdCl::File> HandleState::configureInner(std::unique_ptr<XrdCl::
 }
 
 bool HandleState::reopenPending() {
-  // With adaptive_federation on this does not wait: innerOpenMu is held by a move, or
+  // With failover on this does not wait: innerOpenMu is held by a move, or
   // by an open of the origin that can take its whole budget, and neither is waited for
   // by a call that only asks, nor by a Close or a handle's destruction (a handle closed
   // as its process exits must not hold it up for an origin that does not answer; that
@@ -6182,7 +6190,7 @@ class MissReadHandler : public ResponseHandler {
     // refcount teardown (keeps TSan exact and the lifetime obvious); the user's bytes were copied
     // out of it above. Nothing of it is kept when its edge failed the check (parked readers then
     // fetch for themselves).
-    // adaptive_federation = auto, a handle still undecided when this was issued (fedUndecided):
+    // failover, a handle still undecided when this was issued (fedUndecided):
     // served, never kept.
     if (undecided_)
       keepNone = true;
@@ -6216,7 +6224,7 @@ class MissReadHandler : public ResponseHandler {
   int readerT_;
   OriginInFlight inflight_; // the origin read this handler waits for
   uint64_t arrivedUs_ = 0;  // when its answer arrived (the check may run later)
-  // adaptive_federation = auto: the handle was undecided when this was issued (fedUndecided):
+  // failover: the handle was undecided when this was issued (fedUndecided):
   // what it fetches is served and never kept.
   bool undecided_ = false;
 };
@@ -6658,7 +6666,7 @@ class MissVReadHandler : public ResponseHandler {
   int readerT_;             // the reader's own timeout of the request, 0 for none
   OriginInFlight inflight_; // the origin read this handler waits for
   uint64_t arrivedUs_ = 0;  // when its answer arrived (the check may run later)
-  // adaptive_federation = auto: the handle was undecided when this was issued (fedUndecided):
+  // failover: the handle was undecided when this was issued (fedUndecided):
   // what it fetches is served and never kept.
   bool undecided_ = false;
 };
@@ -6753,8 +6761,8 @@ XRootDStatus originCheckRefused(HandleState& st, ServerTally* tally, const char*
 
 UCacheFile::UCacheFile() : st_(std::make_shared<HandleState>()) {
   st_->store = globalStore();
-  // adaptive_federation = on: every file; auto: decided at Open (off until then).
-  st_->federation.store(globalConfig().federationEverywhere(), std::memory_order_relaxed);
+  // failover: decided at Open (off until then); every file with the test hook.
+  st_->federation.store(failoverForced(), std::memory_order_relaxed);
   auto inner = std::make_unique<XrdCl::File>(false); // made with no lock of ours held
   {
     std::lock_guard<std::mutex> g(st_->mu);
@@ -6953,19 +6961,19 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   if (!passthroughOnly_ && url.find("tried=") != std::string::npos) {
     auto tp = std::make_shared<TriedPatterns>(splitTriedPatterns(url));
     if (tp->any()) {
-      if (cfg.federationPossible())
+      if (cfg.failover)
         warnMalformedPatterns(*tp);
       st_->avoid = std::move(tp);
     }
   }
-  // adaptive_federation = auto: the switch for this file, from the role of the server its URL
+  // failover: the switch for this file, from the role of the server its URL
   // names (ServerRole.h), decided before anything of the open reads it (decideFederation). Off: the
   // reader's properties recorded before the decision (SetProperty) are forgotten, as the switch off
   // never records them. An open the cache answers from a trusted entry decides with what is known
   // here or saved in the cache directory, and with neither leaves the file undecided until its
   // first access to the origin (HandleState::decideFederationLate); every other open decides
   // before its open of the origin.
-  const bool autoMode = cfg.adaptiveFederation == FederationMode::kAuto;
+  const bool autoMode = failoverDecides();
   auto decideFederation = [&](bool knownOnly) {
     // A URL whose tried= holds a host pattern asks for hosts to be avoided, which only the switch's
     // behaviour does: on for the file, at once, whatever its server is and whether or not it
@@ -6973,7 +6981,7 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
     if (st_->avoid && !st_->avoid->patterns.empty()) {
       st_->federation.store(true, std::memory_order_relaxed);
       st_->fedDecided.store(true, std::memory_order_release);
-      UCACHE_DEBUG("adaptive_federation = auto: on for %s (its tried= names hosts to avoid)",
+      UCACHE_DEBUG("failover: on for %s (its tried= names hosts to avoid)",
                    recordFile(url).c_str());
       return;
     }
@@ -7055,11 +7063,11 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // open-retry enabled (opt-in) wrap the app handler so a TRANSIENT open failure
   // is retried on a fresh inner file (Case A); write-opens and
   // the null-handler case are never wrapped.
-  // With adaptive_federation on, a read open of a handle the cache serves has
+  // With failover on, a read open of a handle the cache serves has
   // a deadline (OpenPolicy.h); every other open keeps the reader's timeout.
   const ucache::XrdTimeout openTimeout =
       passthroughOnly_ ? timeout : openDeadline(st_->fed(), static_cast<int>(timeout));
-  // With adaptive_federation on, a cached handle's read open goes through it
+  // With failover on, a cached handle's read open goes through it
   // too: it opens the file at another site when the open fails at one.
   if ((cfg.openRetries > 0 || (st_->fed() && !passthroughOnly_)) && !writey &&
       handler) {
@@ -7390,7 +7398,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
     std::unique_lock<std::mutex> g(st_->mu);
     if (st_->setupDone)
       return (st_->closed || st_->tripped) ? nullptr : st_->entry;
-    // With adaptive_federation on, a request made while the reader's open is in flight waits for
+    // With failover on, a request made while the reader's open is in flight waits for
     // its answer: the File may be open at a copy the checks made at open have yet to judge, or have
     // refused, and neither the entry nor the reader may be given its size. A request made with a
     // handler was parked instead (parkForOpen) and comes here only after the answer; this wait is
@@ -7585,7 +7593,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
         dropEarlierReplica(*key, cfg);
 #ifdef UCACHE_HAVE_COLDRUN
       if (entry && cfg.transpose && !keepOriginal) {
-        st_->armForSetup(copy); // the layout's reads of the records may move (adaptive_federation)
+        st_->armForSetup(copy); // the layout's reads of the records may move (failover)
         // The entry's own modification time, not this URL's copy's: an entry by logical name is
         // one file through every URL, and its store is judged against the entry it was made of.
         chooseLayout(st_, entry, *key, cfg, entry->originMtime(), MetaData::kCksumNone, 0, cold,
@@ -7794,13 +7802,13 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
 XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
                                      ucache::XrdTimeout timeout) {
   st_->syncFork();
-  // Made while the reader's open is in flight (adaptive_federation on): parked until its answer.
+  // Made while the reader's open is in flight (failover on): parked until its answer.
   if (parkForOpen(handler, [force, timeout](UCacheFile* o, ResponseHandler* h) {
         return o->Stat(force, h, timeout);
       }))
     return XRootDStatus();
   // ... and one made where no move may be waited for, before its handle is set up or has the
-  // file's map, is made again where one may (adaptive_federation on).
+  // file's map, is made again where one may (failover on).
   if (parkForParse(
           handler,
           [force, timeout](UCacheFile* o, ResponseHandler* h) { return o->Stat(force, h, timeout); },
@@ -7832,7 +7840,7 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
   // reading, and a handle shown a slot layout must report its size from the
   // very first answer -- forced or not, and for a handle a forked child is
   // setting up again as much as for a new one.
-  // A Stat made while the reader's open is in flight (adaptive_federation on) waits for its
+  // A Stat made while the reader's open is in flight (failover on) waits for its
   // answer there, whether or not its File is open yet.
   bool openPending = false;
   {
@@ -7902,13 +7910,13 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
 XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* buffer,
                                           ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
-  // Made while the reader's open is in flight (adaptive_federation on): parked until its answer.
+  // Made while the reader's open is in flight (failover on): parked until its answer.
   if (parkForOpen(handler, [offset, size, buffer, timeout](UCacheFile* o, ResponseHandler* h) {
         return o->readServe(offset, size, buffer, h, timeout);
       }))
     return XRootDStatus();
   // ... and one made where no move may be waited for, before its handle is set up or has the
-  // file's map, is made again where one may (adaptive_federation on).
+  // file's map, is made again where one may (failover on).
   if (parkForParse(handler, [offset, size, buffer, timeout](UCacheFile* o, ResponseHandler* h) {
         return o->readServe(offset, size, buffer, h, timeout);
       }))
@@ -8051,7 +8059,7 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
     }
   }
   // One time for the request, the map's parse (and a move of its reads) included: its start is
-  // taken before the parse (adaptive_federation: the read's deadline counts from it).
+  // taken before the parse (failover: the read's deadline counts from it).
   const uint64_t missT0 = nowUs();
   st_->decideFederationLate(); // the first access to the origin of an undecided handle
   armKeyCheck(st_, entry, timeout, missT0);
@@ -8111,13 +8119,13 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
 XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void* buffer,
                                             ResponseHandler* handler, ucache::XrdTimeout timeout) {
   st_->syncFork();
-  // Made while the reader's open is in flight (adaptive_federation on): parked until its answer.
+  // Made while the reader's open is in flight (failover on): parked until its answer.
   if (parkForOpen(handler, [offset, size, buffer, timeout](UCacheFile* o, ResponseHandler* h) {
         return o->pgReadServe(offset, size, buffer, h, timeout);
       }))
     return XRootDStatus();
   // ... and one made where no move may be waited for, before its handle is set up or has the
-  // file's map, is made again where one may (adaptive_federation on).
+  // file's map, is made again where one may (failover on).
   if (parkForParse(handler, [offset, size, buffer, timeout](UCacheFile* o, ResponseHandler* h) {
         return o->pgReadServe(offset, size, buffer, h, timeout);
       }))
@@ -8360,13 +8368,13 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
                                                 ResponseHandler* handler,
                                                 ucache::XrdTimeout timeout) {
   st_->syncFork();
-  // Made while the reader's open is in flight (adaptive_federation on): parked until its answer.
+  // Made while the reader's open is in flight (failover on): parked until its answer.
   if (parkForOpen(handler, [chunks, buffer, timeout](UCacheFile* o, ResponseHandler* h) {
         return o->vectorReadServe(chunks, buffer, h, timeout);
       }))
     return XRootDStatus();
   // ... and one made where no move may be waited for, before its handle is set up or has the
-  // file's map, is made again where one may (adaptive_federation on).
+  // file's map, is made again where one may (failover on).
   if (parkForParse(handler, [chunks, buffer, timeout](UCacheFile* o, ResponseHandler* h) {
         return o->vectorReadServe(chunks, buffer, h, timeout);
       }))
@@ -8540,7 +8548,7 @@ bool UCacheFile::parkForOpen(
   return true;
 }
 
-// With adaptive_federation on, a handle trusted at Open that has not been set up yet is set up
+// With failover on, a handle trusted at Open that has not been set up yet is set up
 // before a request that needs the cache's own open of the origin (Stat's way): that open must
 // find the size the entry holds (expectedOriginSize, which the set-up reads from the entry's
 // sidecar), and without it would take a copy of any size. With the switch off nothing changes:
@@ -8593,14 +8601,13 @@ static const int gPropDelayMs = envAtLoad("UCACHE_TEST_PROP_DELAY_MS");
 bool UCacheFile::SetProperty(const std::string& name, const std::string& value) {
   st_->syncFork();
   const bool recovery = name == "ReadRecovery" || name == "WriteRecovery";
-  // With adaptive_federation on, the recording and the setting below are one step for the checks
+  // With failover on, the recording and the setting below are one step for the checks
   // made at open (checkHeader, restoreProps), which take propMu too: a setting recorded just before
   // they turn the File's recovery off is also set before, never after.
   std::unique_lock<std::mutex> props(st_->propMu, std::defer_lock);
-  // With `auto`, a setting made before the open has decided the switch for the file is recorded as
+  // With failover on, a setting made before the open has decided the switch for the file is recorded as
   // with it on; the open forgets it when it decides off.
-  if (st_->fed() || (globalConfig().adaptiveFederation == FederationMode::kAuto &&
-                     !st_->fedDecided.load(std::memory_order_acquire))) {
+  if (st_->fed() || (failoverDecides() && !st_->fedDecided.load(std::memory_order_acquire))) {
     props.lock();
     // Kept, so that a File that replaces this one -- the open retried or made
     // at another site -- is given it too (resetInner). Recorded before it is

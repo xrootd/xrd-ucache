@@ -494,19 +494,23 @@ TEST(Signature, OriginHostComesFromTheUrl) {
   EXPECT_EQ(runs[0].originHosts.size(), 2u);
 }
 
-// A file opened through a redirector by a run with adaptive_federation on (its
-// run_settings say so): its record names the data server the reads went to, and
-// that is the origin, not the redirector in the URL. A record without the field
+// A file opened through a redirector by a run with failover on (its run_settings
+// say so, and its run line lists the URL's host:port in redirector_hosts): its
+// record names the data server the reads went to, and that is the origin, not
+// the redirector in the URL. A record without the field
 // (an older writer, or a file that read nothing from the origin) still falls
 // back to the URL's host. Lines of the newer kinds (an open, a failure) carry no
 // "key" and are not files.
-static void writeServerRun(const std::string& dir, const std::string& runSettings) {
+static void writeServerRun(const std::string& dir, const std::string& runSettings,
+                           const std::string& redirectors = "") {
   const std::string stem = dir + "/h-1-1000-0";
   {
     std::ofstream o(stem + ".jsonl");
     o << "{\"ts\":1100,\"pid\":1," << fillCounters(kGiB);
     if (!runSettings.empty())
       o << ",\"run_settings\":\"" << runSettings << "\"";
+    if (!redirectors.empty())
+      o << ",\"redirector_hosts\":\"" << redirectors << "\"";
     o << "}\n";
   }
   std::ofstream o(stem + ".files.jsonl");
@@ -523,14 +527,14 @@ static void writeServerRun(const std::string& dir, const std::string& runSetting
        "\"op\":\"read\",\"data_server\":\"other.example.org:1094\"}\n";
 }
 
-static const char* const kSettingsOn = "v1 check_origin_integrity=on xrdcl.ConnectionWindow=31/ucache "
-                          "adaptive_federation=on";
+static const char* const kSettingsOn = "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default "
+                          "failover=on";
 static const char* const kSettingsOff = "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default "
-                           "adaptive_federation=off";
+                           "failover=off";
 
 TEST(Signature, OriginHostComesFromTheDataServerWhenTheSwitchWasOn) {
   test::TempDir d;
-  writeServerRun(d.path(), kSettingsOn);
+  writeServerRun(d.path(), kSettingsOn, "redirector.example.org:1094");
   const auto runs = loadRuns(d.path());
   ASSERT_EQ(runs.size(), 1u);
   const ucache::Run& r = runs[0];
@@ -545,14 +549,16 @@ TEST(Signature, OriginHostComesFromTheDataServerWhenTheSwitchWasOn) {
   EXPECT_EQ(r.originRtByHost.at("disk1.site.example.org"), (std::vector<uint64_t>{0, 0, 3}));
 }
 
-// The same records from a run with the switch off, or from one whose counter
-// line does not say (written before run_settings existed): the origin is the
-// host of each file's URL, as `history` and `publish` have always named it. The
-// record's data server is still read (it only adds information).
+// The same records from a run with failover off, from one whose counter line
+// does not say (written before run_settings existed), or with failover on and
+// the URL's host not found a redirector: the origin is the host of each file's
+// URL, as `history` and `publish` have always named it. The record's data
+// server is still read (it only adds information).
 TEST(Signature, OriginHostIsTheUrlsHostWhenTheSwitchWasOff) {
-  for (const char* settings : {kSettingsOff, ""}) {
+  for (const char* settings : {kSettingsOff, "", kSettingsOn}) {
     test::TempDir d;
-    writeServerRun(d.path(), settings);
+    writeServerRun(d.path(), settings,
+                   settings == kSettingsOn ? "other.example.org:1094" : "");
     const auto runs = loadRuns(d.path());
     ASSERT_EQ(runs.size(), 1u);
     const ucache::Run& r = runs[0];
@@ -566,18 +572,15 @@ TEST(Signature, OriginHostIsTheUrlsHostWhenTheSwitchWasOff) {
   }
 }
 
-TEST(Signature, FederationRunReadsTheSwitchFromRunSettings) {
-  EXPECT_TRUE(federationRun(kSettingsOn));
-  EXPECT_TRUE(federationRun("adaptive_federation=on"));
-  EXPECT_FALSE(federationRun(kSettingsOff));
-  EXPECT_FALSE(federationRun(""));
-  EXPECT_FALSE(federationRun("v1 adaptive_federation=online"));
-  EXPECT_FALSE(federationRun("v1 adaptive_federation=auto"));
-  EXPECT_TRUE(federationAutoRun("v1 adaptive_federation=auto"));
-  EXPECT_TRUE(federationAutoRun("v1 adaptive_federation=auto logical_names=on/abcdef01"));
-  EXPECT_FALSE(federationAutoRun("v1 adaptive_federation=automatic"));
-  EXPECT_FALSE(federationAutoRun(kSettingsOn));
-  EXPECT_FALSE(federationRun("v1 xadaptive_federation=on"));
+TEST(Signature, FailoverRunReadsTheSettingFromRunSettings) {
+  EXPECT_TRUE(failoverRun(kSettingsOn));
+  EXPECT_TRUE(failoverRun("failover=on"));
+  EXPECT_TRUE(failoverRun("v1 failover=on logical_names=on/abcdef01"));
+  EXPECT_FALSE(failoverRun(kSettingsOff));
+  EXPECT_FALSE(failoverRun(""));
+  EXPECT_FALSE(failoverRun("v1 failover=online"));
+  EXPECT_FALSE(failoverRun("v1 xfailover=on"));
+  EXPECT_FALSE(failoverRun("v1 adaptive_federation=auto")) << "the name of development builds";
 }
 
 TEST(Baseline, OriginShareIsWeightedByOriginSize) {

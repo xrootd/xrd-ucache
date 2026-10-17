@@ -1,4 +1,4 @@
-// The servers that failed in a way of their own (adaptive_federation): site-fault memory, shared by
+// The servers that failed in a way of their own (failover): site-fault memory, shared by
 // every process of a cache.
 //
 // A server is marked when it stalled while other sites answered normally at the same time, or when

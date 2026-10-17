@@ -1,4 +1,4 @@
-// adaptive_federation = auto: what each server was found to be (a redirector or not), kept in the
+// failover: what each server was found to be (a redirector or not), kept in the
 // cache directory and shared by every process of the cache, so that a later process decides a
 // file it opens from a trusted entry -- with no network -- as the process that asked the server
 // did.

@@ -3,10 +3,10 @@
 Bump `MetaData::kFormatVersion` on ANY layout change; readers reject other
 versions (entry treated as absent and rebuilt).
 
-In this document "with `adaptive_federation = on`" means: for a file the
-switch is on for -- every file with `on`; with `auto`, the default, a file
-opened at a server that reports a redirector's role (USER_GUIDE.md, "Which
-files the switch is on for").
+In this document "with failover on" means: for a file failover applies to --
+with `failover = on`, the default, a file opened at a server that reports a
+redirector's role, or whose URL has a host pattern in `tried=` (USER_GUIDE.md,
+"Failover between copies").
 
 ```
 $UCACHE_DIR/                         (0700)
@@ -22,9 +22,8 @@ $UCACHE_DIR/                         (0700)
                                      #  origin open and failure lines (below)
   stats/<stem>.trace.jsonl           # sampled IO trace, `trace = io` (docs/STATS.md)
   inuse/<hh>/<sha256(key)>           # in-use record of a file's maps, and its copies' faults
-  sources                            # servers that failed (adaptive_federation; below)
-  roles                              # what each server was found to be (adaptive_federation =
-                                     #  auto; below)
+  sources                            # servers that failed (failover; below)
+  roles                              # what each server was found to be (failover; below)
   sources.lock                       # flock held while `sources` is written
   sources.new                        # transient during its rewrite
   names/<hh>/<sha256(name)>.to       # an entry's other name (logical_name_prefixes; below)
@@ -137,7 +136,7 @@ had `logical_name_prefixes` set has no such directory, and nothing below is read
 `npages = ceil(file_size / page_size)`. The tail page covers only
 `file_size − (npages−1)·page_size` bytes; its CRC covers exactly those bytes.
 
-Flag bit2, *size confirmed*: with `adaptive_federation = on`, an open of a file
+Flag bit2, *size confirmed*: with failover on, an open of a file
 named `*.root` (in upper or lower case) at the origin checks the copy it landed on: its
 first 300 bytes, and the list of the file's top-level objects (USER_GUIDE.md). A ROOT
 file's header states where the file ends; when that equals the size the copy reported and
@@ -432,7 +431,7 @@ fault <site> <server host:port> <last proof> <first proof> <reason> <proofs>
   store rebuilt while the record is in use is laid out with them, whatever the
   rebuilding process's `recompress_codecs`, so the positions readers hold stay
   right.
-- A `fault` line (with `adaptive_federation = on`) is a copy of the file
+- A `fault` line (with failover on) is a copy of the file
   proven bad at a server: reason `enoent`, the server said the file is not
   there although the regional redirector, asked again, still listed it. Such a
   copy is tried after every other copy of the file for 7 days after its last
@@ -448,7 +447,7 @@ fault <site> <server host:port> <last proof> <first proof> <reason> <proofs>
 
 ## Sources that failed: `<dir>/sources`
 
-With `adaptive_federation = auto`, what each server a job asked was found to be
+With `failover = on`, what each server a job asked was found to be
 (a redirector or not) is kept in `<cacheDir>/roles`, for the other processes of
 the cache, which read it at an open answered from a trusted entry (no network)
 and at an open of the origin within 10 minutes of the verdict. The same
@@ -468,7 +467,7 @@ that is not printable, `-` for none. Only answers are kept, never "no answer". A
 line that does not parse is skipped; a verdict saved more than 30 days before is
 dropped at the next write; at most 4096 servers are kept, the newest first.
 
-With `adaptive_federation = on`, the servers the cache's processes remember as
+With failover on, the servers the cache's processes remember as
 failed (USER_GUIDE.md), one small text file per cache, shared by all its
 processes:
 
@@ -542,11 +541,11 @@ STATS.md).
   `lazy` (a trusted handle's open at its first miss), `degraded` (a trusted
   handle whose cached entry was gone at its first read), `fork` (a forked
   child's open afresh of a handle it inherited), `failover` (with
-  `adaptive_federation = on`, an attempt of any of these at another site after
+  failover on, an attempt of any of these at another site after
   the open failed at one; its `seq` is the first attempt's), `candidate` (an
   attempt at a server a regional redirector listed as holding the file, opened
-  directly or through its own redirector), `read` (with `adaptive_federation =
-  on`, every attempt of an open made because reads of the file stopped at the
+  directly or through its own redirector), `read` (with failover
+  on, every attempt of an open made because reads of the file stopped at the
   server it was open at; the `origin_failure` line of the read that stopped it
   comes first, and names that server in `data_server`).
 - `status` `ok` or `error`, with the client's `code` and `errno` (the server's
@@ -563,8 +562,8 @@ STATS.md).
 - `stat_flags` and `size`: the file's stat as the open answered it; -1 on
   failure.
 - `us`: issue to answer; `timeout_s`: the timeout the request carried, the
-  client's `RequestTimeout` when it carried none. With `adaptive_federation =
-  on` that is the open deadline, 60 s, or a shorter open timeout of the
+  client's `RequestTimeout` when it carried none. With failover
+  on that is the open deadline, 60 s, or a shorter open timeout of the
   reader's own, or the client's `RequestTimeout` when the reader gave none and
   that is shorter. With it off (and in records of builds without the
   deadline), a `relay` line has the reader's own open timeout, or the
@@ -572,12 +571,12 @@ STATS.md).
   has the `RequestTimeout`: uCache's own opens carry no timeout then.
 - `msg`: the error's text, at most 200 bytes as written (escapes included);
   `""` on success.
-- With `adaptive_federation = on`, the line of the attempt that decided how
+- With failover on, the line of the attempt that decided how
   the open ended has, after `msg`, `"outcome"` (`ok` or `error`) and
   `"budget_s"`, the time the open's attempts were allowed in all, in seconds.
   An open that ended because its handle was closed before a next attempt was
   issued has no such line.
-- With `adaptive_federation = on`, `"sitename"` at the end of the line: the
+- With failover on, `"sitename"` at the end of the line: the
   name the chain's effective server (the one the client names in `tried=`,
   else its last host) gave for its site; when a data server sent the open on
   to another host, that is an earlier host than `data_server` and `site`,
@@ -614,8 +613,8 @@ any server and has no line.
   whose key is not where the tree's record puts it), `first_pass` (a
   replica's first pass, and a basket or page there that failed its checksum),
   `records` (the file's own records, read to set up its layout), `relay` (a
-  request passed straight to the origin), `open` (with `adaptive_federation =
-  on`, a copy refused after its open succeeded: an empty copy of a file named
+  request passed straight to the origin), `open` (with failover
+  on, a copy refused after its open succeeded: an empty copy of a file named
   `*.root`, or one whose first bytes show it is not a whole ROOT file (its size smaller
   than the end its header states, not beginning with `root`, too short for its header, or
   those bytes answered short), `msg` saying which;
@@ -635,7 +634,7 @@ any server and has no line.
   `open` lines only; a copy refused after its open succeeded is there too, as
   a line of op `open`.
 
-**`"kind":"size_disagreement"`, v1** — with `adaptive_federation = on`, one
+**`"kind":"size_disagreement"`, v1** — with failover on, one
 line each time an open uCache made of a file it holds landed on a copy of
 another size through a redirector, whether it was then made again at another
 site or refused:
@@ -649,7 +648,7 @@ site or refused:
   domain); `sizes`: the copy's size, then the size of the file uCache holds.
   The `size_disagreements` counter (STATS.md) counts these too.
 
-**`"kind":"site_fault"`, v1** — with `adaptive_federation = on`, one line each
+**`"kind":"site_fault"`, v1** — with failover on, one line each
 time a server is marked in `<dir>/sources`:
 
 ```json
@@ -663,7 +662,7 @@ time a server is marked in `<dir>/sources`:
   clock, seconds); `site`: the name the server gave, else its domain; `file`:
   the file whose request failed there.
 
-**`"kind":"host_avoided"`, v1** — with `adaptive_federation = on` and host
+**`"kind":"host_avoided"`, v1** — with failover on and host
 patterns in the URL's `tried=`, one line each time a copy at a host a pattern
 matches is refused (once per server and open):
 
@@ -678,7 +677,7 @@ matches is refused (once per server and open):
   before anything was read) or `listed` (the regional redirector listed it, and it
   was not tried). The `hosts_avoided` counter (STATS.md) counts these too.
 
-**`"kind":"copy_fault"`, v1** — with `adaptive_federation = on`, one line each
+**`"kind":"copy_fault"`, v1** — with failover on, one line each
 time a copy is proven missing:
 
 ```json

@@ -112,7 +112,7 @@ struct Stats {
   // Record lines (origin opens and failures) dropped because the queue that
   // holds them until the next checkpoint was full.
   std::atomic<uint64_t> recordsDropped{0};
-  // Opens at another site (adaptive_federation, docs/STATS.md): attempts made
+  // Opens at another site (failover, docs/STATS.md): attempts made
   // at another site, opens that succeeded after one, opens that failed at
   // every site they tried, and attempts that passed the open deadline.
   std::atomic<uint64_t> openFailovers{0};
@@ -130,26 +130,26 @@ struct Stats {
   // checks existed whose stored header states an end past its stored size, or an entry holding
   // bytes from a copy that a check then found bad.
   std::atomic<uint64_t> badEntriesDropped{0};
-  // Servers asked for the name of their site (adaptive_federation), and the asks that gave none
+  // Servers asked for the name of their site (failover), and the asks that gave none
   // (none configured, an error, no answer in time): those servers' site is their domain.
   std::atomic<uint64_t> siteNameQueries{0};
   std::atomic<uint64_t> siteNamesMissing{0};
-  // adaptive_federation = auto: servers asked for their role, those that reported a redirector's
+  // failover: servers asked for their role, those that reported a redirector's
   // (the switch on for their files), and those that gave none (an error, no answer in time).
   std::atomic<uint64_t> roleQueries{0};
   std::atomic<uint64_t> roleRedirectors{0};
   std::atomic<uint64_t> roleUnanswered{0};
   // Requests made where no move may be waited for (a client callback thread), before their handle
-  // had the file's map, made again on the open-wait pool (adaptive_federation).
+  // had the file's map, made again on the open-wait pool (failover).
   std::atomic<uint64_t> requestsParkedForParse{0};
-  // Remembering sources that failed (adaptive_federation): servers marked for a fault of their own
+  // Remembering sources that failed (failover): servers marked for a fault of their own
   // or a stall while other sites answered, marks cleared by a success, copies proven missing, and
   // listed copies tried after the others for a mark.
   std::atomic<uint64_t> siteFaultsMarked{0};
   std::atomic<uint64_t> siteMarksCleared{0};
   std::atomic<uint64_t> copyFaultsMarked{0};
   std::atomic<uint64_t> markedCopiesLast{0};
-  // Copies at a host the URL's tried= asks to avoid, by pattern (adaptive_federation): opens
+  // Copies at a host the URL's tried= asks to avoid, by pattern (failover): opens
   // that landed there and were refused before anything was read, and listed copies not tried.
   std::atomic<uint64_t> hostsAvoided{0};
   // Replica tier (docs/STATS.md):

@@ -129,26 +129,26 @@ struct HandleState {
   // The URL every open of the origin this handle makes starts from: the reader's, without its
   // tried= patterns where they are uCache's to apply.
   const std::string& originUrl() const { return avoid && fed() ? avoid->url : url; }
-  // adaptive_federation for this handle's file: on for every handle with the
-  // switch on; with `auto`, decided at Open from the role of the server the
-  // URL names (ServerRole.h), before anything reads it, and never changed
-  // after; off otherwise. Read wherever the switch's behaviour is the file's
+  // failover for this handle's file: with failover on, decided at Open from
+  // the role of the server the URL names (ServerRole.h) or the URL's tried=
+  // patterns, before anything reads it, and never changed after (on for every
+  // handle with the test hook UCACHE_TEST_FAILOVER_FORCE); off otherwise. Read wherever the switch's behaviour is the file's
   // (fed()). A forked child keeps the parent's decision for a handle it
   // inherits.
   std::atomic<bool> federation{false};
   bool fed() const { return federation.load(std::memory_order_relaxed); }
-  // With `auto`: set once `federation` is decided: at the open, or, for a handle a trusted open
+  // With failover on: set once `federation` is decided: at the open, or, for a handle a trusted open
   // left undecided (its server not known in this process nor saved in the cache directory), at
   // its first access to the origin (decideFederationLate).
   std::atomic<bool> fedDecided{false};
   std::mutex lateFedMu; // serializes decideFederationLate
-  // With `auto`: the handle is undecided (a trusted open whose server is not known here nor saved)
+  // With failover on: the handle is undecided (a trusted open whose server is not known here nor saved)
   // and so far no access to the origin could decide it (one from a thread that may not wait, while
   // the question was out): what its misses fetch meanwhile is served and never kept.
   std::atomic<bool> fedUndecided{false};
   void decideFederationLate() noexcept;
   // The timeout the reader gave its Open (0 = the client's default): with
-  // adaptive_federation on, the cache's own opens of this handle honour a
+  // failover on, the cache's own opens of this handle honour a
   // shorter one (OpenPolicy.h openDeadlineS); with it off it is unused, and
   // those opens pass none (the client's RequestTimeout), as before.
   std::atomic<int> readerOpenTimeoutS{0};
@@ -219,17 +219,17 @@ struct HandleState {
   std::vector<std::unique_ptr<XrdCl::File>> retired;
   static constexpr uint64_t kRetiredFailedKeepUs = 600ull * 1000000;
   std::vector<std::pair<std::unique_ptr<XrdCl::File>, uint64_t>> retiredFailed;
-  // With adaptive_federation on, the properties the reader set (SetProperty),
+  // With failover on, the properties the reader set (SetProperty),
   // in order, given again to every File resetInner makes: an open made again
   // at another site would otherwise lose them. Under mu.
   std::vector<std::pair<std::string, std::string>> readerProps;
-  // With adaptive_federation on: held across the recording of a reader's property and its setting
+  // With failover on: held across the recording of a reader's property and its setting
   // on the File (UCacheFile::SetProperty), and by the checks made at open while they turn the
   // File's recovery and redirects off and give them back (checkHeader, restoreProps), so that a
   // setting of the reader's never lands on the File between the two. Taken before mu, never under
   // it.
   std::mutex propMu;
-  // adaptive_federation: a handle that moves its reads to another site (OpenPolicy.h
+  // failover: a handle that moves its reads to another site (OpenPolicy.h
   // armedForReads) is armed once it is set up and an open of it went through a
   // redirector (`viaRedirector`, under mu). The client's own recovery of a read is
   // off on every File of an armed handle, and a read that fails in a way another
@@ -240,7 +240,7 @@ struct HandleState {
   // origin failed is served again from the start, at the origin's offsets, once the handle reads
   // from another copy (moveSlotRequest). The client's own recovery is off on its Files too.
   std::atomic<bool> moveSlotReads{false};
-  // adaptive_federation: the reads of the handle's setup (a replica's layout made from the file's
+  // failover: the reads of the handle's setup (a replica's layout made from the file's
   // records, at its first use) may move as its reads will once it is set up (armForSetup), though
   // the handle is armed only at the end of the setup (applyReadPolicy).
   std::atomic<bool> setupMoves{false};
@@ -267,7 +267,7 @@ struct HandleState {
   // One of the cache's own opens of the origin (ensureInnerOpen) failed for this handle and none
   // has succeeded since: its File is not open, so no request is given to it, each gets that open's
   // error and the next after the cool-down opens it again (the same as a trusted handle's,
-  // ownOpenPending). With adaptive_federation on, any such open; with it off, only a forked
+  // ownOpenPending). With failover on, any such open; with it off, only a forked
   // child's open afresh of a handle that was not trusted at Open (whose File is otherwise given
   // every request it makes: a trusted handle's are ownOpenPending's, as before).
   std::atomic<bool> ownOpenFailed{false};
@@ -288,7 +288,7 @@ struct HandleState {
   // meanwhile are kept in readerProps, from `headerProps` on, and given to the File at its end.
   bool headerReading = false;
   size_t headerProps = 0;
-  // Under mu: with adaptive_federation on, the reader's open of a handle the cache serves is in
+  // Under mu: with failover on, the reader's open of a handle the cache serves is in
   // flight (RetryingOpenHandler), from its first attempt to the completion the reader gets. Its
   // File may meanwhile be open at a copy the checks made at open have yet to judge, or have
   // refused: a request made on the handle then is parked until the answer (openWaiters), or, made
@@ -296,7 +296,7 @@ struct HandleState {
   // nor its reader is given that copy's size (ensureEntry).
   bool readerOpenPending = false;
   std::condition_variable openCv;
-  // Under mu, with adaptive_federation on: the requests made with a handler while the reader's open
+  // Under mu, with failover on: the requests made with a handler while the reader's open
   // is in flight, parked here instead of waiting on the thread that made them (it may be a client
   // callback thread that the open's own checks need: UCacheFile::parkForOpen). Taken whole by the
   // first of: the open's answer, Close, the plugin object's end (under mu). Each is then given its
@@ -318,7 +318,7 @@ struct HandleState {
   // Set by the plugin's destructor before it waits: a parse waiting for a move in such a request
   // waits no longer (parseReadMoves).
   std::atomic<bool> ownerGone{false};
-  // With adaptive_federation on, for a file the cache caches: what the checks made at the reader's
+  // With failover on, for a file the cache caches: what the checks made at the reader's
   // open read of the copy the open took, as whole pages of the file (OpenPolicy.h checkReadSpan),
   // kept here from the open's answer until the handle's entry is set up (ensureEntry), which stores
   // them as it stores any bytes fetched from the origin, when the entry is of the size the copy
@@ -385,7 +385,7 @@ struct HandleState {
   // Written under mu; atomic, because requests read it without (ownOpenPending, acquireInner).
   std::atomic<bool> cacheOnly{false};
   // Set at Open when the handle is trusted (cacheOnly): its File is opened only by the cache's own
-  // open (ensureInnerOpen), never by the reader's. With adaptive_federation on, no request goes to
+  // open (ensureInnerOpen), never by the reader's. With failover on, no request goes to
   // that File until that open has succeeded. With it off, the same holds once the handle has lost
   // its trust (its entry gone by its first read): a request on a File that never opened fails in
   // the client, or crashes it. A handle that still trusts its entry gives an Fcntl, a Visa or a
@@ -409,7 +409,7 @@ struct HandleState {
   // holds positions in this one. A refusal latches for the handle and drops
   // the entry's trust, so the next open checks the origin again.
   std::atomic<uint64_t> expectedOriginSize{0};
-  // With adaptive_federation on, the size the reader's open was answered with, by the copy that
+  // With failover on, the size the reader's open was answered with, by the copy that
   // open took (0: none, or not known): the size its reader was shown, which a move of its reads
   // must find again (sizeShownLocked).
   std::atomic<uint64_t> readerOpenSize{0};
@@ -419,7 +419,7 @@ struct HandleState {
   uint64_t sizeShownLocked() const;
   // The origin size that passed the header check of a ROOT file (0: none), the copy's own header
   // saying where the file ends at the size it reported (OpenPolicy.h rootFileEnd): set by the
-  // reader's open of a file named *.root with adaptive_federation on, and by a handle whose
+  // reader's open of a file named *.root with failover on, and by a handle whose
   // entry carries the size confirmed (MetaData::kFlagSizeConfirmed).
   std::atomic<uint64_t> confirmedSize{0};
   std::string trustMarker; // under mu: the entry's .val path, removed on such a refusal
@@ -476,7 +476,7 @@ struct HandleState {
   // read recovery off. Under mu.
   std::unique_ptr<XrdCl::File> configureInner(std::unique_ptr<XrdCl::File> f);
   // A forked child has yet to open this handle's origin file afresh, or is doing so.
-  // With adaptive_federation on it never waits: a move holds innerOpenMu for its whole
+  // With failover on it never waits: a move holds innerOpenMu for its whole
   // budget, and a caller that needs the open calls ensureInnerOpen, which waits for it.
   bool reopenPending();
 
@@ -561,14 +561,14 @@ class UCacheFile : public XrdCl::FilePlugIn {
                                       ucache::XrdTimeout timeout);
   void invalidateOnWrite();
   // Sets up a handle trusted at Open before a request that would make the cache's own open of the
-  // origin (adaptive_federation on only): that open must find the entry's size.
+  // origin (failover on only): that open must find the entry's size.
   void setUpBeforeOwnOpen();
-  // With adaptive_federation on, a request made with a handler while the reader's open is in flight
+  // With failover on, a request made with a handler while the reader's open is in flight
   // is parked (HandleState::openWaiters) and true is returned: `redo` then makes it again, or
   // `handler` is answered, exactly once, after the open's answer. False (nothing parked) otherwise.
   bool parkForOpen(XrdCl::ResponseHandler* handler,
                    std::function<XrdCl::XRootDStatus(UCacheFile*, XrdCl::ResponseHandler*)> redo);
-  // With adaptive_federation on: a request made with a handler on a thread that may not wait for a
+  // With failover on: a request made with a handler on a thread that may not wait for a
   // move (a client callback thread: a read a reader issues from inside its own completion; or one
   // of uCache's pools that serve hits, run moves or give answers), while the handle is not set up
   // yet or holds no map of the file, is made again on the open-wait pool (releaseOpenWaiters),
@@ -636,7 +636,7 @@ void noteOriginFailure(HandleState& st, ServerTally* tally, const char* op, uint
 // handle of this process is served from it again, their reads go to the origin (and move as any
 // read does), and its files are removed off this thread (CacheStore::removeDropped), so that the
 // next open of the file starts a new entry. Only with check_origin_integrity on, which
-// adaptive_federation forces. No I/O: it may run on a client callback thread.
+// failover forces. No I/O: it may run on a client callback thread.
 void dropEntryOfBadCopy(HandleState& st, const std::shared_ptr<FileEntry>& entry,
                         const std::string& server) noexcept;
 // The same, with the handle's own entry.
@@ -652,7 +652,7 @@ void dropEntryOfBadRecords(HandleState& st, const std::shared_ptr<FileEntry>& en
 // none yet, `parked` is set and `then` (when given and set) is posted to the executor once that
 // parse ends (keySeeksBuilt): the caller serves the request again then, rather than unchecked.
 // Null, not parked: the setting is off, or no map could be made (a failed parse).
-// adaptive_federation, a handle whose reads move (byte path or slot layout): a read of the file's
+// failover, a handle whose reads move (byte path or slot layout): a read of the file's
 // records that uCache's own parse made on the File `on` failed with `s`, or answered `got` of the
 // `len` bytes asked at `off` from `server` (s OK: a short answer, a data failure of the copy when it
 // lies inside the confirmed size; recorded against `tally` as a miss's is, and the entry dropped).
@@ -673,7 +673,7 @@ bool parseReadMoves(const std::shared_ptr<HandleState>& st, XrdCl::File* on,
 std::shared_ptr<const KeyMap> originCheckMapFor(const std::shared_ptr<HandleState>& st,
                                                 const std::shared_ptr<FileEntry>& entry,
                                                 std::function<void()>* then, bool& parked);
-// adaptive_federation, a handle shown a slot layout (HandleState::moveSlotReads): a request of the
+// failover, a handle shown a slot layout (HandleState::moveSlotReads): a request of the
 // slot run whose fetch from the origin failed with `s` on the File `on`, the fetch's own (null: the
 // failure is no copy's, made in uCache itself, and the request does not move; `checkFailed`: its
 // bytes failed a check: a data failure of that copy) moves as a byte-path read does (the same move,
@@ -702,8 +702,8 @@ XrdCl::XRootDStatus originCheckRefused(HandleState& st, ServerTally* tally, cons
 // Process-wide config/store accessors (UCacheFactory.cc).
 const Config& globalConfig();
 // check_origin_integrity for the file of handle `st`: the setting, or forced by
-// adaptive_federation for a file the switch is on for (every file with `on`,
-// the files from a redirector with `auto`). Null `st`: the setting alone.
+// failover for a file it applies to (a file from a redirector, or with tried=
+// patterns). Null `st`: the setting alone.
 inline bool checksOrigin(const HandleState* st) {
   return globalConfig().checkOriginIntegrity || (st && st->fed());
 }

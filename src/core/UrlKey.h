@@ -183,7 +183,7 @@ std::string ownOpenUrl(const std::string& url);
 // which. The ones this process saw fail for the file are the reader's own
 // reason for the request, so the cache's own open avoids them too; the others
 // are not passed on (with every holder of the file named, a redirector finds
-// no server at all). Used with adaptive_federation on.
+// no server at all). Used with failover on.
 std::string ownOpenUrl(const std::string& url, const std::vector<std::string>& failedHosts);
 
 // The reader's URL as the base of a retry of its own open at another site:

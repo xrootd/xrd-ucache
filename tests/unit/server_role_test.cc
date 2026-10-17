@@ -1,4 +1,4 @@
-// adaptive_federation = auto (ServerRole.h): a server's login flags and the role
+// failover (ServerRole.h): a server's login flags and the role
 // in its answer to `query config role`, which are a redirector's, and the per-server table:
 // one query per server, waits bounded, the first outcome standing. Pure; the
 // query itself is made where the plugin runs.

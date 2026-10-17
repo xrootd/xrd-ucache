@@ -119,7 +119,9 @@ jobs:
           export XRD_CONNECTIONRETRY=1 XRD_PLUGINCONFDIR=/tmp/conf XRD_LOGLEVEL=Debug
           F=/bench/data/f.bin; U=root://127.0.0.1:10940/$F
           mkdir -p /tmp/cache-op
-          XRD_LOGFILE=/tmp/op.log UCACHE_DIR=/tmp/cache-op UCACHE_ADAPTIVE_FEDERATION=on \
+          # The test hook gives this plain server's file failover's protections, as a
+          # redirector's file would have (the property is kept for the retried open).
+          XRD_LOGFILE=/tmp/op.log UCACHE_DIR=/tmp/cache-op UCACHE_TEST_FAILOVER_FORCE=1 \
             UCACHE_REVALIDATE_S=0 UCACHE_OPEN_RETRIES=1 UCACHE_TEST_OPEN_FAIL_N=1 \
             UCACHE_OPEN_RETRY_BASE_MS=1000 ./build/tests/ucache-plugin-fuzz "$U" $F 1 1 1 open-property
           # The first attempt went to the refused port: without it the mode
@@ -128,7 +130,7 @@ jobs:
           echo "first attempts at the refused port: $n"
           [ "$n" -ge 1 ]
 
-      - name: a federation on loopback: servers that refuse a file, the regional's locate, and reads made again at another site
+      - name: a redirector and three servers on loopback: servers that refuse a file, the regional's locate, and reads made again at another copy
         run: |
           # One regional redirector and three data servers (xrootd and cmsd of the
           # EPEL package); the script runs them as an ordinary user.

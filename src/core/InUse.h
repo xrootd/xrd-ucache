@@ -28,7 +28,7 @@
 //   range <store id, hex> <first address> <end address> <last use> <last held> <pid>
 //   fault <site> <server host:port> <last> <first> <reason> <count>
 //
-// A "fault" line (adaptive_federation) is a copy of the file proven bad at a server: `enoent`, the
+// A "fault" line (failover) is a copy of the file proven bad at a server: `enoent`, the
 // server said the file is not there although the regional redirector, asked again, still listed it.
 // Such a copy is tried after every other copy of the file for kCopyFaultS after its last proof. A
 // live fault keeps the record (it is not removed by the sweep, nor reset by a note), but does not

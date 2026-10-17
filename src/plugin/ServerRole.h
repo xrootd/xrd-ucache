@@ -1,4 +1,4 @@
-// adaptive_federation = auto: whether the server a file's URL names is a
+// failover: whether the server a file's URL names is a
 // redirector, from what the server says of itself.
 //
 // Two answers, both asked once per server (host:port) and process, before the
@@ -17,8 +17,7 @@
 //    one. A server that names no role (an error, a key it does not know, no
 //    answer in time) is taken at its login flags.
 // A file opened at a redirector may be found at several data servers, which is
-// what adaptive_federation is for. With `auto` the switch is on for it and off
-// for every other.
+// what failover is for: failover applies to it, and not to any other.
 //
 // An open waits for the answers at most kRoleWaitS in all (or the reader's
 // own open timeout when shorter); one that has none by then goes the way of a

@@ -6,10 +6,11 @@ activation (whichever way you configured it), and prints `[ OK ]` / `[WARN]` /
 the whole chain dynamically (cold + warm pass; warm must be origin-free).
 Most issues below map to one of their lines.
 
-In this document "with `adaptive_federation = on`" means: for a file the
-switch is on for -- every file with `on`; with `auto`, the default, a file
-opened at a server that reports a redirector's role (USER_GUIDE.md, "Which
-files the switch is on for").
+In this document "with failover on" means: for a file failover applies to --
+with `failover = on`, the default, a file opened at a server that reports a
+redirector's role, or whose URL has a host pattern in `tried=` (USER_GUIDE.md,
+"Failover between copies"). A file with one copy, or a URL straight at one
+server, has nothing to fail over to and is read as with `failover = off`.
 
 To see what uCache does, turn on debug messages the way you would for the
 XRootD client: `XRD_LOGLEVEL=Debug XRD_LOGFILE=/tmp/xrd.log <your job>` puts
@@ -39,7 +40,7 @@ second. If not:
    `ucache setup --host <host:port>` (e.g. `eospublic.cern.ch:1094`) to bind your
    data host explicitly.
 4. **Host mismatch.** The cache key includes host:port. If you read via a
-   federation redirector on the cold pass and a direct site URL on the warm pass
+   redirector on the cold pass and a direct site URL on the warm pass
    (or vice versa), they are different keys, unless the path has a logical name
    and `logical_name_prefixes` is set: then every URL of the file is one key,
    `lfn:/store/...` (USER_GUIDE.md, "Keys by logical name"). Otherwise read via
@@ -256,7 +257,7 @@ trying to reconnect before it reports an error. With its default settings that
 takes about 8 minutes (measured: 480 s), and meanwhile reads neither fail nor
 progress. With the default settings a job through uCache behaves exactly like
 one without it, with caching on or off: the error arrives at the same moment.
-(With `adaptive_federation = on` a read that fails at its server is made again
+(With failover on a read that fails at its server is made again
 at another site; see below.)
 
 To fail sooner, shorten the client's reconnect policy for the job, for example
@@ -264,17 +265,17 @@ To fail sooner, shorten the client's reconnect policy for the job, for example
 about 15 seconds. Files already in the cache and inside the freshness window
 need no server at all, so a warm pass over them is not affected.
 
-With `adaptive_federation = on`, uCache sets that policy itself where no
-`XRD_*` variable or `client.conf` sets it: a connection is tried for 31 s, twice,
-so a server that is down is given up after about a minute, and the failure is
-remembered for 180 s (`ucache doctor` and the run's `run_settings` show the
-values in force).
+uCache never sets that policy itself, failover or not: the job's `XRD_*`
+variables or `client.conf` decide it (the run's `run_settings` show the values
+in force). `XRD_CONNECTIONWINDOW=31 XRD_CONNECTIONRETRY=2
+XRD_STREAMERRORWINDOW=180` gives up on a server that is down after about a
+minute, and remembers the failure for 180 s.
 
 A server that stays up but stops answering (it keeps the connection and never
 replies) is different: a read then fails when its time runs out, with
 `operation expired`: the job's own timeout for the read, or the client's request
 timeout (`XRD_REQUESTTIMEOUT`, 1800 s by default). Through uCache, with
-`adaptive_federation = off`, a read the cache does not hold fails at the same
+`failover = off`, a read the cache does not hold fails at the same
 moment, with the same error, single and vector reads alike: the cache's fetch
 from the server is sent with the read's own timeout (the client's request
 timeout when the job gives none), and when it runs out of time (or the
@@ -296,12 +297,12 @@ gives none); a read that was waiting for it makes its own fetch, within its
 own time left, or fails with `operation expired` when none is left. An answer
 short of the bytes asked for is followed by the job's own read too, with at
 least 30 s (half the job's own timeout when that is shorter). (With
-`adaptive_federation = on` such a read is made again at another site; see
+failover on such a read is made again at another site; see
 below.)
 
 ## An open fails after a minute (`did not complete within 60 s`)
 
-With `adaptive_federation = on`, every read open of a file uCache serves has a
+With failover on, every read open of a file uCache serves has a
 deadline of 60 s: the job's own open, and the opens uCache makes of the origin
 when it needs bytes it does not hold. Without a deadline, an open waits for the
 XRootD client's request timeout (30 minutes by default) when a server never
@@ -315,65 +316,70 @@ it is: one the program gives its open, or the client's `RequestTimeout`
 (`XRD_REQUESTTIMEOUT`, or a `client.conf`) when the program gives none.
 
 A server that never accepts the connection (its address drops every packet)
-is given up by the client after its connection window times its retries, 31 s
-twice with the switch on, which is past the deadline: such an open fails at the
+is given up by the client after its connection window times its retries (120 s
+five times by default), which is past the deadline: such an open fails at the
 deadline, 60 s, with the same `operation expired` error and the same warning.
 
 Through a redirector, an open that passes the deadline at one site is made
 again at another (next entry); the warning is then followed by
 `trying another site`.
 
-With the switch off for the file (`adaptive_federation = off`, or with the
-default, `auto`, a file whose URL names a server that is not a redirector)
-there is no deadline: the job's own open
+For a file failover does not apply to (`failover = off`, or with the default,
+`on`, a file whose URL names a server that is not a redirector) there is no
+deadline: the job's own open
 passes the job's own timeout, or none, exactly as without uCache, and the opens
 uCache makes of the origin carry none (they wait for the client's
 `RequestTimeout`), so the client's own
 recovery (at a redirector, going on to another server after a connection
 fails) has all the time it has without uCache.
 
-## Is the switch on for my files? (`adaptive_federation = auto`)
+## Does failover apply to my files?
 
-With the default, `auto`, the switch is on for a file whose URL names a
-redirector and off for every other (USER_GUIDE.md, "Which files the switch is
-on for"). `log = info` (or `XRD_LOGLEVEL=Info`) names what each server said,
-once per job: `adaptive_federation = auto: <host:port> reports the role
-'manager (login: manager)', a redirector's: the files opened there are read
-with the switch on`, or `... not a redirector's ...`, or `... gave no role (no
-answer within 5 s) ...`. `ucache stats` counts them (`role_queries`,
-`role_redirectors`, `role_unanswered`).
+Failover can only help where there is another copy to go to. With the default,
+`failover = on`, it applies to a file whose URL names a redirector, and not to a
+file whose URL names one server directly (USER_GUIDE.md, "Failover between
+copies"): such a file is read on the plain path, as without uCache.
+`log = info` (or `XRD_LOGLEVEL=Info`) names what each server said, once per job:
+`failover: <host:port> reports the role 'manager (login: manager)', a
+redirector's: the files opened there have failover`, or `... not a
+redirector's ...`, or `... gave no role (no answer within 5 s) ...`.
+`ucache stats` counts them (`role_queries`, `role_redirectors`,
+`role_unanswered`).
 
-- **A host pattern in the URL's `tried=` turns it on** for that file, at its open,
+- **A host pattern in the URL's `tried=` gives a file failover**, at its open,
   whatever server the URL names, and no role is asked (USER_GUIDE.md, "Keeping
-  reads away from some hosts"); only `adaptive_federation = off` leaves such a URL
-  as it is.
-- **A site's own redirector turns it on.** It says `manager` as a federation's
-  redirectors do: it too sends opens to several servers. Set
-  `adaptive_federation = off` to read every file as uCache 1.4.0 did.
-- **An EOS instance leaves it off.** EOS says `manager` at login but `none` as
+  reads away from some hosts"); only `failover = off` leaves such a URL as it is.
+- **A site's own redirector has it.** It says `manager` as the global and
+  regional redirectors do: it too sends opens to several servers. Set
+  `failover = off` to read every file as uCache 1.4.0 did.
+- **An EOS instance does not.** EOS says `manager` at login but `none` as
   its configured role, and uCache takes the configured role.
 - **The first open of a job waited about 5 s.** The server the URL names did
-  not answer the question in time (it was stopped or overloaded); the switch is off for its files for the rest of the job, and
-  later opens there do not wait again. An open the cache answers from a trusted
-  entry never asks.
+  not answer the question in time (it was stopped or overloaded); failover does
+  not apply to its files for the rest of the job, and later opens there do not
+  wait again. An open the cache answers from a trusted entry never asks.
 - **A warm job asks no server at its opens.** An open answered from a trusted
   entry takes the verdict this job or an earlier one found (`<dir>/roles`);
   with none, the file is decided at its first read the cache does not hold
   (the log says `decided at its first access to the origin`).
 - **Opens through a redirector were refused for a long time after it came
-  back.** With `auto` the XRootD client keeps its own connection settings: a
+  back.** uCache leaves the XRootD client's connection settings as they are: a
   server that failed is answered with that failure for 30 minutes (after
-  trying it for up to 10). `adaptive_federation = on`, or
-  `XRD_CONNECTIONWINDOW=31 XRD_CONNECTIONRETRY=2 XRD_STREAMERRORWINDOW=180`,
-  gives up sooner and tries again after 3 minutes.
-- **`ucache doctor` says adaptive_federation has a value it does not know.**
-  The value (a typo, `yes`) is ignored and the jobs run with the layer below,
-  or the default `auto`; set `off`, `on` or `auto`.
+  trying it for up to 10). `XRD_CONNECTIONWINDOW=31 XRD_CONNECTIONRETRY=2
+  XRD_STREAMERRORWINDOW=180` in the job's environment gives up sooner and tries
+  again after 3 minutes.
+- **`ucache doctor` says failover has a value it does not know.**
+  The value (a typo, `yes`, `auto`) is ignored and the jobs run with the layer
+  below, or the default `on`; set `on` or `off`.
+- **`ucache doctor` says `adaptive_federation` is now called failover.** A conf,
+  the state file or the environment still names the setting by the name it had
+  in development builds; that name sets nothing. Use `failover = on` or `off`
+  (`on` is what `auto` was).
 
 ## One server refuses or fails and stops the job
 
-Reading through a federation (a redirector that picks one of several servers
-holding the file), one bad server can be enough to stop a job: it refuses
+Reading through a redirector (one that picks one of several servers holding
+the file), one bad server can be enough to stop a job: it refuses
 opens (for example `permission denied`), or serves a damaged copy. Through
 uCache this often shows as a **read** error rather than an open error, because
 the file was opened from the cache and uCache opened the origin only when it
@@ -381,8 +387,8 @@ needed bytes it did not hold; the redirector then picked the bad server for
 that open.
 
 Find the server's full host name in the error, in uCache's warning when it is
-uCache's own open that failed with `adaptive_federation = on` (`<file>: opening
-it at <host>:<port> failed (...)`; with the switch off the warning is `lazy
+uCache's own open that failed with failover on (`<file>: opening
+it at <host>:<port> failed (...)`; with failover off the warning is `lazy
 origin open failed for <URL> (...)`, which names no server), or in the
 client's log (`XRD_LOGLEVEL=Debug`, the host the open was redirected to), and
 add it to the file's URL as `?tried=<full host name>`
@@ -396,12 +402,12 @@ list, so they avoid it too (releases up to 1.4.0 dropped `tried=` from those
 opens). If every copy is on the servers you name, the redirector answers that
 no server has the file.
 
-With `adaptive_federation = on`, uCache does this itself for each open (next
+With failover on, uCache does this itself for each open (next
 entry).
 
 ## uCache opened the file at another site
 
-With `adaptive_federation = on`, an open through a redirector that fails at
+With failover on, an open through a redirector that fails at
 one site (the server refused this client, stalled past the open deadline, could
 not be reached, or failed with a server or storage error) is made again through
 the redirector, with the servers that failed named in `tried=`. The log shows
@@ -413,8 +419,9 @@ each step:
 - `<file>: no site could open it: <site> (<host>:<port>): <error>; ...`, when
   none did. The job gets that error, with the code of the last one.
 
-An open stops after 4 sites or after 180 s in all (160 s with the switch's
-error window, less with a shorter open timeout of the job's own). A server the
+An open stops after 4 sites or after 180 s in all (less with a shorter open
+timeout of the job's own, or a client error window set below 200 s: 20 s less
+than it). A server the
 redirector names by its address, or by a name without a dot, cannot be named
 in `tried=` (a redirector masks servers by full host name), so the redirector
 may send the next attempt to it again; uCache then asks the regional
@@ -510,7 +517,7 @@ per-file record file has a line per attempt (FORMAT.md, routes `failover` and
 ## The open fails: `every copy found is at a host the URL's tried= asks to avoid`
 
 The file's URL has a host pattern in `tried=` (an entry with a `*`, such as
-`tried=*.site-a.example`), and with `adaptive_federation` on for the file uCache
+`tried=*.site-a.example`), and with failover on for the file uCache
 keeps every read away from the hosts it matches (USER_GUIDE.md, "Keeping reads
 away from some hosts"). The error
 
@@ -538,7 +545,7 @@ holds a character no host name has), which is ignored and not sent.
 
 ## The open fails, and the error says uCache holds an earlier copy
 
-With `adaptive_federation = on`, once the freshness window of the cache's entry for a file
+With failover on, once the freshness window of the cache's entry for a file
 has passed (`revalidate_seconds`, 7 days by default), the next open checks the file at an
 origin. When no copy passes (each is refused by the checks made at open, or none can be
 reached), the open fails with the one error that names every copy tried, and uCache does
@@ -576,7 +583,7 @@ the error gives no advice for it.
 
 ## A server or a copy is tried last (`ucache sources`)
 
-With `adaptive_federation = on`, the log says when a server is marked or a
+With failover on, the log says when a server is marked or a
 copy is proven missing (a server's fault of its own is marked from a read, a
 listed copy's stat, or an open made at that server; an open made through a
 redirector does not see it: the XRootD client itself makes such an open again
@@ -602,7 +609,7 @@ process holds it, stopped) is dropped: a lost mark costs one more failover.
 
 ## uCache read the file at another site
 
-With `adaptive_federation = on`, a read that fails at the server a file was
+With failover on, a read that fails at the server a file was
 opened at, in a way another site may not share (the server stopped answering,
 the connection was lost, the request ran past its time limit of 5 minutes, or
 the server reported a fault of its own or of its storage), is made again at
@@ -692,7 +699,7 @@ meanwhile), that read opens the file at an origin, with the failover of an open.
 fails at every copy, each read and `Stat` of the file gets that open's error, which names the
 copies (`no copy could serve the read: ...`), and nothing is sent to an origin on the file
 until an open succeeds: the first read after a second opens it again. With
-the switch off for the file (`off`, or a file `auto` leaves off) the same holds, with no other copy tried: each read
+failover off for the file (`off`, or a file failover does not apply to) the same holds, with no other copy tried: each read
 and `Stat` gets the error the origin gave that open (for example `permission denied`), the
 one a job without uCache would have got at its open. (In uCache 1.4.0 and earlier, such
 reads got the XRootD client's `[ERROR] Invalid operation`, and a page read there could
@@ -755,14 +762,14 @@ answered from what the open returned.
 ## A cache entry was dropped (`bad_entries_dropped`)
 
 uCache drops a file's cache entry when what it holds came from a bad copy, and the next open
-of the file fills a new one. The first case below needs `adaptive_federation = on`; the second
-needs `check_origin_integrity = on`, which the switch forces on. The log says why, once per
+of the file fills a new one. The first case below needs failover on; the second
+needs `check_origin_integrity = on`, which failover forces on. The log says why, once per
 entry:
 
 - `<file>: the cache entry holds <M> bytes and the header it holds says the file is <N>
   bytes: it was filled from a cut copy, and is dropped; the file is opened at an origin`:
-  an entry made before the checks at open existed (by uCache 1.4.0 or earlier, or with the
-  switch off) from a copy that holds only the first M bytes of the file. Such an entry
+  an entry made before the checks at open existed (by uCache 1.4.0 or earlier, or with
+  failover off) from a copy that holds only the first M bytes of the file. Such an entry
   answered every read past M with nothing; the open now goes to an origin and takes a whole
   copy (see "uCache opened the file at another site" above).
 - `<file>: the cache entry holds bytes from <host>:<port>, whose copy failed a check: the

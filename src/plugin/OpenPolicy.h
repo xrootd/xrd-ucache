@@ -100,7 +100,7 @@ struct ChainView {
   size_t hops = 0;
 };
 ChainView readChain(const std::vector<Hop>& hops);
-// The hop the site-fault memory marks for an attempt that failed (adaptive_federation): the last
+// The hop the site-fault memory marks for an attempt that failed (failover): the last
 // host the attempt reached, the one that did not answer in time or answered with the fault, unless
 // it is a redirector (which holds no copy and is never marked); -1 for none. Not `effective`: for
 // a chain that went on after a data server's own answer (a "not found" the client took elsewhere,
@@ -117,7 +117,7 @@ std::string chainText(const std::vector<Hop>& hops);
 // without a dot, and an IPv4 or IPv6 address, is its own site.
 std::string siteOf(const std::string& host);
 
-// Site names (adaptive_federation): a server says which site it belongs to when asked for its
+// Site names (failover): a server says which site it belongs to when asked for its
 // configuration value "sitename" (the server's all.sitename), as CMSSW's XRootD adaptor asks.
 // The name from an answer's bytes (`data`, `len`): its first line, without surrounding blanks;
 // "" when it names none: empty, the word "sitename" itself (what a server with none
@@ -155,14 +155,14 @@ enum class OpenRoute : uint8_t {
   kLazy,     // a trusted handle's open at its first miss
   kDegraded, // a trusted handle whose entry was gone at its first read
   kFork,     // a forked child's open afresh of a handle it inherited
-  kFailover, // with adaptive_federation on, an open of any of these at another site
+  kFailover, // with failover on, an open of any of these at another site
   kCandidate, // ... at a server a regional redirector listed as holding the file
   kRead,     // ... made because reads of the handle stopped (every attempt of such an open)
 };
 // "relay", "lazy", "degraded", "fork", "failover", "candidate", "read"
 const char* openRouteName(OpenRoute r);
 
-// With adaptive_federation on, the deadline of every read open of a handle
+// With failover on, the deadline of every read open of a handle
 // the cache serves: the reader's own open, and the cache's own opens of the
 // origin (a trusted handle's first miss, a handle whose entry was gone, a
 // forked child's open afresh). Without one, an open waits for as long as the
@@ -190,7 +190,7 @@ static_assert(kOpenDeadlineS >= 30, "an open deadline below 30 s expires healthy
 // the 30 s floor.
 int openDeadlineS(int readerTimeoutS, int deadlineS = 0);
 
-// ---- Opening a file at another site (adaptive_federation on) --------------
+// ---- Opening a file at another site (failover on) --------------
 // When an open through a redirector fails at one site in a way another site
 // may not share, the open is made again through the redirector, with the
 // failed servers named in tried= so that it sends the open elsewhere; a
@@ -463,7 +463,7 @@ ByteSpan checkReadSpan(bool keep, uint32_t pageSize, uint64_t size, uint64_t at,
 std::vector<ByteSpan> rootLabelSpans(const RootHeaderVerdict& v, const std::vector<ByteView>& kept,
                                      bool keep, uint32_t pageSize, uint64_t room);
 
-// ---- An earlier copy of the file, when no copy passes at the open (adaptive_federation on) ----
+// ---- An earlier copy of the file, when no copy passes at the open (failover on) ----
 // When the freshness window of the file's entry has expired and no copy passes at the open (each
 // is refused by a check or cannot be reached), the open fails with the one error that names the
 // copies, and uCache does not serve the entry on its own judgment. When it holds one, the error
@@ -577,7 +577,7 @@ bool sameSite(const SiteFailure& a, const SiteFailure& b);
 // for a copy named by an address (it stands for its server alone).
 bool atFailedSite(const SiteFailure& x, const std::string& host, const std::string& name);
 
-// What a failure at a server says of the server itself (site-fault memory, adaptive_federation):
+// What a failure at a server says of the server itself (site-fault memory, failover):
 //   kStall   it stalled: a request that ran out of uCache's own time there (an expiry, `ownTime`:
 //            the deadline was uCache's, not a shorter one the job gave), or a connection gone quiet
 //            past the client's stream timeout (not when the job lowered it: jobStream);
@@ -712,7 +712,7 @@ std::string noCopyServedText(const std::string& file, const std::vector<SiteFail
 // kErrorTextMax bytes. `moveText` as it is when it is not noCopyServedText's.
 std::string earlierMoveText(const std::string& moveText, uint64_t agoMs);
 
-// ---- Reading a file from another site (adaptive_federation on) --------------
+// ---- Reading a file from another site (failover on) --------------
 // A handle is armed to move its reads when the cache serves it, an open of it
 // succeeded through a redirector, and the size its reader was shown is known. A
 // handle shown a slot layout (`slotLayout`) is not armed this way: its reader's
@@ -830,7 +830,7 @@ bool emptyPageReadInsideConfirmed(bool armed, bool pageRead, int code, uint64_t 
 // be given to it before that open succeeds: the handle was trusted at Open (no request at open,
 // `trustedAtOpen`) and that open has not succeeded (`opened`). A request on a File that never
 // opened fails in the client ("invalid operation"), and a page read there crashes the client; the
-// request waits for the open, or gets its error. With adaptive_federation off (`federation`) this
+// request waits for the open, or gets its error. With failover off (`federation`) this
 // holds only once the handle has lost its trust (its entry gone by its first read:
 // `stillTrusted` false): a handle that still trusts its entry is served as it always was. With it
 // on, it holds whether or not the handle still trusts its entry.

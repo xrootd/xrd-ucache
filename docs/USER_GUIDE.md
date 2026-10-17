@@ -74,7 +74,7 @@ sudo dnf -y install gcc-c++ cmake make \
   which the **recompression** feature (`ucache recompress`, see
   §Configuration), read-ahead (`prefetch`), `max_read_fraction` and the checks
   of what the origin sends (`check_origin_integrity`, which
-  `adaptive_federation` turns on for the files it is on for) all need. Omit them and everything else
+  `failover` turns on for the files it applies to) all need. Omit them and everything else
   still builds — the page cache works fully — but those are skipped (fail-open
   at build time): no replica is made, nothing is read ahead or checked, and
   every file is cached whatever `max_read_fraction` says (`ucache doctor` warns
@@ -720,7 +720,7 @@ it.
   logical name, below, whose modification time belongs to one site's copy);
   a changed file is re-cached. Set
   `revalidate_seconds = 0` to re-check on every open. With
-  `adaptive_federation = on`, when that re-check finds no copy that passes
+  failover on, when that re-check finds no copy that passes
   (each refused by the checks at open, or none reachable), the open fails and
   the old entry is not served; the error then says that uCache holds an earlier
   copy, how long ago it was last confirmed at an origin, how much of the file it
@@ -736,7 +736,7 @@ it.
 - **Servers to avoid (`?tried=`).** A reader can keep a redirector from
   sending it to a given server by adding `?tried=<full host name>` (a comma
   separated list for several) to the file's URL. An entry with a `*` is a
-  host pattern that uCache applies itself, with `adaptive_federation` on
+  host pattern that uCache applies itself, with failover on
   for the file (Configuration, "Keeping reads away from some hosts"). uCache honours it on every
   origin open it makes for that file, its own included: when a file opened
   from the cache needs bytes the cache does not hold, uCache opens the origin
@@ -750,7 +750,7 @@ it.
   client sends to get a second server beside the ones it already reads from
   (CMSSW does this). uCache's own open does not need a second server, and
   inheriting that request could send it to one this host cannot reach. With
-  `adaptive_federation = on`, the servers in such a request that this process
+  failover on, the servers in such a request that this process
   has seen fail a request for the file are kept (with `triedrc=ioerr`): they
   are the reason the client asked, and the others are servers it reads from
   without trouble.
@@ -788,11 +788,11 @@ overriding your defaults. Common keys:
 | `in_use_seconds = 86400` | `UCACHE_IN_USE_S` | how long after a reader last used a file it stays in use: not evicted (read, or its maps handed out, this recently), and a replaced map keeps its place for readers that still hold it (default 1 day; 0 = plain LRU, and a replaced map stays valid only while an open handle holds it). Replaces `evict_protect_seconds` and `map_expiry_seconds` |
 | `validate = size`   | `UCACHE_VALIDATE`       | `none` / `size` / `size+mtime` / `cksum`. **Caveat:** the plugin has no origin-checksum source yet, so `cksum` currently degrades to size-only (weaker than `size+mtime`) — prefer `size+mtime` until a checksum query lands |
 | `revalidate_seconds = 604800` | `UCACHE_REVALIDATE_S` | freshness window (TTL): an entry validated against the origin within this many seconds is served with **no remote contact at all**. Default 7 days — right for write-once physics data. `0` = re-check on every open; `ucache rm <url>` forces a re-check anytime |
-| `open_retries = 0`  | `UCACHE_OPEN_RETRIES`   | retry a transient open failure this many times (0 = off); backoff via `open_retry_base_ms`/`open_retry_max_ms`. With `adaptive_federation = on`, an open through a redirector that passed its deadline at a server, or whose connection to the server timed out, was lost or could not be made, is not retried at the same URL: it goes to another site (below) |
+| `open_retries = 0`  | `UCACHE_OPEN_RETRIES`   | retry a transient open failure this many times (0 = off); backoff via `open_retry_base_ms`/`open_retry_max_ms`. With failover on, an open through a redirector that passed its deadline at a server, or whose connection to the server timed out, was lost or could not be made, is not retried at the same URL: it goes to another site (below) |
 | `recompress = off`  | `UCACHE_RECOMPRESS`     | `on` = the files your jobs read get fast-to-decode replicas **automatically**, created on their first pass (default off — opt-in CPU/disk). Flip it with `ucache set recompress on`. The conversion runs on one thread per CPU the process may use, and each thread that converts reserves 64 MiB of address space for its allocations: under a limit on the job's address space (`ulimit -v`) a reader on a machine with many CPUs can reach it (TROUBLESHOOTING.md) |
-| `check_origin_integrity = off` | `UCACHE_CHECK_ORIGIN_INTEGRITY` | a setting for tests and diagnosis. `on` = check what arrives from the origin before it is cached or served: a block that fails a check is not served, and the read fails with an error naming the copy and the reason. **Forced on by `adaptive_federation = on`** (`ucache settings` says "forced by adaptive_federation"). `recompress = on` does not need it: recompression checks every block it converts, and only those, each by its own checksum (zlib's adler32, LZMA's CRC32, LZ4's XXH64; ZSTD and uncompressed blocks carry none), and every RNTuple page it converts by the page's own checksum (XXH3-64, which ROOT writes after each page unless the file was written without page checksums); a block that fails is never converted, since the converted block would carry a new, valid checksum, and on a first pass it is not kept or served either: the read fails with "failed its checksum ... not served", naming the server. A job run with `recompress = off` that reads a file whose replica was made earlier still converts what it reads of it for the first time; with this setting off, a block there that fails its own checksum is kept as stored and served, and the reader's own decoder reports the damage, as it would without uCache. What this setting checks is what the cache fetches from the origin, against the file map: the position and length of each basket of a TTree, as the tree's own record gives them. Each basket that starts in the fetched bytes, its key header wholly in them, must say in its key that it sits where the tree's record puts it (ROOT itself refuses a basket whose key does not; bytes that are not the basket, zeros among them, fail it), with a key length above 0 and within the length the tree's record gives it, and a length and an object length of 0 or more (ROOT fails, or reads the wrong bytes, on a key that does not; a key whose own length alone is damaged, which ROOT does not read the basket by, is not held against the copy). Its length is held to the one the tree's record gives only where it matters to ROOT: ROOT reads a basket by the tree's record's length and decides from the key whether it is compressed, so a key whose length differs counts against the copy only where that decision changes (ROOT would take compressed bytes for the entries, wrong values with no error, or fail to decompress stored ones); a key whose length alone differs and that ROOT reads correctly is not held against the copy. Each basket that lies wholly in the fetched bytes, its key passing and its length known, is also checked by its own checksum where ROOT decompresses it: its data is decompressed as ROOT decompresses it, and a ZLIB (adler32) or LZMA (the xz stream's check) block that fails its checksum or does not decode, or an LZ4 block whose XXH64 (which ROOT verifies over the compressed bytes before it decodes them) does not hold, fails the read ("failed its check (its data fails its own check: ...)"); ZSTD blocks written without a content checksum (as ROOT writes them), ROOT's old algorithm and baskets stored uncompressed carry none and are not judged (nothing, ROOT included, can find damage inside them). A decoder that cannot do its work for reasons of the job's own process (no memory, for one, under a limit on its address space) fails no check and holds nothing against the copy: the fetch it judged is served unjudged and not kept, and a conversion that fails so is made again at the same copy; a stored page of uCache's own layout that it cannot decode so is kept and decoded again, and a read that still cannot have it fails with an error that says so (not "corrupted data"). An LZMA block whose decoder would need more than 1 GiB (it names a dictionary no ROOT writer makes; ROOT's largest is 64 MiB) fails its check. This costs CPU: one more decompression of each ZLIB or LZMA basket fetched from the origin (an LZ4 one costs a hash), about what ROOT spends decompressing it again, with each thread's decoders kept from one basket to the next. It runs on a pool of uCache's own, of at most one thread per CPU the process may use and at most 16 (`UCACHE_THREADS` does not set it), started one at a time as the work needs them (like every pool of uCache's), apart from the threads that serve the cache's hits and write its pages, and never on the XRootD client's: a fetch's baskets are spread over the pool in parts of about a megabyte, so a cold fetch is answered later by about its decompression time divided by the threads free, and no other request waits for it. Each decode thread keeps its decoders' state (an LZMA dictionary: 64 MiB of address space for ROOT's LZMA level 9, in memory only as far as a basket fills it), a scratch buffer of at most 16 MiB, the C library's own reserve for the thread's allocations (64 MiB of address space) and its stack (8 MiB): up to about 2.4 GiB of address space for 16 threads, which matters to a job run under a limit on its address space (`ulimit -v`). Other threads (recompression's among them) keep no decoder between uses. A basket recompression converts is decompressed once, by the conversion's own check. A copy whose tree's record fails its own checksum (ROOT cannot read the tree from it either), or whose record places a basket past the copy's end, is bad for that tree: the reads it answers of that tree's record, and of its baskets when the record could be read, fail the same way, while a read of another tree of the copy (a job reading only `Runs`) is served; what the cache entry took from that copy is dropped as soon as the map shows it. A read that holds such a basket, or such a part of a copy, fails with "failed its check (the reason) ... not served", and nothing of that fetch is kept (with `adaptive_federation = on` the read is first made again at another copy, and the map made again from it; below). A file whose tree's record uses a layout uCache's reader does not support, and a file with no tree (RNTuple), make no claim: their baskets are not checked. A tree's record that carries no checksum (ZSTD without one, or stored uncompressed) cannot show its copy bad, but the map is made from it and the baskets are checked. The map costs reading the tree's record once per file and process (tens to hundreds of KB, usually already in the cache). Nothing is decompressed for the check that carries no checksum: ZSTD blocks written without a content checksum, an xz stream that declares no check, ROOT's old algorithm and baskets stored uncompressed are not decoded (they count as carrying no check), and an LZ4 block is judged by its hash alone. Checked: byte-cache misses, single and vector (the pieces of one vector read that follow each other are judged as one run, so a key header or a basket that the cut between two pieces divides is judged whole); in a file that has a replica (`recompress = on`), whatever `recompress` says, every basket wholly in the original bytes a read fetches outside the converted baskets (a branch whose codec is not in `recompress_codecs` among them), the key of every basket placed in the replica (where the tree's record puts it, as for a miss: the replica rewrites a basket's own position, so ROOT could no longer catch one fetched from the wrong place), and the data of a converted branch's basket the conversion leaves as stored; a basket the conversion decodes has its data checked once, by its conversion; the reads the cache relays to the origin for a handle that holds the file's map (page reads, a read relayed after a cache error, the single reads of a file read straight from the origin under `max_read_fraction`, and a read moved to another site); read-ahead (nothing of a read-ahead fetch in which a basket fails, or made while the file's map is not known, is staged); and the bytes the checks at a job's open keep, when they hold the tree's record themselves (a small file's do; the map is then made from them). A request of another handle made while the file's records are read waits for that read and is checked then. A basket that fails fails the read ("failed its check ... not served"), nothing of those bytes is kept, and the entry is dropped; with `adaptive_federation = on` the read is first made again at another copy (below). A read waiting for another handle's reading of the file's records is bounded by that reading (the waiting read's own timeout does not shorten it), and when that reading fails the waiting read is served unchecked, and nothing of it kept, as on the byte path. Not checked: bytes already in the cache (among them the pages of the file's own records, which uCache reads to make the map and which are judged only by the record's own checksum, and the pages the checks at a job's open keep when they do not hold the tree's record: they are stored before the map exists); the reads of a handle that holds no map (a copy tool's, whose reads are passed straight to the origin, and a handle that has made no miss: making the map for it would cost a read of the file's records for bytes uCache does not keep); a basket that the fetched bytes do not hold whole (cut by the fetch's edge), or whose length the tree's records do not agree on; and, in a file with a replica, the bytes around a basket the conversion leaves as stored, up to the page on each side, which are cached with it (a small basket of another branch wholly among them is not judged). A build without the codec libraries makes no map and checks nothing. To find the baskets, the first read of a file that misses waits, before its own fetch, for uCache's own reads of its records, each with that read's own timeout (a stalled origin can hold it for several of them); a miss of another handle made meanwhile is answered only once those reads end, and is checked then. When one of those reads fails, misses are served unchecked, and nothing of them kept, until one a second later or more reads the records again; with `adaptive_federation = on`, such a read that fails at its copy (a stall, a lost connection, a server's own error, a short answer inside the file's confirmed size) first moves the file to another copy, as any read does, and the records are read there (TROUBLESHOOTING.md). See STATS.md for the counters |
-| `adaptive_federation = auto` | `UCACHE_ADAPTIVE_FEDERATION` | the switch for reading through a federation of sites (a redirector in front of many sites' servers). `auto` (the default) = the switch is on for a file opened at a redirector and off for every other file, decided at each file's open from the role the server its URL names reports (see "Which files the switch is on for" below); the XRootD client's connection settings are left as they are, and `check_origin_integrity` is forced on only for the files the switch is on for (`ucache settings` says so). `off` = the switch is off for every file, the behaviour of uCache 1.4.0, where off was the default. `on` = the switch is on for every file, and the XRootD client gives up on a server it cannot reach sooner: connection window 31 s, 2 connection retries, error window 180 s (its own defaults are 120 s, 5 and 1800 s), each only where neither an `XRD_*` variable nor a `client.conf` has set it; every read open of a file uCache serves gets a deadline of 60 s (below); an open through a redirector that fails at one site is made again at another (below); a read of such a file that fails at its site is made again at another (below); a copy of a ROOT file is checked inside the open, before the job is shown it: its header, its list of top-level objects and the labels of the records that list names (below; a few reads per cold open, the last a vector read of about a hundred bytes per record, at most 64 records); and `check_origin_integrity` is **forced on** for the whole job (`ucache settings` says "forced by adaptive_federation"). The values in force are in `run_settings` (STATS.md) and in `ucache doctor` |
-| `logical_name_prefixes = off` | (none) | a space-separated list of path prefixes (CMS's official namespaces: `/store/data/ /store/mc/ /store/hidata/`); set, a file whose URL's path holds one of these prefixes is cached under its logical name, `lfn:/store/...` (the path from the first place a prefix begins), so one file read through any site or redirector is one cache entry (see "Keys by logical name" below). Only the cache's key changes: where an open or a read goes, and what it does when it fails, is as for any other file. Each prefix begins and ends with `/`. `off` (the default) = every file keyed by its URL, as before. Independent of `adaptive_federation`. A property of the cache, not of a job: no environment variable sets it, so that two jobs never key one URL two ways; set it in the conf or with `ucache set` (which refuses a list that is not valid) |
+| `check_origin_integrity = off` | `UCACHE_CHECK_ORIGIN_INTEGRITY` | a setting for tests and diagnosis. `on` = check what arrives from the origin before it is cached or served: a block that fails a check is not served, and the read fails with an error naming the copy and the reason. **Forced on by `failover` for the files it applies to** (`ucache settings` says so). `recompress = on` does not need it: recompression checks every block it converts, and only those, each by its own checksum (zlib's adler32, LZMA's CRC32, LZ4's XXH64; ZSTD and uncompressed blocks carry none), and every RNTuple page it converts by the page's own checksum (XXH3-64, which ROOT writes after each page unless the file was written without page checksums); a block that fails is never converted, since the converted block would carry a new, valid checksum, and on a first pass it is not kept or served either: the read fails with "failed its checksum ... not served", naming the server. A job run with `recompress = off` that reads a file whose replica was made earlier still converts what it reads of it for the first time; with this setting off, a block there that fails its own checksum is kept as stored and served, and the reader's own decoder reports the damage, as it would without uCache. What this setting checks is what the cache fetches from the origin, against the file map: the position and length of each basket of a TTree, as the tree's own record gives them. Each basket that starts in the fetched bytes, its key header wholly in them, must say in its key that it sits where the tree's record puts it (ROOT itself refuses a basket whose key does not; bytes that are not the basket, zeros among them, fail it), with a key length above 0 and within the length the tree's record gives it, and a length and an object length of 0 or more (ROOT fails, or reads the wrong bytes, on a key that does not; a key whose own length alone is damaged, which ROOT does not read the basket by, is not held against the copy). Its length is held to the one the tree's record gives only where it matters to ROOT: ROOT reads a basket by the tree's record's length and decides from the key whether it is compressed, so a key whose length differs counts against the copy only where that decision changes (ROOT would take compressed bytes for the entries, wrong values with no error, or fail to decompress stored ones); a key whose length alone differs and that ROOT reads correctly is not held against the copy. Each basket that lies wholly in the fetched bytes, its key passing and its length known, is also checked by its own checksum where ROOT decompresses it: its data is decompressed as ROOT decompresses it, and a ZLIB (adler32) or LZMA (the xz stream's check) block that fails its checksum or does not decode, or an LZ4 block whose XXH64 (which ROOT verifies over the compressed bytes before it decodes them) does not hold, fails the read ("failed its check (its data fails its own check: ...)"); ZSTD blocks written without a content checksum (as ROOT writes them), ROOT's old algorithm and baskets stored uncompressed carry none and are not judged (nothing, ROOT included, can find damage inside them). A decoder that cannot do its work for reasons of the job's own process (no memory, for one, under a limit on its address space) fails no check and holds nothing against the copy: the fetch it judged is served unjudged and not kept, and a conversion that fails so is made again at the same copy; a stored page of uCache's own layout that it cannot decode so is kept and decoded again, and a read that still cannot have it fails with an error that says so (not "corrupted data"). An LZMA block whose decoder would need more than 1 GiB (it names a dictionary no ROOT writer makes; ROOT's largest is 64 MiB) fails its check. This costs CPU: one more decompression of each ZLIB or LZMA basket fetched from the origin (an LZ4 one costs a hash), about what ROOT spends decompressing it again, with each thread's decoders kept from one basket to the next. It runs on a pool of uCache's own, of at most one thread per CPU the process may use and at most 16 (`UCACHE_THREADS` does not set it), started one at a time as the work needs them (like every pool of uCache's), apart from the threads that serve the cache's hits and write its pages, and never on the XRootD client's: a fetch's baskets are spread over the pool in parts of about a megabyte, so a cold fetch is answered later by about its decompression time divided by the threads free, and no other request waits for it. Each decode thread keeps its decoders' state (an LZMA dictionary: 64 MiB of address space for ROOT's LZMA level 9, in memory only as far as a basket fills it), a scratch buffer of at most 16 MiB, the C library's own reserve for the thread's allocations (64 MiB of address space) and its stack (8 MiB): up to about 2.4 GiB of address space for 16 threads, which matters to a job run under a limit on its address space (`ulimit -v`). Other threads (recompression's among them) keep no decoder between uses. A basket recompression converts is decompressed once, by the conversion's own check. A copy whose tree's record fails its own checksum (ROOT cannot read the tree from it either), or whose record places a basket past the copy's end, is bad for that tree: the reads it answers of that tree's record, and of its baskets when the record could be read, fail the same way, while a read of another tree of the copy (a job reading only `Runs`) is served; what the cache entry took from that copy is dropped as soon as the map shows it. A read that holds such a basket, or such a part of a copy, fails with "failed its check (the reason) ... not served", and nothing of that fetch is kept (with failover on the read is first made again at another copy, and the map made again from it; below). A file whose tree's record uses a layout uCache's reader does not support, and a file with no tree (RNTuple), make no claim: their baskets are not checked. A tree's record that carries no checksum (ZSTD without one, or stored uncompressed) cannot show its copy bad, but the map is made from it and the baskets are checked. The map costs reading the tree's record once per file and process (tens to hundreds of KB, usually already in the cache). Nothing is decompressed for the check that carries no checksum: ZSTD blocks written without a content checksum, an xz stream that declares no check, ROOT's old algorithm and baskets stored uncompressed are not decoded (they count as carrying no check), and an LZ4 block is judged by its hash alone. Checked: byte-cache misses, single and vector (the pieces of one vector read that follow each other are judged as one run, so a key header or a basket that the cut between two pieces divides is judged whole); in a file that has a replica (`recompress = on`), whatever `recompress` says, every basket wholly in the original bytes a read fetches outside the converted baskets (a branch whose codec is not in `recompress_codecs` among them), the key of every basket placed in the replica (where the tree's record puts it, as for a miss: the replica rewrites a basket's own position, so ROOT could no longer catch one fetched from the wrong place), and the data of a converted branch's basket the conversion leaves as stored; a basket the conversion decodes has its data checked once, by its conversion; the reads the cache relays to the origin for a handle that holds the file's map (page reads, a read relayed after a cache error, the single reads of a file read straight from the origin under `max_read_fraction`, and a read moved to another site); read-ahead (nothing of a read-ahead fetch in which a basket fails, or made while the file's map is not known, is staged); and the bytes the checks at a job's open keep, when they hold the tree's record themselves (a small file's do; the map is then made from them). A request of another handle made while the file's records are read waits for that read and is checked then. A basket that fails fails the read ("failed its check ... not served"), nothing of those bytes is kept, and the entry is dropped; with failover on the read is first made again at another copy (below). A read waiting for another handle's reading of the file's records is bounded by that reading (the waiting read's own timeout does not shorten it), and when that reading fails the waiting read is served unchecked, and nothing of it kept, as on the byte path. Not checked: bytes already in the cache (among them the pages of the file's own records, which uCache reads to make the map and which are judged only by the record's own checksum, and the pages the checks at a job's open keep when they do not hold the tree's record: they are stored before the map exists); the reads of a handle that holds no map (a copy tool's, whose reads are passed straight to the origin, and a handle that has made no miss: making the map for it would cost a read of the file's records for bytes uCache does not keep); a basket that the fetched bytes do not hold whole (cut by the fetch's edge), or whose length the tree's records do not agree on; and, in a file with a replica, the bytes around a basket the conversion leaves as stored, up to the page on each side, which are cached with it (a small basket of another branch wholly among them is not judged). A build without the codec libraries makes no map and checks nothing. To find the baskets, the first read of a file that misses waits, before its own fetch, for uCache's own reads of its records, each with that read's own timeout (a stalled origin can hold it for several of them); a miss of another handle made meanwhile is answered only once those reads end, and is checked then. When one of those reads fails, misses are served unchecked, and nothing of them kept, until one a second later or more reads the records again; with failover on, such a read that fails at its copy (a stall, a lost connection, a server's own error, a short answer inside the file's confirmed size) first moves the file to another copy, as any read does, and the records are read there (TROUBLESHOOTING.md). See STATS.md for the counters |
+| `failover = on` | `UCACHE_FAILOVER` | when a file has more than one copy behind a redirector (a server that sends each open to one of several servers holding the file), an open or a read that fails at one copy is made again at another, and each copy is checked before it is used (see "Failover between copies" below). It helps only where there is something to fail over to: a file with one copy, or a URL that names one server directly, is read on the plain path, as with `off`. `on` (the default) = decided at each file's open: failover applies to a file whose URL names a server that reports a redirector's role, or whose URL has a host pattern in `tried=`, and `check_origin_integrity` is forced on for those files (`ucache settings` says so); every other file is read as with `off`. `off` = every file is read as in uCache 1.4.0. uCache never changes the XRootD client's connection settings. The values in force are in `run_settings` (STATS.md) and in `ucache doctor` |
+| `logical_name_prefixes = off` | (none) | a space-separated list of path prefixes (CMS's official namespaces: `/store/data/ /store/mc/ /store/hidata/`); set, a file whose URL's path holds one of these prefixes is cached under its logical name, `lfn:/store/...` (the path from the first place a prefix begins), so one file read through any site or redirector is one cache entry (see "Keys by logical name" below). Only the cache's key changes: where an open or a read goes, and what it does when it fails, is as for any other file. Each prefix begins and ends with `/`. `off` (the default) = every file keyed by its URL, as before. Independent of `failover`. A property of the cache, not of a job: no environment variable sets it, so that two jobs never key one URL two ways; set it in the conf or with `ucache set` (which refuses a list that is not valid) |
 | `recompress_keep_originals = off` | `UCACHE_RECOMPRESS_KEEP_ORIGINALS` | `on` = when baskets are converted into a replica, keep their original bytes in the byte cache too (by default they are not kept, and a copy held from before is released: the cache would hold the same data twice) |
 | `mixed_maps = on` | `UCACHE_MIXED_MAPS` | with `recompress = on`: each open of a TTree or RNTuple file is shown its newest map, the baskets or pages converted by then back to back at their real size (see "Recompression"); `off` = every open sees the first-pass layout, every basket at the size of its room and every RNTuple page decoded — for jobs that hand basket positions to workers on other machines with caches of their own |
 | `recompress_codecs = lzma,zlib` | `UCACHE_RECOMPRESS_CODECS` | which **source** codecs are worth recompressing (comma list); branches in other codecs are served as-is |
@@ -815,10 +815,23 @@ overriding your defaults. Common keys:
 
 Sizes accept `k`/`m`/`g`/`t` suffixes.
 
-**Which files the switch is on for (`adaptive_federation = auto`, the default).**
-A file whose URL has a host pattern in `tried=` has it on, at its open, and no
+**Failover between copies (`failover`, on by default).** First, when it cannot
+help: failover needs another copy to go to. A file stored in one place, or a URL
+that names one server directly (a site's data server, or an EOS instance such as
+`root://eoscms.cern.ch//eos/...`), has nothing to fail over to: uCache reads it on
+the plain path, as with `failover = off` and as uCache 1.4.0 read every file, and a
+failure there is the job's, as it would be without uCache. Failover applies to a
+file opened through a redirector (CMS's global or regional redirectors, or a site's
+own redirector, each of which sends an open to one of several servers holding the
+file), and to a file whose URL has a host pattern in `tried=` ("Keeping reads
+away from some hosts", below). For those files, an open or a read that fails at
+one copy is made again at another, copies are checked as they are opened and
+read, and servers that failed are remembered (all below).
+
+**Which files failover applies to.**
+A file whose URL has a host pattern in `tried=` has it, at its open, and no
 server is asked ("Keeping reads away from some hosts", below). For any other
-file, with `auto`, uCache asks the server a file's URL names what it is, at the
+file, uCache asks the server a file's URL names what it is, at the
 first open of a file there, once per server (host and port) and job, and waits
 for the answers at most 5 s in all (or the job's own open timeout, when
 shorter). It asks first for the flags every XRootD server gives at login
@@ -828,23 +841,22 @@ a proxy) is not a redirector, and nothing more is asked. One that says
 `xrdfs <host> query config role` asks it): `manager`, `meta manager` or
 `supervisor` confirm it; another role it names makes it not a redirector --
 an EOS instance says `manager` at login (it sends each open to a storage
-node) and `none` as its role, and the switch stays off for its files; a
+node) and `none` as its role, and failover does not apply to its files; a
 server that names no role (an error, a key it does not know) is taken at its
-login flags. A redirector turns the switch on for the files opened there:
-everything `on` does to a file below, `check_origin_integrity` included.
+login flags. Failover applies to the files opened at a redirector, everything
+below included, `check_origin_integrity` too.
 Anything else, an error, or no answer in time leaves the files of that server
-exactly as with the switch off; an answer that comes after the 5 s changes
+exactly as with failover off; an answer that comes after the 5 s changes
 nothing for the opens that went on without it. A server that gave no answer is
 asked again at an open made 10 minutes later or more, and a verdict, an answer
 of this job's or a saved one, is renewed (asked again) at an open of the origin
 made 10 minutes or more after it. Only a new answer replaces a verdict: a
 renewal that gets none (the redirector slow or down just then) leaves the
-earlier answer standing, and is tried again a minute later. A federation's top
-redirector (CMS's global one says `meta manager`) and a regional one
-(`manager`) turn it on; so does **a site's own redirector**, which also says
-`manager`: it too sends opens to several servers. To read every file as with
-the switch off, set `adaptive_federation = off`; to have it on for every file,
-whatever server the URL names, `on`.
+earlier answer standing, and is tried again a minute later. The top redirector
+of a set of sites (CMS's global one says `meta manager`) and a regional one
+(`manager`) have it; so does **a site's own redirector**, which also says
+`manager`: it too sends opens to several servers. To read every file as uCache
+1.4.0 did, set `failover = off`.
 
 The questions cost one round trip to each server a job opens files at (two to
 a redirector), once per job (and once per 10 minutes at most), on the
@@ -854,9 +866,9 @@ cache directory (`<dir>/roles`, FORMAT.md) for the other jobs of the cache.
 An open the cache answers from a trusted entry (within its freshness window)
 asks nothing, so a warm open never reaches the network: it takes what this job
 already knows of the server, else the verdict saved in `<dir>/roles` (whatever
-its age), and the switch is on or off for the file as it was for the job that
+its age), and failover applies to the file or not as it did for the job that
 asked. When neither knows the server (an entry filled by uCache 1.4.0, or with
-the switch off), the file is decided at its first access to the origin -- its
+failover off), the file is decided at its first access to the origin -- its
 first read the cache does not hold, or the cache's own open of the origin:
 the server is asked then (the same 5 s at most), before that read is made, and
 the reads the cache holds never wait for it. A read made where uCache may not
@@ -865,42 +877,40 @@ yet leaves the file undecided: that read is served, nothing it fetches is kept,
 and a later read decides. So the second pass of a job, which
 reads other parts of files a first pass cached, has the protections for what it
 fetches. A handle that only relays (a write, a copy, the cache disabled) is not
-asked for: the switch is off for it. A handle a forked child inherits keeps the
-decision its parent made. The XRootD client's connection settings, which `on`
-changes for the whole job, stay as they are with `auto`, so that a file the
-switch is off for is read exactly as without it. The protections of a file the
-switch is on for do not depend on them (the open deadline, the moves, the client's
-own read recovery turned off and the checks are the file's), but the time the
-client takes to give up on a server it cannot reach does: with the client's own
-values (a connection tried for 120 s, 5 times, a server that failed answered
-with that failure for 30 minutes) a redirector that was down for more than about
-10 minutes can have the job's opens through it refused for up to 30 minutes
-after it is back, where `on` (31 s, 2 tries, 3 minutes) recovers within about 3
-minutes. `on`, or `XRD_CONNECTIONWINDOW=31 XRD_CONNECTIONRETRY=2
-XRD_STREAMERRORWINDOW=180` in the job's environment, gives the shorter policy
-with `auto`. `ucache stats` counts the
+asked for: failover does not apply to it. A handle a forked child inherits keeps the
+decision its parent made. uCache never changes the XRootD client's connection
+settings, which are the whole job's, so that a file failover does not apply to
+is read exactly as without uCache. The protections of a file failover applies
+to do not depend on them (the open deadline, the moves, the client's own read
+recovery turned off and the checks are the file's), but the time the client
+takes to give up on a server it cannot reach does: with the client's own values
+(a connection tried for 120 s, 5 times, a server that failed answered with that
+failure for 30 minutes) a redirector that was down for more than about 10
+minutes can have the job's opens through it refused for up to 30 minutes after
+it is back. `XRD_CONNECTIONWINDOW=31 XRD_CONNECTIONRETRY=2
+XRD_STREAMERRORWINDOW=180` in the job's environment recovers within about 3
+minutes. `ucache stats` counts the
 servers asked (`role_queries`, renewals included), those that reported a
 redirector's role (`role_redirectors`) and those that gave none
 (`role_unanswered`); `log = info` names each server's answer. The setting takes
-`off`, `on` or `auto` in any case (and `1`/`true`, `0`/`false`); any other value
-is ignored with a warning, the layer below (or the default, `auto`) holds, and
+`on` or `off` in any case (and `1`/`true`, `0`/`false`); any other value
+is ignored with a warning, the layer below (or the default, `on`) holds, and
 `ucache doctor` names it.
 
-Below, "with `adaptive_federation = on`" means: for a file the switch is on
-for -- every file with `on`, a file opened at a redirector with `auto`.
+Below, "with failover on" means: for a file failover applies to.
 
-**The open deadline (part of `adaptive_federation`).** With
-`adaptive_federation = on`, every read open of a file uCache serves, the job's
+**The open deadline (part of failover).** With
+failover on, every read open of a file uCache serves, the job's
 own and the opens uCache makes of the origin, has a deadline of 60 s, or the
 job's own open timeout, or the client's `RequestTimeout`, when that is shorter.
 An open that passes it fails with the client's `operation expired` error
-(TROUBLESHOOTING.md). With the switch off, the job's own open waits as long as
+(TROUBLESHOOTING.md). With failover off, the job's own open waits as long as
 it would without uCache (the job's own open timeout, or the client's
 `RequestTimeout`), and the opens uCache makes of the origin wait for the
 client's `RequestTimeout`.
 
-**Opening a file at another site (part of `adaptive_federation`).** With
-`adaptive_federation = on`, when an open through a redirector fails at the
+**Opening a file at another site (part of failover).** With
+failover on, when an open through a redirector fails at the
 site it was sent to, in a way another site may not share -- the server refused
 this client (`[3010]`), stalled past the deadline, could not be reached, or
 failed the request with a server or storage error -- uCache opens the file again
@@ -970,7 +980,7 @@ records the job reads right after its open (the class descriptions, trees, RNTup
 as their whole pages and kept, as the checks' other reads are. A list that carries ROOT's
 mark of a freed record (a writer stopped in the middle of a save, below) makes no claim on any
 label: the records it names may have been deleted and their space reused since, and ROOT reads
-such a file. These checks at open run only with `adaptive_federation = on`, where a copy they
+such a file. These checks at open run only with failover on, where a copy they
 refuse can be replaced by another; `check_origin_integrity` alone does not turn them on.
 
 The first read gets what is left of that attempt's time (at least 5 s); each later one gets
@@ -1017,7 +1027,7 @@ next open checks the origin again). After the window the next open checks the or
 and reads the header of the copy it lands on: a copy that fails the check is refused, and
 one that passes at another size (the file was rewritten) replaces the entry and becomes
 its confirmed size. With `revalidate_seconds = 0` every open does so. An entry made before
-these checks existed (by an earlier release, or with the switch off) carries no confirmed
+these checks existed (by an earlier release, or with failover off) carries no confirmed
 size: within its window, a job's open that such an entry of a `*.root` file would answer
 first compares the end its header states, as the cache holds it, with the size the entry
 holds, reading nothing but the cache. An entry whose header states an end past its size was
@@ -1034,7 +1044,8 @@ without uCache stays readable. When every copy is refused for what it is (empty,
 or the URL names a server directly and that copy is), the job's open fails with one error of class `data`
 that names each copy tried, its size and why it was refused. Each open tries
 at most 4 sites, within 180 s in all (less when the job's own open timeout is
-shorter, and with the switch's error window of 180 s, 160 s), and an open that
+shorter, or the client's error window is set short: 20 s less than it, 160 s for
+an error window of 180 s), and an open that
 fails at every site it tries ends with an error naming each site and its
 error. A file the redirector finds nowhere, a
 redirector that is down or refuses the client itself, and a direct URL to a
@@ -1079,12 +1090,12 @@ STATS.md).
 A job's own `tried=` list is kept ahead of uCache's names. An open
 that uCache makes of the origin holds one of its worker threads while it tries
 sites, so with a stalled site and every worker so held, the next step of a
-job's own open waits for a free one. With the
-switch off nothing of this happens: an open's failure is the job's, as without
+job's own open waits for a free one. With
+failover off nothing of this happens: an open's failure is the job's, as without
 uCache.
 
-**Reading a file from another site (part of `adaptive_federation`).** With
-`adaptive_federation = on`, a file that was opened through a redirector, whether
+**Reading a file from another site (part of failover).** With
+failover on, a file that was opened through a redirector, whether
 uCache serves it or passes its reads straight to the origin (its host left out by the
 cache's allow and deny lists), or shows it in a layout of its own (`recompress = on`),
 has the reads it makes of the origin bounded: one that has not been answered
@@ -1134,7 +1145,7 @@ it is, above), the whole entry is dropped
 reads go to the origin, and move as above), and its files are removed, so the next open of
 the file starts a new entry (at once, or when the job ends: a job killed first, or ending with
 `_exit`, can leave them). The same holds when a block fails its own checksum where
-`recompress` converts it. This needs `check_origin_integrity`, which the switch forces on.
+`recompress` converts it. This needs `check_origin_integrity`, which failover forces on.
 Only this process's own fetches are known: an entry another process filled from that copy,
 or this process before it opened the file this time, is not dropped, and another process
 that holds the entry open at the same time goes on serving what it holds until it closes the
@@ -1153,16 +1164,16 @@ the addresses the job was shown never change. Each fetch is judged on its own: n
 of a fetch that failed is kept, while what the request's other fetches brought from the
 copy it left and that passed their checks stays (unless that copy is found bad: then the
 entry is dropped, as above). A failure made in uCache itself (a conversion that ran out of
-memory, say) is no copy's: the request is served again at the same copy, as with the
-switch off. A file read from a direct URL and a
-file the job copies are not changed. With the switch off nothing of this happens.
+memory, say) is no copy's: the request is served again at the same copy, as with
+failover off. A file read from a direct URL and a
+file the job copies are not changed. With failover off nothing of this happens.
 
-**Keys by logical name (`logical_name_prefixes`).** A federation names each
-file by its logical name (CMS: `/store/...`), and the same file is reached through
+**Keys by logical name (`logical_name_prefixes`).** CMS names each
+file by its logical name (`/store/...`), and the same file is reached through
 many URLs: a regional or the global redirector, a site's server, a site's own
 prefix (`root://eoscms.cern.ch//eos/cms/store/mc/...`). With
 `logical_name_prefixes` set (it is off by default, and does not depend on
-`adaptive_federation`), a file whose URL's path holds one of the prefixes has a
+`failover`), a file whose URL's path holds one of the prefixes has a
 logical name (`lfn:/store/mc/...`), whatever server the URL names, and its cache entry
 has several names: the logical name, which is the entry's core name and groups the
 others, and each URL that reached it. One entry, read once from the origin, then
@@ -1202,7 +1213,7 @@ command takes any of its names (`ucache pin lfn:/store/mc/...`, or a URL).
   same key is not reached through it). In the same way, one site's copy of the
   file's size whose bytes are damaged reaches the readers of every URL of the file
   once it is cached, a healthy site's direct URL included, unless
-  `check_origin_integrity` (which `adaptive_federation` turns on) catches it as it
+  `check_origin_integrity` (which failover turns on) catches it as it
   is fetched.
 - **Copies of another size.** One name reached through several sites can meet a
   copy that is not the file: cut short, or another version. A URL whose copy is not
@@ -1276,8 +1287,8 @@ command takes any of its names (`ucache pin lfn:/store/mc/...`, or a URL).
   (STATS.md, PUBLISH.md). Such a record keeps the origin its URL named. The records
   of a run keyed by other prefixes are read as written (the command says so once).
 
-**Remembering sources that failed (part of `adaptive_federation`).** With
-`adaptive_federation = on`, the processes of one cache remember the servers and
+**Remembering sources that failed (part of failover).** With
+failover on, the processes of one cache remember the servers and
 copies that failed, so that the next open does not meet them first:
 
 - **A server** is marked when it stalled (an open that ran out of uCache's own
@@ -1306,10 +1317,10 @@ mark, the bounds of an open are unchanged, and a redirector's own choice is not
 overruled (the marks are not sent to it). Server marks live in `<dir>/sources`
 (FORMAT.md), shared by every process of the cache; `ucache sources` shows them
 and the copies marked (`site_faults_marked`, `site_marks_cleared`,
-`copy_faults_marked`, `marked_copies_last`, STATS.md). With the switch off
+`copy_faults_marked`, `marked_copies_last`, STATS.md). With failover off
 nothing is marked or read.
 
-**Keeping reads away from some hosts (`tried=` patterns, part of `adaptive_federation`).**
+**Keeping reads away from some hosts (`tried=` patterns, part of failover).**
 A redirector compares the entries of `tried=` with whole host names only, so a
 site's many servers cannot be named there in one entry. uCache can: an entry of
 `tried=` that holds a `*` is a pattern on the full host name, `*` standing for
@@ -1321,10 +1332,10 @@ and of a second one:
 root://global-redirector.example//store/data/Run2024A/file.root?tried=*.site-a.example,*.site-b.example
 ```
 
-A URL with a host pattern turns `adaptive_federation` on for its file under the
-default `auto`, at its open, whatever server the URL names and without asking it
-its role: the reader asked for hosts to be avoided, and only the switch's
-behaviour avoids them (with `on`, it is on anyway). uCache then applies the
+With failover on (the default), a URL with a host pattern has failover for its
+file, at its open, whatever server the URL names and without asking it its role:
+the reader asked for hosts to be avoided, and only failover's behaviour avoids
+them. uCache then applies the
 patterns itself and never sends them: no URL that reaches a server carries one. An open that lands on a data server whose name matches is refused
 there before anything is read of it, and asked again through the redirector with
 that server's own full name added to `tried=` (where a front end handed the open
@@ -1359,7 +1370,7 @@ own line carries `avoided`) and counted (`hosts_avoided`, STATS.md), so a run ca
 show that no byte came from a matching host (`data_servers` in the per-file
 records). A warm read is served from the cache as before and asks no server, and
 `tried=` is never part of the file's cache key, so one file read with and without
-patterns is one entry. With `adaptive_federation = off`, and for a file uCache
+patterns is one entry. With `failover = off`, and for a file uCache
 passes straight through (a copy made with a copy tool such as `xrdcp`, a write,
 `UCACHE_DISABLE`), the URL is sent exactly as written, the patterns included, as
 without uCache: a redirector then avoids nothing for them. So a run that must
@@ -1496,7 +1507,7 @@ always cached, and so are files under 64 MiB unless the limit is `0`.
 every ROOT file with a TTree or RNTuple, whatever its size and whatever the
 job reads, is read straight from the origin. uCache stays in the data path, so
 everything it does for the reads themselves still applies — with
-`adaptive_federation = on`, the move of a failed open or read to another site,
+failover on, the move of a failed open or read to another site,
 the checks of what the origin sends, and the memory of sites that failed — but
 none of the file's data is kept. Use it to have those for jobs whose data you
 do not want on the local disk; `UCACHE_MAX_READ_FRACTION=0 ./my_job` does it
@@ -1515,8 +1526,8 @@ for one job.
   check, as on a damaged copy (ROOT cannot read the tree from it either), or
   uses a layout uCache's reader does not support — is read directly whole:
   nothing the job fetches of it is kept (only what uCache read of its records
-  to judge it), from that copy or, after a move with `adaptive_federation =
-  on`, from any other. The decision holds for the file for the life of the
+  to judge it), from that copy or, after a move with failover on, from any
+  other. The decision holds for the file for the life of the
   process.
 - What is read directly is the data of the file's main tree (the one named
   `Events`, else its first TTree) or of its RNTuple. The file's other trees
@@ -1524,11 +1535,11 @@ for one job.
   its records are.
 - What is still written to the cache directory: the pages that hold the file's
   own records (header, keys list, tree metadata, the other trees; for an
-  RNTuple file its first 128 KiB too) and the bytes `adaptive_federation`'s
+  RNTuple file its first 128 KiB too) and the bytes failover's
   checks at open read, so that the next job does not fetch them again; the
   entry's small files beside them (`.meta`, `.cost`, FORMAT.md); the run
   records under `stats/` that `ucache stats` reads; and, with
-  `adaptive_federation = on`, the marks of servers that failed (`sources`).
+  failover on, the marks of servers that failed (`sources`).
 - Bytes already cached are still served: a file cached before you set `0`
   is read from the cache as before (`ucache rm` removes it). A replica made
   earlier is served in its layout, and no file gets a new one (`recompress =
@@ -1583,7 +1594,7 @@ below and the dedicated guide in `docs/CACHE_MANAGEMENT.md`.
 | `ucache recompress [--jobs N] [--yes]` | convert what is cached of the files whose source codec is in `recompress_codecs` into their replicas — the same form a first pass with `recompress = on` makes — in the foreground with live progress (`--jobs` default: every core the process may use). Estimates the disk growth first; a file that would not fit above the free-space floor is deferred, never evicted around |
 | `ucache branches <url>` | which branches your analysis read: branches whose every basket is cached or converted into the file's store (`stored`), with bytes + source codec, and the summary share |
 | `ucache untranspose <url>` | drop an entry's replica; the byte cache is kept |
-| `ucache sources` | with `adaptive_federation = on`: the servers and sites this cache remembers as failed (their marks and how long each holds) and the copies proven missing, which are tried after the others (TROUBLESHOOTING.md) |
+| `ucache sources` | with failover on: the servers and sites this cache remembers as failed (their marks and how long each holds) and the copies proven missing, which are tried after the others (TROUBLESHOOTING.md) |
 
 **Recompression (decompress-once replicas).** Tightly compressed (LZMA)
 ntuples spend most of a *warm* analysis just decompressing. uCache can rebuild

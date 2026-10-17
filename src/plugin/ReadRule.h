@@ -145,7 +145,7 @@ bool readRuleDirect(const std::string& key);
 // is parsed again when `current` (the server the handle reads from now) is
 // another (the handle moved), at most once a second. `fmServer`: with `fm`,
 // the server its records were read from. `startUs`: when the request that needs the map began (0:
-// now): a move of the parse's reads counts its time from there (adaptive_federation).
+// now): a move of the parse's reads counts its time from there (failover).
 std::shared_ptr<const KeyMap>
 keySeeksFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEntry>& entry,
             XrdTimeout timeout, const transpose::FileMeta* fm = nullptr,

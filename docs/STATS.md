@@ -8,10 +8,10 @@ human-readable summary of these same numbers. This file is for reading the raw
 JSON, or building tooling on it. The user guide's monitoring section explains
 how to read the printed summary.
 
-In this document "with `adaptive_federation = on`" means: for a file the
-switch is on for -- every file with `on`; with `auto`, the default, a file
-opened at a server that reports a redirector's role (USER_GUIDE.md, "Which
-files the switch is on for").
+In this document "with failover on" means: for a file failover applies to --
+with `failover = on`, the default, a file opened at a server that reports a
+redirector's role, or whose URL has a host pattern in `tried=` (USER_GUIDE.md,
+"Failover between copies").
 
 ## Which number answers which question
 
@@ -106,7 +106,7 @@ the consumers together.
  "origin_checks_unjudged": 0, "origin_checks_not_examined": 0,
  "entries": [{"key": "root://host:1094/path", "file_size": 0,
               "cached_bytes": 0, "page_size": 4096}],
- "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ... adaptive_federation=auto",
+ "run_settings": "v1 check_origin_integrity=off xrdcl.ConnectionWindow=120/default ... failover=on",
  "redirector_hosts": "cms-redirector.example.org:1094"}
 ```
 
@@ -174,8 +174,8 @@ not to cache, and says the cache is under pressure rather than broken.
   read with a "data is corrupted" error naming both sizes and the server (and
   the next open checks the origin again); a handle opening while the process
   holds the entry reads that file uncached. Non-zero means two copies of one
-  file disagree — usually one damaged or truncated copy among a federation's
-  sites — or a file rewritten while it was being read.
+  file disagree — usually one damaged or truncated copy among the copies
+  a redirector chooses from — or a file rewritten while it was being read.
 - `crc_failures` — pages that failed CRC on read and were quarantined
   (refetched later). `meta_corrupt` — sidecars that failed to load (torn or
   damaged) and were rebuilt.
@@ -240,11 +240,11 @@ ones included, so a run with caching disabled shows its origin failures too.
   the redirect limit. `notfound`: no server holds the file. `data`: bytes
   refused (a basket or page that failed its checksum, a basket of a
   byte-cache fetch whose key is not where the tree's record puts it, or, with
-  `adaptive_federation = on`, an empty copy of a file named `*.root`, or one whose
+  failover on, an empty copy of a file named `*.root`, or one whose
   first bytes show it is not a whole ROOT file, or a read a copy answered short inside the
   file's confirmed size).
   `expired`: a request that outlived its timeout, whose timeout not said; with
-  `adaptive_federation = on`, among them an open that passed the open deadline
+  failover on, among them an open that passed the open deadline
   (USER_GUIDE.md), its `timeout_s` in its open line (FORMAT.md). `other`: the
   rest, among
   them a server's report that it could not reach a server behind it, which can
@@ -257,7 +257,7 @@ ones included, so a run with caching disabled shows its origin failures too.
   16384 distinct (file, server, class) failures it has recorded (each records
   at most 16 lines). The counters above still count them.
 - `open_failovers`, `opens_recovered`, `opens_failed_everywhere` — with
-  `adaptive_federation = on` (USER_GUIDE.md): attempts made at another site
+  failover on (USER_GUIDE.md): attempts made at another site
   after an open failed at one, opens that succeeded after at least one such
   attempt, and opens that ended with every site they tried failing (stopped by
   the bound of sites or time, or by the redirector sending the open back to a
@@ -267,17 +267,17 @@ ones included, so a run with caching disabled shows its origin failures too.
   (USER_GUIDE.md) counts in them as an open does: each of its attempts is one
   in `open_failovers`, its success one in `opens_recovered`, and its failure
   at every site one in `opens_failed_everywhere`.
-- `open_deadline_expiries` — with `adaptive_federation = on`, open attempts
+- `open_deadline_expiries` — with failover on, open attempts
   that expired at their timeout: the open deadline, the job's own shorter open
   timeout, or what was left of an open's time budget (also counted in
   `origin_failures_expired`).
-- `failover_locates`, `offline_copies_skipped` — with `adaptive_federation =
-  on`, requests to a regional redirector for the places a file is (made when
+- `failover_locates`, `offline_copies_skipped` — with failover
+  on, requests to a regional redirector for the places a file is (made when
   the redirector sends an open back to a server or site that failed, or finds
   no copy after servers were left out; one request answers every open waiting
   for the same answer), and listed copies not opened because the server says
   they are on tape.
-- `open_check_bytes_kept` — with `adaptive_federation = on`, for files the
+- `open_check_bytes_kept` — with failover on, for files the
   cache caches: bytes the checks made inside a job's open read of the copy the
   open took (its first page, and the pages of its list of top-level objects;
   whole pages, at most 1 MiB of a copy), kept in the file's entry so that the
@@ -286,49 +286,49 @@ ones included, so a run with caching disabled shows its origin failures too.
   which is where a read the job makes of them would otherwise have been
   counted. Nothing a refused copy's checks read is kept.
 - `bad_entries_dropped` — cache entries dropped because what they hold came
-  from a bad copy: with `adaptive_federation = on`, an entry made before the
+  from a bad copy: with failover on, an entry made before the
   checks at open existed whose stored header states an end past its stored
   size (filled from a cut copy), found at an open the entry would have
-  answered; and, with `check_origin_integrity = on` (which the switch forces
+  answered; and, with `check_origin_integrity = on` (which failover forces
   on), an entry holding bytes this process fetched from a copy that a check
   then found bad, at a read or at an open that refused the copy.
   The next open of the file fills a new entry (TROUBLESHOOTING.md).
-- `requests_parked_for_parse` — with `adaptive_federation = on`, requests made where no move may
+- `requests_parked_for_parse` — with failover on, requests made where no move may
   be waited for (a client callback thread: a read issued from inside a completion handler) before
   their file was set up or had its map, made again on a thread of uCache's own
   (TROUBLESHOOTING.md).
-- `site_name_queries`, `site_names_missing` — with `adaptive_federation =
-  on`: servers asked for the name of their site (their `all.sitename`, as the
+- `site_name_queries`, `site_names_missing` — with failover
+  on: servers asked for the name of their site (their `all.sitename`, as the
   server's configuration value `sitename`; USER_GUIDE.md: a server that answered
   an open, and a listed copy when its turn comes), once per server and
   process (again 5 minutes after a query that got no answer), and the asks
   that gave no name (none configured, an error, or no answer within 5 s):
   such a server's site is its domain.
 - `role_queries`, `role_redirectors`, `role_unanswered` — with
-  `adaptive_federation = auto` (the default; USER_GUIDE.md, "Which files the
-  switch is on for"): servers asked what they are (their login flags, and for
+  `failover = on` (the default; USER_GUIDE.md, "Which files failover applies
+  to"): servers asked what they are (their login flags, and for
   one that says manager there its configured role), at the first open of a
   file there, once per server and process (an open the cache answers from a
-  trusted entry asks nothing); those found to be a redirector, which turns the
-  switch on for their files; and those that gave no answer (an error, or none
-  within 5 s), whose files are read as with the switch off. A server is asked
+  trusted entry asks nothing); those found to be a redirector, which gives their
+  files failover; and those that gave no answer (an error, or none
+  within 5 s), whose files are read as with failover off. A server is asked
   again 10 minutes after its last outcome, at an open that needs it (each
   counted); a renewal that gets no answer is counted in `role_unanswered` and
   leaves the earlier answer standing. The servers asked
   and counted in neither are not redirectors (a data server, a proxy, an EOS
   instance).
 - `redirector_hosts` (a string, on the counter line after `run_settings`, only
-  when there is one) — with `auto`, the servers (`host:port`, lower-cased) found
+  when there is one) — with `failover = on`, the servers (`host:port`, lower-cased) found
   to be redirectors in this process (a forked child keeps its parent's), one
   space between them.
 - `site_faults_marked`, `site_marks_cleared`, `copy_faults_marked`,
-  `marked_copies_last` — with `adaptive_federation = on` (USER_GUIDE.md,
+  `marked_copies_last` — with failover on (USER_GUIDE.md,
   "Remembering sources that failed"): servers marked in `<dir>/sources` (a
   stall while another site answered, or a fault of the server's own; each mark
   written, a repeat included), marks cleared by a success, copies proven
   missing (noted in the file's in-use record), and copies a regional
   redirector listed that were put after the others for a mark.
-- `hosts_avoided` — with `adaptive_federation = on` and host patterns in the
+- `hosts_avoided` — with failover on and host patterns in the
   URL's `tried=` (USER_GUIDE.md, "Keeping reads away from some hosts"): copies
   at a host a pattern matches, each refused once per open: an open that landed
   there and was refused before anything was read, or a copy a regional
@@ -341,15 +341,12 @@ origin is reached, as the plugin found them at load, one string:
 `v1 check_origin_integrity=on|off`, then `xrdcl.<name>=<value>/<source>` for
 the XRootD client's `ConnectionWindow`, `ConnectionRetry`, `StreamErrorWindow`,
 `RequestTimeout`, `StreamTimeout` and `TimeoutResolution`, then
-`adaptive_federation=on|off|auto`. The source is `env` when the `XRD_<NAME>`
+`failover=on|off`. The source is `env` when the `XRD_<NAME>`
 variable is set, `default` when the value is the client's built-in one, and
 `client` when it differs and no variable is set (a `client.conf`, or the
-application). With `adaptive_federation = on` (not `auto`), the first three say `ucache`
-when uCache set them (USER_GUIDE.md), `kept` when uCache kept the value of an
-`XRD_<NAME>` variable instead or the client refused uCache's write, and
-`client` when it kept a `client.conf` value. With `logical_name_prefixes` set
+application); uCache sets none of them. With `logical_name_prefixes` set
 (and valid), the string ends with `logical_names=on/<hash>`, whatever
-`adaptive_federation` says: files whose path holds one of the prefixes are keyed by
+`failover` says: files whose path holds one of the prefixes are keyed by
 their logical name; `<hash>` is the first 8 hex digits of the SHA-256 of
 `logical_name_prefixes` as `ucache settings` shows it, one space between prefixes,
 so two runs that keyed files two ways can be told apart. With it off there is no
@@ -769,17 +766,17 @@ reading was re-reading, and what the cache disk was asked to do.
 
   `ucache summary`, `history` and `publish` take a file's origin from the
   host in the file's URL, as they always have, unless the run had
-  `adaptive_federation = on` (its counter line's `run_settings` say so), or
-  `auto` and the file's URL names a server (host and port, 1094 when the URL
-  names none) found to be a redirector (the counter line's `redirector_hosts`):
-  the switch was on for the file. For
+  `failover = on` (its counter line's `run_settings` say so) and the file's
+  URL names a server (host and port, 1094 when the URL names none) found to be
+  a redirector (the counter line's `redirector_hosts`): failover applied to the
+  file. For
   such a file they take it from `data_server` when it names one, and from the
   host in the file's URL otherwise (files that read nothing from the origin):
   for a file opened through a redirector the origin is then the data server
   the reads went to, and `history --json` and `publish` show that server's
   domain under `origins` and `origins_rt`, not the redirector's. A run whose
   records do not say (written before `run_settings` existed, or a job killed
-  before it wrote a counter line) is taken as one with the switch off. A file
+  before it wrote a counter line) is taken as one with failover off. A file
   keyed by its logical name has no host in its key: its origin is `data_server`,
   and a file of such a run that read nothing from the origin names none.
 

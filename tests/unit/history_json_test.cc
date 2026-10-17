@@ -150,8 +150,8 @@ TEST(HistoryJson, OriginTimingsGoByDomainWhenPublishedAndByHostLocally) {
                                                     {"root://xrootd.example.org", V{"3"}}}));
 }
 
-// A file opened through a redirector by a run with adaptive_federation on (its
-// run_settings say so) is published under the domain of the data server its
+// A file opened through a redirector by a run with failover on (its
+// run_settings say so, its run line names the redirector) is published under the domain of the data server its
 // reads went to (the record's data_server), not the redirector's; a record
 // without one keeps the URL's host. Neither host is published, only domains.
 static std::vector<std::string> publishedOrigins(const std::string& runSettings,
@@ -188,7 +188,8 @@ static std::vector<std::string> publishedOrigins(const std::string& runSettings,
 
 TEST(HistoryJson, OriginsAreTheDataServersDomainsWhenTheSwitchWasOn) {
   std::string text;
-  EXPECT_EQ(publishedOrigins("v1 check_origin_integrity=on adaptive_federation=on", &text),
+  EXPECT_EQ(publishedOrigins("v1 check_origin_integrity=off failover=on", &text,
+                             "redirector.example.org:1094"),
             (std::vector<std::string>{"root://cern.ch", "root://fnal.gov", "rt root://cern.ch",
                                       "rt root://fnal.gov"}));
   for (const char* leak : {"disk3", "redirector", "example.com"})
@@ -198,7 +199,7 @@ TEST(HistoryJson, OriginsAreTheDataServersDomainsWhenTheSwitchWasOn) {
 // The same records from a run with the switch off, or one whose records do not
 // say: each file is published under the domain of its URL's host, as before.
 TEST(HistoryJson, OriginsAreTheUrlsDomainsWhenTheSwitchWasOff) {
-  for (const char* settings : {"v1 check_origin_integrity=off adaptive_federation=off", ""}) {
+  for (const char* settings : {"v1 check_origin_integrity=off failover=off", ""}) {
     std::string text;
     EXPECT_EQ(publishedOrigins(settings, &text),
               (std::vector<std::string>{"root://cern.ch", "root://example.org",
@@ -240,17 +241,16 @@ TEST(HistoryJson, AnOldRecordAddsOnlyWhatItCanSay) {
   }
 }
 
-// A run with adaptive_federation = auto: a file whose URL's host reported a
-// redirector's role (the run line's redirector_hosts) is published under its
-// data server's domain, as with the switch on; every other file under its
-// URL's, as with it off. The hosts are host:port (the URL's port 1094 when it names none): a
+// A run with failover on: a file whose URL's host reported a redirector's role
+// (the run line's redirector_hosts) is published under its data server's
+// domain; every other file under its URL's, as with failover off. The hosts are host:port (the URL's port 1094 when it names none): a
 // redirector on another port of the same host does not count.
 TEST(HistoryJson, OriginsUnderAutoFollowTheRedirectorHosts) {
-  EXPECT_EQ(publishedOrigins("v1 check_origin_integrity=off adaptive_federation=auto", nullptr,
+  EXPECT_EQ(publishedOrigins("v1 check_origin_integrity=off failover=on", nullptr,
                              "redirector.example.org:1094"),
             (std::vector<std::string>{"root://cern.ch", "root://fnal.gov", "rt root://cern.ch",
                                       "rt root://fnal.gov"}));
-  EXPECT_EQ(publishedOrigins("v1 check_origin_integrity=off adaptive_federation=auto", nullptr,
+  EXPECT_EQ(publishedOrigins("v1 check_origin_integrity=off failover=on", nullptr,
                              "other.example.org:1094 redirector.example.org:2094"),
             (std::vector<std::string>{"root://cern.ch", "root://example.org", "rt root://cern.ch",
                                       "rt root://example.org"}));

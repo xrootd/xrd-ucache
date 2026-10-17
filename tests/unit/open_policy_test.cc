@@ -1931,7 +1931,7 @@ TEST(OpenPolicy, WithAdvice) {
 }
 
 // A handle trusted at Open whose own open has not succeeded gives no request to its File, which
-// never opened: with adaptive_federation off once it has lost its trust (its entry gone by its
+// never opened: with failover off once it has lost its trust (its entry gone by its
 // first read), with it on also before. A handle not trusted at Open, or whose open succeeded, is
 // never held.
 TEST(OpenPolicy, OwnOpenPending) {

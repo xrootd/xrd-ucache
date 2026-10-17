@@ -72,7 +72,7 @@ struct Run {
   // The origin settings the run had (docs/STATS.md `run_settings`), from the
   // last counter line; empty on records written before it existed.
   std::string runSettings;
-  // adaptive_federation = auto: the servers (host:port) found to be redirectors in this run (the
+  // failover: the servers (host:port) found to be redirectors in this run (the
   // counter line's `redirector_hosts`), lower-cased.
   std::set<std::string> redirectorHosts;
   // perf only: the share of the time the counters were enabled that they were
@@ -187,9 +187,9 @@ struct Run {
   // signatures instead, since two routes can honestly disagree about a file
   // or two out of hundreds without having done different work.
   std::string readSig;
-  // Origin hosts seen, by file count: with adaptive_federation on (the run's
-  // run_settings), the data server each file's record names; otherwise the
-  // host of the file's URL. A dataset can be served from several
+  // Origin hosts seen, by file count: with failover on (the run's run_settings),
+  // the data server each file's record names for a file of a redirector's URL;
+  // otherwise the host of the file's URL. A dataset can be served from several
   // sites (redirectors, distributed sets), and the mix is a property of a RUN,
   // not of the input set: a baseline drawn from one site is weak evidence for
   // a run whose data came from another.
@@ -383,12 +383,10 @@ std::string runSettingsOf(const std::string& countersPath);
 // Whether any counter line of a stats directory says its run keyed files by the prefixes of hash
 // `prefixesHash` (`ucache stats --files`).
 bool recordsKeyedByName(const std::string& statsDir, const std::string& prefixesHash);
-// Whether a run's `run_settings` (docs/STATS.md) say adaptive_federation was
-// on. False for an empty string: a record written before the field existed.
-bool federationRun(const std::string& runSettings);
-// Whether they say adaptive_federation = auto (the switch on for the files of
-// the hosts the run line lists in `redirector_hosts`).
-bool federationAutoRun(const std::string& runSettings);
+// Whether a run's `run_settings` (docs/STATS.md) say failover was on (it applied to the files
+// of the hosts the run line lists in `redirector_hosts`). False for an empty string: a record
+// written before the field existed.
+bool failoverRun(const std::string& runSettings);
 
 // What the cache bought, measured against a BASELINE run -- the same work done
 // once with the cache out of the loop (UCACHE_DISABLE=1), which the plugin

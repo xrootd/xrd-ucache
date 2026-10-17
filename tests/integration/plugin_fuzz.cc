@@ -23,7 +23,7 @@
 // Open itself with the switch off, as without uCache; through the reader's
 // handler with the switch on (see runOpenRefused).
 //
-// Two more cover an open made again, with adaptive_federation on:
+// Two more cover an open made again, with failover on:
 //   open-property      a property set while the open is retried reaches the
 //                      File that replaces the first (see runOpenProperty)
 //   open-property-race a ReadRecovery set just as the checks made at open
@@ -51,7 +51,7 @@
 //
 // read-failover <case> checks that a read an origin failure was injected into
 // (UCACHE_TEST_READ_FAIL_N, UCACHE_TEST_READ_FAIL_KIND) is answered with the
-// right bytes, once, with adaptive_federation on and the file's copies behind a
+// right bytes, once, with failover on and the file's copies behind a
 // redirector (see runReadFailover). The caller checks the records. The cases
 // zero, zerov and zeroerr do the same for a read of a basket that a server serves
 // as zeros (see runZero), len, lenv and lenerr for one whose key states another length, rec,
@@ -67,6 +67,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -715,8 +716,8 @@ int runInnerRace(const char* url, const char* local, uint64_t cycles, int racers
 // as any connection failure does; the second, of a second handle in the same
 // process, is the one refused at once.
 //
-// With adaptive_federation off (or auto, the default, when the URL names a
-// server that is not a redirector) a handle the cache serves answers
+// With failover off, or on (the default) when the URL names a server that is
+// not a redirector, a handle the cache serves answers
 // as the client does without uCache: the first open's failure comes through its
 // handler (once, with a host list, on another thread than the one in Open), and
 // the second Open returns the error itself, with no completion ever after. With
@@ -726,16 +727,19 @@ int runInnerRace(const char* url, const char* local, uint64_t cycles, int racers
 // thread (the second handle's first attempt is refused inside Open, and its
 // retry is scheduled, not made there).
 //
-// With UCACHE_ADAPTIVE_FEDERATION=on, Open returns OK for both, and each handler
+// With failover's protections on every file (the test hook
+// UCACHE_TEST_FAILOVER_FORCE=1, failover on), Open returns OK for both, and each handler
 // gets exactly one failure, with a host list, on another thread than the one in
 // Open. With UCACHE_OPEN_RETRIES=1 the first handle's failure carries the host
 // list of the attempt that reached the client (naming 127.0.0.1:1).
 int runOpenRefused(const char* url) {
   const char* mode = "open-refused";
   const int retries = envInt("UCACHE_OPEN_RETRIES", 0);
-  const char* sw = ::getenv("UCACHE_ADAPTIVE_FEDERATION");
-  const bool fed = sw && (std::string(sw) == "on" || std::string(sw) == "1" ||
-                          std::string(sw) == "true" || std::string(sw) == "yes");
+  std::string sw = ::getenv("UCACHE_FAILOVER") ? ::getenv("UCACHE_FAILOVER") : "";
+  for (char& c : sw)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  const bool off = sw == "off" || sw == "0" || sw == "false";
+  const bool fed = !off && envInt("UCACHE_TEST_FAILOVER_FORCE", 0) > 0;
   if ((retries != 0 && retries != 1) || envInt("UCACHE_TEST_OPEN_FAIL_N", 0) < retries + 1 ||
       envInt("UCACHE_REVALIDATE_S", -1) != 0 || envInt("XRD_CONNECTIONRETRY", 0) != 1) {
     std::printf("%s: SETUP: needs UCACHE_OPEN_RETRIES=0 with UCACHE_TEST_OPEN_FAIL_N>=1, or "
@@ -744,10 +748,11 @@ int runOpenRefused(const char* url) {
                 mode);
     return 2;
   }
-  // The label says the setting as given (unset: the default, auto); the checks below expect the
-  // switch on only with `on`, off otherwise (auto at the server the fault sends opens to is off).
-  std::printf("%s: adaptive_federation %s, open_retries %d\n", mode,
-              fed ? "on" : sw && *sw ? sw : "auto (the default)", retries);
+  // The label says the setting as given; the checks below expect failover's protections only with
+  // the test hook (failover on at the server the fault sends opens to, not a redirector, is off).
+  std::printf("%s: failover %s, open_retries %d\n", mode,
+              fed ? "on, forced for every file (test hook)" : off ? "off" : "on, not a redirector",
+              retries);
   struct Handler : StrictOpenHandler {
     std::thread::id on;
     bool nullHosts = false;
@@ -1215,7 +1220,7 @@ int runKeyCheck(const char* url, const char* local, uint64_t off, uint32_t len) 
 // reaches the File that a retry puts in place of the first. The first
 // attempt is faulted (UCACHE_TEST_OPEN_FAIL_N=1) and retried after a backoff
 // (UCACHE_OPEN_RETRIES=1, UCACHE_OPEN_RETRY_BASE_MS of 1000 or more, so the
-// property is set before the File is replaced), with adaptive_federation on.
+// property is set before the File is replaced), with failover on.
 // ReadRecovery is set to false right after Open returns; after the open it
 // must read false. A plugin that sets it on the first File only reads the
 // new File's default, true.
@@ -1248,7 +1253,7 @@ int runOpenProperty(const char* url) {
 }
 
 // open-property-race: ReadRecovery set by the reader just as the checks made at open begin (a file
-// named *.root, adaptive_federation on). The checks turn the File's recovery off for their reads
+// named *.root, failover on). The checks turn the File's recovery off for their reads
 // and give the reader's setting back after them; a setting recorded just before they begin must
 // be on the File before they turn it off, never after. UCACHE_TEST_PROP_DELAY_MS (2000 or more)
 // holds the setting between its recording and its setting on the File, and the checks' first read
@@ -1295,7 +1300,7 @@ int runOpenPropertyRace(const char* url) {
 }
 
 // open-stat-during-checks [cut]: a Stat made by the reader while the checks made at open run (a
-// file named *.root that the cache caches, adaptive_federation on; the checks' first read sent 5 s
+// file named *.root that the cache caches, failover on; the checks' first read sent 5 s
 // late, UCACHE_TEST_HEADER_FAIL_N=1, _KIND=delay). Until the open answers, its File may be open at
 // a copy the checks have yet to judge: the Stat waits for the open's answer before the handle is
 // set up, so neither the entry nor the reader is given the size of a copy the checks then refuse.
@@ -1416,7 +1421,7 @@ struct TimedAnswer : XrdCl::ResponseHandler {
 };
 
 // open-park-from-callback: an asynchronous Stat and Read made on a file whose reader's open is in
-// flight (adaptive_federation on, a file named *.root the cache caches; the checks' first read sent
+// flight (failover on, a file named *.root the cache caches; the checks' first read sent
 // 5 s late, UCACHE_TEST_HEADER_FAIL_N=1, _KIND=delay), from inside the completion of another file's
 // request, on the client's own callback thread. Each call must return at once (within 1 s): the
 // thread is the client's, and the open's own checks may need it to deliver their reads. Each
@@ -1700,7 +1705,7 @@ struct ReadCase {
 // read-failover zero | zerov | zeroerr: <local-path> is the fixture of key-check (a ROOT
 // file whose basket at 4915, 2481 bytes, lies wholly in the last page of the basket before
 // it) and <root-url> serves it from the servers of a federation, with that basket zeroed on
-// some of them; check_origin_integrity is on (adaptive_federation forces it). The handle is
+// some of them; check_origin_integrity is on (failover forces it). The handle is
 // opened, then UCACHE_ZERO_CMD, when set, is run with the port of the server the handle
 // landed on and zeroes the basket there. Then the basket is read:
 //   zero     a Read: the bytes are the fixture's, once, from another server than the one
@@ -1820,7 +1825,7 @@ int runZero(const char* url, const char* local, const std::string& which) {
 // read-failover cut | cutpg | cutpgpast | cutonly | end: <local-path> is a ROOT file of at least
 // 64 KiB, whose header says where it ends, and <root-url> serves it from the servers of a
 // federation that do not use sendfile (a copy cut under an open file then answers short, where
-// sendfile would break the connection). The handle is opened (adaptive_federation on: the open
+// sendfile would break the connection). The handle is opened (failover on: the open
 // reads the header, so the file's size is confirmed), then UCACHE_CUT_CMD, when set, is run with
 // the port of the server the handle landed on and cuts that copy short. Then 64 KiB are read
 // inside the file's size, past the cut:
@@ -1845,7 +1850,7 @@ int runZero(const char* url, const char* local, const std::string& which) {
 //            once (at the call or through the handler), with the open's error, which names the
 //            copies ("no copy could serve the read"); never the client's error for a File that
 //            never opened, and the PgRead is never sent on that File (the client crashes there)
-//   degradedoff the same with adaptive_federation off: a Read, a VectorRead, a Stat, an Fcntl, a
+//   degradedoff the same with failover off: a Read, a VectorRead, a Stat, an Fcntl, a
 //            Visa and a PgRead (last) each fail, once, with the open's own error, the one the
 //            reader's open would have got without the cache (here a refusal to authorize,
 //            kXR_NotAuthorized), naming no copies; never the client's error for a File that never
