@@ -130,7 +130,7 @@ jobs:
           echo "first attempts at the refused port: $n"
           [ "$n" -ge 1 ]
 
-      - name: a redirector and three servers on loopback: servers that refuse a file, the regional's locate, and reads made again at another copy
+      - name: "a redirector and three servers on loopback: servers that refuse a file, the regional's locate, and reads made again at another copy"
         run: |
           # One regional redirector and three data servers (xrootd and cmsd of the
           # EPEL package); the script runs them as an ordinary user.

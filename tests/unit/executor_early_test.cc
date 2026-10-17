@@ -46,7 +46,13 @@ struct EarlyUse {
     g_failuresAtInit.store(static_cast<int>(Executor::threadStartFailures()));
   }
 };
+#if defined(__APPLE__)
+// Mach-O has no init_priority (Apple's clang warns, and the build warns as errors): its static
+// initializers run in link order, and this file is linked before Executor.cc.
+EarlyUse g_early;
+#else
 __attribute__((init_priority(101))) EarlyUse g_early;
+#endif
 
 int g_fails = 0;
 void check(bool ok, const char* what) {
