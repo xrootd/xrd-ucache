@@ -22,8 +22,8 @@ v0.21.0.
 - A file read through different sites can be cached once. With
   `logical_name_prefixes = /store/mc/` set, these two URLs are one cache
   entry:
-  root://eoscms.cern.ch//eos/cms/store/mc/Run3Summer22EENanoAODv12/TTToHcToWAToMuMu_MHc-100_MA-60_MultiLepFilter_TuneCP5_13p6TeV_madgraph-pythia8/NANOAODSIM/130X_mcRun3_2022_realistic_postEE_v6-v2/2820000/03fd6a3a-e792-408b-a497-2607ffca2ace.root
-  root://cms-xrd-global.cern.ch//store/mc/Run3Summer22EENanoAODv12/TTToHcToWAToMuMu_MHc-100_MA-60_MultiLepFilter_TuneCP5_13p6TeV_madgraph-pythia8/NANOAODSIM/130X_mcRun3_2022_realistic_postEE_v6-v2/2820000/03fd6a3a-e792-408b-a497-2607ffca2ace.root
+  `root://eoscms.cern.ch//eos/cms/store/mc/Run3Summer22EENanoAODv12/TTToHcToWAToMuMu_MHc-100_MA-60_MultiLepFilter_TuneCP5_13p6TeV_madgraph-pythia8/NANOAODSIM/130X_mcRun3_2022_realistic_postEE_v6-v2/2820000/03fd6a3a-e792-408b-a497-2607ffca2ace.root`
+  `root://cms-xrd-global.cern.ch//store/mc/Run3Summer22EENanoAODv12/TTToHcToWAToMuMu_MHc-100_MA-60_MultiLepFilter_TuneCP5_13p6TeV_madgraph-pythia8/NANOAODSIM/130X_mcRun3_2022_realistic_postEE_v6-v2/2820000/03fd6a3a-e792-408b-a497-2607ffca2ace.root`
 
 ## v1.4.0 — 2026-10-05
 - Recompressing files as they are first read (`recompress = on`) now makes
