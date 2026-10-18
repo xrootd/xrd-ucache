@@ -683,3 +683,18 @@ TEST(Config, ValidPageSize) {
   EXPECT_FALSE(Config::validPageSize(2048));
   EXPECT_FALSE(Config::validPageSize(2u << 20));
 }
+
+// A local file (root://local) is checked on its size and modification time at
+// every open, whatever validate says, unless it says none.
+TEST(Config, LocalFilesAreCheckedOnSizeAndTime) {
+  Config c;
+  const auto local = *UrlKey::parse("root://local//data/x.root");
+  const auto remote = *UrlKey::parse("root://h//data/x.root");
+  for (const ValidateMode m : {ValidateMode::kSize, ValidateMode::kSizeMtime, ValidateMode::kCksum}) {
+    c.validate = m;
+    EXPECT_EQ(c.validateFor(local), ValidateMode::kSizeMtime);
+    EXPECT_EQ(c.validateFor(remote), m);
+  }
+  c.validate = ValidateMode::kNone;
+  EXPECT_EQ(c.validateFor(local), ValidateMode::kNone);
+}

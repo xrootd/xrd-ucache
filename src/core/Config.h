@@ -313,9 +313,16 @@ struct Config {
   // The freshness check an entry of `key` gets: `validate`, except that an
   // entry keyed by logical name is checked on its size where validate =
   // size+mtime (a modification time belongs to one site's copy, and would
-  // start the entry again at every change of site).
+  // start the entry again at every change of site), and that a local file
+  // (root://local, UrlKey.h) is checked on its size and modification time
+  // unless validate = none: the file is the only copy, and a file rewritten in
+  // place must never be served from the bytes it had before.
   ValidateMode validateFor(const UrlKey& key) const {
-    return validate == ValidateMode::kSizeMtime && key.logical() ? ValidateMode::kSize : validate;
+    if (key.logical())
+      return validate == ValidateMode::kSizeMtime ? ValidateMode::kSize : validate;
+    if (key.host == kLocalFileHost && validate != ValidateMode::kNone)
+      return ValidateMode::kSizeMtime;
+    return validate;
   }
   // Serialized current value of a known key (for `ucache settings`).
   std::string valueOf(const std::string& key) const;

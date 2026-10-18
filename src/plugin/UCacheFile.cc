@@ -478,6 +478,18 @@ std::string faultOpenUrl(const std::string& url, int attempt) {
   return (n > 0 && attempt <= n) ? rewritePortTo1(url) : url;
 }
 
+// The URL an inner File is opened with: the one given, except that a local
+// file's (root://local, UrlKey.h) is the client's own URL of that file,
+// file://localhost/<path>. Every open a handle sends goes through here -- the
+// reader's, the cache's own, a forked child's, a pass-through or disabled
+// handle's -- so nothing for a local file ever reaches a server, in any state.
+// The scheme is not the reader's, so the open can never come back to this
+// plug-in.
+std::string innerOpenUrl(const std::string& url) {
+  std::string local = localFileClientUrl(url);
+  return local.empty() ? url : local;
+}
+
 // UCACHE_TEST_OPEN_DEADLINE_S replaces the open deadline, for tests that
 // cannot wait a minute. Read once, when the library loads: a value set then
 // has no first-use guard that a fork could catch half taken, and the cache's
@@ -2732,7 +2744,8 @@ OpenAnswer openAndWait(XrdCl::File* f, const std::string& url, OpenAttempt& a,
   a.endUs = 0;
   a.timeoutS = static_cast<int>(timeout);
   ans.fresh = firstOpenOn(*a.st, f);
-  ans.status = f->Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, h, timeout);
+  ans.status =
+      f->Open(innerOpenUrl(url), XrdCl::OpenFlags::Read, XrdCl::Access::None, h, timeout);
   if (!ans.status.IsOK()) {
     delete h;
     return ans;
@@ -2971,7 +2984,7 @@ class RetryingOpenHandler : public ResponseHandler {
     const std::string url = sentUrl_; // once sent, `this` may be gone at any time
     fresh = firstOpenOn(*st_, f);
     const std::shared_ptr<HandleState> st = st_;
-    XRootDStatus s = f->Open(url, flags_, mode_, this, t);
+    XRootDStatus s = f->Open(innerOpenUrl(url), flags_, mode_, this, t);
     if (s.IsOK())
       sentOpenOn(*st, f);
     return s;
@@ -7002,10 +7015,24 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
       noteCopier(sig, url);
     }
   }
+  // A local file (root://local, UrlKey.h): read from this machine's file system, with no server
+  // to fail over from or to ask anything of. Failover is off for it, decided here, so that no
+  // question about its server is ever asked (decideFederation, decideFederationLate), and every
+  // open of it compares the cached entry with the file itself (below).
+  const bool local = isLocalFileUrl(url);
+  if (local) {
+    st_->federation.store(false, std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> p(st_->propMu);
+      std::lock_guard<std::mutex> g(st_->mu);
+      st_->readerProps.clear();
+    }
+    st_->fedDecided.store(true, std::memory_order_release);
+  }
   // The host patterns of the reader's tried= (UrlKey.h splitTriedPatterns): kept for a handle the
   // cache serves, applied where the switch's behaviour is the file's (HandleState::avoid).
   st_->avoid.reset();
-  if (!passthroughOnly_ && url.find("tried=") != std::string::npos) {
+  if (!passthroughOnly_ && !local && url.find("tried=") != std::string::npos) {
     auto tp = std::make_shared<TriedPatterns>(splitTriedPatterns(url));
     if (tp->any()) {
       if (cfg.failover)
@@ -7020,7 +7047,7 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // here or saved in the cache directory, and with neither leaves the file undecided until its
   // first access to the origin (HandleState::decideFederationLate); every other open decides
   // before its open of the origin.
-  const bool autoMode = failoverDecides();
+  const bool autoMode = failoverDecides() && !local;
   auto decideFederation = [&](bool knownOnly) {
     // A URL whose tried= holds a host pattern asks for hosts to be avoided, which only the switch's
     // behaviour does: on for the file, at once, whatever its server is and whether or not it
@@ -7066,8 +7093,10 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // serve from cache — the origin is touched only if a genuine miss forces a
   // lazy open (fail-open). This is the reliability control: warm reads don't
   // depend on a flaky/loaded/WAN remote. UCACHE_REVALIDATE_S=0 (revalidate
-  // every open) never enters here.
-  if (!passthroughOnly_ && cfg.revalidateSeconds > 0) {
+  // every open) never enters here, and neither does a local file: its open is
+  // a call to its own file system, never a request to a server, so every open
+  // compares the entry with the file as it is now (Config::validateFor).
+  if (!passthroughOnly_ && !local && cfg.revalidateSeconds > 0) {
     auto key = cfg.entryKey(url);
     {
       std::lock_guard<std::mutex> g(st_->mu);
@@ -7141,7 +7170,7 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // uCache's to apply)
   const std::string openUrl = faultOpenUrl(passthroughOnly_ ? url : st_->originUrl(), 1);
   const bool fresh = firstOpenOn(*st_, f);
-  const XRootDStatus s = f->Open(openUrl, flags, mode, h, openTimeout);
+  const XRootDStatus s = f->Open(innerOpenUrl(openUrl), flags, mode, h, openTimeout);
   if (s.IsOK())
     sentOpenOn(*st_, f);
   else if (watched)
@@ -8689,6 +8718,21 @@ bool UCacheFile::SetProperty(const std::string& name, const std::string& value) 
 
 bool UCacheFile::GetProperty(const std::string& name, std::string& value) const {
   st_->syncFork();
+  // A local file (root://local, UrlKey.h) answers the local redirect below in
+  // every state, whatever its inner File would say: that File's DataServer is
+  // "localhost", and a client that asks a data server for its settings (as
+  // fsspec-xrootd does) would send that question to whatever listens there.
+  if (name == "LastURL" || name == "DataServer") {
+    std::string local;
+    {
+      std::lock_guard<std::mutex> g(st_->mu);
+      local = localFileClientUrl(st_->url);
+    }
+    if (!local.empty()) {
+      value = name == "LastURL" ? local : std::string();
+      return true;
+    }
+  }
   if (st_->inner.load()->GetProperty(name, value) && !value.empty())
     return true;
   // Trusted cache-only handles never opened a transport, so the properties
@@ -8717,7 +8761,13 @@ bool UCacheFile::GetProperty(const std::string& name, std::string& value) const 
   if (name == "LastURL") {
     std::lock_guard<std::mutex> g(st_->mu);
     if (!st_->url.empty()) {
-      value = "file://localhost" + XrdCl::URL(st_->url).GetPath();
+      // The client gives root://host/abs/path the path "abs/path" (only
+      // root://host//abs/path keeps its "/"): a URL is made only of an
+      // absolute one.
+      std::string path = XrdCl::URL(st_->url).GetPath();
+      if (path.empty() || path[0] != '/')
+        path.insert(0, "/");
+      value = "file://localhost" + path;
       return true;
     }
   }

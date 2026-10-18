@@ -176,6 +176,27 @@ std::optional<UrlParts> urlParts(const std::string& url, const std::vector<std::
 }
 } // namespace
 
+std::string localFilePath(const std::string& url) {
+  if (url.compare(0, 4, kLfnPrefix) == 0)
+    return "";
+  auto p = urlParts(url, {});
+  // The host alone, root://local:1094, as a file-system object may be made for: its path is "/".
+  if (const auto s = url.find("://"); !p && s != std::string::npos &&
+                                       url.find('/', s + 3) == std::string::npos)
+    p = urlParts(url + "/", {});
+  // The root schemes are the ones whose default port is the XRootD port.
+  if (!p || p->host != kLocalFileHost || defaultPort(p->scheme) != 1094)
+    return "";
+  return p->path;
+}
+
+std::string localFileClientUrl(const std::string& url) {
+  const std::string path = localFilePath(url);
+  return path.empty() ? std::string() : "file://localhost" + path;
+}
+
+std::string localPathOf(const std::string& path) { return normalizePath(path); }
+
 // ---- Keys by logical name ---------------------------------------------------
 
 namespace {

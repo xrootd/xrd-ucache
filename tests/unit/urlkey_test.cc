@@ -385,3 +385,35 @@ TEST(UrlKey, WithTriedHosts) {
   EXPECT_EQ(withTriedHosts(base + "?tried=" + longReader, {"aaaaaaaaaaaaaaa.x.org", "b.x.org"}),
             base + "?tried=" + longReader + ",b.x.org");
 }
+
+// root://local names a file of this machine's file system, by the path its key holds.
+TEST(LocalFiles, UrlsOfTheLocalHost) {
+  EXPECT_EQ(localFilePath("root://local//data/x.root"), "/data/x.root");
+  EXPECT_EQ(localFilePath("root://local/data/x.root"), "/data/x.root");
+  EXPECT_EQ(localFilePath("root://LOCAL:1094//data//./y/../x.root?xrdcl.requuid=1"),
+            "/data/x.root");
+  EXPECT_EQ(localFilePath("xroot://local:2000//a"), "/a");
+  EXPECT_EQ(localFilePath("roots://user@local//a"), "/a");
+  EXPECT_EQ(localFilePath("root://local:1094"), "/"); // the host alone
+  EXPECT_EQ(localFilePath("root://local:1094/"), "/");
+  // Anything else is not a local file.
+  EXPECT_EQ(localFilePath("root://localhost//data/x.root"), "");
+  EXPECT_EQ(localFilePath("root://local.example.org//data/x.root"), "");
+  EXPECT_EQ(localFilePath("root://mylocal//data/x.root"), "");
+  EXPECT_EQ(localFilePath("https://local//data/x.root"), "");
+  EXPECT_EQ(localFilePath("file://local/data/x.root"), "");
+  EXPECT_EQ(localFilePath("lfn:/store/mc/a.root"), "");
+  EXPECT_EQ(localFilePath("/data/x.root"), "");
+  EXPECT_TRUE(isLocalFileUrl("root://local//a"));
+  EXPECT_FALSE(isLocalFileUrl("root://localhost//a"));
+  EXPECT_EQ(localFileClientUrl("root://local//data/x.root"), "file://localhost/data/x.root");
+  EXPECT_EQ(localFileClientUrl("root://h//data/x.root"), "");
+  // The file read is the one the key names: both spellings of a path are one entry.
+  EXPECT_EQ(UrlKey::parse("root://local//data/x.root")->key, "root://local:1094/data/x.root");
+  EXPECT_EQ(UrlKey::parse("root://local/data/x.root")->key,
+            UrlKey::parse("root://local//data/x.root")->key);
+  EXPECT_EQ(UrlKey::parse("root://local//data/x.root")->host, kLocalFileHost);
+  // A path given to a stat or a listing on the host.
+  EXPECT_EQ(localPathOf("data//x/./y/.."), "/data/x");
+  EXPECT_EQ(localPathOf(""), "/");
+}

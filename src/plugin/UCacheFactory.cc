@@ -11,14 +11,19 @@
 // CreateFileSystem returns nullptr: XrdCl logs and continues without a
 // plugin for filesystem objects (verified in XrdClFileSystem.cc) — all FS
 // ops are naturally pass-through, and a broken cache can never break a job.
+// The one exception is the local host, root://local (UrlKey.h), which has no
+// server to pass anything to: its stat and listing are answered here
+// (LocalFileSystem.h).
 #include "Announce.h"
 #include "CopyDetect.h"
 #include "CpuCounters.h"
 #include "EntryNames.h"
 #include "Executor.h"
+#include "LocalFileSystem.h"
 #include "PluginSupport.h"
 #include "Log.h"
 #include "UCacheFile.h"
+#include "UrlKey.h"
 #ifdef UCACHE_HAVE_PREFETCH
 #include "Prefetch.h"
 #endif
@@ -455,7 +460,9 @@ void resumeAfterFork() {
 class UCacheFactory : public XrdCl::PlugInFactory {
  public:
   XrdCl::FilePlugIn* CreateFile(const std::string& /*url*/) override { return new UCacheFile(); }
-  XrdCl::FileSystemPlugIn* CreateFileSystem(const std::string& /*url*/) override {
+  XrdCl::FileSystemPlugIn* CreateFileSystem(const std::string& url) override {
+    if (isLocalFileUrl(url))
+      return new LocalFileSystem(url);
     return nullptr; // default FileSystem; see header comment
   }
 };

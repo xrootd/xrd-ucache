@@ -157,6 +157,13 @@ if(UCACHE_BUILD_PLUGIN)
   add_executable(ucache-tried-probe integration/tried_probe.cc)
   target_include_directories(ucache-tried-probe SYSTEM PRIVATE ${XRDCL_INCLUDE_DIR})
   target_link_libraries(ucache-tried-probe PRIVATE ${XRDCL_LIBRARY})
+  # Local files (root://local): read, cached and checked at every open, with no
+  # server anywhere. Self-contained, so it is a ctest entry of its own.
+  add_executable(ucache-local-probe integration/local_probe.cc)
+  target_include_directories(ucache-local-probe SYSTEM PRIVATE ${XRDCL_INCLUDE_DIR})
+  target_link_libraries(ucache-local-probe PRIVATE ${XRDCL_LIBRARY})
+  add_test(NAME local-files COMMAND ucache-local-probe $<TARGET_FILE:XrdClUCache>)
+  set_tests_properties(local-files PROPERTIES TIMEOUT 120)
   add_executable(ucache-plugin-fuzz integration/plugin_fuzz.cc)
   target_include_directories(ucache-plugin-fuzz SYSTEM PRIVATE ${XRDCL_INCLUDE_DIR})
   target_link_libraries(ucache-plugin-fuzz PRIVATE ${XRDCL_LIBRARY})

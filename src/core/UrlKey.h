@@ -61,6 +61,24 @@ struct UrlKey {
   std::string objectDir(const std::string& cacheDir) const;
 };
 
+// Local files. A URL whose host is `local` -- root://local//abs/path, with any
+// of the root schemes and any port -- names the file /abs/path of this
+// machine's file system. The plug-in reads that file itself, through the
+// client's own local-file access, and no server is ever contacted: `local` is
+// no server's address, so the URL cannot mean anything else to a program
+// without uCache, where `localhost` would be a real server's. The path is the
+// URL's normalized path, the same one its key holds, so the file read is
+// always the file the key names.
+inline constexpr const char* kLocalFileHost = "local";
+// The absolute, normalized path a local-file URL names; "" for any other URL. Pure.
+std::string localFilePath(const std::string& url);
+inline bool isLocalFileUrl(const std::string& url) { return !localFilePath(url).empty(); }
+// The client's own URL of that file, "file://localhost/abs/path"; "" for any other URL. Pure.
+std::string localFileClientUrl(const std::string& url);
+// A path given to a request on the local host itself (a stat or a listing), as
+// a URL's path is: made absolute and normalized. Pure.
+std::string localPathOf(const std::string& path);
+
 // Logical names are off unless the cache sets its prefixes. CMS's official namespaces, as the
 // documentation gives them for an example: "/store/data/ /store/mc/ /store/hidata/".
 inline constexpr const char* kDefaultLogicalNamePrefixes = "off";
