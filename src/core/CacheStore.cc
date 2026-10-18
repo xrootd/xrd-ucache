@@ -282,13 +282,24 @@ std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSi
           // One entry per key per process — for one size. A source of another
           // size is another copy of the file (a damaged or truncated one, or the
           // file rewritten): its bytes never join an entry whose readers hold
-          // the first size.
-          if (live->fileSize() != originSize) {
+          // the first size. Where the modification time is checked (a local
+          // file, or validate = size+mtime: Config::validateFor), a source of
+          // another time is another copy too: the file rewritten in place at
+          // the same size.
+          const bool otherTime = cfg_.validateFor(key) == ValidateMode::kSizeMtime &&
+                                 live->originMtime() != originMtime;
+          if (live->fileSize() != originSize || otherTime) {
             stats_.sizeDisagreements.fetch_add(1, std::memory_order_relaxed);
-            UCACHE_WARN("%s: the origin reports %llu bytes, the open cache entry holds %llu; "
-                        "not mixing them, this handle reads uncached",
-                        key.key.c_str(), static_cast<unsigned long long>(originSize),
-                        static_cast<unsigned long long>(live->fileSize()));
+            if (live->fileSize() != originSize)
+              UCACHE_WARN("%s: the origin reports %llu bytes, the open cache entry holds %llu; "
+                          "not mixing them, this handle reads uncached",
+                          key.key.c_str(), static_cast<unsigned long long>(originSize),
+                          static_cast<unsigned long long>(live->fileSize()));
+            else
+              UCACHE_WARN("%s: the origin reports the modification time %llu, the open cache "
+                          "entry holds %llu; not mixing them, this handle reads uncached",
+                          key.key.c_str(), static_cast<unsigned long long>(originMtime),
+                          static_cast<unsigned long long>(live->originMtime()));
             if (declinedSizeDiffers)
               *declinedSizeDiffers = true;
             return nullptr;

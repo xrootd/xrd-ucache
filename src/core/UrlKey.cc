@@ -75,6 +75,12 @@ struct UrlParts {
 };
 std::optional<UrlParts> urlParts(const std::string& url, const std::vector<std::string>& keepCgi);
 
+// The parts of a local file's URL (localFilePath): the host `local`, with one of the root schemes,
+// whose default port is the XRootD port.
+bool isLocalParts(const UrlParts& p) {
+  return p.host == kLocalFileHost && defaultPort(p.scheme) == 1094;
+}
+
 constexpr const char* kLfnPrefix = "lfn:";
 
 // "lfn:/<path>[?query]": the key as it is, its path normalized. nullopt for
@@ -184,8 +190,7 @@ std::string localFilePath(const std::string& url) {
   if (const auto s = url.find("://"); !p && s != std::string::npos &&
                                        url.find('/', s + 3) == std::string::npos)
     p = urlParts(url + "/", {});
-  // The root schemes are the ones whose default port is the XRootD port.
-  if (!p || p->host != kLocalFileHost || defaultPort(p->scheme) != 1094)
+  if (!p || !isLocalParts(*p))
     return "";
   return p->path;
 }
@@ -195,7 +200,9 @@ std::string localFileClientUrl(const std::string& url) {
   return path.empty() ? std::string() : "file://localhost" + path;
 }
 
-std::string localPathOf(const std::string& path) { return normalizePath(path); }
+std::string localPathOf(const std::string& path) {
+  return normalizePath(path.substr(0, path.find('?'))); // a query is no part of a file's path
+}
 
 // ---- Keys by logical name ---------------------------------------------------
 
@@ -346,7 +353,10 @@ std::optional<UrlKey> KeyRules::derive(const std::string& url) const {
   out.host = p->host;
   out.key = p->scheme + "://" + p->host + ":" + std::to_string(p->port) + p->path + p->kept;
   out.hashHex = sha256Hex(out.key);
-  if (!logical_)
+  // A local file is keyed by its own path, never by a logical name: it is the
+  // only copy, may be rewritten in place, and is checked on its modification
+  // time, which an entry other URLs share by name is not (Config::validateFor).
+  if (!logical_ || isLocalParts(*p))
     return out;
   const std::string name = logicalNameOf(prefixes_, p->path);
   if (name.empty())
@@ -365,7 +375,7 @@ std::string KeyRules::mapStored(const std::string& storedKey) const {
   // A stored key is a URL key already (normalized, its kept CGI sorted): its
   // own kept query goes on as it is.
   const auto p = urlParts(storedKey, {});
-  if (!p)
+  if (!p || isLocalParts(*p)) // a local file's key stays its URL's (derive)
     return storedKey;
   const std::string name = logicalNameOf(prefixes_, p->path);
   if (name.empty())

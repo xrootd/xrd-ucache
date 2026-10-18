@@ -85,9 +85,10 @@ class CacheStore {
   // inside the protection window, so this NEW entry is not admitted. The read
   // still succeeds uncached either way, but only the first is a fail-open event.
   // `declinedSizeDiffers` (optional, out) marks the third: the process already
-  // holds this file's entry at a different size. Its readers hold that size, so
-  // the entry is neither restarted nor extended from this source; the caller
-  // reads uncached and `size_disagreements` counts it.
+  // holds this file's entry at a different size (or, where the modification
+  // time is checked, a different time). Its readers hold that copy, so the
+  // entry is neither restarted nor extended from this source; the caller reads
+  // uncached and `size_disagreements` counts it.
   std::shared_ptr<FileEntry> open(const UrlKey& key, uint64_t originSize,
                                   uint64_t originMtime = 0,
                                   uint8_t cksumKind = MetaData::kCksumNone,

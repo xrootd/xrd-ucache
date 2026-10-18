@@ -88,6 +88,44 @@ TEST(CacheStore, LiveEntryOfAnotherSizeIsNotShared) {
   EXPECT_EQ(store.stats().sizeDisagreements.load(), 1u);
 }
 
+TEST(CacheStore, LiveEntryOfAnotherTimeIsNotSharedWhereTimeIsChecked) {
+  // A file rewritten in place at the same size: where the modification time is
+  // checked (validate = size+mtime, or a local file whatever validate says), a
+  // source of another time does not join the entry the process holds.
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg); // validate = size: a remote file's time is not compared
+  auto a = store.open(keyN(1), 100000, 1000);
+  ASSERT_TRUE(a);
+  auto b = store.open(keyN(1), 100000, 2000);
+  EXPECT_EQ(a.get(), b.get());
+
+  const UrlKey local = *UrlKey::parse("root://local//data/x.root");
+  auto l1 = store.open(local, 100000, 1000);
+  ASSERT_TRUE(l1);
+  bool space = true, differs = false;
+  auto l2 = store.open(local, 100000, 2000, MetaData::kCksumNone, 0, &space, &differs);
+  EXPECT_FALSE(l2);
+  EXPECT_TRUE(differs);
+  EXPECT_FALSE(space);
+  EXPECT_EQ(store.stats().sizeDisagreements.load(), 1u);
+  auto l3 = store.open(local, 100000, 1000, MetaData::kCksumNone, 0, &space, &differs);
+  EXPECT_EQ(l1.get(), l3.get()); // the same time still shares
+  EXPECT_FALSE(differs);
+
+  Config timed = cfg;
+  timed.validate = ValidateMode::kSizeMtime;
+  TempDir td2;
+  timed.cacheDir = td2.path();
+  CacheStore store2(io, timed);
+  auto r1 = store2.open(keyN(1), 100000, 1000);
+  ASSERT_TRUE(r1);
+  EXPECT_FALSE(store2.open(keyN(1), 100000, 2000));
+  EXPECT_EQ(store2.stats().sizeDisagreements.load(), 1u);
+}
+
 TEST(CacheStore, OpenFailureFailsOpen) {
   TempDir td;
   RealIO io;

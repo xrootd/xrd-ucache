@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <cstring>
 #include <dirent.h>
+#include <memory>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -66,8 +67,11 @@ LocalFileSystem::LocalFileSystem(const std::string& url) {
   hostId_ = std::string(kLocalFileHost) + ":" + std::to_string(u.IsValid() ? u.GetPort() : 1094);
 }
 
+// Each request answers or fails as a server would, and never throws into the
+// client: one it cannot even set up (no memory) is refused at once.
 XrdCl::XRootDStatus LocalFileSystem::Locate(const std::string& path, XrdCl::OpenFlags::Flags,
-                                            XrdCl::ResponseHandler* handler, ucache::XrdTimeout) {
+                                            XrdCl::ResponseHandler* handler,
+                                            ucache::XrdTimeout) try {
   // A leading '*' asks a server to locate the path everywhere it may be (the
   // client's deep locate sends one); it is not part of the path.
   const std::string p = localPathOf(!path.empty() && path[0] == '*' ? path.substr(1) : path);
@@ -76,15 +80,18 @@ XrdCl::XRootDStatus LocalFileSystem::Locate(const std::string& path, XrdCl::Open
     deliver(handler, failure(errno), nullptr);
     return XrdCl::XRootDStatus();
   }
-  auto* info = new XrdCl::LocationInfo();
+  auto info = std::make_unique<XrdCl::LocationInfo>();
   info->Add(XrdCl::LocationInfo::Location(hostId_, XrdCl::LocationInfo::ServerOnline,
                                           XrdCl::LocationInfo::ReadWrite));
-  deliver(handler, okStatus(), objectOf(info));
+  deliver(handler, okStatus(), objectOf(info.release()));
   return XrdCl::XRootDStatus();
+} catch (...) {
+  return XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errInternal);
 }
 
 XrdCl::XRootDStatus LocalFileSystem::Stat(const std::string& path,
-                                          XrdCl::ResponseHandler* handler, ucache::XrdTimeout) {
+                                          XrdCl::ResponseHandler* handler,
+                                          ucache::XrdTimeout) try {
   const std::string p = localPathOf(path);
   struct ::stat sb{};
   if (::stat(p.c_str(), &sb) != 0)
@@ -92,38 +99,62 @@ XrdCl::XRootDStatus LocalFileSystem::Stat(const std::string& path,
   else
     deliver(handler, okStatus(), objectOf(statInfoOf(p, sb)));
   return XrdCl::XRootDStatus();
+} catch (...) {
+  return XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errInternal);
 }
 
 XrdCl::XRootDStatus LocalFileSystem::DirList(const std::string& path,
                                              XrdCl::DirListFlags::Flags flags,
-                                             XrdCl::ResponseHandler* handler, ucache::XrdTimeout) {
+                                             XrdCl::ResponseHandler* handler,
+                                             ucache::XrdTimeout) try {
   if (flags & XrdCl::DirListFlags::Recursive)
     return XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errNotSupported, 0,
                                "a recursive listing of a local directory is not supported");
   const std::string p = localPathOf(path);
-  DIR* d = ::opendir(p.c_str());
+  std::unique_ptr<DIR, int (*)(DIR*)> d(::opendir(p.c_str()), &::closedir);
   if (!d) {
     deliver(handler, failure(errno), nullptr);
     return XrdCl::XRootDStatus();
   }
-  auto* list = new XrdCl::DirectoryList();
+  auto list = std::make_unique<XrdCl::DirectoryList>();
   list->SetParentName(p);
   const std::string dir = p == "/" ? p : p + "/";
-  while (const struct ::dirent* e = ::readdir(d)) {
+  for (;;) {
+    errno = 0;
+    const struct ::dirent* e = ::readdir(d.get());
+    if (!e) {
+      if (errno != 0) { // not the end: a listing cut short is no listing
+        deliver(handler, failure(errno), nullptr);
+        return XrdCl::XRootDStatus();
+      }
+      break;
+    }
     const std::string name = e->d_name;
     if (name == "." || name == "..")
       continue;
     XrdCl::StatInfo* si = nullptr;
     if (flags & XrdCl::DirListFlags::Stat) {
+      // As a server lists: every entry with its stat. A link to nothing is
+      // listed as the link; an entry gone since the directory was read is
+      // left out; any other failure (a directory that may be read but not
+      // searched, an I/O error) fails the listing.
       struct ::stat sb{};
-      if (::stat((dir + name).c_str(), &sb) == 0)
-        si = statInfoOf(dir + name, sb);
+      const std::string full = dir + name;
+      if (::stat(full.c_str(), &sb) != 0 && ::lstat(full.c_str(), &sb) != 0) {
+        if (errno == ENOENT)
+          continue;
+        deliver(handler, failure(errno), nullptr);
+        return XrdCl::XRootDStatus();
+      }
+      si = statInfoOf(full, sb);
     }
-    list->Add(new XrdCl::DirectoryList::ListEntry("localhost", name, si));
+    // The entry's host is the host itself, never a server's address.
+    list->Add(new XrdCl::DirectoryList::ListEntry(hostId_, name, si));
   }
-  ::closedir(d);
-  deliver(handler, okStatus(), objectOf(list));
+  deliver(handler, okStatus(), objectOf(list.release()));
   return XrdCl::XRootDStatus();
+} catch (...) {
+  return XrdCl::XRootDStatus(XrdCl::stError, XrdCl::errInternal);
 }
 
 } // namespace ucache

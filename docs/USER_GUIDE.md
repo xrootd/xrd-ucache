@@ -1395,20 +1395,25 @@ system's page cache made complete: the bytes your jobs read are kept on the
 cache disk, outlive the process and a reboot, are not limited by memory, and
 are evicted by uCache's own rules (`max_bytes`, `min_free_bytes`,
 `in_use_seconds`, `ucache pin`) rather than by memory pressure. Every open
-compares the cached entry with the file as it is now, by its size and
-modification time — one `stat`, whatever `validate` and `revalidate_seconds`
-say (unless `validate = none`) — so a file rewritten in place is read afresh.
+opens the file (with your permissions) and compares the cached entry with it
+as it is now, by its size and modification time (to the second) — whatever
+`validate` and `revalidate_seconds` say, unless `validate = none` — so a file
+rewritten in place is read afresh by every new open, also in a job that still
+has it open.
 
 - The host is `local`, never `localhost`: `root://localhost` is the address
   of a real server on your machine, and a job run without uCache must not
   find that a URL means something else. Without uCache, `root://local` fails
-  at once (there is no such host), rather than reaching some other server.
+  at once wherever no machine is named `local`, rather than reaching some
+  other server.
 - The shipped conf binds every host (`url = *`), `local` included. A conf
   that lists its hosts needs `local` in the list
-  (`url = eospublic.cern.ch:1094;local`).
+  (`url = eospublic.cern.ch:1094;local`); that binds `root://local` on the
+  default port, and `url = *` binds every scheme and port.
 - `root://local//abs/path` and `root://local/abs/path` name the same file, and
   `..` and repeated slashes are resolved in the URL, as for any URL; give the
-  path a program would open.
+  path a program would open. A local file is always cached by its path:
+  `logical_name_prefixes` never applies to it.
 - A stat or a directory listing on the host (`xrdfs root://local ls /dir`, a
   wildcard in a `TChain`, uproot's own size and listing calls) is answered from
   the file system too. A recursive listing is not supported.
@@ -1416,10 +1421,11 @@ say (unless `validate = none`) — so a file rewritten in place is read afresh.
   the file directly and do not fill the cache (§Copies are the origin's bytes),
   a job that reads most of a file reads it directly (`max_read_fraction`), and
   `ucache ls`, `ucache rm` and `ucache pin` take the URL as written. A write
-  open writes the file itself, with nothing cached.
-- uCache is a per-user cache: keep the cache directory your own. The plugin
-  reads each file with your permissions, but serves what it has cached without
-  asking the file system again.
+  open writes the file itself, with nothing cached. `xrdcp --cksum` cannot ask
+  for a local file's checksum.
+- uCache is a per-user cache: keep the cache directory your own. The bytes it
+  holds are readable by whoever can read that directory, whatever the
+  permissions of the files they came from.
 
 **Put the cache on local disk.** `dir` has **no default** — an unset cache
 location is a loud condition (`doctor` FAILs, the plugin passes through

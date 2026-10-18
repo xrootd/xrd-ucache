@@ -413,7 +413,21 @@ TEST(LocalFiles, UrlsOfTheLocalHost) {
   EXPECT_EQ(UrlKey::parse("root://local/data/x.root")->key,
             UrlKey::parse("root://local//data/x.root")->key);
   EXPECT_EQ(UrlKey::parse("root://local//data/x.root")->host, kLocalFileHost);
-  // A path given to a stat or a listing on the host.
+  // A path given to a stat or a listing on the host; a query is no part of it.
   EXPECT_EQ(localPathOf("data//x/./y/.."), "/data/x");
   EXPECT_EQ(localPathOf(""), "/");
+  EXPECT_EQ(localPathOf("/data/x.root?xrd.wantprot=unix"), "/data/x.root");
+}
+
+// A local file is keyed by its own path, never by a logical name: it is the
+// only copy, and is checked on its modification time.
+TEST(LocalFiles, NeverKeyedByLogicalName) {
+  const KeyRules rules({}, true, "/store/mc/");
+  ASSERT_TRUE(rules.logical());
+  EXPECT_EQ(rules.key("root://local//eos/cms/store/mc/a.root")->key,
+            "root://local:1094/eos/cms/store/mc/a.root");
+  EXPECT_EQ(rules.key("root://h//eos/cms/store/mc/a.root")->key, "lfn:/store/mc/a.root");
+  EXPECT_EQ(rules.mapStored("root://local:1094/eos/cms/store/mc/a.root"),
+            "root://local:1094/eos/cms/store/mc/a.root");
+  EXPECT_EQ(rules.mapStored("root://h:1094/eos/cms/store/mc/a.root"), "lfn:/store/mc/a.root");
 }

@@ -169,7 +169,9 @@ not to cache, and says the cache is under pressure rather than broken.
   cached before, shows the other size is cached apart without an open, and is not
   counted.
 - `size_disagreements` — times a source reported a different file size than
-  the cached entry it was about to extend. Bytes from that source are never
+  the cached entry it was about to extend (or, where the modification time is
+  checked — a local file, or `validate = size+mtime` — a different time while
+  the process holds the entry). Bytes from that source are never
   mixed into the entry: a handle that already holds the cached size fails its
   read with a "data is corrupted" error naming both sizes and the server (and
   the next open checks the origin again); a handle opening while the process

@@ -68,7 +68,10 @@ struct UrlKey {
 // no server's address, so the URL cannot mean anything else to a program
 // without uCache, where `localhost` would be a real server's. The path is the
 // URL's normalized path, the same one its key holds, so the file read is
-// always the file the key names.
+// always the file the key names, and the key is always the URL's: never a
+// logical name (KeyRules). Which of these URLs reach the plug-in is the
+// client's plug-in configuration's choice (`url = *`, or `local` for
+// root://local on the default port).
 inline constexpr const char* kLocalFileHost = "local";
 // The absolute, normalized path a local-file URL names; "" for any other URL. Pure.
 std::string localFilePath(const std::string& url);

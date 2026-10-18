@@ -22,9 +22,15 @@
 //      only the cache holds.
 //   C. a new modification time: the reads give the new bytes.
 //   D. a new size: the open's stat gives it, and the reads give the new bytes.
+//   E. in one process: a handle reads the file and stays open, the file is
+//      rewritten at the same size with a new time, and a second handle reads
+//      the new bytes (the process's open entry is not reused for them).
+//   F. with uCache disabled (UCACHE_DISABLE=1) the file is still read.
+//   G. an open of a file that does not exist fails.
 // In every phase the client's own log (Debug level, captured in the child)
-// must show no connection, no address lookup and no channel: nothing is ever
-// sent to a server. The trust window and the freshness check are left at their
+// must hold the local-file access's own lines (the log was captured) and show no
+// connection, no address lookup and no channel: nothing is ever sent to a
+// server. The trust window and the freshness check are left at their
 // defaults (revalidate_seconds of 7 days, validate = size), because a local
 // file is checked at every open whatever they say.
 //
@@ -78,6 +84,15 @@ void check(bool ok, const std::string& what) {
   std::printf("%s: %s\n", ok ? "PASS" : "FAIL", what.c_str());
   if (!ok)
     ++gFails;
+}
+
+// The client logged a line holding `text`.
+bool logged(const char* text) {
+  std::lock_guard<std::mutex> g(lines().mu);
+  for (const auto& l : lines().all)
+    if (l.find(text) != std::string::npos)
+      return true;
+  return false;
 }
 
 // The first line of the client's log that shows a request on its way to a
@@ -246,21 +261,71 @@ void readJob(const std::string& url, const std::string& path, const std::string&
 const size_t kSize = (3u << 20) + 4321;
 
 // The file's contents in each version: 1 and 2 differ at (almost) every byte
-// and have one size; 3 is 2 with 4 KiB more.
+// and have one size; 3 is 2 with 4 KiB more; 4 is another file of 3's size.
 std::string version(int v) {
   if (v == 3)
     return contents(kSize, 2) + contents(4096, 3);
+  if (v == 4)
+    return contents(kSize + 4096, 4);
   return contents(kSize, static_cast<unsigned>(v));
 }
 
+struct ::timespec mtimeOf(const struct ::stat& sb) {
+#if defined(__APPLE__)
+  return sb.st_mtimespec;
+#else
+  return sb.st_mtim;
+#endif
+}
+
+// Phase E's job: one handle reads version `v` and stays open while the file is
+// rewritten as version `next` at the same size with a later time; a second
+// handle in this process then reads `next`.
+void sameProcessJob(const std::string& url, const std::string& path, int v, int next,
+                    const char* phase) {
+  XrdCl::File first;
+  const XrdCl::XRootDStatus os = first.Open(url, XrdCl::OpenFlags::Read);
+  const std::string want = version(v);
+  std::vector<char> buf(256 * 1024);
+  uint32_t got = 0;
+  const bool read = os.IsOK() && first.Read(0, static_cast<uint32_t>(buf.size()), buf.data(), got)
+                                     .IsOK() &&
+                    got == buf.size() && std::memcmp(buf.data(), want.data(), got) == 0;
+  check(read, std::string(phase) + ": the first handle reads the file");
+  struct ::stat sb{};
+  struct ::timespec later{};
+  const bool rewritten = ::stat(path.c_str(), &sb) == 0 &&
+                         writeFile(path, version(next), O_TRUNC) &&
+                         (later = mtimeOf(sb), later.tv_sec += 100, setMtime(path, later));
+  check(rewritten, std::string(phase) + ": the file rewritten at its size, with a later time");
+  readJob(url, path, version(next), phase, false);
+  if (os.IsOK()) {
+    const XrdCl::XRootDStatus cs = first.Close();
+    (void)cs;
+  }
+}
+
 // A phase, in the process the probe started for it: set up the client, run
-// the job, check that nothing reached a server, exit normally.
+// the job of its kind, check that nothing reached a server, exit normally.
 int runPhase(const char* name, const std::string& url, const std::string& path, int v,
-             bool fileSystem) {
+             const std::string& kind) {
   XrdCl::Log* log = XrdCl::DefaultEnv::GetLog();
   log->SetOutput(new Capture);
   log->SetLevel(XrdCl::Log::DebugMsg);
-  readJob(url, path, version(v), name, fileSystem);
+  if (kind == "missing") {
+    XrdCl::File f;
+    const XrdCl::XRootDStatus os = f.Open(url + ".missing", XrdCl::OpenFlags::Read);
+    check(!os.IsOK(), std::string(name) + ": the open fails (" + os.ToStr() + ")");
+  } else if (kind == "same-process") {
+    sameProcessJob(url, path, v, v + 1, name);
+  } else {
+    readJob(url, path, version(v), name, kind == "fs");
+  }
+  // The plug-in's binding is logged before the capture starts (the client
+  // reads its plug-in configuration when it sets up its log); the inner
+  // File's own lines come after, and say the local-file access was used.
+  check(logged("@file://localhost/"),
+        std::string(name) + ": the client's log was captured (it holds the local-file access)");
   const std::string net = networkLine();
   check(net.empty(), std::string(name) + ": nothing was sent to a server" +
                          (net.empty() ? "" : " (the client logged: " + net + ")"));
@@ -275,16 +340,21 @@ int runPhase(const char* name, const std::string& url, const std::string& path, 
 }
 
 // Runs a phase in a new process of this program, with the environment set up.
+// Kinds: "fs" (reads, then the file-system requests), "plain" (reads),
+// "same-process" (phase E), "disabled" (reads with UCACHE_DISABLE=1),
+// "missing" (an open of a file that does not exist).
 bool phase(const std::string& self, const char* name, const std::string& url,
-           const std::string& path, int v, bool fileSystem) {
+           const std::string& path, int v, const char* kind) {
   std::fflush(stdout);
   const pid_t pid = ::fork();
   if (pid < 0)
     return false;
   if (pid == 0) {
     const std::string vs = std::to_string(v);
+    if (std::strcmp(kind, "disabled") == 0)
+      ::setenv("UCACHE_DISABLE", "1", 1);
     ::execl(self.c_str(), self.c_str(), "--phase", name, url.c_str(), path.c_str(), vs.c_str(),
-            fileSystem ? "fs" : "-", static_cast<char*>(nullptr));
+            kind, static_cast<char*>(nullptr));
     std::printf("FAIL: %s: cannot run %s again: %s\n", name, self.c_str(), std::strerror(errno));
     std::fflush(stdout);
     ::_exit(1);
@@ -298,7 +368,7 @@ bool phase(const std::string& self, const char* name, const std::string& url,
 
 int main(int argc, char** argv) {
   if (argc == 7 && std::strcmp(argv[1], "--phase") == 0)
-    return runPhase(argv[2], argv[3], argv[4], std::atoi(argv[5]), std::strcmp(argv[6], "fs") == 0);
+    return runPhase(argv[2], argv[3], argv[4], std::atoi(argv[5]), argv[6]);
   if (argc != 2) {
     std::fprintf(stderr, "usage: %s <plugin library>\n", argv[0]);
     return 3;
@@ -350,23 +420,27 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "local_probe: SETUP, cannot stat %s\n", path.c_str());
     return 3;
   }
-  const struct ::timespec firstMtime = sb.st_mtim;
+  const struct ::timespec firstMtime = mtimeOf(sb);
   const std::string url = "root://local/" + path; // the double slash of an absolute path
 
-  bool ok = phase(self, "A cold", url, path, 1, /*fileSystem=*/true);
+  bool ok = phase(self, "A cold", url, path, 1, "fs");
   check(cacheHasEntry(cache), "A: the file has a cache entry");
   ok = gFails == 0 && ok;
 
   ok = writeFile(path, version(2), 0) && setMtime(path, firstMtime) && ok; // same size and time
-  ok = phase(self, "B same size and time", url, path, 1, false) && ok;
+  ok = phase(self, "B same size and time", url, path, 1, "plain") && ok;
 
   struct ::timespec later = firstMtime;
   later.tv_sec += 100;
   ok = setMtime(path, later) && ok;
-  ok = phase(self, "C new time", url, path, 2, false) && ok;
+  ok = phase(self, "C new time", url, path, 2, "plain") && ok;
 
   ok = writeFile(path, version(3), O_TRUNC) && ok;
-  ok = phase(self, "D new size", url, path, 3, false) && ok;
+  ok = phase(self, "D new size", url, path, 3, "plain") && ok;
+
+  ok = phase(self, "E one process", url, path, 3, "same-process") && ok; // leaves version 4
+  ok = phase(self, "F disabled", url, path, 4, "disabled") && ok;
+  ok = phase(self, "G missing", url, path, 4, "missing") && ok;
 
   ok = ok && gFails == 0;
   if (ok)
