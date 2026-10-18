@@ -11,7 +11,7 @@ Recompression stays off unless you turn it on. Nothing is published unless you
 run `ucache publish`. Any XRootD 5.6 or newer 5.x client works; 6.x from
 v0.21.0.
 
-## v1.5.0 — 2026-10-17
+## v1.5.0 — 2026-10-18
 - Failover: when a file is read through a redirector (as in CMS AAA) and a
   site stalls, fails or serves a damaged copy, uCache switches to another
   copy if one is available.
