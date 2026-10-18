@@ -353,10 +353,7 @@ std::optional<UrlKey> KeyRules::derive(const std::string& url) const {
   out.host = p->host;
   out.key = p->scheme + "://" + p->host + ":" + std::to_string(p->port) + p->path + p->kept;
   out.hashHex = sha256Hex(out.key);
-  // A local file is keyed by its own path, never by a logical name: it is the
-  // only copy, may be rewritten in place, and is checked on its modification
-  // time, which an entry other URLs share by name is not (Config::validateFor).
-  if (!logical_ || isLocalParts(*p))
+  if (!logical_)
     return out;
   const std::string name = logicalNameOf(prefixes_, p->path);
   if (name.empty())
@@ -375,7 +372,7 @@ std::string KeyRules::mapStored(const std::string& storedKey) const {
   // A stored key is a URL key already (normalized, its kept CGI sorted): its
   // own kept query goes on as it is.
   const auto p = urlParts(storedKey, {});
-  if (!p || isLocalParts(*p)) // a local file's key stays its URL's (derive)
+  if (!p)
     return storedKey;
   const std::string name = logicalNameOf(prefixes_, p->path);
   if (name.empty())

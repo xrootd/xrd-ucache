@@ -419,15 +419,19 @@ TEST(LocalFiles, UrlsOfTheLocalHost) {
   EXPECT_EQ(localPathOf("/data/x.root?xrd.wantprot=unix"), "/data/x.root");
 }
 
-// A local file is keyed by its own path, never by a logical name: it is the
-// only copy, and is checked on its modification time.
-TEST(LocalFiles, NeverKeyedByLogicalName) {
+// A local file is keyed by a logical name as any URL is: a mounted copy
+// (/eos/cms/store/... through eosxd) and a server's URL of it are one entry.
+TEST(LocalFiles, KeyedByLogicalNameAsAnyUrl) {
   const KeyRules rules({}, true, "/store/mc/");
   ASSERT_TRUE(rules.logical());
-  EXPECT_EQ(rules.key("root://local//eos/cms/store/mc/a.root")->key,
+  const auto local = rules.key("root://local//eos/cms/store/mc/a.root");
+  ASSERT_TRUE(local);
+  EXPECT_EQ(local->key, "lfn:/store/mc/a.root");
+  EXPECT_EQ(local->urlKey, "root://local:1094/eos/cms/store/mc/a.root");
+  EXPECT_EQ(rules.key("root://eoscms.cern.ch//eos/cms/store/mc/a.root")->key, local->key);
+  EXPECT_EQ(rules.mapStored("root://local:1094/eos/cms/store/mc/a.root"), "lfn:/store/mc/a.root");
+  // Outside the prefixes, and with names off, it keeps its URL's key.
+  EXPECT_EQ(rules.key("root://local//data/x.root")->key, "root://local:1094/data/x.root");
+  EXPECT_EQ(KeyRules({}, false, "/store/mc/").key("root://local//eos/cms/store/mc/a.root")->key,
             "root://local:1094/eos/cms/store/mc/a.root");
-  EXPECT_EQ(rules.key("root://h//eos/cms/store/mc/a.root")->key, "lfn:/store/mc/a.root");
-  EXPECT_EQ(rules.mapStored("root://local:1094/eos/cms/store/mc/a.root"),
-            "root://local:1094/eos/cms/store/mc/a.root");
-  EXPECT_EQ(rules.mapStored("root://h:1094/eos/cms/store/mc/a.root"), "lfn:/store/mc/a.root");
 }

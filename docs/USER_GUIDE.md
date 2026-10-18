@@ -1412,8 +1412,10 @@ has it open.
   default port, and `url = *` binds every scheme and port.
 - `root://local//abs/path` and `root://local/abs/path` name the same file, and
   `..` and repeated slashes are resolved in the URL, as for any URL; give the
-  path a program would open. A local file is always cached by its path:
-  `logical_name_prefixes` never applies to it.
+  path a program would open. With `logical_name_prefixes`, a local file is
+  keyed as any URL is: `root://local//eos/cms/store/mc/...` and
+  `root://eoscms.cern.ch//eos/cms/store/mc/...` are one entry, checked as every
+  file keyed by name is (§Keys by logical name).
 - A stat or a directory listing on the host (`xrdfs root://local ls /dir`, a
   wildcard in a `TChain`, uproot's own size and listing calls) is answered from
   the file system too. A recursive listing is not supported.
