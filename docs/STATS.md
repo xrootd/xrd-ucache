@@ -468,8 +468,8 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   waited, summed. Each waits at most a minute. Nonzero means the cache disk, or
   the kernel's limit on unwritten data (`vm.dirty_bytes`), set the first pass's
   pace; the records were kept. After a commit that could not keep its records
-  (no room, a failed write: `cold_replica_declined`) nothing waits for half a
-  minute.
+  (no room, a failed write: `cold_replica_declined`) nothing waits until a
+  commit keeps its records again.
 - `cold_origin_failures` — origin reads sent on the first pass that failed. The
   request is served again from the start, twice at most, so a read the origin
   fails once or twice is answered; a third failure in a row reaches the reader,

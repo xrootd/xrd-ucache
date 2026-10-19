@@ -2602,13 +2602,14 @@ uint64_t transientCap() {
 }
 
 // A commit had to drop its records (no room above the free-space floor, or a
-// write that failed): until this time, records are served and not queued for
-// a commit (the transient budget bounds them), and nothing waits for commits
-// that cannot keep what they are given. Then commits are tried again.
-std::atomic<uint64_t> g_commitsRefusedUntilUs{0};
-constexpr uint64_t kCommitsRefusedUs = 30'000'000;
+// write that failed): until a commit keeps its records again, records are
+// served and not queued for a commit (the transient budget bounds them), and
+// nothing waits for commits that cannot keep what they are given. The records
+// held so go with the next commit (ColdFill::commit), so commits go on being
+// tried, and the first that keeps them ends this.
+std::atomic<bool> g_commitsRefused{false};
 bool commitsRefused() {
-  return nowUs() < g_commitsRefusedUntilUs.load(std::memory_order_relaxed);
+  return g_commitsRefused.load(std::memory_order_relaxed);
 }
 
 // The records waiting are past their cap: `again` (the request served again from the start) is
@@ -3011,7 +3012,7 @@ void ColdFill::queueCommit() {
 }
 
 void ColdFill::dropRecords(const std::vector<SlotRecord>& recs, const std::string& why) {
-  g_commitsRefusedUntilUs.store(nowUs() + kCommitsRefusedUs, std::memory_order_relaxed);
+  g_commitsRefused.store(true, std::memory_order_relaxed);
   static std::atomic<bool> warned{false};
   if (!warned.exchange(true))
     UCACHE_WARN("slot records for %s not kept (%s); they are converted again when read "
@@ -3156,6 +3157,7 @@ void ColdFill::commit() try {
     dropRecords(recs, std::strerror(static_cast<int>(-n)));
     return;
   }
+  g_commitsRefused.store(false, std::memory_order_relaxed); // records are kept again
   if (n > 0)
     commitHoldOnce();
   std::vector<std::pair<uint64_t, uint64_t>> punch;
