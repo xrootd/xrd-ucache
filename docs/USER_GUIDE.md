@@ -1693,7 +1693,9 @@ converted records can be written to the cache disk: when writing falls behind
 (a slow disk, or a system that limits how much unwritten data the kernel may
 hold, `vm.dirty_bytes`), the reads that would convert more wait for it, for at
 most a minute each, so that everything converted is kept and the next pass
-reads it from the replica.
+reads it from the replica. When the cache has no room for what was converted
+(the free-space floor) or a write fails, nothing waits: for half a minute what
+is converted is served and not kept, and a later pass converts it again.
 
 **It also costs memory, on every pass that reads such a file.** ROOT sizes its
 read buffers from the layout described below and does not shrink them to fit

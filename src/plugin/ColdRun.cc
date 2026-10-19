@@ -2601,12 +2601,22 @@ uint64_t transientCap() {
   return cap;
 }
 
+// A commit had to drop its records (no room above the free-space floor, or a
+// write that failed): until this time, records are served and not queued for
+// a commit (the transient budget bounds them), and nothing waits for commits
+// that cannot keep what they are given. Then commits are tried again.
+std::atomic<uint64_t> g_commitsRefusedUntilUs{0};
+constexpr uint64_t kCommitsRefusedUs = 30'000'000;
+bool commitsRefused() {
+  return nowUs() < g_commitsRefusedUntilUs.load(std::memory_order_relaxed);
+}
+
 // The records waiting are past their cap: `again` (the request served again from the start) is
 // parked until the commits bring them under it, and every file's waiting records are sent to be
 // committed now (a file's own commit otherwise starts only once it holds kCommitBytes, and with
 // every request parked none would). False: under the cap, go on.
 bool parkForCommits(std::function<void()> again) {
-  if (g_pendingTotal.load(std::memory_order_relaxed) <= pendingCap())
+  if (g_pendingTotal.load(std::memory_order_relaxed) <= pendingCap() || commitsRefused())
     return false;
   auto fired = std::make_shared<std::atomic<bool>>(false);
   std::function<void()> once = [fired, again = std::move(again)] {
@@ -2730,12 +2740,12 @@ void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool kee
         heldList.emplace_back(i, s.token, s.stagedUs);
         *group = s.token;
       } else {
-        // Committed, unless the store is gone: then it is served to the
-        // requests that asked for it (they hold it) and kept only while the
-        // transient budget allows. The records waiting are held to their cap
-        // before conversion, by the requests that wait (parkForCommits): what
-        // is converted is kept.
-        const bool persist = !storeGone.load(std::memory_order_relaxed);
+        // Committed, unless the store is gone or commits are refused for now
+        // (commitsRefused): then it is served to the requests that asked for
+        // it (they hold it) and kept only while the transient budget allows.
+        // The records waiting are held to their cap before conversion, by the
+        // requests that wait (parkForCommits): what is converted is kept.
+        const bool persist = !storeGone.load(std::memory_order_relaxed) && !commitsRefused();
         keep = placeLocked(i, s, rec, b, inCache, persist, lost, kick);
       }
     }
@@ -2801,11 +2811,11 @@ bool ColdFill::placeLocked(uint32_t i, Info& s, const Rec& rec, uint64_t b, bool
 void ColdFill::appendGroupLocked(std::vector<std::pair<uint32_t, uint64_t>>& group,
                                  uint64_t& lost, bool& kick) {
   std::sort(group.begin(), group.end());
-  // The whole group goes one way: committed, unless the store is gone (then
-  // served and transient). The records waiting may pass their cap by the
-  // requests already converting when it was reached: new ones wait for the
-  // commits (parkForCommits).
-  const bool persist = !storeGone.load(std::memory_order_relaxed);
+  // The whole group goes one way: committed, unless the store is gone or
+  // commits are refused for now (then served and transient). The records
+  // waiting may pass their cap by the requests already converting when it was
+  // reached: new ones wait for the commits (parkForCommits).
+  const bool persist = !storeGone.load(std::memory_order_relaxed) && !commitsRefused();
   for (const auto& [i, token] : group) {
     auto it = info.find(i);
     if (it == info.end())
@@ -3001,6 +3011,7 @@ void ColdFill::queueCommit() {
 }
 
 void ColdFill::dropRecords(const std::vector<SlotRecord>& recs, const std::string& why) {
+  g_commitsRefusedUntilUs.store(nowUs() + kCommitsRefusedUs, std::memory_order_relaxed);
   static std::atomic<bool> warned{false};
   if (!warned.exchange(true))
     UCACHE_WARN("slot records for %s not kept (%s); they are converted again when read "
