@@ -60,6 +60,8 @@ TEST(Stats, JsonBodyHasAllCounters) {
   s.readvCalls = 9;
   s.copierHandles = 2;
   s.coldReplicaSkipped = 4;
+  s.coldReplicaWaits = 9;
+  s.coldReplicaWaitUs = 10;
   s.slotMapsMade = 5;
   s.slotMapOpens = 6;
   s.reqReadBytes.add(4096);
@@ -84,6 +86,8 @@ TEST(Stats, JsonBodyHasAllCounters) {
   EXPECT_NE(j.find("\"disabled_handles\":0"), std::string::npos);
   EXPECT_NE(j.find("\"copier_handles\":2"), std::string::npos);
   EXPECT_NE(j.find("\"cold_replica_skipped\":4"), std::string::npos);
+  EXPECT_NE(j.find("\"cold_replica_waits\":9"), std::string::npos);
+  EXPECT_NE(j.find("\"cold_replica_wait_us\":10"), std::string::npos);
   EXPECT_NE(j.find("\"cold_replica_declined\":0"), std::string::npos); // its own counter
   EXPECT_NE(j.find("\"slot_maps_made\":5"), std::string::npos);
   EXPECT_NE(j.find("\"slot_map_opens\":6"), std::string::npos);

@@ -26,7 +26,7 @@ redirector's role, or whose URL has a host pattern in `tried=` (USER_GUIDE.md,
 | What is the cache disk being asked to do? | `hit_disk_reads`, `hit_disk_bytes`, `replica_reads`, `replica_read_bytes`, `hist_*_read_bytes` |
 | Is the cache disk keeping up? | `buffer_stalls`, `buffer_stall_us`, `hist_hit_read_us`, `hist_flush_write_us` |
 | Did the replica tier get used? | `replica_bytes_served`, `cold_replica_files` |
-| Were replicas created as files were read? | `cold_replica_files`, `cold_replica_in_bytes`, `cold_replica_baskets_kept`, `cold_replica_declined`, `cold_replica_skipped` |
+| Were replicas created as files were read? | `cold_replica_files`, `cold_replica_in_bytes`, `cold_replica_baskets_kept`, `cold_replica_declined`, `cold_replica_skipped`, `cold_replica_waits` |
 | Were later passes shown the converted baskets at their real size? | `slot_maps_made`, `slot_map_opens`, `slot_map_full` |
 
 ## Where the numbers are written
@@ -72,7 +72,8 @@ the consumers together.
  "replica_bytes_served": 0,
  "cold_replica_files": 0, "cold_replica_in_bytes": 0, "cold_replica_out_bytes": 0,
  "cold_replica_baskets": 0, "cold_replica_baskets_kept": 0, "cold_replica_convert_us": 0,
- "cold_replica_declined": 0, "cold_replica_skipped": 0, "cold_origin_failures": 0,
+ "cold_replica_declined": 0, "cold_replica_skipped": 0, "cold_replica_waits": 0,
+ "cold_replica_wait_us": 0, "cold_origin_failures": 0,
  "slot_maps_made": 0, "slot_map_opens": 0, "slot_map_full": 0,
  "slot_crc_failures": 0, "slot_read_fallbacks": 0, "slot_pages_decoded": 0,
  "kept_reads": 0, "kept_read_bytes": 0,
@@ -457,9 +458,16 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   it; it is CPU a pass spends that a pass without recompression does not.
 - `cold_replica_declined` — converted records not kept: they still did not fit
   above the free-space floor after an eviction pass, writing them failed (the
-  log says which), the store was removed meanwhile, or the process already held
-  its limit of records waiting to be written. They were served to the job that
-  read them; a later read converts them again.
+  log says which), or the store was removed meanwhile. They were served to the
+  job that read them; a later read converts them again. (Records waiting to be
+  written are not a reason: past their limit, the reads that would convert more
+  wait for the writes.)
+- `cold_replica_waits`, `cold_replica_wait_us` — first-pass requests that waited
+  for the cache's writes before converting more (the records converted and not
+  yet written had reached their limit, 512 MiB per process), and the time they
+  waited, summed. Each waits at most a minute. Nonzero means the cache disk, or
+  the kernel's limit on unwritten data (`vm.dirty_bytes`), set the first pass's
+  pace; the records were kept.
 - `cold_origin_failures` — origin reads sent on the first pass that failed. The
   request is served again from the start, twice at most, so a read the origin
   fails once or twice is answered; a third failure in a row reaches the reader,

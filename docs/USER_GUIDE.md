@@ -1688,7 +1688,12 @@ would anyway, converts each basket or page to ZSTD-1 as it arrives, and keeps
 the converted records in the file's replica as it goes; the next run reads
 them. Nothing extra is fetched and no command is needed. That first pass costs
 CPU — everything it reads is converted — so on a machine short of cores it can
-be slower than a pass with recompression off.
+be slower than a pass with recompression off. It also goes no faster than the
+converted records can be written to the cache disk: when writing falls behind
+(a slow disk, or a system that limits how much unwritten data the kernel may
+hold, `vm.dirty_bytes`), the reads that would convert more wait for it, for at
+most a minute each, so that everything converted is kept and the next pass
+reads it from the replica.
 
 **It also costs memory, on every pass that reads such a file.** ROOT sizes its
 read buffers from the layout described below and does not shrink them to fit

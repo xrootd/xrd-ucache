@@ -194,6 +194,8 @@ struct Stats {
   std::atomic<uint64_t> coldReplicaConvertUs{0};        // time spent converting, summed over threads
   std::atomic<uint64_t> coldReplicaDeclined{0};  // replicas not published (no room, or failed)
   std::atomic<uint64_t> coldReplicaSkipped{0};   // files whose own content declined the first pass
+  std::atomic<uint64_t> coldReplicaWaits{0};     // first-pass requests that waited for the cache's writes
+  std::atomic<uint64_t> coldReplicaWaitUs{0};    // ... and how long, summed
   std::atomic<uint64_t> coldOriginFailures{0};   // first-pass origin reads that failed (each asked again)
   std::atomic<uint64_t> slotMapsMade{0};      // mixed maps this process made
   std::atomic<uint64_t> slotMapOpens{0};      // handles given a mixed map at open
@@ -338,7 +340,7 @@ struct StatsTotals {
            coldReplicaBaskets = 0, coldReplicaBasketsKept = 0, coldReplicaConvertUs = 0,
            originChecksPassed = 0, originChecksFailed = 0, originChecksNone = 0,
            originChecksUnjudged = 0, originChecksSkipped = 0, originChecksNotExamined = 0,
-           coldReplicaDeclined = 0, coldReplicaSkipped = 0,
+           coldReplicaDeclined = 0, coldReplicaSkipped = 0, coldReplicaWaits = 0, coldReplicaWaitUs = 0,
            slotMapsMade = 0, slotMapOpens = 0, slotMapFull = 0, replicaReadBytes = 0,
            relayBytes = 0, readvChunks = 0, readvCalls = 0, readvMixed = 0, flushRuns = 0,
            flushRunBytes = 0, bufferStalls = 0, bufferStallUs = 0;

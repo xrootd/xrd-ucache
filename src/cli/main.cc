@@ -478,6 +478,11 @@ void printStats(const StatsTotals& t) {
                 human(t.coldReplicaOutBytes).c_str(), (unsigned long long)t.coldReplicaBaskets,
                 (unsigned long long)t.coldReplicaBasketsKept, static_cast<double>(t.coldReplicaConvertUs) / 1e6,
                 (unsigned long long)t.coldReplicaDeclined);
+  if (t.coldReplicaWaits) // the first pass went at the pace of the cache's writes
+    std::printf("  waited for writes  %llu request%s, %.1f s in all (converted records waited to be "
+                "written to the cache disk)\n",
+                (unsigned long long)t.coldReplicaWaits, t.coldReplicaWaits == 1 ? "" : "s",
+                static_cast<double>(t.coldReplicaWaitUs) / 1e6);
   if (t.slotMapsMade || t.slotMapOpens || t.slotMapFull)
     std::printf("  mixed maps         %llu made, %llu open%s shown one%s\n",
                 (unsigned long long)t.slotMapsMade, (unsigned long long)t.slotMapOpens,

@@ -134,6 +134,17 @@ void commitHoldOnce() {
   std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
 }
 
+// UCACHE_TEST_COMMIT_DELAY_MS=N (inert unless set): every slot-store commit waits N ms before its
+// write, as a cache disk slower than the conversion (or a kernel that throttles the cache's
+// writes), so a gate can show that the first pass then waits for its commits and drops nothing.
+void commitDelay() {
+  static const long delayMs = [] {
+    const char* v = std::getenv("UCACHE_TEST_COMMIT_DELAY_MS");
+    return v ? std::strtol(v, nullptr, 10) : 0L;
+  }();
+  if (delayMs > 0)
+    std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+}
 
 // The store's kind for a converted basket, and back.
 uint8_t entryKind(uint8_t basketKind) {
@@ -230,9 +241,8 @@ class ColdFill : public tp::StoreMaps, public std::enable_shared_from_this<ColdF
   // Slots held for requests (slot, token, staged at), oldest first; entries no
   // longer held are dropped when met.
   std::deque<std::tuple<uint32_t, uint64_t, uint64_t>> heldList;
-  // Records served but not to be committed (the store is gone, or the
-  // process's pending cap is reached): kept for the requests that need them,
-  // oldest dropped first past kTransientBytes.
+  // Records served but not to be committed (the store is gone): kept for the
+  // requests that need them, oldest dropped first past transientFileCap().
   std::deque<uint32_t> transient;
   uint64_t transientBytes = 0;
   // Original ranges of relocated baskets, merged and sorted: bytes the reader
@@ -430,8 +440,7 @@ class ColdFill : public tp::StoreMaps, public std::enable_shared_from_this<ColdF
 
  private:
   // Send a staged record to `pending`, or -- when not allowed (the store is
-  // gone, or the process holds its cap of records waiting) -- to the transient
-  // budget. False when it is not kept at all.
+  // gone) -- to the transient budget. False when it is not kept at all.
   bool placeLocked(uint32_t i, Info& s, const Rec& rec, uint64_t b, bool inCache, bool persist,
                    uint64_t& lost, bool& kick);
   void appendGroupLocked(std::vector<std::pair<uint32_t, uint64_t>>& group, uint64_t& lost,
@@ -848,6 +857,12 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
 
 struct ColdRequest;
 void serveRequest(const std::shared_ptr<ColdRequest>& req);
+// Whether a request that would convert more must wait for the commits (defined with the cap of
+// records waiting, below); `again` serves it again then.
+bool parkForCommits(std::function<void()> again);
+// How long a request waits for the commits at most: commits that make no progress (a store locked
+// by another process that does not let go) must not hold reads up for ever.
+constexpr uint64_t kParkMaxUs = 60'000'000;
 
 struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   std::shared_ptr<HandleState> st;
@@ -933,6 +948,7 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   // thread parsed; a request made during another handle's parse waits for it, serveRequest).
   std::shared_ptr<const KeyMap> checkMap;
   bool mapWaited = false; // served again after waiting for another handle's parse: waits no more
+  uint64_t parkedSinceUs = 0; // first parked for the commits (parkForCommits); 0: never
   std::mutex emu;
   XRootDStatus err;
 
@@ -2288,6 +2304,41 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
                               }),
                need.end());
   }
+  // Back-pressure: while the records this process converted wait past their cap for the commits
+  // to write them (a cache disk, or a kernel's limit on dirty pages, slower than the conversion),
+  // a request that would convert more waits for them, before it claims anything, and is served
+  // again from the start: the first pass goes at the pace its records are written, and none is
+  // dropped (each would be fetched again by the next pass). Nothing is converted for a file read
+  // directly, or kept once its store is gone: those do not wait.
+  if (!need.empty() && !cf.direct() && !cf.storeGone.load(std::memory_order_relaxed)) {
+    const uint64_t now = nowUs();
+    const uint64_t since = req->parkedSinceUs ? req->parkedSinceUs : now;
+    const bool first = !req->parkedSinceUs;
+    if (now - since < kParkMaxUs && parkForCommits([req, since] {
+          auto r2 = std::make_shared<ColdRequest>();
+          r2->st = req->st;
+          r2->entry = req->entry;
+          r2->cf = req->cf;
+          r2->chunks = req->chunks;
+          r2->isVRead = req->isVRead;
+          r2->user = req->user;
+          r2->attempt = req->attempt;
+          r2->mayPark = req->mayPark;
+          r2->t0 = req->t0;
+          r2->readerT = req->readerT;
+          r2->retryS = req->retryS;
+          r2->mapWaited = req->mapWaited;
+          r2->parkedSinceUs = since;
+          serveRequest(r2);
+        })) {
+      if (first && req->st->store)
+        req->st->store->stats().coldReplicaWaits.fetch_add(1, std::memory_order_relaxed);
+      return; // served again by the lambda, on the executor (this request is dropped unanswered)
+    }
+  }
+  if (req->parkedSinceUs && req->st->store) // it waited, and goes on now
+    req->st->store->stats().coldReplicaWaitUs.fetch_add(nowUs() - req->parkedSinceUs,
+                                                        std::memory_order_relaxed);
   if (!need.empty() || !req->origPieces.empty()) // fetched, or waited for
     noteWaitTier(req->user, ReaderWait::kOrigin);
   // max_read_fraction is decided at the first request that needs the origin,
@@ -2479,32 +2530,106 @@ namespace {
 
 // Commits run here: they take the store's exclusive lock, which may wait for
 // another process's commit, and nothing that serves reads may wait on that.
-// Leaked like the other pools.
+// One file's commits run one at a time; several files' at once, on up to 8
+// threads: under a kernel that throttles each writer (a small limit on dirty
+// pages), more writers write more. Leaked like the other pools.
 Executor& commitPool() {
-  static Executor* pool = new Executor(2, "uc-commit", "uc-commit-timer");
+  static Executor* pool =
+      new Executor(std::clamp(usableCpus() / 4, 2u, 8u), "uc-commit", "uc-commit-timer");
   return *pool;
 }
 
 // Maps are made on a pool of their own: making one (an RNTuple file's page
 // list and footer are parsed and rebuilt) must never hold up commits, or the
-// records waiting pass their cap and conversions are served without being
-// kept -- read from the origin again by the next pass.
+// records waiting pass their cap and the first pass waits for them.
 Executor& mapPool() {
   static Executor* pool = new Executor(2, "uc-map", "uc-map-timer");
   return *pool;
 }
 
-// Records converted in this process and not yet committed, all files. Past
-// the cap the thread that converts commits itself -- back-pressure instead of
-// memory growth.
+// UCACHE_TEST_PENDING_CAP_KB=N (inert unless set): the caps below are N KiB, so a gate can reach
+// them with a small file.
+uint64_t testCapOr(uint64_t bytes) {
+  static const long long kb = [] {
+    const char* v = std::getenv("UCACHE_TEST_PENDING_CAP_KB");
+    return v ? std::atoll(v) : 0LL;
+  }();
+  return kb > 0 ? static_cast<uint64_t>(kb) << 10 : bytes;
+}
+
+// Records converted in this process and not yet collected by a commit, all
+// files. Past the cap a request that would convert more waits for the commits
+// (parkForCommits): back-pressure, so that memory does not grow and nothing
+// converted is dropped.
 std::atomic<uint64_t> g_pendingTotal{0};
-constexpr uint64_t kPendingCap = 512ull << 20;
+uint64_t pendingCap() {
+  static const uint64_t cap = testCapOr(512ull << 20);
+  return cap;
+}
+
+// Requests parked for the commits: served again when a commit brings the
+// records waiting under the cap (wakeParked), or at the latest after
+// kParkRecheckMs, when they look again. Leaked like the pools.
+std::mutex g_parkMu;
+std::vector<std::function<void()>>& parked() {
+  static auto* v = new std::vector<std::function<void()>>();
+  return *v;
+}
+constexpr uint64_t kParkRecheckMs = 200;
+
+void wakeParked() {
+  if (g_pendingTotal.load(std::memory_order_relaxed) > pendingCap())
+    return;
+  std::vector<std::function<void()>> go;
+  {
+    std::lock_guard<std::mutex> g(g_parkMu);
+    go.swap(parked());
+  }
+  for (auto& f : go)
+    Executor::instance().post(std::move(f));
+}
 // Records served but not committed (see ColdFill::transient): a cache for a
 // reader that reads a slot again, nothing more -- every request holds the
 // records it needs itself. Per file, and for the whole process.
-constexpr uint64_t kTransientBytes = 16ull << 20;
+uint64_t transientFileCap() {
+  static const uint64_t cap = testCapOr(16ull << 20);
+  return cap;
+}
 std::atomic<uint64_t> g_transientTotal{0};
-constexpr uint64_t kTransientCap = 256ull << 20;
+uint64_t transientCap() {
+  static const uint64_t cap = testCapOr(256ull << 20);
+  return cap;
+}
+
+// The records waiting are past their cap: `again` (the request served again from the start) is
+// parked until the commits bring them under it, and every file's waiting records are sent to be
+// committed now (a file's own commit otherwise starts only once it holds kCommitBytes, and with
+// every request parked none would). False: under the cap, go on.
+bool parkForCommits(std::function<void()> again) {
+  if (g_pendingTotal.load(std::memory_order_relaxed) <= pendingCap())
+    return false;
+  auto fired = std::make_shared<std::atomic<bool>>(false);
+  std::function<void()> once = [fired, again = std::move(again)] {
+    if (!fired->exchange(true))
+      again();
+  };
+  {
+    std::lock_guard<std::mutex> g(g_parkMu);
+    parked().push_back(once);
+  }
+  std::vector<std::shared_ptr<ColdFill>> all;
+  {
+    std::lock_guard<std::mutex> g(g_regMu);
+    for (const auto& [k, cf] : registry())
+      all.push_back(cf);
+  }
+  for (const auto& cf : all)
+    cf->queueCommit();
+  wakeParked(); // the commits may have caught up between the look above and the parking
+  // A wakeup lost all the same must not hang the read: it looks again (and parks again).
+  Executor::instance().postAfter(kParkRecheckMs, once, /*housekeeping=*/true);
+  return true;
+}
 
 // The file's first 128 KiB is never punched: ROOT reads it as one block, and
 // a hole there sends every open to the origin.
@@ -2605,13 +2730,12 @@ void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool kee
         heldList.emplace_back(i, s.token, s.stagedUs);
         *group = s.token;
       } else {
-        // Committed, unless the store is gone or the process already holds its
-        // cap of records waiting: then it is served to the requests that asked
-        // for it (they hold it) and kept only while the transient budget
-        // allows -- memory never grows to cope, and nothing that serves reads
-        // waits for a commit.
-        const bool persist = !storeGone.load(std::memory_order_relaxed) &&
-                             g_pendingTotal.load(std::memory_order_relaxed) + b <= kPendingCap;
+        // Committed, unless the store is gone: then it is served to the
+        // requests that asked for it (they hold it) and kept only while the
+        // transient budget allows. The records waiting are held to their cap
+        // before conversion, by the requests that wait (parkForCommits): what
+        // is converted is kept.
+        const bool persist = !storeGone.load(std::memory_order_relaxed);
         keep = placeLocked(i, s, rec, b, inCache, persist, lost, kick);
       }
     }
@@ -2646,8 +2770,8 @@ bool ColdFill::placeLocked(uint32_t i, Info& s, const Rec& rec, uint64_t b, bool
   if (inCache)
     return true; // served from the byte cache: committed the next time it is staged with room
   // Oldest first, never this record, until both budgets fit.
-  while ((transientBytes + b > kTransientBytes ||
-          g_transientTotal.load(std::memory_order_relaxed) + b > kTransientCap) &&
+  while ((transientBytes + b > transientFileCap() ||
+          g_transientTotal.load(std::memory_order_relaxed) + b > transientCap()) &&
          !transient.empty()) {
     const uint32_t j = transient.front();
     transient.pop_front();
@@ -2659,8 +2783,8 @@ bool ColdFill::placeLocked(uint32_t i, Info& s, const Rec& rec, uint64_t b, bool
       ++lost;
     }
   }
-  const bool keep = transientBytes + b <= kTransientBytes &&
-                    g_transientTotal.load(std::memory_order_relaxed) + b <= kTransientCap;
+  const bool keep = transientBytes + b <= transientFileCap() &&
+                    g_transientTotal.load(std::memory_order_relaxed) + b <= transientCap();
   if (!keep) {
     ++lost;
     return false;
@@ -2677,10 +2801,11 @@ bool ColdFill::placeLocked(uint32_t i, Info& s, const Rec& rec, uint64_t b, bool
 void ColdFill::appendGroupLocked(std::vector<std::pair<uint32_t, uint64_t>>& group,
                                  uint64_t& lost, bool& kick) {
   std::sort(group.begin(), group.end());
-  // The whole group goes one way: committed if the process is under its cap of
-  // records waiting (it may pass it by one group), else served and transient.
-  const bool persist = !storeGone.load(std::memory_order_relaxed) &&
-                       g_pendingTotal.load(std::memory_order_relaxed) <= kPendingCap;
+  // The whole group goes one way: committed, unless the store is gone (then
+  // served and transient). The records waiting may pass their cap by the
+  // requests already converting when it was reached: new ones wait for the
+  // commits (parkForCommits).
+  const bool persist = !storeGone.load(std::memory_order_relaxed);
   for (const auto& [i, token] : group) {
     auto it = info.find(i);
     if (it == info.end())
@@ -2970,6 +3095,7 @@ void ColdFill::commit() try {
       transient.clear();
     }
   }
+  wakeParked(); // the records collected no longer count against the cap
   if (recs.empty())
     return;
   if (!store || storeGone.load()) {
@@ -2994,6 +3120,7 @@ void ColdFill::commit() try {
       return;
     }
   }
+  commitDelay(); // test hook: a cache disk slower than the conversion
   std::vector<SlotEntry> committed;
   int64_t n = -EIO; // test hook: the commit's write refused
   if (!commitFaultFire())
