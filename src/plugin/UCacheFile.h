@@ -119,6 +119,8 @@ struct HandleState {
   bool cpuBlended = false;
   std::shared_ptr<CacheStore> store; // process-wide; null => never cache
   std::string url;
+  // The file is a local file (root://local, UrlKey.h isLocalFileUrl): set at Open, with `url`.
+  bool localFile = false;
   // The host patterns of the reader's tried= (UrlKey.h splitTriedPatterns), set at Open, with
   // `url`, for a handle the cache serves whose URL holds any; null otherwise. Where the switch's
   // behaviour is the file's (fed()), they are applied by uCache: no URL that carries them
@@ -409,6 +411,11 @@ struct HandleState {
   // holds positions in this one. A refusal latches for the handle and drops
   // the entry's trust, so the next open checks the origin again.
   std::atomic<uint64_t> expectedOriginSize{0};
+  // With it, for a local file (root://local) checked on its modification time
+  // (Config::validateFor), the time the entry holds, 0 otherwise: a source of another time is
+  // refused in the same way (a forked child's open afresh of a file rewritten in place at its
+  // size).
+  std::atomic<uint64_t> expectedOriginMtime{0};
   // With failover on, the size the reader's open was answered with, by the copy that
   // open took (0: none, or not known): the size its reader was shown, which a move of its reads
   // must find again (sizeShownLocked).
@@ -615,6 +622,27 @@ std::string answeredBy(HandleState& st, const XrdCl::HostList* hosts) noexcept;
 // this is the server the read goes to unless the client redirects or recovers
 // it.
 std::string issueServer(HandleState& st, XrdCl::File* f) noexcept;
+// One read of `st`'s origin file on `f`, answered to `rh` as XrdCl::File::Read
+// answers (`pages`: as XrdCl::File::PgRead does, page checksums included). A
+// local file's is sent as a vector read of one chunk: the client reads a local
+// file with POSIX AIO, whose helper threads stay for a second after a read, and
+// a child forked in that second inherits them as present -- its read is queued
+// to a thread that does not exist and is never answered. The client's vector
+// read of a local file is a plain pread.
+XrdCl::XRootDStatus readInner(const HandleState& st, XrdCl::File* f, uint64_t off, uint32_t len,
+                              void* buf, XrdCl::ResponseHandler* rh, ucache::XrdTimeout t,
+                              bool pages = false);
+// The same, waited for; `got` is the length read.
+XrdCl::XRootDStatus readInnerSync(const HandleState& st, XrdCl::File* f, uint64_t off, uint32_t len,
+                                  void* buf, uint32_t& got, ucache::XrdTimeout t);
+// A vector read relayed to `st`'s origin file on `f`, answered to `rh` as
+// XrdCl::File::VectorRead answers. A local file's answer that holds fewer bytes
+// than asked (a chunk past the end of a file truncated while it is read, which
+// the client's local-file access answers short and OK) is an error, as a
+// server's is: a reader such as ROOT checks only the status of a vector read.
+XrdCl::XRootDStatus vectorReadInner(const HandleState& st, XrdCl::File* f,
+                                    const XrdCl::ChunkList& chunks, void* buf,
+                                    XrdCl::ResponseHandler* rh, ucache::XrdTimeout t);
 // A trace record's members for one origin request: its server ("ds",
 // host:port), when it was issued ("t0", steady clock µs) and the requests in
 // flight to the server it was sent to then, itself included ("nc"). "" if

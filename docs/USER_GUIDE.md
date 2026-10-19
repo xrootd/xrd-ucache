@@ -787,7 +787,7 @@ overriding your defaults. Common keys:
 | `max_bytes = 50g`   | `UCACHE_MAX_BYTES`      | hard cache-size cap; unset ⇒ no cap (use the disk, evict at the floor) |
 | `min_free_bytes = …`| `UCACHE_MIN_FREE_BYTES` | keep this much disk free (the default limit) |
 | `in_use_seconds = 86400` | `UCACHE_IN_USE_S` | how long after a reader last used a file it stays in use: not evicted (read, or its maps handed out, this recently), and a replaced map keeps its place for readers that still hold it (default 1 day; 0 = plain LRU, and a replaced map stays valid only while an open handle holds it). Replaces `evict_protect_seconds` and `map_expiry_seconds` |
-| `validate = size`   | `UCACHE_VALIDATE`       | `none` / `size` / `size+mtime` / `cksum`. **Caveat:** the plugin has no origin-checksum source yet, so `cksum` currently degrades to size-only (weaker than `size+mtime`) — prefer `size+mtime` until a checksum query lands. A local file (`root://local`) is always checked on `size+mtime`, unless this is `none` |
+| `validate = size`   | `UCACHE_VALIDATE`       | `none` / `size` / `size+mtime` / `cksum`. **Caveat:** the plugin has no origin-checksum source yet, so `cksum` currently degrades to size-only (weaker than `size+mtime`) — prefer `size+mtime` until a checksum query lands. A local file (`root://local`) not keyed by a logical name is checked on `size+mtime`, unless this is `none` |
 | `revalidate_seconds = 604800` | `UCACHE_REVALIDATE_S` | freshness window (TTL): an entry validated against the origin within this many seconds is served with **no remote contact at all**. Default 7 days — right for write-once physics data. `0` = re-check on every open; `ucache rm <url>` forces a re-check anytime. A local file (`root://local`) is re-checked on every open whatever this says |
 | `open_retries = 0`  | `UCACHE_OPEN_RETRIES`   | retry a transient open failure this many times (0 = off); backoff via `open_retry_base_ms`/`open_retry_max_ms`. With failover on, an open through a redirector that passed its deadline at a server, or whose connection to the server timed out, was lost or could not be made, is not retried at the same URL: it goes to another site (below) |
 | `recompress = off`  | `UCACHE_RECOMPRESS`     | `on` = the files your jobs read get fast-to-decode replicas **automatically**, created on their first pass (default off — opt-in CPU/disk). Flip it with `ucache set recompress on`. The conversion runs on one thread per CPU the process may use, and each thread that converts reserves 64 MiB of address space for its allocations: under a limit on the job's address space (`ulimit -v`) a reader on a machine with many CPUs can reach it (TROUBLESHOOTING.md) |
@@ -1390,41 +1390,65 @@ python3 -c 'import uproot; uproot.open("root://local//mnt/cephfs/data/file.root"
 
 The plugin reads `/mnt/cephfs/data/file.root` itself, through the XRootD
 client's own access to local files: nothing is sent to any server, and no
-server named `local` exists or is needed. Think of it as the operating
+server named `local` is needed or contacted. Think of it as the operating
 system's page cache made complete: the bytes your jobs read are kept on the
 cache disk, outlive the process and a reboot, are not limited by memory, and
 are evicted by uCache's own rules (`max_bytes`, `min_free_bytes`,
 `in_use_seconds`, `ucache pin`) rather than by memory pressure. Every open
 opens the file (with your permissions) and compares the cached entry with it
-as it is now, by its size and modification time (to the second) — whatever
-`validate` and `revalidate_seconds` say, unless `validate = none` — so a file
-rewritten in place is read afresh by every new open, also in a job that still
-has it open.
+as it is now, whatever `revalidate_seconds` says: by its size and
+modification time (to the second), or by its size alone with
+`validate = none` or when the file is keyed by a logical name (below). So a
+file rewritten in place is read afresh by every new open, also in a job that
+still has it open. As without uCache, a file must not change while a job reads
+it: a handle open across the change can read bytes from before it and from
+after it. A vector read past the new end of a file truncated under it fails,
+where the file system would answer it short (ROOT checks only that a vector
+read succeeded). Only the `root://local` name
+goes through uCache: a program that opens the plain path (`/mnt/...`) reads
+around it.
 
 - The host is `local`, never `localhost`: `root://localhost` is the address
   of a real server on your machine, and a job run without uCache must not
   find that a URL means something else. Without uCache, `root://local` fails
   at once wherever no machine is named `local`, rather than reaching some
-  other server.
+  other server. So a job that names `root://local` needs uCache loaded
+  wherever it runs: where it is not, the open fails (a server's URL would be
+  read uncached). With the plugin loaded but disabled (`UCACHE_DISABLE=1`, or
+  no `dir`) the file is still read, uncached.
 - The shipped conf binds every host (`url = *`), `local` included. A conf
   that lists its hosts needs `local` in the list
   (`url = eospublic.cern.ch:1094;local`); that binds `root://local` on the
   default port, and `url = *` binds every scheme and port.
 - `root://local//abs/path` and `root://local/abs/path` name the same file, and
-  `..` and repeated slashes are resolved in the URL, as for any URL; give the
-  path a program would open. With `logical_name_prefixes`, a local file is
-  keyed as any URL is: `root://local//eos/cms/store/mc/...` and
-  `root://eoscms.cern.ch//eos/cms/store/mc/...` are one entry, checked as every
-  file keyed by name is (§Keys by logical name).
-- A stat or a directory listing on the host (`xrdfs root://local ls /dir`, a
-  wildcard in a `TChain`, uproot's own size and listing calls) is answered from
-  the file system too. A recursive listing is not supported.
+  repeated slashes and `..` are resolved in the text of the URL, as for any
+  URL, not by the file system: after a symbolic link, `..` can name another
+  file than a program would open, so give a path without `..`. A directory, a
+  pipe or a device is refused at its open.
+- With `logical_name_prefixes`, a local file is keyed as any URL is:
+  `root://local//eos/cms/store/mc/...` and
+  `root://eoscms.cern.ch//eos/cms/store/mc/...` are one entry, checked on its
+  size alone as every file keyed by name is ("Freshness" under "Keys by logical
+  name" above): a rewrite in place at the same size is not noticed
+  (`ucache rm` the file after one). Without logical names the two are two
+  URLs and two entries: a file read both ways is cached twice. When the
+  prefixes are turned off again, a local URL whose entry another URL filled
+  with another modification time (an EOS mount and EOS's servers report one
+  file's time about 2 s apart) is read under its own URL while they stay off,
+  and is one entry with the others again once they are set.
+- Failover never applies to a local file (there is one copy): no server is
+  asked anything, and `tried=` in its URL is ignored.
+- A stat, a directory listing and a locate on the host (`xrdfs root://local
+  ls /dir`, a wildcard in a `TChain`, uproot's own size and listing calls) are
+  answered from the file system too; a recursive listing is not supported, and
+  every other request on the host (`xrdfs ... rm`, `mkdir`, `query checksum`)
+  is refused. So `xrdcp --cksum` gets no checksum for a `root://local` source:
+  check a copy against the plain path (`xrdadler32 /abs/path`).
 - Everything else is as for any file: copies (`xrdcp`, `hadd`, `rootcp`) read
-  the file directly and do not fill the cache (§Copies are the origin's bytes),
-  a job that reads most of a file reads it directly (`max_read_fraction`), and
-  `ucache ls`, `ucache rm` and `ucache pin` take the URL as written. A write
-  open writes the file itself, with nothing cached. `xrdcp --cksum` cannot ask
-  for a local file's checksum.
+  the file directly and do not fill the cache ("Copies are the origin's bytes"
+  below), a job that reads most of a file reads it directly
+  (`max_read_fraction`), and `ucache ls`, `ucache rm` and `ucache pin` take the
+  URL as written. A write open writes the file itself, with nothing cached.
 - uCache is a per-user cache: keep the cache directory your own. The bytes it
   holds are readable by whoever can read that directory, whatever the
   permissions of the files they came from.

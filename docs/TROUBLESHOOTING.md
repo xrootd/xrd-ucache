@@ -163,7 +163,9 @@ Expected inside the freshness window (default 7 days, `revalidate_seconds`):
 a validated entry is served without contacting the origin, so a file
 *replaced under the same name* keeps serving the cached version until the
 window expires. Physics data is normally write-once, which is why the default
-trusts the cache. When you know a file changed:
+trusts the cache. A local file (`root://local`) is not trusted so: it is
+checked at every open, on its size and modification time to the second (on its
+size alone when it is keyed by a logical name). When you know a file changed:
 
 - `ucache rm <url>` — drop that entry; the next open re-fetches. With
   `logical_name_prefixes` set and a path with a logical name, the entry is the

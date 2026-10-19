@@ -288,6 +288,12 @@ std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSi
           // the same size.
           const bool otherTime = cfg_.validateFor(key) == ValidateMode::kSizeMtime &&
                                  live->originMtime() != originMtime;
+          // Reached through a name (an alias of another key's entry), a source of the entry's size
+          // and another time is refused as FileEntry::open refuses an aliased entry that does not
+          // validate: the caller resolves the name again and reads under the URL's own key. Not a
+          // disagreement: the entry was filled from another URL's copy, whose time it holds.
+          if (key.entryGen && otherTime && live->fileSize() == originSize)
+            return nullptr;
           if (live->fileSize() != originSize || otherTime) {
             stats_.sizeDisagreements.fetch_add(1, std::memory_order_relaxed);
             if (live->fileSize() != originSize)
@@ -371,6 +377,21 @@ std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSi
           if (live->dropped()) { // dropped since (drops_ moved, above): cannot be
             entry->abandon();
             continue;
+          }
+          // As in the first lookup: an entry another source of another copy registered meanwhile
+          // (another size, or another time where the time is checked) is never handed to this one.
+          const bool otherTime = cfg_.validateFor(key) == ValidateMode::kSizeMtime &&
+                                 live->originMtime() != originMtime;
+          if (key.entryGen && otherTime && live->fileSize() == originSize) {
+            entry->abandon(); // as in the first lookup: the caller resolves the name again
+            return nullptr;
+          }
+          if (live->fileSize() != originSize || otherTime) {
+            entry->abandon(); // never handed out; its files are the live entry's
+            stats_.sizeDisagreements.fetch_add(1, std::memory_order_relaxed);
+            if (declinedSizeDiffers)
+              *declinedSizeDiffers = true;
+            return nullptr;
           }
           live->obs().opens.fetch_add(1, std::memory_order_relaxed);
           return live;

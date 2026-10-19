@@ -314,9 +314,9 @@ struct Config {
   // entry keyed by logical name is checked on its size where validate =
   // size+mtime (a modification time belongs to one site's copy, and would
   // start the entry again at every change of site), and that a local file
-  // (root://local, UrlKey.h) is checked on its size and modification time
-  // unless validate = none: the file is the only copy, and a file rewritten in
-  // place must never be served from the bytes it had before.
+  // (root://local, UrlKey.h) not keyed by a logical name is checked on its size
+  // and modification time unless validate = none: a file rewritten in place
+  // must not be served from the bytes it had before.
   ValidateMode validateFor(const UrlKey& key) const {
     if (key.logical())
       return validate == ValidateMode::kSizeMtime ? ValidateMode::kSize : validate;

@@ -773,6 +773,10 @@ struct Shard {
       uint64_t wire = 0;
       for (const auto& e : elems_)
         wire += e.len;
+      // An answer short of what was asked is no answer (PluginSupport.h vreadComplete).
+      if (s && s->IsOK() && !vreadComplete(r.get(), elems_))
+        s = std::make_unique<XrdCl::XRootDStatus>(XrdCl::stError, XrdCl::errDataError, 0,
+                                                  kShortVectorRead);
       if (!s || !s->IsOK()) {
         if (stats)
           stats->prefetchFetchErrors.fetch_add(1, std::memory_order_relaxed);

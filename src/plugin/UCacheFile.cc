@@ -2651,7 +2651,9 @@ class ReaderOpenHandler : public ResponseHandler {
     noteOriginOpen(a_, status, hostList, nullptr);
     ResponseHandler* real = real_;
     delete this;
-    real->HandleResponseWithHosts(status, response, hostList);
+    // A server's answer always carries its hosts; XrdCl's own access to local files (a root://local
+    // file) sends none when the open fails, and a reader may read the list unconditionally.
+    real->HandleResponseWithHosts(status, response, hostList ? hostList : new HostList());
   }
   void HandleResponse(XRootDStatus* status, AnyObject* response) override {
     ClientCallback inClientCallback; // PluginSupport.h
@@ -2678,6 +2680,28 @@ class ReaderOpenHandler : public ResponseHandler {
   ResponseHandler* real_;
   std::shared_ptr<HandleState> st_;
   OpenAttempt a_;
+};
+
+// A pass-through open of a local file (root://local, UrlKey.h): XrdCl's completion goes to the
+// reader as it is, except that a failed open's missing host list is given as an empty one, as on
+// every completion this plug-in hands a reader (XrdCl's local-file access sends none on a failure).
+class LocalOpenHandler : public ResponseHandler {
+ public:
+  explicit LocalOpenHandler(ResponseHandler* real) : real_(real) {}
+  void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
+                               HostList* hostList) override {
+    ResponseHandler* real = real_;
+    delete this;
+    real->HandleResponseWithHosts(status, response, hostList ? hostList : new HostList());
+  }
+  void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    ResponseHandler* real = real_;
+    delete this;
+    real->HandleResponse(status, response);
+  }
+
+ private:
+  ResponseHandler* real_;
 };
 
 // The cache's own origin open, waited for. The asynchronous open is used
@@ -3348,8 +3372,8 @@ class RetryingOpenHandler : public ResponseHandler {
         --chunks.back().length;
       rs = hr->f->VectorRead(chunks, nullptr, hr, static_cast<ucache::XrdTimeout>(limitS));
     } else if (hr->f)
-      rs = hr->f->Read(hr->readAt, answeredShort ? want - 1 : want, hr->buf.data(), hr,
-                       static_cast<ucache::XrdTimeout>(limitS));
+      rs = readInner(*st_, hr->f, hr->readAt, answeredShort ? want - 1 : want, hr->buf.data(), hr,
+                     static_cast<ucache::XrdTimeout>(limitS));
     if (!rs.IsOK()) // nothing was sent, so no completion will come: the failure is the answer
       hr->HandleResponseWithHosts(new XRootDStatus(rs), nullptr, nullptr);
   }
@@ -3642,6 +3666,121 @@ AnyObject* vreadResponse(const ChunkList& chunks) {
   auto* obj = new AnyObject();
   obj->Set(info);
   return obj;
+}
+
+namespace {
+// A PgRead's answer for `len` bytes read at `off`: the bytes with the crc32c of
+// each 4 KiB page of the file they hold part of, as the wire protocol counts them.
+AnyObject* pageResponse(uint64_t off, uint32_t len, void* buf) {
+  std::vector<uint32_t> cks;
+  const auto* p = static_cast<const uint8_t*>(buf);
+  for (uint64_t pos = off; pos < off + len;) {
+    const uint64_t pageEnd = std::min<uint64_t>((pos / 4096 + 1) * 4096, off + len);
+    cks.push_back(crc32c(p + (pos - off), pageEnd - pos));
+    pos = pageEnd;
+  }
+  auto* obj = new AnyObject();
+  obj->Set(new XrdCl::PageInfo(off, len, buf, std::move(cks)));
+  return obj;
+}
+
+// Answers a vector read of one chunk as the single read it stands for (readInner).
+class OneChunkRead : public ResponseHandler {
+ public:
+  OneChunkRead(ResponseHandler* to, uint64_t off, void* buf, bool pages)
+      : to_(to), off_(off), buf_(buf), pages_(pages) {}
+  void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    ClientCallback inClientCallback; // PluginSupport.h
+    HandleResponseWithHosts(status, response, nullptr);
+  }
+  void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
+                               HostList* hosts) override {
+    ClientCallback inClientCallback; // PluginSupport.h
+    std::unique_ptr<OneChunkRead> self(this);
+    std::unique_ptr<AnyObject> asked(response);
+    if (!status)
+      status = new XRootDStatus(XrdCl::stError, XrdCl::errInternal);
+    AnyObject* answer = nullptr;
+    if (status->IsOK()) {
+      XrdCl::VectorReadInfo* info = nullptr;
+      if (asked)
+        asked->Get(info);
+      const uint32_t got =
+          info && !info->GetChunks().empty() ? info->GetChunks().front().length : 0;
+      answer = pages_ ? pageResponse(off_, got, buf_) : chunkResponse(off_, got, buf_);
+    }
+    to_->HandleResponseWithHosts(status, answer, hosts ? hosts : new HostList());
+  }
+
+ private:
+  ResponseHandler* to_;
+  uint64_t off_;
+  void* buf_;
+  bool pages_;
+};
+
+// Answers a local file's vector read short of what was asked as an error (vectorReadInner).
+class WholeVectorRead : public ResponseHandler {
+ public:
+  WholeVectorRead(ResponseHandler* to, ChunkList asked) : to_(to), asked_(std::move(asked)) {}
+  void HandleResponse(XRootDStatus* status, AnyObject* response) override {
+    ClientCallback inClientCallback; // PluginSupport.h
+    HandleResponseWithHosts(status, response, nullptr);
+  }
+  void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
+                               HostList* hosts) override {
+    ClientCallback inClientCallback; // PluginSupport.h
+    std::unique_ptr<WholeVectorRead> self(this);
+    if (!status)
+      status = new XRootDStatus(XrdCl::stError, XrdCl::errInternal);
+    if (status->IsOK() && !vreadComplete(response, asked_)) {
+      delete status;
+      delete response;
+      response = nullptr;
+      status = new XRootDStatus(XrdCl::stError, XrdCl::errDataError, 0, kShortVectorRead);
+    }
+    to_->HandleResponseWithHosts(status, response, hosts ? hosts : new HostList());
+  }
+
+ private:
+  ResponseHandler* to_;
+  ChunkList asked_;
+};
+} // namespace
+
+XRootDStatus readInner(const HandleState& st, XrdCl::File* f, uint64_t off, uint32_t len, void* buf,
+                       ResponseHandler* rh, ucache::XrdTimeout t, bool pages) {
+  if (!st.localFile)
+    return pages ? f->PgRead(off, len, buf, rh, t) : f->Read(off, len, buf, rh, t);
+  auto* one = new OneChunkRead(rh, off, buf, pages);
+  XRootDStatus s = f->VectorRead(ChunkList{ChunkInfo(off, len, buf)}, nullptr, one, t);
+  if (!s.IsOK())
+    delete one;
+  return s;
+}
+
+XRootDStatus readInnerSync(const HandleState& st, XrdCl::File* f, uint64_t off, uint32_t len,
+                           void* buf, uint32_t& got, ucache::XrdTimeout t) {
+  if (!st.localFile)
+    return f->Read(off, len, buf, got, t);
+  XrdCl::VectorReadInfo* info = nullptr;
+  XRootDStatus s = f->VectorRead(ChunkList{ChunkInfo(off, len, buf)}, nullptr, info, t);
+  std::unique_ptr<XrdCl::VectorReadInfo> answered(info);
+  got = s.IsOK() && answered && !answered->GetChunks().empty()
+            ? answered->GetChunks().front().length
+            : 0;
+  return s;
+}
+
+XRootDStatus vectorReadInner(const HandleState& st, XrdCl::File* f, const ChunkList& chunks,
+                             void* buf, ResponseHandler* rh, ucache::XrdTimeout t) {
+  if (!st.localFile)
+    return f->VectorRead(chunks, buf, rh, t);
+  auto* whole = new WholeVectorRead(rh, chunks);
+  XRootDStatus s = f->VectorRead(chunks, buf, whole, t);
+  if (!s.IsOK())
+    delete whole;
+  return s;
 }
 
 std::string answeredBy(HandleState& st, const HostList* hosts) noexcept {
@@ -3984,7 +4123,7 @@ static void checkOwnOpen(HandleState& st, XrdCl::File* f, const OpenAttempt& a,
       break; // the labels are the checks' last read
     }
     uint32_t got = 0;
-    rs = f->Read(at, len, buf.data(), got, static_cast<ucache::XrdTimeout>(limitS));
+    rs = readInnerSync(st, f, at, len, buf.data(), got, static_cast<ucache::XrdTimeout>(limitS));
     if (!rs.IsOK())
       break;
     const size_t n = std::min<size_t>(got, len);
@@ -4165,18 +4304,29 @@ bool HandleState::ensureInnerOpen() {
     XrdCl::StatInfo* si = nullptr;
     const XRootDStatus ss = f->Stat(false, si);
     std::unique_ptr<XrdCl::StatInfo> sip(si);
-    if (ss.IsOK() && si && si->GetSize() != want) {
+    // Where the entry is checked on its modification time (expectedOriginMtime), a source of the
+    // entry's size and another time is another copy too: the file rewritten in place.
+    const uint64_t wantMtime = expectedOriginMtime.load(std::memory_order_relaxed);
+    const bool otherTime =
+        ss.IsOK() && si && si->GetSize() == want && wantMtime && si->GetModTime() != wantMtime;
+    if (ss.IsOK() && si && (si->GetSize() != want || otherTime)) {
       std::string server;
       f->GetProperty("DataServer", server);
       // The message goes to the log and back to the reader as its error, so it
       // names the file without the URL's query, which can carry an access token.
       const std::string shown = url.substr(0, url.find('?'));
       char msg[512];
-      std::snprintf(msg, sizeof msg,
-                    "%s: %s serves %llu bytes, the cached file has %llu; not mixing them",
-                    shown.c_str(), server.empty() ? "the origin" : server.c_str(),
-                    static_cast<unsigned long long>(si->GetSize()),
-                    static_cast<unsigned long long>(want));
+      if (otherTime)
+        std::snprintf(msg, sizeof msg,
+                      "%s: the file was modified (time %llu, the cached file has %llu); not mixing "
+                      "them",
+                      shown.c_str(), static_cast<unsigned long long>(si->GetModTime()),
+                      static_cast<unsigned long long>(wantMtime));
+      else
+        std::snprintf(
+            msg, sizeof msg, "%s: %s serves %llu bytes, the cached file has %llu; not mixing them",
+            shown.c_str(), server.empty() ? "the origin" : server.c_str(),
+            static_cast<unsigned long long>(si->GetSize()), static_cast<unsigned long long>(want));
       UCACHE_WARN("%s (the read fails; the next open checks the origin again)", msg);
       if (store)
         store->stats().sizeDisagreements.fetch_add(1, std::memory_order_relaxed);
@@ -6115,7 +6265,7 @@ class MissReadHandler : public ResponseHandler {
       if (XrdCl::File* f = st_->acquireInner()) {
         auto* relay = newRelay(st_, f, user_, userOff_, userLen_);
         XRootDStatus s2 =
-            f->Read(userOff_, userLen_, userBuf_, relay, ucache::xrdTimeoutOf(relayS));
+            readInner(*st_, f, userOff_, userLen_, userBuf_, relay, ucache::xrdTimeoutOf(relayS));
         if (s2.IsOK()) {
           delete this;
           return;
@@ -6242,9 +6392,9 @@ class MissReadHandler : public ResponseHandler {
    bool handOff(const XRootDStatus& s, std::unique_ptr<HostList>& h, bool checkFailed) {
      return st_->moveOnReads && moveRead(
                                     st_, on_, user_, userOff_, userLen_, readerT_, t0_,
-                                    [off = userOff_, len = userLen_, buf = userBuf_](
+                                    [st = st_, off = userOff_, len = userLen_, buf = userBuf_](
                                         XrdCl::File* f, ResponseHandler* rh, ucache::XrdTimeout t) {
-                                      return f->Read(off, len, buf, rh, t);
+                                      return readInner(*st, f, off, len, buf, rh, t);
                                     },
                                     s, h, checkFailed);
    }
@@ -6277,7 +6427,7 @@ XRootDStatus issueWireRead(const std::shared_ptr<HandleState>& st, XrdCl::File* 
   bool late = false;
   if (!injectReadFault(false, mh, s, false, &late)) {
     ResponseHandler* rh = late ? new LateAnswer(mh) : static_cast<ResponseHandler*>(mh);
-    s = f->Read(off, len, buf, rh, st->originTimeout(readerT, startUs));
+    s = readInner(*st, f, off, len, buf, rh, st->originTimeout(readerT, startUs));
     if (!s.IsOK() && rh != mh)
       delete rh;
   }
@@ -6460,6 +6610,10 @@ class MissVReadHandler : public ResponseHandler {
     uint64_t wireBytes = 0;
     for (const auto& w : wire_)
       wireBytes += w.len;
+    // An answer short of what was asked (a local file truncated or rewritten while it is read) is
+    // no answer: nothing of it is served or kept (PluginSupport.h vreadComplete).
+    if (s && s->IsOK() && !vreadComplete(r.get(), wire_))
+      s = std::make_unique<XRootDStatus>(XrdCl::stError, XrdCl::errDataError, 0, kShortVectorRead);
 
     if (!s || !s->IsOK()) {
       // Wire failure: fail open — reissue the FULL original chunk list as
@@ -6482,8 +6636,8 @@ class MissVReadHandler : public ResponseHandler {
       if (f) {
         auto* relay =
             newRelay(st_, f, user_, chunksFirst(userChunks_), chunksBytes(userChunks_));
-        XRootDStatus s2 = f->VectorRead(userChunks_, nullptr, relay,
-                                        ucache::xrdTimeoutOf(relayS));
+        XRootDStatus s2 =
+            vectorReadInner(*st_, f, userChunks_, nullptr, relay, ucache::xrdTimeoutOf(relayS));
         if (s2.IsOK()) {
           delete this;
           return;
@@ -6644,8 +6798,9 @@ class MissVReadHandler : public ResponseHandler {
      return st_->moveOnReads &&
             moveRead(
                 st_, on_, user_, chunksFirst(userChunks_), chunksBytes(userChunks_), 0, t0_,
-                [chunks = userChunks_](XrdCl::File* f, ResponseHandler* rh, ucache::XrdTimeout t) {
-                  return f->VectorRead(chunks, nullptr, rh, t);
+                [st = st_, chunks = userChunks_](XrdCl::File* f, ResponseHandler* rh,
+                                                 ucache::XrdTimeout t) {
+                  return vectorReadInner(*st, f, chunks, nullptr, rh, t);
                 },
                 s, h, checkFailed);
    }
@@ -6999,6 +7154,7 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
 
   const Config& cfg = globalConfig();
   st_->url = url;
+  st_->localFile = isLocalFileUrl(url);
   st_->readerOpenTimeoutS.store(static_cast<int>(timeout));
   using OF = XrdCl::OpenFlags;
   bool writey = flags & (OF::Update | OF::Write | OF::New | OF::Delete);
@@ -7019,7 +7175,27 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // to fail over from or to ask anything of. Failover is off for it, decided here, so that no
   // question about its server is ever asked (decideFederation, decideFederationLate), and every
   // open of it compares the cached entry with the file itself (below).
-  const bool local = isLocalFileUrl(url);
+  const bool local = st_->localFile;
+  // A local file must be a regular file: a server refuses a directory at its open, and a FIFO
+  // would hold the open forever (the client's local-file access opens whatever the path names).
+  // A path that does not exist is left to the open, whose error is the file system's.
+  if (local) {
+    struct ::stat sb{};
+    if (::stat(localFilePath(url).c_str(), &sb) == 0 && !S_ISREG(sb.st_mode)) {
+      const bool dir = S_ISDIR(sb.st_mode);
+      auto* status = new XRootDStatus(
+          XrdCl::stError, XrdCl::errErrorResponse,
+          static_cast<uint32_t>(XProtocol::mapError(dir ? EISDIR : EINVAL)),
+          dir ? "uCache: a directory is not a file to open" : "uCache: not a regular file");
+      if (!handler) {
+        const XRootDStatus s = *status;
+        delete status;
+        return s;
+      }
+      Executor::instance().post([handler, status] { complete(handler, status, nullptr); });
+      return XRootDStatus();
+    }
+  }
   if (local) {
     st_->federation.store(false, std::memory_order_relaxed);
     {
@@ -7163,8 +7339,11 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // the plugin; for a watched open it is recorded as a failed attempt first.
   ResponseHandler* h = handler;
   ReaderOpenHandler* watched = nullptr;
+  LocalOpenHandler* local0 = nullptr;
   if (!passthroughOnly_ && handler)
     h = watched = new ReaderOpenHandler(handler, st_, static_cast<int>(openTimeout));
+  else if (local && handler)
+    h = local0 = new LocalOpenHandler(handler);
   XrdCl::File* f = st_->inner.load();
   // test hook only; in production the reader's URL (without its tried= patterns where they are
   // uCache's to apply)
@@ -7175,6 +7354,8 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
     sentOpenOn(*st_, f);
   else if (watched)
     watched->refused(s, openUrl, fresh);
+  else
+    delete local0; // refused at once: no completion will come
   return s;
 }
 
@@ -7545,6 +7726,11 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
         std::lock_guard<std::mutex> g(st_->mu);
         st_->trustMarker = valPath(*key, cfg.cacheDir);
       }
+      st_->expectedOriginMtime.store(isLocalFileUrl(st_->url) &&
+                                             cfg.validateFor(*key) == ValidateMode::kSizeMtime
+                                         ? meta->originMtime
+                                         : 0,
+                                     std::memory_order_relaxed);
       st_->expectedOriginSize.store(meta->fileSize, std::memory_order_relaxed);
       const WholeFirstRead whole = wholeFirstRead(firstRead, meta->fileSize, *key, cfg, forkLayout);
       keepOriginal = keepOriginal || whole == WholeFirstRead::kAsStored;
@@ -7641,7 +7827,11 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
       // An entry reached through an alias, under another key's hash, is taken as it is or not at
       // all (FileEntry::open): when it went, was started again, or does not validate for this
       // URL's copy since the name was resolved, the name is resolved again, once. A URL still
-      // named to that same entry is cached apart.
+      // named to that same entry, at this copy's size (compareSize kept one of another size apart
+      // already), was refused for its modification time (validate = size+mtime, or a local file:
+      // EOS's data servers and its mount, for one, report one file's time 2 s apart). It is read
+      // under its own key, without being kept apart for good (no self alias): its name leads to the
+      // entry again once the times agree, or once files are keyed by their names again.
       if (!entry && !copy && key->entryGen && !key->urlHash.empty() && !declinedForSpace &&
           !declinedSizeDiffers) {
         const auto again = cfg.entryKey(st_->url);
@@ -7650,7 +7840,10 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry(const std::pair<uint64_t, uin
           key = again;
           compareSize();
         } else {
-          keepApart();
+          UCACHE_DEBUG("%s: the entry of %s holds another modification time; read under its own "
+                       "URL",
+                       key->urlKey.c_str(), key->key.c_str());
+          key = UrlKey::ofEntry(key->urlKey, key->urlHash);
         }
         entry = st_->store->open(*key, si->GetSize(), si->GetModTime(), MetaData::kCksumNone, 0,
                                  &declinedForSpace, &declinedSizeDiffers);
@@ -8065,8 +8258,8 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
     noteRelayBytes(st_, size, offset, size);
     return relayToInner(
         st_, handler, timeout,
-        [=](XrdCl::File* f, ResponseHandler* rh, ucache::XrdTimeout t) {
-          return f->Read(offset, size, buffer, rh, t);
+        [=, st = st_](XrdCl::File* f, ResponseHandler* rh, ucache::XrdTimeout t) {
+          return readInner(*st, f, offset, size, buffer, rh, t);
         },
         entry ? 0 : size, offset, size);
   }
@@ -8132,8 +8325,8 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
       noteDirectBytes(st_, entry, size);
       return relayToInner(
           st_, handler, timeout,
-          [=](XrdCl::File* f, ResponseHandler* rh, ucache::XrdTimeout t) {
-            return f->Read(offset, size, buffer, rh, t);
+          [=, st = st_](XrdCl::File* f, ResponseHandler* rh, ucache::XrdTimeout t) {
+            return readInner(*st, f, offset, size, buffer, rh, t);
           },
           0, offset, size);
     }
@@ -8258,17 +8451,7 @@ XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void
         std::unique_ptr<AnyObject> rr(r); // ChunkInfo response; rebuilt below
         std::unique_ptr<HostList> hh(h);
         if (s && s->IsOK()) {
-          std::vector<uint32_t> cks;
-          uint64_t pos = off;
-          const auto* p = static_cast<const uint8_t*>(buf);
-          while (pos < off + size) {
-            uint64_t pageEnd = std::min<uint64_t>((pos / 4096 + 1) * 4096, off + size);
-            cks.push_back(crc32c(p + (pos - off), pageEnd - pos));
-            pos = pageEnd;
-          }
-          auto* obj = new AnyObject();
-          obj->Set(new XrdCl::PageInfo(off, size, buf, std::move(cks)));
-          complete(user, s, obj);
+          complete(user, s, pageResponse(off, size, buf));
         } else {
           complete(user, s ? s : new XRootDStatus(XrdCl::stError, XrdCl::errInternal),
                    nullptr);
@@ -8296,8 +8479,8 @@ XrdCl::XRootDStatus UCacheFile::pgReadServe(uint64_t offset, uint32_t size, void
   noteRelayBytes(st_, size, offset, size);
   return relayToInner(
       st_, handler, timeout,
-      [=](XrdCl::File* f, ResponseHandler* rh, ucache::XrdTimeout t) {
-        return f->PgRead(offset, size, buffer, rh, t);
+      [=, st = st_](XrdCl::File* f, ResponseHandler* rh, ucache::XrdTimeout t) {
+        return readInner(*st, f, offset, size, buffer, rh, t, /*pages=*/true);
       },
       entry ? 0 : size, offset, size, /*reissuable=*/true, /*pageRead=*/true);
 }
@@ -8491,8 +8674,9 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
     const auto kept = keepChunks(*st_, chunks);
     return relayToInner(
         st_, handler, timeout,
-        [kept, &chunks, buffer](XrdCl::File* f, ResponseHandler* rh, ucache::XrdTimeout t) {
-          return f->VectorRead(kept ? *kept : chunks, buffer, rh, t);
+        [st = st_, kept, &chunks, buffer](XrdCl::File* f, ResponseHandler* rh,
+                                          ucache::XrdTimeout t) {
+          return vectorReadInner(*st, f, kept ? *kept : chunks, buffer, rh, t);
         },
         0, chunksFirst(chunks), chunksBytes(chunks), kept != nullptr);
   }
@@ -8527,8 +8711,9 @@ XrdCl::XRootDStatus UCacheFile::vectorReadServe(const ChunkList& chunks, void* b
       const auto kept = keepChunks(*st_, chunks);
       return relayToInner(
           st_, handler, timeout,
-          [kept, &chunks, buffer](XrdCl::File* f, ResponseHandler* rh, ucache::XrdTimeout t) {
-            return f->VectorRead(kept ? *kept : chunks, buffer, rh, t);
+          [st = st_, kept, &chunks, buffer](XrdCl::File* f, ResponseHandler* rh,
+                                            ucache::XrdTimeout t) {
+            return vectorReadInner(*st, f, kept ? *kept : chunks, buffer, rh, t);
           },
           0, chunksFirst(chunks), chunksBytes(chunks), kept != nullptr);
     }

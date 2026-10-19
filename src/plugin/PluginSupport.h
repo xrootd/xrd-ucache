@@ -34,6 +34,43 @@ struct ClientCallback {
   ClientCallback& operator=(const ClientCallback&) = delete;
 };
 bool onClientCallback();
+
+// Whether a vector read's answer holds every byte asked, chunk by chunk (`asked`: the elements
+// sent, in order, each with its length in `len`, or a ChunkList). A server's answer always does
+// (the client refuses one that does not); the client's own access to local files (file://, a
+// root://local file) answers a chunk past the file's end with fewer bytes, or none, and still OK --
+// a file truncated or rewritten while it is read. What it did not return must be neither served nor
+// kept: the wire buffers' rest is zeros.
+inline constexpr const char* kShortVectorRead =
+    "uCache: a vector read was answered with fewer bytes than asked (the file changed while it "
+    "was read)";
+inline uint64_t askedLength(const XrdCl::ChunkInfo& c) {
+  return c.length;
+}
+template <typename Elem> auto askedLength(const Elem& e) -> decltype(uint64_t(e.len)) {
+  return e.len;
+}
+template <typename Elems> bool vreadComplete(XrdCl::AnyObject* response, const Elems& asked) {
+  XrdCl::VectorReadInfo* info = nullptr;
+  if (response)
+    response->Get(info);
+  if (!info)
+    return false;
+  uint64_t want = 0;
+  for (const auto& e : asked)
+    want += askedLength(e);
+  if (info->GetSize() != want)
+    return false;
+  const XrdCl::ChunkList& got = info->GetChunks();
+  if (got.size() == asked.size()) {
+    size_t i = 0;
+    for (const auto& e : asked)
+      if (got[i++].length != askedLength(e))
+        return false;
+  }
+  return true;
+}
+
 // Test-only (UCACHE_TEST_READ_FAIL_KIND=convert, with UCACHE_TEST_READ_FAIL_N): true for the
 // process's first N conversions of the slot run, each of which then throws as for want of memory,
 // instead of the reads failing. slotFetchFaultFire: readFaultFire for the slot run's fetches,
