@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <iterator>
 #include <limits>
@@ -11,6 +12,8 @@ namespace ucache {
 // kXR_readv element ceiling: each element of a vector read must fit inside a
 // 2 MiB frame, 16 bytes of which are its header.
 constexpr uint64_t kMaxReadvElem = 2 * 1024 * 1024 - 16;
+// ... and a vector read carries at most this many elements: more, and the server refuses all of it.
+constexpr size_t kMaxReadvElems = 1024;
 
 // Widen [off, off+len) out to whole pages, so that what is fetched is what can
 // be stored.

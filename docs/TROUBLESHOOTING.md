@@ -925,8 +925,9 @@ likelihood:
    saying so in its summary. Free some space. See "The cache is filling my
    disk".
 
-4. **Nothing qualifies yet.** Only what your jobs actually read is cached, and
-   so converted by a sweep. A file whose metadata is not cached yet (a job
+4. **Nothing qualifies yet.** Only what your jobs actually read (with
+   `complete_chunks`, the rest of the clusters they touched) is cached, and so
+   converted by a sweep. A file whose metadata is not cached yet (a job
    opened it and read little else) is reported as `incomplete` and retried on a
    later pass.
 

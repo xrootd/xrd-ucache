@@ -194,12 +194,15 @@ struct Stats {
   std::atomic<uint64_t> coldReplicaConvertUs{0};        // time spent converting, summed over threads
   std::atomic<uint64_t> coldReplicaDeclined{0};  // replicas not published (no room, or failed)
   std::atomic<uint64_t> coldReplicaSkipped{0};   // files whose own content declined the first pass
-  std::atomic<uint64_t> coldReplicaWaits{0};     // first-pass requests that waited for the writes
+  std::atomic<uint64_t> coldReplicaWaits{0};     // first-pass waits for the writes
   std::atomic<uint64_t> coldReplicaWaitUs{0};    // ... and how long, summed
-  std::atomic<uint64_t> coldReplicaCompleted{0}; // baskets fetched to complete clusters
+  std::atomic<uint64_t> coldReplicaCompleted{0}; // baskets taken along to complete clusters
   std::atomic<uint64_t> coldReplicaCompletedBytes{0}; // ... their original bytes
   std::atomic<uint64_t> fillCompleted{0};             // the same for byte-cache fills
-  std::atomic<uint64_t> fillCompletedBytes{0};        // ... the bytes fetched for them
+  std::atomic<uint64_t> fillCompletedBytes{0};        // ... the bytes kept for them
+  std::atomic<uint64_t> slowCacheEpisodes{0};    // times the cache disk was too slow to be filled
+  std::atomic<uint64_t> slowCacheUs{0};          // ... and how long, summed
+  std::atomic<uint64_t> fillNotKeptBytes{0};     // byte-cache fill bytes not kept meanwhile
   std::atomic<uint64_t> coldOriginFailures{0};   // first-pass origin reads that failed (each asked again)
   std::atomic<uint64_t> slotMapsMade{0};      // mixed maps this process made
   std::atomic<uint64_t> slotMapOpens{0};      // handles given a mixed map at open
@@ -346,9 +349,10 @@ struct StatsTotals {
            originChecksUnjudged = 0, originChecksSkipped = 0, originChecksNotExamined = 0,
            coldReplicaDeclined = 0, coldReplicaSkipped = 0, coldReplicaWaits = 0,
            coldReplicaWaitUs = 0, coldReplicaCompleted = 0, coldReplicaCompletedBytes = 0,
-           fillCompleted = 0, fillCompletedBytes = 0, slotMapsMade = 0, slotMapOpens = 0,
-           slotMapFull = 0, replicaReadBytes = 0, relayBytes = 0, readvChunks = 0, readvCalls = 0,
-           readvMixed = 0, flushRuns = 0, flushRunBytes = 0, bufferStalls = 0, bufferStallUs = 0;
+           fillCompleted = 0, fillCompletedBytes = 0, slowCacheEpisodes = 0, slowCacheUs = 0,
+           fillNotKeptBytes = 0, slotMapsMade = 0, slotMapOpens = 0, slotMapFull = 0,
+           replicaReadBytes = 0, relayBytes = 0, readvChunks = 0, readvCalls = 0, readvMixed = 0,
+           flushRuns = 0, flushRunBytes = 0, bufferStalls = 0, bufferStallUs = 0;
   uint64_t originOpenAttempts = 0, originOpenFailures = 0, recordsDropped = 0;
   uint64_t openFailovers = 0, opensRecovered = 0, opensFailedEverywhere = 0,
            openDeadlineExpiries = 0, failoverLocates = 0, offlineCopiesSkipped = 0,

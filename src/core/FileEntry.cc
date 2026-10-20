@@ -10,11 +10,13 @@
 #include "vendor/crc32c.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
 #include <sstream>
 #include <sys/file.h>
+#include <thread>
 
 namespace ucache {
 
@@ -52,11 +54,65 @@ std::string jsonEscapeMin(const std::string& s) {
 std::atomic<uint64_t> FileEntry::g_bufTotal_{0};
 std::atomic<uint64_t> FileEntry::g_specTotal_{0};
 std::atomic<uint64_t> FileEntry::g_specDropped_{0};
+std::atomic<bool> FileEntry::g_fillSlow_{false};
+std::atomic<uint64_t> FileEntry::g_fillSlowSinceUs_{0};
+std::atomic<uint64_t> FileEntry::g_fillSlowWarnUs_{0};
+std::atomic<uint64_t> FileEntry::g_fillNotKeptAt_{0};
+
+namespace {
+// A drain past its cap that wrote nothing for this long: the cache disk is too slow to be filled.
+constexpr uint64_t kSlowFillUs = 2'000'000;
+// Episodes after the first are reported at most this often (a disk that stays slow comes and
+// goes as each drain ends).
+constexpr uint64_t kSlowWarnEveryUs = 60'000'000;
+// UCACHE_TEST_FLUSH_DELAY_MS=N (inert unless set): each write of a drain of staged pages waits N ms
+// first, as a cache disk slower than the fills, so a gate can show the fills then served and not
+// kept. Read once, at load (a fork never meets it half made).
+const long kTestFlushDelayMs = [] {
+  const char* v = std::getenv("UCACHE_TEST_FLUSH_DELAY_MS");
+  return v ? std::strtol(v, nullptr, 10) : 0L;
+}();
+} // namespace
 
 void FileEntry::afterForkChild() {
   g_bufTotal_.store(0, std::memory_order_relaxed);
   g_specTotal_.store(0, std::memory_order_relaxed);
   g_specDropped_.store(0, std::memory_order_relaxed);
+  g_fillSlow_.store(false, std::memory_order_relaxed); // the parent's disk state, not the child's
+}
+
+void FileEntry::startFillSlow(uint64_t stalledUs) {
+  if (g_fillSlow_.exchange(true))
+    return;
+  const uint64_t now = nowUsSteady();
+  g_fillSlowSinceUs_.store(now, std::memory_order_relaxed);
+  g_fillNotKeptAt_.store(stats_.fillNotKeptBytes.load(), std::memory_order_relaxed);
+  stats_.slowCacheEpisodes.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t last = g_fillSlowWarnUs_.load(std::memory_order_relaxed);
+  if (!last || now - last >= kSlowWarnEveryUs) {
+    g_fillSlowWarnUs_.store(now, std::memory_order_relaxed);
+    UCACHE_WARN("the cache disk is too slow to be filled (a write of %s's staged pages made no "
+                "progress for %.1f s): what reads fetch is served and not kept until it catches "
+                "up; reads go on",
+                key_.key.c_str(), static_cast<double>(stalledUs) / 1e6);
+  }
+}
+
+void FileEntry::endFillSlowIfDrained() {
+  if (!g_fillSlow_.load(std::memory_order_relaxed) ||
+      g_bufTotal_.load(std::memory_order_relaxed) > (uint64_t(cfg_.fillBufferTotalMb) << 20) / 2 ||
+      !g_fillSlow_.exchange(false))
+    return;
+  const uint64_t now = nowUsSteady();
+  const uint64_t us = now - g_fillSlowSinceUs_.load(std::memory_order_relaxed);
+  stats_.slowCacheUs.fetch_add(us, std::memory_order_relaxed);
+  const uint64_t at = g_fillNotKeptAt_.load(std::memory_order_relaxed);
+  const uint64_t lost =
+      stats_.fillNotKeptBytes.load() - std::min(at, stats_.fillNotKeptBytes.load());
+  if (now - g_fillSlowWarnUs_.load(std::memory_order_relaxed) <= us) // its start was reported
+    UCACHE_WARN("the cache disk caught up after %.1f s: reads fill the cache again (%llu MiB "
+                "fetched meanwhile not kept)",
+                static_cast<double>(us) / 1e6, static_cast<unsigned long long>(lost >> 20));
 }
 
 std::shared_ptr<FileEntry> FileEntry::open(IOBackend& io, const Config& cfg, Stats& stats,
@@ -607,11 +663,27 @@ void FileEntry::writePages(uint64_t off, uint64_t len, const void* buf) {
   uint64_t end = std::min(off + len, meta_.fileSize);
   if (off >= end)
     return;
+  if (g_fillSlow_.load(std::memory_order_relaxed)) { // the cache disk too slow: not kept
+    stats_.fillNotKeptBytes.fetch_add(end - off, std::memory_order_relaxed);
+    return;
+  }
 
   // Stage full pages in RAM: no disk IO on this path at all.
   uint64_t staged = 0, covered = 0;
   {
     std::lock_guard<std::mutex> g(mu_);
+    // This entry's buffer past its cap with its drain writing nothing for kSlowFillUs: the cache
+    // disk does not keep up, and staging more would only grow memory.
+    if (flushInProgress_ &&
+        (bufBytes_ >= (uint64_t(cfg_.fillBufferMb) << 20) ||
+         g_bufTotal_.load(std::memory_order_relaxed) >= (uint64_t(cfg_.fillBufferTotalMb) << 20))) {
+      const uint64_t now = nowUsSteady(), since = flushProgressUs_.load(std::memory_order_relaxed);
+      if (since && now - since >= kSlowFillUs) {
+        startFillSlow(now - since);
+        stats_.fillNotKeptBytes.fetch_add(end - off, std::memory_order_relaxed);
+        return;
+      }
+    }
     for (uint64_t i = (off + P - 1) / P; i * P < end; ++i) {
       uint64_t pStart = i * P;
       uint32_t nbytes = meta_.pageBytes(i);
@@ -927,6 +999,7 @@ void FileEntry::flushBuffer(bool force) {
     snapBytes = bufBytes_;
     bufBytes_ = 0;
     flushInProgress_ = true;
+    flushProgressUs_.store(nowUsSteady(), std::memory_order_relaxed);
   }
   const uint64_t stallT0 = capStall ? nowUsSteady() : 0;
 
@@ -952,6 +1025,8 @@ void FileEntry::flushBuffer(bool force) {
       ++next;
       ++it;
     }
+    if (kTestFlushDelayMs > 0) // test hook: a slow cache disk
+      std::this_thread::sleep_for(std::chrono::milliseconds(kTestFlushDelayMs));
     const uint64_t wT0 = nowUsSteady();
     int64_t w = io_.pwriteFull(dataFd_, run.data(), run.size(),
                                firstPage * static_cast<uint64_t>(P));
@@ -963,6 +1038,7 @@ void FileEntry::flushBuffer(bool force) {
       break;
     }
     const uint64_t wUs = nowUsSteady() - wT0;
+    flushProgressUs_.store(wT0 + wUs, std::memory_order_relaxed);
     stats_.flushRuns.fetch_add(1, std::memory_order_relaxed);
     stats_.flushRunBytes.fetch_add(run.size(), std::memory_order_relaxed);
     stats_.flushWriteUs.add(wUs);
@@ -1007,6 +1083,7 @@ void FileEntry::flushBuffer(bool force) {
     stats_.bufferStalls.fetch_add(1, std::memory_order_relaxed);
     stats_.bufferStallUs.fetch_add(nowUsSteady() - stallT0, std::memory_order_relaxed);
   }
+  endFillSlowIfDrained();
   flushMeta(force);
   if (written && onPersist_)
     onPersist_(written, !closing_); // count always; never evict from the dtor
@@ -1065,6 +1142,18 @@ void FileEntry::noteFetchInFlight(uint64_t off, uint64_t len) {
     return;
   std::lock_guard<std::mutex> g(mu_);
   flight_.emplace_back(off / P, (end + P - 1) / P);
+}
+
+bool FileEntry::overlapsInFlight(uint64_t off, uint64_t len) {
+  if (len == 0 || off + len < off)
+    return false;
+  const uint32_t P = meta_.pageSize;
+  const uint64_t a = off / P, b = (off + len + P - 1) / P;
+  std::lock_guard<std::mutex> g(mu_);
+  for (const auto& [x, y] : flight_)
+    if (x < b && a < y)
+      return true;
+  return false;
 }
 
 void FileEntry::clearFetchInFlight(const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {

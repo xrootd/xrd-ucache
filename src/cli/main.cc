@@ -478,22 +478,26 @@ void printStats(const StatsTotals& t) {
                 human(t.coldReplicaOutBytes).c_str(), (unsigned long long)t.coldReplicaBaskets,
                 (unsigned long long)t.coldReplicaBasketsKept, static_cast<double>(t.coldReplicaConvertUs) / 1e6,
                 (unsigned long long)t.coldReplicaDeclined);
-  if (t.coldReplicaCompleted) // complete_chunks: fetched beyond what the readers asked for
-    std::printf("  completed clusters %llu basket%s, %s fetched beyond the reads (the rest of the "
+  if (t.coldReplicaCompleted) // complete_chunks: taken along beyond what the readers asked for
+    std::printf("  completed, converted %llu basket%s, %s beyond the reads (the rest of the "
                 "clusters the readers touched)\n",
                 (unsigned long long)t.coldReplicaCompleted, t.coldReplicaCompleted == 1 ? "" : "s",
                 human(t.coldReplicaCompletedBytes).c_str());
   if (t.fillCompleted) // complete_chunks on byte-cache fills
-    std::printf("  completed clusters %llu basket%s, %s fetched into the byte cache beyond the "
+    std::printf("  completed, cached  %llu basket%s, %s kept in the byte cache beyond the "
                 "reads\n",
                 (unsigned long long)t.fillCompleted, t.fillCompleted == 1 ? "" : "s",
                 human(t.fillCompletedBytes).c_str());
   if (t.coldReplicaWaits) // the first pass went at the pace of the cache's writes
-    std::printf(
-        "  waited for writes  %llu request%s, %.1f s in all (converted records waited to be "
-        "written to the cache disk)\n",
-        (unsigned long long)t.coldReplicaWaits, t.coldReplicaWaits == 1 ? "" : "s",
-        static_cast<double>(t.coldReplicaWaitUs) / 1e6);
+    std::printf("  waited for writes  %llu time%s, %.1f s in all (converted records waited to be "
+                "written to the cache disk)\n",
+                (unsigned long long)t.coldReplicaWaits, t.coldReplicaWaits == 1 ? "" : "s",
+                static_cast<double>(t.coldReplicaWaitUs) / 1e6);
+  if (t.slowCacheEpisodes) // the cache disk could not keep up: reads went on, the cache unfilled
+    std::printf("  cache disk slow    %llu time%s, %.1f s in all not filling the cache (%s of "
+                "byte-cache fills not kept; converted records not kept count above)\n",
+                (unsigned long long)t.slowCacheEpisodes, t.slowCacheEpisodes == 1 ? "" : "s",
+                static_cast<double>(t.slowCacheUs) / 1e6, human(t.fillNotKeptBytes).c_str());
   if (t.slotMapsMade || t.slotMapOpens || t.slotMapFull)
     std::printf("  mixed maps         %llu made, %llu open%s shown one%s\n",
                 (unsigned long long)t.slotMapsMade, (unsigned long long)t.slotMapOpens,

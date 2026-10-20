@@ -256,6 +256,8 @@ class FileEntry {
   // means something is missing that nobody is fetching: go to the origin.
   bool waitForInFlight(const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
                        std::function<void()> cb);
+  // True when [off, off+len) shares a page with a range on the wire.
+  bool overlapsInFlight(uint64_t off, uint64_t len);
 
   // Replica punch-and-clear: for each byte range, mark every
   // FULLY-covered page absent (bit cleared, CRC zeroed; partial edge pages
@@ -479,6 +481,16 @@ class FileEntry {
   static std::atomic<uint64_t> g_bufTotal_;
   static std::atomic<uint64_t> g_specTotal_;   // process-wide speculative bytes
   static std::atomic<uint64_t> g_specDropped_; // process-wide never-used bytes
+  // The cache disk too slow for byte-cache fills: a drain of a buffer past its cap wrote nothing
+  // for kSlowFillUs. Until the buffers have drained to half their total cap, what fills fetch is
+  // served and not staged (writePages): the reads go on, the cache is not filled. Process-wide.
+  static std::atomic<bool> g_fillSlow_;
+  static std::atomic<uint64_t> g_fillSlowSinceUs_;
+  static std::atomic<uint64_t> g_fillSlowWarnUs_; // when its last start was reported
+  static std::atomic<uint64_t> g_fillNotKeptAt_;  // fill_not_kept_bytes when it started
+  std::atomic<uint64_t> flushProgressUs_{0};      // the drain under way began, or last wrote a run
+  void startFillSlow(uint64_t stalledUs);
+  void endFillSlowIfDrained();
   // In-flight fetch table: (off,len) -> parked re-dispatch callbacks.
   std::map<std::pair<uint64_t, uint64_t>, std::vector<FetchDone>> inflight_;
   // Page ranges read-ahead has on the wire, [firstPage, endPage), one entry

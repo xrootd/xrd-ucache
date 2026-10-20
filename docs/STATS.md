@@ -24,9 +24,10 @@ redirector's role, or whose URL has a host pattern in `tried=` (USER_GUIDE.md,
 | Where did the bytes come from? | `ram_hit_bytes`, `hit_bytes`, `replica_bytes_served`, `miss_bytes`, `relay_bytes` |
 | Is the job re-reading the same data? | `opens` / `files_opened`, `first_touch_bytes` against `hit_bytes` |
 | What is the cache disk being asked to do? | `hit_disk_reads`, `hit_disk_bytes`, `replica_reads`, `replica_read_bytes`, `hist_*_read_bytes` |
-| Is the cache disk keeping up? | `buffer_stalls`, `buffer_stall_us`, `hist_hit_read_us`, `hist_flush_write_us` |
+| Is the cache disk keeping up? | `buffer_stalls`, `buffer_stall_us`, `hist_hit_read_us`, `hist_flush_write_us`, `slow_cache_episodes` |
 | Did the replica tier get used? | `replica_bytes_served`, `cold_replica_files` |
 | Were replicas created as files were read? | `cold_replica_files`, `cold_replica_in_bytes`, `cold_replica_baskets_kept`, `cold_replica_declined`, `cold_replica_skipped`, `cold_replica_waits`, `cold_replica_completed` |
+| Did the cache take along the rest of the clusters a job touched? | `cold_replica_completed`, `fill_completed` and their `_bytes` |
 | Were later passes shown the converted baskets at their real size? | `slot_maps_made`, `slot_map_opens`, `slot_map_full` |
 
 ## Where the numbers are written
@@ -74,7 +75,8 @@ the consumers together.
  "cold_replica_baskets": 0, "cold_replica_baskets_kept": 0, "cold_replica_convert_us": 0,
  "cold_replica_declined": 0, "cold_replica_skipped": 0, "cold_replica_waits": 0,
  "cold_replica_wait_us": 0, "cold_replica_completed": 0, "cold_replica_completed_bytes": 0,
- "fill_completed": 0, "fill_completed_bytes": 0,
+ "fill_completed": 0, "fill_completed_bytes": 0, "slow_cache_episodes": 0, "slow_cache_us": 0,
+ "fill_not_kept_bytes": 0,
  "cold_origin_failures": 0,
  "slot_maps_made": 0, "slot_map_opens": 0, "slot_map_full": 0,
  "slot_crc_failures": 0, "slot_read_fallbacks": 0, "slot_pages_decoded": 0,
@@ -376,9 +378,12 @@ release left (see [FORMAT.md](FORMAT.md)).
 With `recompress = on`, a file that has no replica gets a slot store on its
 first open, and every basket a job reads that the store does not hold yet is
 converted as it arrives -- on the first pass, and later for branches read for
-the first time. All zero otherwise. `ucache stats` prints them on one
-`converted on read` line, and `cold_replica_skipped` on a `not converted` line
-of its own. For an RNTuple file, read "page" wherever these say "basket".
+the first time. All zero otherwise, except `fill_completed`, `fill_completed_bytes` (byte-cache
+fills) and the slow-disk counters (both kinds of fill). `ucache stats` prints the conversions on
+one `converted on read` line, `cold_replica_skipped` on a `not converted` line, what
+`complete_chunks` took along on `completed, converted` and `completed, cached` lines, the waits on
+a `waited for writes` line and a cache disk too slow on a `cache disk slow` line. For an RNTuple
+file, read "page" wherever these say "basket".
 
 - `cold_replica_files` — slot stores created.
 - `cold_replica_in_bytes` / `cold_replica_out_bytes` — original basket bytes
@@ -460,27 +465,41 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   it; it is CPU a pass spends that a pass without recompression does not.
 - `cold_replica_declined` — converted records not kept: they still did not fit
   above the free-space floor after an eviction pass, writing them failed (the
-  log says which), or the store was removed meanwhile. They were served to the
-  job that read them; a later read converts them again. (Records waiting to be
-  written are not a reason: past their limit, the reads that would convert more
-  wait for the writes.)
-- `cold_replica_waits`, `cold_replica_wait_us` — first-pass requests that waited
-  for the cache's writes before converting more (the records converted and not
-  yet written had reached their limit, 512 MiB per process), and the time they
-  waited, summed. Each waits at most a minute. Nonzero means the cache disk, or
-  the kernel's limit on unwritten data (`vm.dirty_bytes`), set the first pass's
-  pace; the records were kept. After a commit that could not keep its records
-  (no room, a failed write: `cold_replica_declined`) nothing waits until a
-  commit keeps its records again.
-- `cold_replica_completed`, `cold_replica_completed_bytes` — baskets a first pass
-  fetched and converted beyond what its readers asked for, and their original
-  bytes: the rest of each read branch's baskets in the clusters the readers
-  touched (`complete_chunks = on`). A basket a reader asks for later is not
-  fetched again.
-- `fill_completed`, `fill_completed_bytes` — the same for byte-cache fills
-  (`recompress = off`, or a file with no replica): baskets fetched into the byte
-  cache beyond what the readers asked for, and the bytes fetched for them (whole
-  pages for those fetched after a single read's miss).
+  log says which), the store was removed meanwhile, or the cache disk was too
+  slow to take them (`slow_cache_episodes`). They were served to the job that
+  read them; a later read converts them again.
+- `cold_replica_waits`, `cold_replica_wait_us` — the times a first-pass request
+  waited for the cache's writes before converting more (the records converted
+  and not yet written had passed 512 MiB in the process), and the time they
+  waited, summed. Each request waits 2 seconds at most, over all its tries.
+  Nonzero means the cache disk, or the kernel's limit on unwritten data
+  (`vm.dirty_bytes`), set the first pass's pace; the records were kept. The
+  512 MiB is where waiting starts, not a bound: requests converting when it is
+  passed go on, and one that has waited its 2 seconds goes on too. After a
+  commit that could not keep its records (no room, a failed write:
+  `cold_replica_declined`) nothing waits until a commit keeps its records again.
+- `slow_cache_episodes`, `slow_cache_us` — the times the cache disk was too slow
+  to be filled, and how long, summed: a first-pass request waited its 2 seconds
+  and the records were still waiting, or a write of the byte cache's staged
+  pages made no progress for 2 seconds while more waited. Meanwhile the reads
+  go on and what they fetch is served and not kept (converted records count
+  under `cold_replica_declined`, byte-cache fills under `fill_not_kept_bytes`);
+  it ends when what waited has been written (to half the limit). The log
+  warns when it starts and when it ends (later episodes at most once a minute).
+  Nonzero means the cache disk cannot keep up with the jobs: the cache fills
+  less, and later passes fetch more from the origin.
+- `fill_not_kept_bytes` — bytes byte-cache fills fetched and did not keep
+  because the cache disk was too slow (above).
+- `cold_replica_completed`, `cold_replica_completed_bytes` — baskets
+  `complete_chunks` took along and converted on a first pass, beyond what the
+  readers asked for, and their original bytes: the rest of each read branch's
+  baskets in the clusters the readers touched, fetched from the origin or read
+  from the byte cache. A basket a reader asks for later is not fetched again;
+  one that failed to come or failed its check is not counted (nor kept).
+- `fill_completed`, `fill_completed_bytes` — the same for byte-cache fills (a
+  file with no replica store): baskets kept in the byte cache beyond what the
+  readers asked for, and the bytes kept for them (basket bytes when they came
+  with a vector read's miss, whole pages when fetched after a single read's).
 - `cold_origin_failures` — origin reads sent on the first pass that failed. The
   request is served again from the start, twice at most, so a read the origin
   fails once or twice is answered; a third failure in a row reaches the reader,

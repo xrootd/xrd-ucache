@@ -137,6 +137,9 @@ std::string Stats::toJsonBody() const {
   f("cold_replica_completed_bytes", coldReplicaCompletedBytes);
   f("fill_completed", fillCompleted);
   f("fill_completed_bytes", fillCompletedBytes);
+  f("slow_cache_episodes", slowCacheEpisodes);
+  f("slow_cache_us", slowCacheUs);
+  f("fill_not_kept_bytes", fillNotKeptBytes);
   f("cold_origin_failures", coldOriginFailures);
   f("slot_maps_made", slotMapsMade);
   f("slot_map_opens", slotMapOpens);
@@ -305,6 +308,9 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.coldReplicaCompletedBytes += extractU64(last, "cold_replica_completed_bytes");
     t.fillCompleted += extractU64(last, "fill_completed");
     t.fillCompletedBytes += extractU64(last, "fill_completed_bytes");
+    t.slowCacheEpisodes += extractU64(last, "slow_cache_episodes");
+    t.slowCacheUs += extractU64(last, "slow_cache_us");
+    t.fillNotKeptBytes += extractU64(last, "fill_not_kept_bytes");
     t.slotMapsMade += extractU64(last, "slot_maps_made");
     t.slotMapOpens += extractU64(last, "slot_map_opens");
     t.slotMapFull += extractU64(last, "slot_map_full");

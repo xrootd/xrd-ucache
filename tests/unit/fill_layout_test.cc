@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <functional>
 #include <gtest/gtest.h>
+#include <limits>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -275,6 +276,19 @@ TEST(FillLayout, ClusterStarts) {
   fm.entries = 0;
   fm.autoFlush = 100;
   EXPECT_TRUE(clusterStarts(fm).empty());
+  // A damaged or extreme record: more clusters than are ever kept, or values at the edge of the
+  // type, give none (and nothing overflows).
+  fm.entries = int64_t{1} << 40;
+  fm.autoFlush = 1;
+  EXPECT_TRUE(clusterStarts(fm).empty());
+  fm.entries = std::numeric_limits<int64_t>::max();
+  fm.autoFlush = std::numeric_limits<int64_t>::max() / 2 + 1;
+  EXPECT_EQ(clusterStarts(fm),
+            (std::vector<int64_t>{0, fm.autoFlush, std::numeric_limits<int64_t>::max()}));
+  fm.autoFlush = 0;
+  fm.clusterRangeEnd = {std::numeric_limits<int64_t>::max()};
+  fm.clusterSize = {std::numeric_limits<int64_t>::max()};
+  EXPECT_EQ(clusterStarts(fm), (std::vector<int64_t>{0, std::numeric_limits<int64_t>::max()}));
 }
 
 TEST(FillLayout, SlotsAreContiguousAndSized) {

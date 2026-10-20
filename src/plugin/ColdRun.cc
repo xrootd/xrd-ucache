@@ -89,6 +89,9 @@ constexpr uint64_t kCommitBytes = 8ull << 20;
 constexpr uint64_t kPartBytes = 4ull << 20;
 constexpr size_t kPartItems = 512;
 
+// complete_chunks: the most a request takes along, in original bytes (as a byte-cache miss does).
+constexpr uint64_t kExtraBytes = 64ull << 20;
+
 // Conversions run here, never on the executor that serves hits: they are
 // CPU-bound and as many as the reader has threads, and a hit must not queue
 // behind them. Leaked like the executor (threads end with the process).
@@ -137,13 +140,19 @@ void commitHoldOnce() {
 // UCACHE_TEST_COMMIT_DELAY_MS=N (inert unless set): every slot-store commit waits N ms before its
 // write, as a cache disk slower than the conversion (or a kernel that throttles the cache's
 // writes), so a gate can show that the first pass then waits for its commits and drops nothing.
-void commitDelay() {
+long commitDelayMs() {
   static const long delayMs = [] {
     const char* v = std::getenv("UCACHE_TEST_COMMIT_DELAY_MS");
-    return v ? std::strtol(v, nullptr, 10) : 0L;
+    const long ms = v ? std::strtol(v, nullptr, 10) : 0L;
+    if (ms > 0)
+      UCACHE_INFO("test hook: every slot-store commit waits %ld ms before its write", ms);
+    return ms;
   }();
-  if (delayMs > 0)
-    std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+  return delayMs;
+}
+void commitDelay() {
+  if (const long ms = commitDelayMs(); ms > 0)
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
 
 // The store's kind for a converted basket, and back.
@@ -193,8 +202,9 @@ class ColdFill : public tp::StoreMaps, public std::enable_shared_from_this<ColdF
   // complete_chunks: each branch's basket entry starts (basketEntry: basket i covers entries
   // [i], [i+1]) and the tree's cluster starts (the tree's entries last), from the tree record the
   // layout serves (decoded in memory: the event axis is the file's own, only the baskets' places
-  // are the slots'). Null when the record does not give them, or does not agree with the slot
-  // table: the file is then served without completion. Built once, under no lock (ensureChunks).
+  // are the slots'). Null when the record does not give them: the file is then served without
+  // completion. Each slot taken along is checked against the slot table (its branch and basket),
+  // and skipped when they disagree (completion). Built once, under no lock (ensureChunks).
   struct Chunks {
     std::vector<std::vector<int64_t>> basketEntry; // per branch of the tree record
     std::vector<int64_t> clusterStart;
@@ -878,9 +888,15 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req);
 // Whether a request that would convert more must wait for the commits (defined with the cap of
 // records waiting, below); `again` serves it again then.
 bool parkForCommits(std::function<void()> again);
-// How long a request waits for the commits at most: commits that make no progress (a store locked
-// by another process that does not let go) must not hold reads up for ever.
-constexpr uint64_t kParkMaxUs = 60'000'000;
+// A request waited kParkMaxUs (`waitedUs`) and the records waiting are still past their cap: the
+// cache disk is too slow for this pass (defined with the cap, below).
+void startSlowCommits(uint64_t waitedUs);
+// Whether converted records are kept at all just now (commits refused, or the cache disk too slow).
+bool notKeeping();
+// How long a request waits for the commits at most. A cache disk that has not taken enough of the
+// records waiting by then is too slow for this pass: the cache stops being filled (the reads go on,
+// served and not kept) until it has caught up (startSlowCommits).
+constexpr uint64_t kParkMaxUs = 2'000'000;
 
 struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   std::shared_ptr<HandleState> st;
@@ -917,6 +933,10 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   };
   std::vector<OrigPiece> origPieces;
   std::vector<uint32_t> claimed; // slots this request fetches
+  // Of those, the ones complete_chunks took along (sorted): no piece of the reader's is in them,
+  // and a failure of theirs is never the reader's: the slot is given back (finishExtra).
+  std::vector<uint32_t> extra;
+  bool isExtra(uint32_t i) const { return std::binary_search(extra.begin(), extra.end(), i); }
   // Slots whose records reach this reader from the origin, not from the cache:
   // fetched by this request, or by another one it waited on. Their bytes are
   // the fill; everything else in a slot is the replica tier.
@@ -967,6 +987,7 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   std::shared_ptr<const KeyMap> checkMap;
   bool mapWaited = false; // served again after waiting for another handle's parse: waits no more
   uint64_t parkedSinceUs = 0; // first parked for the commits (parkForCommits); 0: never
+  uint64_t parkStartUs = 0;   // when its present wait began; 0: not waiting (cold_replica_wait_us)
   std::mutex emu;
   XRootDStatus err;
 
@@ -1190,6 +1211,7 @@ void ColdRequest::again(bool mayParkAgain, int retryAfterS) {
   r2->t0 = t0;
   r2->readerT = readerT;
   r2->retryS = retryAfterS ? retryAfterS : retryS;
+  r2->parkedSinceUs = parkedSinceUs;
   Executor::instance().post([r2] { serveRequest(r2); });
 }
 
@@ -1477,6 +1499,43 @@ void failOriginCheck(const std::shared_ptr<ColdRequest>& req, uint64_t pos, uint
   req->fail(refused, on);
 }
 
+// A basket complete_chunks took along (ColdRequest::extra) that could not be had: no reader
+// asked for it, so nothing fails, moves or is held against a copy. Bytes from the byte cache that
+// failed their check go from there; a basket the origin sent that failed its own is reported and
+// counted. The slot is absent again: a reader that needs it fetches it as any other.
+void finishExtra(const std::shared_ptr<ColdRequest>& req, uint32_t i, const char* why,
+                 bool fromCache = false, uint64_t rStart = 0, uint64_t rLen = 0,
+                 bool checkFailed = false) {
+  if (fromCache && rLen)
+    req->entry->releaseRanges({{rStart, rStart + rLen}});
+  if (checkFailed) {
+    UCACHE_WARN("%s: a basket at %llu, not read by this job (complete_chunks), failed its check "
+                "(%s); not kept",
+                req->cf->key.key.c_str(),
+                static_cast<unsigned long long>(req->cf->slot(i).origSeek), why);
+    if (req->st->store && !fromCache)
+      req->st->store->stats().originChecksFailed.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    UCACHE_DEBUG("%s: a basket at %llu taken along (complete_chunks) not kept: %s",
+                 req->cf->key.key.c_str(),
+                 static_cast<unsigned long long>(req->cf->slot(i).origSeek), why);
+  }
+  { // given back here: not this request's to give back again at finish (another may hold it then)
+    std::lock_guard<std::mutex> g(req->emu);
+    req->converted.push_back(i);
+  }
+  req->cf->abandon(i);
+}
+
+// A basket complete_chunks took along, converted: counted (cold_replica_completed).
+void countExtra(const std::shared_ptr<ColdRequest>& req, uint32_t i, uint32_t recLen) {
+  if (!req->isExtra(i) || !req->st->store)
+    return;
+  auto& stats = req->st->store->stats();
+  stats.coldReplicaCompleted.fetch_add(1, std::memory_order_relaxed);
+  stats.coldReplicaCompletedBytes.fetch_add(recLen, std::memory_order_relaxed);
+}
+
 // Convert one claimed basket and stage it. `rounded` holds the page-rounded
 // original range starting at `rStart`; the basket is [recOff, recOff+recLen)
 // inside it. `fromCache` = the original came from the byte cache (its copy
@@ -1503,7 +1562,9 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     if (!p.error.empty()) {
       // A page whose checksum or decode fails must not be served decoded: the
       // reader could no longer detect it. Fail the read, as ROOT would.
-      if (cf.checkConverted) {
+      if (req->isExtra(i)) {
+        finishExtra(req, i, p.error.c_str(), fromCache, rStart, rounded->size(), true);
+      } else if (cf.checkConverted) {
         failOriginCheck(req, slot.origSeek, recLen, "an RNTuple page", p.error.c_str(), fromCache,
                         rStart, rounded->size(), std::string(), from, on);
       } else {
@@ -1559,6 +1620,7 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
       if (token)
         req->staged.emplace_back(i, token);
     }
+    countExtra(req, i, recLen);
     req->done();
     return;
   }
@@ -1585,6 +1647,11 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
       const std::string why = f.kind == tp::FetchFault::kData     ? "its data fails its own check: " + f.why
                               : f.kind == tp::FetchFault::kLength ? "key length differs from the tree's record"
                                                                   : "key position differs from the tree's record";
+      if (req->isExtra(i)) {
+        finishExtra(req, i, why.c_str(), fromCache, rStart, rounded->size(), true);
+        req->done();
+        return;
+      }
       failOriginCheck(req, slot.origSeek, recLen,
                       c.codec.empty() ? std::string("a basket") : "a basket (" + c.codec + ")",
                       why.c_str(), fromCache, rStart, rounded->size(), c.codec, from, on);
@@ -1600,6 +1667,11 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
   // (convertBasket keeps it as its original record). With recompress = on, or
   // check_origin_integrity on, it is never kept or served either, and the read fails with that
   // error; otherwise it is served as stored (checkConverted).
+  if (cf.checkConverted && c.check == tp::ConvertedBasket::kFailed && req->isExtra(i)) {
+    finishExtra(req, i, c.checkWhy, fromCache, rStart, rounded->size(), true);
+    req->done();
+    return;
+  }
   if (cf.checkConverted && c.check == tp::ConvertedBasket::kFailed) {
     failOriginCheck(req, slot.origSeek, recLen,
                     c.codec.empty() ? std::string("a basket") : "a basket (" + c.codec + ")",
@@ -1637,7 +1709,10 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     }
   }
   if (!tp::patchKeySeek(c.record.data(), c.record.size(), slot.vSeek)) {
-    req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError));
+    if (req->isExtra(i))
+      finishExtra(req, i, "its key could not be placed in its slot");
+    else
+      req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError));
     req->done();
     return;
   }
@@ -1669,10 +1744,15 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     if (token)
       req->staged.emplace_back(i, token);
   }
+  countExtra(req, i, recLen);
   req->done();
 } catch (const std::exception& e) {
-  UCACHE_WARN("slot run for %s: conversion failed (%s)", req->cf->key.key.c_str(), e.what());
-  req->fail(XRootDStatus(XrdCl::stError, XrdCl::errInternal)); // made here: does not move
+  if (req->isExtra(i)) {
+    finishExtra(req, i, e.what());
+  } else {
+    UCACHE_WARN("slot run for %s: conversion failed (%s)", req->cf->key.key.c_str(), e.what());
+    req->fail(XRootDStatus(XrdCl::stError, XrdCl::errInternal)); // made here: does not move
+  }
   req->done();
 }
 
@@ -1793,11 +1873,12 @@ void checkOriginalPieces(const std::shared_ptr<ColdRequest>& req, std::vector<Or
 
 class PartHandler : public ResponseHandler {
  public:
-  // `f`: the file the read is issued on, whose server it is counted against.
+  // `f`: the file the read is issued on, whose server it is counted against. `extra`: a part of
+  // the baskets complete_chunks took along only, whose failure is not the request's.
   PartHandler(std::shared_ptr<ColdRequest> req, XrdCl::File* f, std::vector<PartItem> items,
-              std::vector<WireElem> wire)
+              std::vector<WireElem> wire, bool extra)
       : req_(std::move(req)), on_(f), items_(std::move(items)), wire_(std::move(wire)),
-        t0_(nowUs()),
+        extra_(extra), t0_(nowUs()),
         inflight_(req_->st->store ? &req_->st->store->stats() : nullptr,
                   issueServer(*req_->st, f)) {}
 
@@ -1812,6 +1893,13 @@ class PartHandler : public ResponseHandler {
     // An answer short of what was asked is no answer (PluginSupport.h vreadComplete).
     if (s && s->IsOK() && !vreadComplete(r.get(), wire_))
       s = std::make_unique<XRootDStatus>(XrdCl::stError, XrdCl::errDataError, 0, kShortVectorRead);
+    if ((!s || !s->IsOK()) && extra_) {
+      for (const auto& it : items_)
+        finishExtra(req_, it.index, s ? s->ToString().c_str() : "no answer");
+      req_->done();
+      delete this;
+      return;
+    }
     if (!s || !s->IsOK()) {
       if (req_->st->store)
         req_->st->store->stats().coldOriginFailures.fetch_add(1, std::memory_order_relaxed);
@@ -1851,7 +1939,10 @@ class PartHandler : public ResponseHandler {
     for (const auto& it : items_) {
       auto buf = std::make_shared<std::vector<char>>(it.re - it.rs);
       if (!gather(it.rs, it.re - it.rs, buf->data())) { // made here: the request does not move
-        req_->fail(XRootDStatus(XrdCl::stError, XrdCl::errInternal));
+        if (extra_)
+          finishExtra(req_, it.index, "its bytes could not be gathered");
+        else
+          req_->fail(XRootDStatus(XrdCl::stError, XrdCl::errInternal));
         continue;
       }
       if (it.slot) {
@@ -1906,13 +1997,14 @@ class PartHandler : public ResponseHandler {
   XrdCl::File* on_; // the File the read was issued on: a failure of it is held against its copy
   std::vector<PartItem> items_;
   std::vector<WireElem> wire_;
+  bool extra_;
   uint64_t t0_;
   OriginInFlight inflight_;
 };
 
 // Issue one part: coalesce its rounded ranges, cut them into legal elements,
 // one vector read.
-void issuePart(const std::shared_ptr<ColdRequest>& req, std::vector<PartItem> items) {
+void issuePart(const std::shared_ptr<ColdRequest>& req, std::vector<PartItem> items, bool extra) {
   std::vector<std::pair<uint64_t, uint64_t>> runs;
   for (const auto& it : items) { // items arrive sorted by rs
     if (!runs.empty() && it.rs <= runs.back().second)
@@ -1934,13 +2026,18 @@ void issuePart(const std::shared_ptr<ColdRequest>& req, std::vector<PartItem> it
   req->outstanding.fetch_add(1, std::memory_order_relaxed);
   XrdCl::File* f = req->st->acquireInner();
   if (!f) {
-    req->fail(req->st->missError());
+    if (extra)
+      for (const auto& it : items)
+        finishExtra(req, it.index, "no origin to fetch it from");
+    else
+      req->fail(req->st->missError());
     req->done();
     return;
   }
-  auto* h = new PartHandler(req, f, std::move(items), std::move(wire));
+  auto* h = new PartHandler(req, f, items, std::move(wire), extra);
   XRootDStatus s;
-  if (slotFetchFaultFire() || splitMoveFailNext()) // test hook: the origin's vector read dies mid-stream
+  if (extra ? extraFetchFaultFire()
+            : slotFetchFaultFire() || splitMoveFailNext()) // test hook: the read dies mid-stream
     Executor::instance().post([h] {
       h->HandleResponseWithHosts(new XRootDStatus(XrdCl::stError, XrdCl::errConnectionError),
                                  nullptr, nullptr);
@@ -1951,6 +2048,14 @@ void issuePart(const std::shared_ptr<ColdRequest>& req, std::vector<PartItem> it
                       req->retryS > 0 && !req->st->moveSlotReads.load(std::memory_order_relaxed)
                           ? ucache::xrdTimeoutOf(req->retryS)
                           : req->st->originTimeout(req->readerT, req->t0, req->attempt > 0));
+  if (!s.IsOK() && extra) {
+    delete h;
+    req->st->releaseInner();
+    for (const auto& it : items)
+      finishExtra(req, it.index, s.ToString().c_str());
+    req->done();
+    return;
+  }
   if (!s.IsOK()) {
     delete h;
     req->st->releaseInner();
@@ -2299,6 +2404,7 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
       r2->readerT = req->readerT;
       r2->retryS = req->retryS;
       r2->mapWaited = true;
+      r2->parkedSinceUs = req->parkedSinceUs;
       serveRequest(r2);
     };
     bool parked = false;
@@ -2325,37 +2431,42 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
   // Back-pressure: while the records this process converted wait past their cap for the commits
   // to write them (a cache disk, or a kernel's limit on dirty pages, slower than the conversion),
   // a request that would convert more waits for them, before it claims anything, and is served
-  // again from the start: the first pass goes at the pace its records are written, and none is
-  // dropped (each would be fetched again by the next pass). Nothing is converted for a file read
+  // again from the start: the first pass goes at the pace its records are written. It waits
+  // kParkMaxUs at most, counted from its first wait across its retries: a cache disk that has not
+  // caught up by then is too slow for the pass, and the cache stops being filled until it has
+  // (startSlowCommits); the request goes on at once. Nothing is converted for a file read
   // directly, or kept once its store is gone: those do not wait.
   if (!need.empty() && !cf.direct() && !cf.storeGone.load(std::memory_order_relaxed)) {
     const uint64_t now = nowUs();
     const uint64_t since = req->parkedSinceUs ? req->parkedSinceUs : now;
-    const bool first = !req->parkedSinceUs;
-    if (now - since < kParkMaxUs && parkForCommits([req, since] {
-          auto r2 = std::make_shared<ColdRequest>();
-          r2->st = req->st;
-          r2->entry = req->entry;
-          r2->cf = req->cf;
-          r2->chunks = req->chunks;
-          r2->isVRead = req->isVRead;
-          r2->user = req->user;
-          r2->attempt = req->attempt;
-          r2->mayPark = req->mayPark;
-          r2->t0 = req->t0;
-          r2->readerT = req->readerT;
-          r2->retryS = req->retryS;
-          r2->mapWaited = req->mapWaited;
-          r2->parkedSinceUs = since;
-          serveRequest(r2);
-        })) {
-      if (first && req->st->store)
+    const uint64_t parkAt = req->parkStartUs ? req->parkStartUs : now;
+    if (now - since >= kParkMaxUs) {
+      startSlowCommits(now - since);
+    } else if (parkForCommits([req, since, parkAt] {
+                 auto r2 = std::make_shared<ColdRequest>();
+                 r2->st = req->st;
+                 r2->entry = req->entry;
+                 r2->cf = req->cf;
+                 r2->chunks = req->chunks;
+                 r2->isVRead = req->isVRead;
+                 r2->user = req->user;
+                 r2->attempt = req->attempt;
+                 r2->mayPark = req->mayPark;
+                 r2->t0 = req->t0;
+                 r2->readerT = req->readerT;
+                 r2->retryS = req->retryS;
+                 r2->mapWaited = req->mapWaited;
+                 r2->parkedSinceUs = since;
+                 r2->parkStartUs = parkAt;
+                 serveRequest(r2);
+               })) {
+      if (!req->parkStartUs && req->st->store)
         req->st->store->stats().coldReplicaWaits.fetch_add(1, std::memory_order_relaxed);
       return; // served again by the lambda, on the executor (this request is dropped unanswered)
     }
   }
-  if (req->parkedSinceUs && req->st->store) // it waited, and goes on now
-    req->st->store->stats().coldReplicaWaitUs.fetch_add(nowUs() - req->parkedSinceUs,
+  if (req->parkStartUs && req->st->store) // it waited, and goes on now
+    req->st->store->stats().coldReplicaWaitUs.fetch_add(nowUs() - req->parkStartUs,
                                                         std::memory_order_relaxed);
   if (!need.empty() || !req->origPieces.empty()) // fetched, or waited for
     noteWaitTier(req->user, ReaderWait::kOrigin);
@@ -2413,6 +2524,7 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
         r2->t0 = req->t0;
         r2->readerT = req->readerT;
         r2->retryS = req->retryS;
+        r2->parkedSinceUs = req->parkedSinceUs;
         Executor::instance().post([r2] { serveRequest(r2); });
       };
       if (req->entry->waitForInFlight(want, again)) {
@@ -2449,27 +2561,28 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
   // complete_chunks: the other baskets of these branches in the clusters they lie in are fetched
   // and converted with them, so that a later pass, whose read cache may read a cluster's baskets
   // ahead in another layout (a map states them at their real length), finds them all. Only those
-  // nobody holds or is fetching: the request never waits for them, and no reader reads them here.
-  // Not for a file read directly (nothing is kept), nor once its store is gone.
+  // nobody holds or is fetching, at most kExtraBytes of them, in vector reads of their own: the
+  // request is answered once they are converted too, but a failure of theirs is not the reader's
+  // (finishExtra). Not for a file read directly (nothing is kept), nor once its store is gone or
+  // while the cache is not being filled.
   if (cf.completeChunks && !need.empty() && !cf.direct() &&
-      !cf.storeGone.load(std::memory_order_relaxed)) {
+      !cf.storeGone.load(std::memory_order_relaxed) && !notKeeping()) {
     cf.ensureChunks();
     std::vector<uint32_t> more;
     cf.completion(need, more);
-    uint64_t n = 0, bytes = 0;
+    uint64_t bytes = 0;
     for (uint32_t i : more) {
+      if (bytes + cf.slot(i).origLen > kExtraBytes)
+        break;
       uint8_t expect = ColdFill::kAbsent;
       if (cf.state[i].compare_exchange_strong(expect, ColdFill::kFetching,
                                               std::memory_order_acq_rel)) {
         req->claimed.push_back(i);
-        ++n;
+        req->extra.push_back(i);
         bytes += cf.slot(i).origLen;
       }
     }
-    if (n && req->st->store) {
-      req->st->store->stats().coldReplicaCompleted.fetch_add(n, std::memory_order_relaxed);
-      req->st->store->stats().coldReplicaCompletedBytes.fetch_add(bytes, std::memory_order_relaxed);
-    }
+    std::sort(req->extra.begin(), req->extra.end());
   }
 
   // Which original pages are worth keeping needs every relocated basket's
@@ -2480,7 +2593,7 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
   // What to fetch: claimed baskets the byte cache does not hold, and original
   // bytes it did not have. A claimed basket already in the byte cache (a
   // file read before recompression was switched on) converts from there.
-  std::vector<PartItem> items;
+  std::vector<PartItem> items, extraItems;
   const uint64_t ps = req->entry->pageSize(), fs = req->entry->fileSize();
   for (uint32_t i : req->claimed) {
     const tp::FillSlot& s = cf.slot(i);
@@ -2501,6 +2614,10 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
         continue;
       }
     }
+    if (req->isExtra(i)) {
+      extraItems.push_back({true, i, s.origSeek, s.origLen, rs, re});
+      continue;
+    }
     req->fetched.push_back(i);
     items.push_back({true, i, s.origSeek, s.origLen, rs, re});
   }
@@ -2509,36 +2626,42 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
     auto [rs, re] = roundSpan(ps, fs, p.off, p.len);
     items.push_back({false, k, p.off, p.len, rs, re});
   }
-  std::sort(items.begin(), items.end(),
-            [](const PartItem& a, const PartItem& b) { return a.rs < b.rs; });
   // Parts: consecutive items until a part holds kPartBytes, cut only where the
-  // next item does not share a page with the part so far.
-  std::vector<PartItem> part;
-  uint64_t partBytes = 0, partEnd = 0;
+  // next item does not share a page with the part so far. The baskets taken
+  // along go in parts of their own.
   const size_t maxItems = splitMoveKind() ? 8 : kPartItems; // a test's parts (PluginSupport.h)
   int issued = 0;
-  for (const auto& it : items) {
-    // Cut by bytes, and by element count: a vector read carries at most 1024.
-    if (!part.empty() && (partBytes >= kPartBytes || part.size() >= maxItems) &&
-        it.rs >= partEnd) {
-      if (issued++ == 1 && splitMoveFire()) { // test hook: another request's move lands here
-        XrdCl::File* first = req->st->inner.load();
-        auto moved = std::make_shared<std::promise<bool>>();
-        if (moveSlotRequest(req->st, first,
-                            XRootDStatus(XrdCl::stError, XrdCl::errSocketTimeout), false, 0,
-                            req->t0, [moved](bool m, const XRootDStatus&) { moved->set_value(m); }))
-          moved->get_future().wait_for(std::chrono::seconds(60));
+  auto issueAll = [&](std::vector<PartItem>& all, bool extra) {
+    std::sort(all.begin(), all.end(),
+              [](const PartItem& a, const PartItem& b) { return a.rs < b.rs; });
+    std::vector<PartItem> part;
+    uint64_t partBytes = 0, partEnd = 0;
+    for (const auto& it : all) {
+      // Cut by bytes, and by element count: a vector read carries at most 1024.
+      if (!part.empty() && (partBytes >= kPartBytes || part.size() >= maxItems) &&
+          it.rs >= partEnd) {
+        // Test hook: another request's move lands here.
+        if (!extra && issued++ == 1 && splitMoveFire()) {
+          XrdCl::File* first = req->st->inner.load();
+          auto moved = std::make_shared<std::promise<bool>>();
+          if (moveSlotRequest(req->st, first, XRootDStatus(XrdCl::stError, XrdCl::errSocketTimeout),
+                              false, 0, req->t0,
+                              [moved](bool m, const XRootDStatus&) { moved->set_value(m); }))
+            moved->get_future().wait_for(std::chrono::seconds(60));
+        }
+        issuePart(req, std::move(part), extra);
+        part.clear();
+        partBytes = 0;
       }
-      issuePart(req, std::move(part));
-      part.clear();
-      partBytes = 0;
+      partBytes += it.re - std::max(it.rs, std::min(partEnd, it.re));
+      partEnd = std::max(partEnd, it.re);
+      part.push_back(it);
     }
-    partBytes += it.re - std::max(it.rs, std::min(partEnd, it.re));
-    partEnd = std::max(partEnd, it.re);
-    part.push_back(it);
-  }
-  if (!part.empty())
-    issuePart(req, std::move(part));
+    if (!part.empty())
+      issuePart(req, std::move(part), extra);
+  };
+  issueAll(items, /*extra=*/false);
+  issueAll(extraItems, /*extra=*/true);
   req->done(); // the issuing stage's own hold
 }
 
@@ -2596,41 +2719,61 @@ Executor& mapPool() {
 uint64_t testCapOr(uint64_t bytes) {
   static const long long kb = [] {
     const char* v = std::getenv("UCACHE_TEST_PENDING_CAP_KB");
-    return v ? std::atoll(v) : 0LL;
+    const long long n = v ? std::atoll(v) : 0LL;
+    if (n > 0)
+      UCACHE_INFO("test hook: the caps of converted records waiting are %lld KiB", n);
+    return n;
   }();
   return kb > 0 ? static_cast<uint64_t>(kb) << 10 : bytes;
 }
 
 // Records converted in this process and not yet collected by a commit, all
-// files. Past the cap a request that would convert more waits for the commits
-// (parkForCommits): back-pressure, so that memory does not grow and nothing
-// converted is dropped.
+// files, and those collected and being written. Past the cap a request that would convert more
+// waits for the commits (parkForCommits): back-pressure, so that memory stays near the cap and
+// nothing converted is dropped while the cache disk keeps up.
 std::atomic<uint64_t> g_pendingTotal{0};
+std::atomic<uint64_t> g_writingTotal{0};
 uint64_t pendingCap() {
   static const uint64_t cap = testCapOr(512ull << 20);
   return cap;
 }
+uint64_t waitingTotal() {
+  return g_pendingTotal.load(std::memory_order_relaxed) +
+         g_writingTotal.load(std::memory_order_relaxed);
+}
 
 // Requests parked for the commits: served again when a commit brings the
 // records waiting under the cap (wakeParked), or at the latest after
-// kParkRecheckMs, when they look again. Leaked like the pools.
+// kParkRecheckMs, when they look again. Each is served once, by whichever
+// comes first; one served already is let go of at the next park. Leaked like
+// the pools.
+struct Parked {
+  std::atomic<bool> fired{false};
+  std::function<void()> again;
+  void fire() {
+    if (!fired.exchange(true))
+      again();
+  }
+};
 std::mutex g_parkMu;
-std::vector<std::function<void()>>& parked() {
-  static auto* v = new std::vector<std::function<void()>>();
+std::vector<std::shared_ptr<Parked>>& parked() {
+  static auto* v = new std::vector<std::shared_ptr<Parked>>();
   return *v;
 }
 constexpr uint64_t kParkRecheckMs = 200;
 
-void wakeParked() {
-  if (g_pendingTotal.load(std::memory_order_relaxed) > pendingCap())
+// `all`: every parked request, whatever is waiting (the cache stopped being filled).
+void wakeParked(bool all = false) {
+  if (!all && waitingTotal() > pendingCap())
     return;
-  std::vector<std::function<void()>> go;
+  std::vector<std::shared_ptr<Parked>> go;
   {
     std::lock_guard<std::mutex> g(g_parkMu);
     go.swap(parked());
   }
-  for (auto& f : go)
-    Executor::instance().post(std::move(f));
+  for (auto& p : go)
+    if (!p->fired.load())
+      Executor::instance().post([p] { p->fire(); });
 }
 // Records served but not committed (see ColdFill::transient): a cache for a
 // reader that reads a slot again, nothing more -- every request holds the
@@ -2656,33 +2799,104 @@ bool commitsRefused() {
   return g_commitsRefused.load(std::memory_order_relaxed);
 }
 
+// The cache disk too slow for the first pass: a request waited kParkMaxUs and the records waiting
+// were still past their cap. Until they have drained to half of it, records are served and not
+// queued for a commit, as when commits are refused, and nothing waits: the job goes on at its own
+// pace and the cache is not filled meanwhile. Warned when it starts and when it ends.
+std::atomic<bool> g_commitsSlow{false};
+std::atomic<uint64_t> g_slowSinceUs{0};
+std::atomic<uint64_t> g_slowDeclinedAt{0}; // cold_replica_declined when it started
+std::atomic<uint64_t> g_slowWarnUs{0};     // when a start was last reported
+// Episodes after the first are reported at most this often (a disk that stays slow comes and goes
+// as the records drain).
+constexpr uint64_t kSlowWarnEveryUs = 60'000'000;
+bool notKeeping() {
+  return commitsRefused() || g_commitsSlow.load(std::memory_order_relaxed);
+}
+
+void startSlowCommits(uint64_t waitedUs) {
+  if (waitingTotal() <= pendingCap() || notKeeping() || g_commitsSlow.exchange(true))
+    return;
+  g_slowSinceUs.store(nowUs(), std::memory_order_relaxed);
+  auto store = globalStore();
+  g_slowDeclinedAt.store(store ? store->stats().coldReplicaDeclined.load() : 0,
+                         std::memory_order_relaxed);
+  if (store)
+    store->stats().slowCacheEpisodes.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t now = nowUs(), last = g_slowWarnUs.load(std::memory_order_relaxed);
+  if (!last || now - last >= kSlowWarnEveryUs) {
+    g_slowWarnUs.store(now, std::memory_order_relaxed);
+    UCACHE_WARN("the cache disk is too slow for this pass (%llu MiB of converted records still "
+                "waiting to be written after %.1f s): the cache is not filled until it catches up; "
+                "reads go on",
+                static_cast<unsigned long long>(waitingTotal() >> 20),
+                static_cast<double>(waitedUs) / 1e6);
+  }
+  wakeParked(/*all=*/true);
+}
+
+// After a commit has written: the cache disk caught up.
+void endSlowCommitsIfDrained() {
+  if (!g_commitsSlow.load(std::memory_order_relaxed) || waitingTotal() > pendingCap() / 2 ||
+      !g_commitsSlow.exchange(false))
+    return;
+  const uint64_t us = nowUs() - g_slowSinceUs.load(std::memory_order_relaxed);
+  uint64_t lost = 0;
+  if (auto store = globalStore()) {
+    store->stats().slowCacheUs.fetch_add(us, std::memory_order_relaxed);
+    const uint64_t now = store->stats().coldReplicaDeclined.load();
+    const uint64_t at = g_slowDeclinedAt.load(std::memory_order_relaxed);
+    lost = now > at ? now - at : 0;
+  }
+  if (nowUs() - g_slowWarnUs.load(std::memory_order_relaxed) <= us) // its start was reported
+    UCACHE_WARN("the cache disk caught up after %.1f s: the cache is filled again (%llu converted "
+                "records not kept meanwhile)",
+                static_cast<double>(us) / 1e6, static_cast<unsigned long long>(lost));
+}
+
+// Every live run, for the waiting records to be sent to be committed (parkForCommits): the
+// registry's, and runs it no longer names that still serve their handles. Leaked like the pools.
+std::mutex g_liveMu;
+std::vector<std::weak_ptr<ColdFill>>& liveFills() {
+  static auto* v = new std::vector<std::weak_ptr<ColdFill>>();
+  return *v;
+}
+
 // The records waiting are past their cap: `again` (the request served again from the start) is
 // parked until the commits bring them under it, and every file's waiting records are sent to be
 // committed now (a file's own commit otherwise starts only once it holds kCommitBytes, and with
-// every request parked none would). False: under the cap, go on.
+// every request parked none would). False: under the cap, or the cache not being filled, go on.
 bool parkForCommits(std::function<void()> again) {
-  if (g_pendingTotal.load(std::memory_order_relaxed) <= pendingCap() || commitsRefused())
+  if (waitingTotal() <= pendingCap() || notKeeping())
     return false;
-  auto fired = std::make_shared<std::atomic<bool>>(false);
-  std::function<void()> once = [fired, again = std::move(again)] {
-    if (!fired->exchange(true))
-      again();
-  };
+  auto p = std::make_shared<Parked>();
+  p->again = std::move(again);
   {
     std::lock_guard<std::mutex> g(g_parkMu);
-    parked().push_back(once);
+    auto& v = parked();
+    v.erase(std::remove_if(v.begin(), v.end(),
+                           [](const std::shared_ptr<Parked>& q) { return q->fired.load(); }),
+            v.end());
+    v.push_back(p);
   }
   std::vector<std::shared_ptr<ColdFill>> all;
   {
-    std::lock_guard<std::mutex> g(g_regMu);
-    for (const auto& [k, cf] : registry())
-      all.push_back(cf);
+    std::lock_guard<std::mutex> g(g_liveMu);
+    auto& v = liveFills();
+    for (auto it = v.begin(); it != v.end();) {
+      if (auto cf = it->lock()) {
+        all.push_back(std::move(cf));
+        ++it;
+      } else {
+        it = v.erase(it);
+      }
+    }
   }
   for (const auto& cf : all)
     cf->queueCommit();
   wakeParked(); // the commits may have caught up between the look above and the parking
   // A wakeup lost all the same must not hang the read: it looks again (and parks again).
-  Executor::instance().postAfter(kParkRecheckMs, once, /*housekeeping=*/true);
+  Executor::instance().postAfter(kParkRecheckMs, [p] { p->fire(); }, /*housekeeping=*/true);
   return true;
 }
 
@@ -2785,12 +2999,13 @@ void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool kee
         heldList.emplace_back(i, s.token, s.stagedUs);
         *group = s.token;
       } else {
-        // Committed, unless the store is gone or commits are refused for now
-        // (commitsRefused): then it is served to the requests that asked for
-        // it (they hold it) and kept only while the transient budget allows.
-        // The records waiting are held to their cap before conversion, by the
-        // requests that wait (parkForCommits): what is converted is kept.
-        const bool persist = !storeGone.load(std::memory_order_relaxed) && !commitsRefused();
+        // Committed, unless the store is gone, commits are refused for now or
+        // the cache disk is too slow (notKeeping): then it is served to the
+        // requests that asked for it (they hold it) and kept only while the
+        // transient budget allows. Otherwise the records waiting are held to
+        // their cap before conversion, by the requests that wait
+        // (parkForCommits): what is converted is kept.
+        const bool persist = !storeGone.load(std::memory_order_relaxed) && !notKeeping();
         keep = placeLocked(i, s, rec, b, inCache, persist, lost, kick);
       }
     }
@@ -2856,11 +3071,11 @@ bool ColdFill::placeLocked(uint32_t i, Info& s, const Rec& rec, uint64_t b, bool
 void ColdFill::appendGroupLocked(std::vector<std::pair<uint32_t, uint64_t>>& group,
                                  uint64_t& lost, bool& kick) {
   std::sort(group.begin(), group.end());
-  // The whole group goes one way: committed, unless the store is gone or
-  // commits are refused for now (then served and transient). The records
+  // The whole group goes one way: committed, unless the store is gone or the
+  // cache is not being filled (notKeeping: then served and transient). The records
   // waiting may pass their cap by the requests already converting when it was
   // reached: new ones wait for the commits (parkForCommits).
-  const bool persist = !storeGone.load(std::memory_order_relaxed) && !commitsRefused();
+  const bool persist = !storeGone.load(std::memory_order_relaxed) && !notKeeping();
   for (const auto& [i, token] : group) {
     auto it = info.find(i);
     if (it == info.end())
@@ -3232,7 +3447,21 @@ void ColdFill::commit() try {
       transient.clear();
     }
   }
-  wakeParked(); // the records collected no longer count against the cap
+  // The records collected count against the cap until they are written: memory goes down only
+  // then. Whatever way this commit ends, the parked requests look again, and the cache disk may
+  // have caught up.
+  uint64_t collected = 0;
+  for (const auto& r : recs)
+    collected += r.bytes.size();
+  g_writingTotal.fetch_add(collected, std::memory_order_relaxed);
+  struct Written {
+    uint64_t bytes;
+    ~Written() {
+      g_writingTotal.fetch_sub(bytes, std::memory_order_relaxed);
+      wakeParked();
+      endSlowCommitsIfDrained();
+    }
+  } written{collected};
   if (recs.empty())
     return;
   if (!store || storeGone.load()) {
@@ -3595,6 +3824,10 @@ std::shared_ptr<ColdFill> coldAttach(const std::shared_ptr<HandleState>& st,
   // Registered after the store exists, so it runs before the store is torn down.
   static std::once_flag once;
   std::call_once(once, [] { std::atexit(commitAtExit); });
+  {
+    std::lock_guard<std::mutex> g(g_liveMu);
+    liveFills().push_back(cf);
+  }
   std::lock_guard<std::mutex> g(g_regMu);
   auto [it, inserted] = registry().emplace(key.key, cf);
   if (!inserted && (it->second->L.originSize != entry->fileSize() || it->second->entry != entry ||
@@ -3672,6 +3905,12 @@ void coldForkPrepare() {
   // A child's handler may use these; a first use in progress in another thread
   // at the fork would leave the child waiting on it for good.
   (void)registry();
+  (void)parked();
+  (void)liveFills();
+  (void)pendingCap();
+  (void)transientCap();
+  (void)transientFileCap();
+  (void)commitDelayMs();
 }
 
 void coldForkParent() {
@@ -3702,7 +3941,18 @@ void coldAfterForkChild() {
   new (&g_cmtCv) std::condition_variable;
   g_cmtPending = 0; // the parent's commits are the parent's to wait for at exit
   g_pendingTotal.store(0, std::memory_order_relaxed);
+  g_writingTotal.store(0, std::memory_order_relaxed);
   g_transientTotal.store(0, std::memory_order_relaxed);
+  // The parent's parked requests are its readers' (served on its runs, answered to its handlers):
+  // left behind untouched, as its runs are. Its states of the commits are its own.
+  auto* leftParked = new std::vector<std::shared_ptr<Parked>>(); // leaked, as above
+  leftParked->swap(parked());
+  new (&g_parkMu) std::mutex;
+  auto* leftLive = new std::vector<std::weak_ptr<ColdFill>>(); // leaked, as above
+  leftLive->swap(liveFills());
+  new (&g_liveMu) std::mutex;
+  g_commitsRefused.store(false, std::memory_order_relaxed);
+  g_commitsSlow.store(false, std::memory_order_relaxed);
 }
 
 uint64_t coldVirtualSize(const ColdFill& cf) { return cf.L.virtualSize; }

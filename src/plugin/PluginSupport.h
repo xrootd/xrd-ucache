@@ -83,6 +83,10 @@ bool decodeNoMemFire();
 // pagenomem).
 bool pageNoMemFire();
 bool slotFetchFaultFire();
+// Test hook (UCACHE_TEST_READ_FAIL_KIND=extra, with UCACHE_TEST_READ_FAIL_N): true for the
+// process's first N fetches of what complete_chunks takes along on their own, each of which then
+// fails with a connection error. UCacheFile.cc.
+bool extraFetchFaultFire();
 // Test-only (UCACHE_TEST_READ_FAIL_KIND=splitmove, with UCACHE_TEST_READ_FAIL_N=1): the slot run
 // cuts its fetches into parts of at most 8 baskets; between the first and the second part of the
 // first request that has more than one, the handle is moved to another copy, as another request's

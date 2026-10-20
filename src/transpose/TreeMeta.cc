@@ -1512,26 +1512,36 @@ std::vector<uint8_t> readKeyPayload(Source& src, const KeyInfo& k) {
 }
 
 std::vector<int64_t> clusterStarts(const FileMeta& fm) {
+  // A record's values (a damaged one's among them) bound neither the count nor the sums: past
+  // kMaxClusters, or a step that would overflow, there are none.
+  constexpr size_t kMaxClusters = 1u << 20;
   std::vector<int64_t> out;
   const int64_t n = fm.entries;
   if (n <= 0)
     return out;
+  auto step = [&](int64_t from, int64_t to, int64_t size) {
+    for (int64_t e = from; e<to; e = size> to - e ? to : e + size) {
+      if (out.size() >= kMaxClusters)
+        return false;
+      out.push_back(e);
+    }
+    return true;
+  };
   int64_t at = 0, largest = 0;
   for (size_t r = 0; r < fm.clusterRangeEnd.size() && at < n; ++r) {
-    const int64_t end = std::min<int64_t>(fm.clusterRangeEnd[r] + 1, n);
+    const int64_t end = fm.clusterRangeEnd[r] >= n - 1 ? n : fm.clusterRangeEnd[r] + 1;
     const int64_t size = r < fm.clusterSize.size() ? fm.clusterSize[r] : 0;
     if (size <= 0 || end <= at)
       return {};
-    for (int64_t e = at; e < end; e += size) {
-      out.push_back(e);
-      largest = std::max(largest, std::min(size, end - e));
-    }
+    if (!step(at, end, size))
+      return {};
+    largest = std::max(largest, std::min(size, end - at));
     at = end;
   }
   if (at < n) {
     if (fm.autoFlush > 0) {
-      for (int64_t e = at; e < n; e += fm.autoFlush)
-        out.push_back(e);
+      if (!step(at, n, fm.autoFlush))
+        return {};
     } else if (largest > 0 && n - at <= largest) {
       out.push_back(at);
     } else {

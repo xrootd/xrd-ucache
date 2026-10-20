@@ -192,26 +192,40 @@ bool headerFaultFires() {
 // decoders failing, as for want of memory (decodeNoMemFire, transpose::DecoderNoMemory).
 // pagenomem: the same for the decodes of stored RNTuple pages a request copies (pageNoMemFire).
 // ioerr: the misses, each failing with the server's own I/O error (kXR_IOError), as if it had
-// answered so.
+// answered so. extra: the fetches of what complete_chunks takes along on their own (a slot run's
+// parts of them, a byte-cache miss's background completion), with a connection error
+// (extraFetchFaultFire).
 enum class FaultKind : uint8_t {
-  kMiss, kRelay, kRefuse, kFinal, kLate, kAgain, kLeftData, kConvert, kSplitMove, kDecodeNoMem,
-  kPageNoMem, kIoErr
+  kMiss,
+  kRelay,
+  kRefuse,
+  kFinal,
+  kLate,
+  kAgain,
+  kLeftData,
+  kConvert,
+  kSplitMove,
+  kDecodeNoMem,
+  kPageNoMem,
+  kIoErr,
+  kExtra
 };
 static const FaultKind gFaultKind = [] {
   const char* v = ::getenv("UCACHE_TEST_READ_FAIL_KIND");
   const std::string k = v ? v : "";
-  return k == "relay"      ? FaultKind::kRelay
-         : k == "refuse"   ? FaultKind::kRefuse
-         : k == "final"    ? FaultKind::kFinal
-         : k == "late"     ? FaultKind::kLate
-         : k == "again"    ? FaultKind::kAgain
-         : k == "leftdata" ? FaultKind::kLeftData
-         : k == "convert"  ? FaultKind::kConvert
-         : k == "splitmove" ? FaultKind::kSplitMove
+  return k == "relay"         ? FaultKind::kRelay
+         : k == "refuse"      ? FaultKind::kRefuse
+         : k == "final"       ? FaultKind::kFinal
+         : k == "late"        ? FaultKind::kLate
+         : k == "again"       ? FaultKind::kAgain
+         : k == "leftdata"    ? FaultKind::kLeftData
+         : k == "convert"     ? FaultKind::kConvert
+         : k == "splitmove"   ? FaultKind::kSplitMove
          : k == "decodenomem" ? FaultKind::kDecodeNoMem
-         : k == "pagenomem" ? FaultKind::kPageNoMem
-         : k == "ioerr" ? FaultKind::kIoErr
-                           : FaultKind::kMiss;
+         : k == "pagenomem"   ? FaultKind::kPageNoMem
+         : k == "ioerr"       ? FaultKind::kIoErr
+         : k == "extra"       ? FaultKind::kExtra
+                              : FaultKind::kMiss;
 }();
 bool convertFaultFire() {
   return gFaultKind == FaultKind::kConvert && readFaultFire();
@@ -225,7 +239,10 @@ bool pageNoMemFire() {
 bool slotFetchFaultFire() {
   return gFaultKind != FaultKind::kConvert && gFaultKind != FaultKind::kSplitMove &&
          gFaultKind != FaultKind::kDecodeNoMem && gFaultKind != FaultKind::kPageNoMem &&
-         gFaultKind != FaultKind::kIoErr && readFaultFire();
+         gFaultKind != FaultKind::kIoErr && gFaultKind != FaultKind::kExtra && readFaultFire();
+}
+bool extraFetchFaultFire() {
+  return gFaultKind == FaultKind::kExtra && readFaultFire();
 }
 static std::atomic<bool> gSplitMoveArmed{false};
 bool splitMoveKind() {
@@ -276,7 +293,7 @@ static bool injectReadFault(bool relaySite, ResponseHandler* h, XRootDStatus& s,
       : relaySite ? k == FaultKind::kRelay || k == FaultKind::kRefuse || k == FaultKind::kAgain
                   : k != FaultKind::kRelay && k != FaultKind::kAgain && k != FaultKind::kConvert &&
                         k != FaultKind::kSplitMove && k != FaultKind::kDecodeNoMem &&
-                        k != FaultKind::kPageNoMem;
+                        k != FaultKind::kPageNoMem && k != FaultKind::kExtra;
   if (!here || !readFaultFire())
     return false;
   s = XRootDStatus();
@@ -6583,9 +6600,9 @@ struct WireElem {
 // Vector-read miss stage: one wire VectorRead of rounded+coalesced ranges.
 class MissVReadHandler : public ResponseHandler {
  public:
-  // complete_chunks: the baskets this read fetches beyond the reader's, and their bytes, credited
-  // when its pages are kept.
-  uint64_t completed = 0, completedBytes = 0;
+  // complete_chunks: the baskets this read fetches beyond the reader's ([off, end), one per
+  // basket), credited when their pages are kept.
+  std::vector<std::pair<uint64_t, uint64_t>> completedRanges;
   // `direct`: the file's rule when it is read directly -- its data is served
   // and not kept, only pages holding none of it are. `readerT`: the reader's
   // own timeout of the request, 0 for none.
@@ -6725,6 +6742,22 @@ class MissVReadHandler : public ResponseHandler {
         return;
       }
       keepNone = bad.outside || v.unjudged; // a part not judged is served, never kept
+      // ... unless what failed outside the reader's ranges lies only in baskets complete_chunks
+      // took along: those baskets' elements alone are not kept.
+      if (bad.outside && !v.unjudged && !completedRanges.empty()) {
+        bool onlyTaken = true;
+        for (const auto& f : v.faults) {
+          const uint64_t fe = std::max(f.end, f.at + 1);
+          bool in = false;
+          for (const auto& [ca, ce] : completedRanges)
+            if (f.at < ce && ca < fe) {
+              in = true;
+              notKept_.emplace_back(ca, ce);
+            }
+          onlyTaken = onlyTaken && in;
+        }
+        keepNone = !onlyTaken;
+      }
     }
 #else
     (void)a;
@@ -6793,12 +6826,29 @@ class MissVReadHandler : public ResponseHandler {
       return;
     }
     // Persist each wire element's full pages asynchronously, posted before the user is completed
-    // (see MissReadHandler); buffer ownership moves to each task (single owner).
-    for (auto& w : wire_)
-      persistPages(st_, entry_, w.off, std::move(w.buf), w.len);
-    if (completed && !wire_.empty() && st_->store) {
-      st_->store->stats().fillCompleted.fetch_add(completed, std::memory_order_relaxed);
-      st_->store->stats().fillCompletedBytes.fetch_add(completedBytes, std::memory_order_relaxed);
+    // (see MissReadHandler); buffer ownership moves to each task (single owner). An element that
+    // holds a basket taken along that failed its check is not kept.
+    const uint64_t ps = entry_->pageSize();
+    for (auto& w : wire_) {
+      bool drop = false;
+      for (const auto& [a, e] : notKept_)
+        drop = drop || (w.off < (e + ps - 1) / ps * ps && a / ps * ps < w.off + w.len);
+      if (!drop)
+        persistPages(st_, entry_, w.off, std::move(w.buf), w.len);
+    }
+    if (!completedRanges.empty() && !wire_.empty() && st_->store) {
+      uint64_t n = 0, bytes = 0;
+      for (const auto& [a, e] : completedRanges) {
+        bool drop = false;
+        for (const auto& [x, y] : notKept_)
+          drop = drop || (a == x && e == y);
+        if (!drop) {
+          ++n;
+          bytes += e - a;
+        }
+      }
+      st_->store->stats().fillCompleted.fetch_add(n, std::memory_order_relaxed);
+      st_->store->stats().fillCompletedBytes.fetch_add(bytes, std::memory_order_relaxed);
     }
     complete(user_, okStatus(), vreadResponse(userChunks_));
     delete this;
@@ -6876,6 +6926,8 @@ class MissVReadHandler : public ResponseHandler {
   // failover: the handle was undecided when this was issued (fedUndecided):
   // what it fetches is served and never kept.
   bool undecided_ = false;
+  // Baskets taken along that failed their check: their elements are not kept.
+  std::vector<std::pair<uint64_t, uint64_t>> notKept_;
 };
 
 // Rounded [start,end) for a chunk; the rule and why it is not optional are in
@@ -6907,29 +6959,54 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
     else
       ivals.push_back(roundChunk(*entry, c.offset, c.length));
   }
+  auto coalesce = [](std::vector<std::pair<uint64_t, uint64_t>> iv) {
+    std::sort(iv.begin(), iv.end());
+    std::vector<std::pair<uint64_t, uint64_t>> runs;
+    for (auto [s, e] : iv) {
+      if (!runs.empty() && s <= runs.back().second)
+        runs.back().second = std::max(runs.back().second, e);
+      else
+        runs.emplace_back(s, e);
+    }
+    return runs;
+  };
+  // Elements of a run, cut where the protocol requires (below).
+  const uint64_t ps = entry->pageSize();
+  auto elems = [ps](uint64_t s, uint64_t e) {
+    size_t n = 0;
+    for (uint64_t at = s; at < e; at = readvElemEnd(at, e, ps))
+      ++n;
+    return n;
+  };
   // complete_chunks: the rest of the clusters these baskets lie in go with them (ChunkComplete.h),
-  // kept as the miss's pages are and served to no one now.
-  uint64_t completed = 0, completedBytes = 0;
+  // kept as the miss's pages are and served to no one now; only as many as the read's elements
+  // allow beside the reader's own (a vector read carries at most kMaxReadvElems).
+  std::vector<std::pair<uint64_t, uint64_t>> taken;
 #ifdef UCACHE_HAVE_COLDRUN
   if (!direct) {
     std::vector<std::pair<uint64_t, uint64_t>> asked;
     asked.reserve(missIdx.size());
     for (size_t idx : missIdx)
       asked.emplace_back(userChunks[idx].offset, userChunks[idx].offset + userChunks[idx].length);
-    for (const auto& [a, e] : completionFor(st, entry, asked, completed)) {
-      ivals.push_back(roundChunk(*entry, a, e - a));
-      completedBytes += e - a;
+    uint64_t n = 0;
+    const auto more = completionFor(st, entry, asked, n);
+    if (!more.empty()) {
+      size_t used = 0;
+      for (const auto& [s, e] : coalesce(ivals))
+        used += elems(s, e);
+      for (const auto& [a, e] : more) {
+        const auto [rs, re] = roundChunk(*entry, a, e - a);
+        const size_t k = elems(rs, re); // as if it joined no run: never more than it takes
+        if (used + k > kMaxReadvElems)
+          break;
+        used += k;
+        ivals.emplace_back(rs, re);
+        taken.emplace_back(a, e);
+      }
     }
   }
 #endif
-  std::sort(ivals.begin(), ivals.end());
-  std::vector<std::pair<uint64_t, uint64_t>> runs;
-  for (auto [s, e] : ivals) {
-    if (!runs.empty() && s <= runs.back().second)
-      runs.back().second = std::max(runs.back().second, e);
-    else
-      runs.emplace_back(s, e);
-  }
+  const std::vector<std::pair<uint64_t, uint64_t>> runs = coalesce(std::move(ivals));
   // Cut each run into protocol-legal elements. An element above the ceiling is
   // REFUSED and fails the whole request, so this is correctness, not tuning;
   // cutting on page boundaries keeps every piece storable whole. Runs stay
@@ -6938,7 +7015,7 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
   wire.reserve(runs.size());
   for (auto [s, e] : runs)
     for (uint64_t at = s; at < e;) {
-      const uint64_t cut = readvElemEnd(at, e, entry->pageSize());
+      const uint64_t cut = readvElemEnd(at, e, ps);
       wire.push_back({at, cut - at, nullptr});
       at = cut;
     }
@@ -6956,8 +7033,7 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
   }
   auto* mh = new MissVReadHandler(st, f, entry, std::move(userChunks), std::move(missIdx),
                                   std::move(wire), user, startUs, std::move(direct), readerT);
-  mh->completed = completed;
-  mh->completedBytes = completedBytes;
+  mh->completedRanges = std::move(taken);
   XRootDStatus s;
   if (!injectReadFault(false, mh, s)) // test hook: wire vector read dies mid-stream
     s = f->VectorRead(wireChunks, nullptr, mh, st->originTimeout(readerT, startUs));

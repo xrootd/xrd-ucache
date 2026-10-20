@@ -1,5 +1,6 @@
 #include "ChunkComplete.h"
 
+#include "ClusterSiblings.h"
 #include "Config.h"
 #include "Executor.h"
 #include "FileEntry.h"
@@ -35,7 +36,7 @@ constexpr uint64_t kParseIntervalUs = 2'000'000; // ... and no more often than t
 constexpr int kMaxFails = 32; // looks that found no records or no new branch, tried
                               // again at the next misses
 constexpr uint64_t kMaxCompleteBytes = 64ull << 20; // fetched beyond one miss at most
-constexpr size_t kMaxReadvElems = 1024;             // the vector read's element cap
+constexpr int kMaxTimeoutS = 60; // of a parse's reads and of a completing read: no reader asked
 
 uint64_t nowMicros() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -44,19 +45,17 @@ uint64_t nowMicros() {
 }
 
 // One file's table: the baskets of the branches its readers have asked for, by position, and the
-// tree's cluster starts. Guarded by mu.
+// tree's cluster starts. Guarded by mu, which is never held across a read: a parse runs outside it
+// (`parsing`), and the misses meanwhile use the table as it is.
 struct FileTable {
   std::weak_ptr<FileEntry> entry;
   std::mutex mu;
-  bool none = false; // no tree, or no cluster boundaries: never looked at again
+  bool none = false;    // no tree, or no cluster boundaries: never looked at again
+  bool parsing = false; // a parse of the file's records is under way
   int parses = 0, fails = 0;
   uint64_t lastParseUs = 0; // of the last parse that found the records
   std::vector<int64_t> clusterStart;
-  struct Branch {
-    std::vector<int64_t> seek, entry; // per basket; entry: [writeBasket + 1]
-    std::vector<int32_t> bytes;
-  };
-  std::unordered_map<uint32_t, Branch> kept;                // by the record's branch index
+  std::unordered_map<uint32_t, BranchBaskets> kept;         // by the record's branch index
   std::map<uint64_t, std::pair<uint32_t, uint32_t>> bySeek; // kept baskets: branch, basket
 };
 
@@ -101,17 +100,27 @@ bool converted(const tp::BranchInfo& b) {
   return std::find(codecs.begin(), codecs.end(), c) != codecs.end();
 }
 
+// The timeout of a read made for completion alone: the handle's, at most kMaxTimeoutS.
+XrdTimeout completionTimeout(const std::shared_ptr<HandleState>& st) {
+  const XrdTimeout t = st->originTimeout(0);
+  return t > 0 && t < kMaxTimeoutS ? t : static_cast<XrdTimeout>(kMaxTimeoutS);
+}
+
 // Parse the file's records -- from the byte cache, or from the origin through `st` for what it
-// does not hold yet (a miss's pages are written after it is answered), kept -- and learn the
-// branches whose baskets start at `starts`. Under t.mu.
-void learn(FileTable& t, const std::shared_ptr<HandleState>& st,
-           const std::shared_ptr<FileEntry>& entry, const std::vector<uint64_t>& starts) {
+// does not hold yet (a miss's pages are written after it is answered), kept. Outside t.mu.
+tp::FileMeta parseRecords(const std::shared_ptr<HandleState>& st,
+                          const std::shared_ptr<FileEntry>& entry) {
   OriginSource src;
   src.st = st;
   src.entry = entry;
-  src.timeout = st->originTimeout(0);
+  src.timeout = completionTimeout(st);
   src.mayMove = false; // never waits for a move: it may run on the executor
-  tp::FileMeta fm = tp::parseReaderTree(src, static_cast<int64_t>(entry->fileSize()));
+  return tp::parseReaderTree(src, static_cast<int64_t>(entry->fileSize()));
+}
+
+// Learn from a parse the branches whose baskets start at `starts`. Under t.mu.
+void learn(FileTable& t, const tp::FileMeta& fm, const std::shared_ptr<FileEntry>& entry,
+           const std::vector<uint64_t>& starts) {
   if (!fm.error.empty()) {
     ++t.fails;
     if (fm.error.find("not found") != std::string::npos)
@@ -150,7 +159,7 @@ void learn(FileTable& t, const std::shared_ptr<HandleState>& st,
     if (t.kept.count(b))
       continue;
     auto& br = fm.branches[b];
-    FileTable::Branch& kb = t.kept[b];
+    BranchBaskets& kb = t.kept[b];
     kb.seek = br.basketSeek;
     kb.bytes = br.basketBytes;
     kb.entry = br.basketEntry;
@@ -169,39 +178,10 @@ void learn(FileTable& t, const std::shared_ptr<HandleState>& st,
   ++t.parses;
 }
 
-// The ranges of the baskets to complete for `asked`, under t.mu: the kept branches' baskets in
-// the clusters the asked baskets lie in, other than those asked.
-void siblings(const FileTable& t, const std::vector<std::pair<uint64_t, uint64_t>>& asked,
-              std::vector<std::pair<uint64_t, uint64_t>>& out, uint64_t& n) {
-  const auto& cs = t.clusterStart;
-  for (const auto& [a, e] : asked)
-    for (auto it = t.bySeek.lower_bound(a); it != t.bySeek.end() && it->first < e; ++it) {
-      const auto& kb = t.kept.at(it->second.first);
-      const uint32_t k = it->second.second;
-      const int64_t e0 = kb.entry[k], e1 = kb.entry[k + 1];
-      if (e1 <= e0)
-        continue;
-      auto lo = std::upper_bound(cs.begin(), cs.end(), e0);
-      auto hi = std::lower_bound(cs.begin(), cs.end(), e1);
-      if (lo == cs.begin() || hi == cs.end())
-        continue;
-      const int64_t ca = *(lo - 1), cb = *hi;
-      size_t j = static_cast<size_t>(std::upper_bound(kb.entry.begin(), kb.entry.end(), ca) -
-                                     kb.entry.begin());
-      j = j ? j - 1 : 0;
-      for (; j + 1 < kb.entry.size() && kb.entry[j] < cb; ++j) {
-        if (j == k || kb.entry[j + 1] <= ca || kb.seek[j] <= 0 || kb.bytes[j] <= 0)
-          continue;
-        out.emplace_back(static_cast<uint64_t>(kb.seek[j]),
-                         static_cast<uint64_t>(kb.seek[j]) + static_cast<uint64_t>(kb.bytes[j]));
-        ++n;
-      }
-    }
-}
-
 // The completing read: its pages are kept as a miss's are, checked first where the handle's
 // fetches are (check_origin_integrity). The ranges it registered as in flight are withdrawn on
-// every exit.
+// every exit: once its pages are written when it keeps them (a reader waiting on them then finds
+// them), else when it ends.
 class CompleteHandler : public XrdCl::ResponseHandler {
  public:
   struct Elem {
@@ -209,11 +189,14 @@ class CompleteHandler : public XrdCl::ResponseHandler {
     std::shared_ptr<std::vector<char>> buf;
   };
   CompleteHandler(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
-                  std::vector<Elem> elems, std::vector<std::pair<uint64_t, uint64_t>> runs,
-                  uint64_t baskets)
-      : st_(std::move(st)), entry_(std::move(entry)), elems_(std::move(elems)),
-        runs_(std::move(runs)), baskets_(baskets) {}
-  ~CompleteHandler() override { entry_->clearFetchInFlight(runs_); }
+                  std::vector<Elem> elems, uint64_t baskets)
+      : st_(std::move(st)), entry_(std::move(entry)), elems_(std::move(elems)), baskets_(baskets) {}
+  ~CompleteHandler() override {
+    if (!runs_.empty())
+      entry_->clearFetchInFlight(runs_);
+  }
+  // The ranges registered as in flight, withdrawn as above.
+  std::vector<std::pair<uint64_t, uint64_t>> runs_;
 
   void HandleResponseWithHosts(XrdCl::XRootDStatus* status, XrdCl::AnyObject* response,
                                XrdCl::HostList* hosts) override {
@@ -233,8 +216,10 @@ class CompleteHandler : public XrdCl::ResponseHandler {
         map = keySeeksBuilt(entry_, nullptr).map;
     }
     st_->releaseInner();
-    // An answer short of what was asked is no answer (PluginSupport.h vreadComplete).
-    if (!s || !s->IsOK() || !vreadComplete(r.get(), elems_)) {
+    // An answer short of what was asked is no answer (PluginSupport.h vreadComplete); a handle
+    // still undecided keeps nothing it fetches (as its misses).
+    if (!s || !s->IsOK() || !vreadComplete(r.get(), elems_) ||
+        st_->fedUndecided.load(std::memory_order_relaxed)) {
       delete this;
       return;
     }
@@ -264,15 +249,31 @@ class CompleteHandler : public XrdCl::ResponseHandler {
  private:
   void keep() {
     uint64_t bytes = 0;
-    for (auto& e : elems_) {
+    for (const auto& e : elems_)
       bytes += e.len;
-      auto entry = entry_;
-      const uint64_t off = e.off, len = e.len;
-      HandleState::postPersist(st_, [entry, off, len, buf = std::move(e.buf)] {
-        entry->writePages(off, len, buf->data());
-        entry->flushMeta(false);
-      });
-    }
+    // The ranges are withdrawn by the write, after its pages are in; by the write's end when it is
+    // never made (not queued, for want of memory).
+    struct Withdraw {
+      std::shared_ptr<FileEntry> entry;
+      std::vector<std::pair<uint64_t, uint64_t>> runs;
+      void now() {
+        if (!runs.empty())
+          entry->clearFetchInFlight(runs);
+        runs.clear();
+      }
+      ~Withdraw() { now(); }
+    };
+    auto w = std::make_shared<Withdraw>();
+    w->entry = entry_;
+    w->runs = std::move(runs_);
+    runs_.clear();
+    auto elems = std::make_shared<std::vector<Elem>>(std::move(elems_));
+    HandleState::postPersist(st_, [w, elems] {
+      for (const auto& e : *elems)
+        w->entry->writePages(e.off, e.len, e.buf->data());
+      w->entry->flushMeta(false);
+      w->now();
+    });
     if (st_->store) {
       auto& stats = st_->store->stats();
       stats.fillCompleted.fetch_add(baskets_, std::memory_order_relaxed);
@@ -285,7 +286,6 @@ class CompleteHandler : public XrdCl::ResponseHandler {
   std::shared_ptr<HandleState> st_;
   std::shared_ptr<FileEntry> entry_;
   std::vector<Elem> elems_;
-  std::vector<std::pair<uint64_t, uint64_t>> runs_;
   uint64_t baskets_;
 };
 
@@ -298,29 +298,48 @@ completionFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<File
   std::vector<std::pair<uint64_t, uint64_t>> out;
   const Config& cfg = globalConfig();
   if (!st || !entry || asked.empty() || !cfg.completeChunks || !cfg.transpose ||
-      readRuleDirect(entry->key().key))
+      st->fedUndecided.load(std::memory_order_relaxed) || readRuleDirect(entry->key().key))
     return out;
   auto t = tableFor(entry);
-  std::vector<std::pair<uint64_t, uint64_t>> want;
-  uint64_t n = 0;
+  // Misses that start where no kept basket does: a branch not learned yet (or the file's own
+  // records, which no look finds; the parse limits bound those). Looked for by one parse at a
+  // time, never on a client callback thread (a synchronous read there may wait for the thread
+  // itself), and outside the table's lock: the misses meanwhile use the table as it is.
+  std::vector<uint64_t> unknown;
   {
     std::lock_guard<std::mutex> g(t->mu);
     if (t->none)
       return out;
-    // Misses that start where no kept basket does: a branch not learned yet (or the file's own
-    // records, which no look finds; the parse limits bound those).
-    std::vector<uint64_t> unknown;
     for (const auto& [a, e] : asked)
       if (!t->bySeek.count(a))
         unknown.push_back(a);
-    if (!unknown.empty() && t->fails < kMaxFails && t->parses < kMaxParses &&
-        (!t->parses || nowMicros() - t->lastParseUs >= kParseIntervalUs))
-      learn(*t, st, entry, unknown);
+    if (unknown.empty() || t->parsing || onClientCallback() || t->fails >= kMaxFails ||
+        t->parses >= kMaxParses || (t->parses && nowMicros() - t->lastParseUs < kParseIntervalUs))
+      unknown.clear();
+    else
+      t->parsing = true;
+  }
+  if (!unknown.empty()) {
+    tp::FileMeta fm;
+    try {
+      fm = parseRecords(st, entry);
+    } catch (const std::exception& e) {
+      fm.error = e.what();
+    }
+    std::lock_guard<std::mutex> g(t->mu);
+    t->parsing = false;
+    learn(*t, fm, entry, unknown);
+  }
+  std::vector<std::pair<uint64_t, uint64_t>> want;
+  uint64_t n = 0;
+  {
+    std::lock_guard<std::mutex> g(t->mu);
     if (t->none || t->clusterStart.empty())
       return out;
-    siblings(*t, asked, want, n);
+    clusterSiblings(t->clusterStart, t->kept, t->bySeek, asked, want, n);
   }
-  // Not what the miss itself fetches, nor what the cache holds; at most kMaxCompleteBytes.
+  // Not what the miss itself fetches, nor what the cache holds or another fetch is bringing; at
+  // most kMaxCompleteBytes of whole baskets (the pages they are fetched in may add a little).
   std::sort(want.begin(), want.end());
   want.erase(std::unique(want.begin(), want.end()), want.end());
   uint64_t total = 0;
@@ -328,7 +347,7 @@ completionFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<File
     bool overlaps = false;
     for (const auto& [x, y] : asked)
       overlaps = overlaps || (a < y && x < e);
-    if (overlaps || entry->hasRange(a, e - a))
+    if (overlaps || entry->hasRange(a, e - a) || entry->overlapsInFlight(a, e - a))
       continue;
     if (total + (e - a) > kMaxCompleteBytes)
       break;
@@ -341,7 +360,8 @@ completionFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<File
 
 namespace {
 
-// The background fetch of completeAfterMiss: the ranges in pages, as a miss keeps them.
+// The background fetch of completeAfterMiss: the ranges in pages, as a miss keeps them, in one
+// vector read of at most kMaxReadvElems elements (the baskets that do not fit are left out).
 void fetchCompletion(const std::shared_ptr<HandleState>& st,
                      const std::shared_ptr<FileEntry>& entry,
                      const std::vector<std::pair<uint64_t, uint64_t>>& asked) {
@@ -371,25 +391,36 @@ void fetchCompletion(const std::shared_ptr<HandleState>& st,
       elems.push_back(std::move(el));
       at = cut;
     }
-  if (elems.size() >= kMaxReadvElems) { // what did not fit is not announced or fetched
+  if (elems.size() >= kMaxReadvElems) { // what did not fit is not announced, fetched or counted
     runs.clear();
     for (const auto& el : elems)
       if (!runs.empty() && runs.back().second == el.off)
         runs.back().second = el.off + el.len;
       else
         runs.emplace_back(el.off, el.off + el.len);
+    const uint64_t end = runs.back().second;
+    baskets = static_cast<uint64_t>(
+        std::count_if(want.begin(), want.end(), [end](const auto& w) { return w.second <= end; }));
   }
+  if (extraFetchFaultFire()) // test hook: the completing read fails
+    return;
   XrdCl::File* f = st->acquireInnerIfOpen();
   if (!f)
     return; // no origin open: nothing is opened for this
-  // Announced before the read goes out, so a reader's miss inside them waits for this copy.
-  std::vector<std::pair<uint64_t, uint64_t>> reg;
-  for (const auto& [s, e] : runs) {
-    entry->noteFetchInFlight(s, e - s);
-    reg.emplace_back(s, e - s);
+  CompleteHandler* h = nullptr;
+  try {
+    h = new CompleteHandler(st, entry, std::move(elems), baskets);
+    // Announced before the read goes out, so a reader's miss inside them waits for this copy.
+    for (const auto& [s, e] : runs) {
+      h->runs_.emplace_back(s, e - s);
+      entry->noteFetchInFlight(s, e - s);
+    }
+  } catch (...) {
+    delete h; // withdraws what it registered
+    st->releaseInner();
+    throw;
   }
-  auto* h = new CompleteHandler(st, entry, std::move(elems), std::move(reg), baskets);
-  XrdCl::XRootDStatus s = f->VectorRead(wire, nullptr, h, st->originTimeout(0));
+  XrdCl::XRootDStatus s = f->VectorRead(wire, nullptr, h, completionTimeout(st));
   if (!s.IsOK()) {
     delete h; // withdraws the ranges
     st->releaseInner();

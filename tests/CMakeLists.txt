@@ -50,6 +50,7 @@ add_executable(ucache-unit-tests
   unit/keyseek_list_test.cc
   unit/publish_test.cc
   unit/pluginfile_test.cc
+  unit/cluster_siblings_test.cc
   ${CMAKE_SOURCE_DIR}/src/plugin/Announce.cc  # pure identity strings (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/CopyDetect.cc # copy tools and copy engines (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/CopyGuard.cc  # the truncated-copy guard (pure policy)
@@ -59,6 +60,7 @@ add_executable(ucache-unit-tests
   ${CMAKE_SOURCE_DIR}/src/plugin/ServerRole.cc # a server's role and the table of them (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/Executor.cc   # thread pool (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/OriginInFlight.cc # per-server read counts (no XrdCl)
+  ${CMAKE_SOURCE_DIR}/src/plugin/ClusterSiblings.cc # complete_chunks' choice of baskets (pure)
   ${CMAKE_SOURCE_DIR}/src/cli/RunLog.cc        # run reader (pure file parsing)
   ${CMAKE_SOURCE_DIR}/src/cli/HistoryJson.cc   # the history emitter (pure)
   ${CMAKE_SOURCE_DIR}/src/cli/CpuBench.cc      # the publish CPU workload

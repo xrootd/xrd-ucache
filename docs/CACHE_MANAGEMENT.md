@@ -89,7 +89,8 @@ SIZE      CACHED    COV%   LAST   RECOMP    PIN   KEY
 ```
 
 - **SIZE** — the origin file size; **CACHED** — how much of it is actually on
-  your disk (uCache stores only the pages your jobs read, not whole files);
+  your disk (uCache stores only the pages your jobs read, with `complete_chunks`
+  the rest of the clusters they touched too, not whole files);
   **COV%** — that fraction. Both count the byte cache: once a basket is
   converted into the file's replica, its original leaves the byte cache
   (`recompress_keep_originals = off`) and is counted under RECOMP instead, so

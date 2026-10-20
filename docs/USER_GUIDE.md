@@ -795,7 +795,7 @@ overriding your defaults. Common keys:
 | `failover = on` | `UCACHE_FAILOVER` | when a file has more than one copy behind a redirector (a server that sends each open to one of several servers holding the file), an open or a read that fails at one copy is made again at another, and each copy is checked before it is used (see "Failover between copies" below). It helps only where there is something to fail over to: a file with one copy, or a URL that names one server directly, is read on the plain path, as with `off`. `on` (the default) = decided at each file's open: failover applies to a file whose URL names a server that reports a redirector's role, or whose URL has a host pattern in `tried=`, and `check_origin_integrity` is forced on for those files (`ucache settings` says so); every other file is read as with `off`. `off` = every file is read as in uCache 1.4.0. uCache never changes the XRootD client's connection settings. The values in force are in `run_settings` (STATS.md) and in `ucache doctor` |
 | `logical_name_prefixes = off` | (none) | a space-separated list of path prefixes (CMS's official namespaces: `/store/data/ /store/mc/ /store/hidata/`); set, a file whose URL's path holds one of these prefixes is cached under its logical name, `lfn:/store/...` (the path from the first place a prefix begins), so one file read through any site or redirector is one cache entry (see "Keys by logical name" below). Only the cache's key changes: where an open or a read goes, and what it does when it fails, is as for any other file. Each prefix begins and ends with `/`. `off` (the default) = every file keyed by its URL, as before. Independent of `failover`. A property of the cache, not of a job: no environment variable sets it, so that two jobs never key one URL two ways; set it in the conf or with `ucache set` (which refuses a list that is not valid) |
 | `recompress_keep_originals = off` | `UCACHE_RECOMPRESS_KEEP_ORIGINALS` | `on` = when baskets are converted into a replica, keep their original bytes in the byte cache too (by default they are not kept, and a copy held from before is released: the cache would hold the same data twice) |
-| `complete_chunks = on` | `UCACHE_COMPLETE_CHUNKS` | when a read fetches baskets of a TTree branch from the origin, that branch's other baskets in the same clusters are fetched too, so that a later pass finds everything ROOT's read cache may read of those clusters and needs no origin, in whatever layout it is shown (see "Recompression"). With `recompress = on` they are converted with the rest; with it off they go to the byte cache (only branches in a codec of `recompress_codecs`, which a sweep would convert): with the miss of a vector read, and in the background after a single read's. Only the branches and clusters the job touched; the counters are `cold_replica_completed`, `fill_completed` and their `_bytes` (STATS.md). `off` = only the baskets the job asks for: a job that reads a few events per cluster keeps a smaller cache |
+| `complete_chunks = on` | `UCACHE_COMPLETE_CHUNKS` | when a read fetches baskets of a TTree branch from the origin, that branch's other baskets in the same clusters are fetched too, so that a later pass, which in another layout (a replica's) may read baskets of those clusters that this one skipped, finds them in the cache (see "Recompression"). In a file with a replica store (a first pass with `recompress = on`, or a sweep, made it) they are converted with the rest (`cold_replica_completed`); in any other file they go to the byte cache (`fill_completed`), only for branches in a codec of `recompress_codecs`, which a sweep would convert. They go with the read's own fetch, which is answered once they have come too, except after a single read's miss, when they are fetched in the background. Done as far as it can be: about 64 MiB of baskets beyond one read at most, only for branches whose baskets uCache has found in the file's records (it looks a few times per file), none while the cache disk is too slow to be filled. A basket taken along that fails to come, or fails its check, is not kept and never fails the read. `off` = only the baskets the job asks for: a job that reads a few events per cluster keeps a smaller cache, and its first pass fetches (and converts) less |
 | `mixed_maps = on` | `UCACHE_MIXED_MAPS` | with `recompress = on`: each open of a TTree or RNTuple file is shown its newest map, the baskets or pages converted by then back to back at their real size (see "Recompression"); `off` = every open sees the first-pass layout, every basket at the size of its room and every RNTuple page decoded — for jobs that hand basket positions to workers on other machines with caches of their own |
 | `recompress_codecs = lzma,zlib` | `UCACHE_RECOMPRESS_CODECS` | which **source** codecs are worth recompressing (comma list); branches in other codecs are served as-is |
 | `page_size = 4k` | `UCACHE_PAGE_SIZE` | size of the pages the cache stores: 4 KiB, and 16 KiB on macOS, where a smaller page written into a hole of the cache file takes 16 KiB of disk anyway. Applies to files cached from then on. `ucache doctor` checks it against the cache disk |
@@ -1694,17 +1694,23 @@ layout it can read a few baskets ahead that it skipped on the first pass, which
 a later pass would otherwise fetch from the origin (with no network, such a read
 would wait for the connection and then fail). It fetches only baskets of the
 branches and clusters your job touched, none of them twice: one your job reads
-later is already there. That first pass costs
-CPU — everything it reads is converted — so on a machine short of cores it can
-be slower than a pass with recompression off. It also goes no faster than the
-converted records can be written to the cache disk: when writing falls behind
-(a slow disk, or a system that limits how much unwritten data the kernel may
-hold, `vm.dirty_bytes`), the reads that would convert more wait for it, for at
-most a minute each, so that everything converted is kept and the next pass
-reads it from the replica. When the cache has no room for what was converted
-(the free-space floor) or a write fails, nothing waits: what is converted is
-served and not kept, and a later pass converts it again, until a write keeps
-its records again (as soon as there is room).
+later is already there. That first pass costs CPU — everything it reads is
+converted — so on a machine short of cores it can be slower than a pass with
+recompression off. It also goes no faster than the converted records can be
+written to the cache disk: when writing falls behind (a slow disk, or a system
+that limits how much unwritten data the kernel may hold, `vm.dirty_bytes`), the
+reads that would convert more wait for it, for at most 2 seconds each, so that
+what is converted is kept and the next pass reads it from the replica. A cache
+disk that has not caught up by then is too slow for the pass: uCache warns,
+and stops filling the cache until the disk has caught up (the reads go on at
+their own pace; what they fetch meanwhile is served and not kept, and a later
+pass fetches it again). The byte cache does the same
+when its writes make no progress for 2 seconds. When the cache has no room for
+what was converted (the free-space floor) or a write fails, nothing waits
+either: what is converted is served, and kept only if a later write of the
+same process finds room for it (a bounded amount is held meanwhile); the rest
+is converted again by a later pass. Writing is tried again as records arrive,
+and room is looked for by eviction at most every 30 seconds.
 
 **It also costs memory, on every pass that reads such a file.** ROOT sizes its
 read buffers from the layout described below and does not shrink them to fit
