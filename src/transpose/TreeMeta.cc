@@ -1511,6 +1511,37 @@ std::vector<uint8_t> readKeyPayload(Source& src, const KeyInfo& k) {
   return readKeyPayloadFrom(r, k);
 }
 
+std::vector<int64_t> clusterStarts(const FileMeta& fm) {
+  std::vector<int64_t> out;
+  const int64_t n = fm.entries;
+  if (n <= 0)
+    return out;
+  int64_t at = 0, largest = 0;
+  for (size_t r = 0; r < fm.clusterRangeEnd.size() && at < n; ++r) {
+    const int64_t end = std::min<int64_t>(fm.clusterRangeEnd[r] + 1, n);
+    const int64_t size = r < fm.clusterSize.size() ? fm.clusterSize[r] : 0;
+    if (size <= 0 || end <= at)
+      return {};
+    for (int64_t e = at; e < end; e += size) {
+      out.push_back(e);
+      largest = std::max(largest, std::min(size, end - e));
+    }
+    at = end;
+  }
+  if (at < n) {
+    if (fm.autoFlush > 0) {
+      for (int64_t e = at; e < n; e += fm.autoFlush)
+        out.push_back(e);
+    } else if (largest > 0 && n - at <= largest) {
+      out.push_back(at);
+    } else {
+      return {};
+    }
+  }
+  out.push_back(n);
+  return out;
+}
+
 bool parseTreeBlob(const uint8_t* blob, size_t n, uint16_t keylen, FileMeta& fm) {
   // Streamed TTree v20 walk.
   fm.branches.clear();

@@ -241,6 +241,42 @@ TEST(FillLayout, CodecOfSetting) {
   EXPECT_EQ(codecOfSetting(1, 0), "");        // algorithm 0 = global default, unknown here
 }
 
+// complete_chunks' clusters: ranges in steps of their sizes, then fAutoFlush; none when the record
+// does not say (as ROOT's cluster iterator, which estimates those from the read cache's size).
+TEST(FillLayout, ClusterStarts) {
+  FileMeta fm;
+  fm.entries = 20000;
+  fm.autoFlush = 10000; // no ranges: fAutoFlush steps
+  EXPECT_EQ(clusterStarts(fm), (std::vector<int64_t>{0, 10000, 20000}));
+  fm.entries = 25000;
+  EXPECT_EQ(clusterStarts(fm), (std::vector<int64_t>{0, 10000, 20000, 25000}));
+  // NanoAOD's: one range per cluster (sizes 1000 then 6809, ...), the tail past the last range one
+  // cluster no longer than the largest before.
+  fm.entries = 9000;
+  fm.autoFlush = 0;
+  fm.clusterRangeEnd = {999, 7808};
+  fm.clusterSize = {1000, 6809};
+  EXPECT_EQ(clusterStarts(fm), (std::vector<int64_t>{0, 1000, 7809, 9000}));
+  // A range of several clusters.
+  fm.entries = 3000;
+  fm.clusterRangeEnd = {2999};
+  fm.clusterSize = {1000};
+  EXPECT_EQ(clusterStarts(fm), (std::vector<int64_t>{0, 1000, 2000, 3000}));
+  // Nothing said: no cluster size in a range, or a tail longer than any cluster with no fAutoFlush.
+  fm.clusterSize = {0};
+  EXPECT_TRUE(clusterStarts(fm).empty());
+  fm.entries = 9000;
+  fm.clusterRangeEnd = {999};
+  fm.clusterSize = {1000};
+  EXPECT_TRUE(clusterStarts(fm).empty());
+  fm.clusterRangeEnd.clear();
+  fm.clusterSize.clear();
+  EXPECT_TRUE(clusterStarts(fm).empty()); // no ranges, no fAutoFlush
+  fm.entries = 0;
+  fm.autoFlush = 100;
+  EXPECT_TRUE(clusterStarts(fm).empty());
+}
+
 TEST(FillLayout, SlotsAreContiguousAndSized) {
   Fx fx = fixture();
   FillLayout L = layout(fx);

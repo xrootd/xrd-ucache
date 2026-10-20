@@ -13,6 +13,7 @@
 #include "OpenPolicy.h"
 #include "OpenRetry.h"
 #ifdef UCACHE_HAVE_COLDRUN
+#include "ChunkComplete.h"
 #include "FetchCheck.h"
 #include "OriginSource.h"
 #include "ReadRule.h"
@@ -6520,7 +6521,11 @@ void redispatchRead(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> 
       st->releaseInner();
       entry->endFetch(ws, we - ws);
       complete(handler, new XRootDStatus(s), nullptr);
+      return;
     }
+#ifdef UCACHE_HAVE_COLDRUN
+    completeAfterMiss(st, entry, {{ offset, offset + size }}); // complete_chunks (ChunkComplete.h)
+#endif
     return;
   }
   entry->endFetch(ws, we - ws);
@@ -6578,6 +6583,9 @@ struct WireElem {
 // Vector-read miss stage: one wire VectorRead of rounded+coalesced ranges.
 class MissVReadHandler : public ResponseHandler {
  public:
+  // complete_chunks: the baskets this read fetches beyond the reader's, and their bytes, credited
+  // when its pages are kept.
+  uint64_t completed = 0, completedBytes = 0;
   // `direct`: the file's rule when it is read directly -- its data is served
   // and not kept, only pages holding none of it are. `readerT`: the reader's
   // own timeout of the request, 0 for none.
@@ -6788,6 +6796,10 @@ class MissVReadHandler : public ResponseHandler {
     // (see MissReadHandler); buffer ownership moves to each task (single owner).
     for (auto& w : wire_)
       persistPages(st_, entry_, w.off, std::move(w.buf), w.len);
+    if (completed && !wire_.empty() && st_->store) {
+      st_->store->stats().fillCompleted.fetch_add(completed, std::memory_order_relaxed);
+      st_->store->stats().fillCompletedBytes.fetch_add(completedBytes, std::memory_order_relaxed);
+    }
     complete(user_, okStatus(), vreadResponse(userChunks_));
     delete this;
   }
@@ -6895,6 +6907,21 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
     else
       ivals.push_back(roundChunk(*entry, c.offset, c.length));
   }
+  // complete_chunks: the rest of the clusters these baskets lie in go with them (ChunkComplete.h),
+  // kept as the miss's pages are and served to no one now.
+  uint64_t completed = 0, completedBytes = 0;
+#ifdef UCACHE_HAVE_COLDRUN
+  if (!direct) {
+    std::vector<std::pair<uint64_t, uint64_t>> asked;
+    asked.reserve(missIdx.size());
+    for (size_t idx : missIdx)
+      asked.emplace_back(userChunks[idx].offset, userChunks[idx].offset + userChunks[idx].length);
+    for (const auto& [a, e] : completionFor(st, entry, asked, completed)) {
+      ivals.push_back(roundChunk(*entry, a, e - a));
+      completedBytes += e - a;
+    }
+  }
+#endif
   std::sort(ivals.begin(), ivals.end());
   std::vector<std::pair<uint64_t, uint64_t>> runs;
   for (auto [s, e] : ivals) {
@@ -6929,6 +6956,8 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
   }
   auto* mh = new MissVReadHandler(st, f, entry, std::move(userChunks), std::move(missIdx),
                                   std::move(wire), user, startUs, std::move(direct), readerT);
+  mh->completed = completed;
+  mh->completedBytes = completedBytes;
   XRootDStatus s;
   if (!injectReadFault(false, mh, s)) // test hook: wire vector read dies mid-stream
     s = f->VectorRead(wireChunks, nullptr, mh, st->originTimeout(readerT, startUs));
@@ -8364,6 +8393,10 @@ XrdCl::XRootDStatus UCacheFile::readServe(uint64_t offset, uint32_t size, void* 
       entry->endFetch(ws, we - ws);
       return s;
     }
+#ifdef UCACHE_HAVE_COLDRUN
+    // complete_chunks: the rest of the clusters this basket lies in (ChunkComplete.h).
+    completeAfterMiss(st_, entry, {{ offset, offset + size }});
+#endif
     return XRootDStatus();
   }
   // No usable inner (teardown, or a trusted handle whose lazy origin open

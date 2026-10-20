@@ -74,6 +74,7 @@ the consumers together.
  "cold_replica_baskets": 0, "cold_replica_baskets_kept": 0, "cold_replica_convert_us": 0,
  "cold_replica_declined": 0, "cold_replica_skipped": 0, "cold_replica_waits": 0,
  "cold_replica_wait_us": 0, "cold_replica_completed": 0, "cold_replica_completed_bytes": 0,
+ "fill_completed": 0, "fill_completed_bytes": 0,
  "cold_origin_failures": 0,
  "slot_maps_made": 0, "slot_map_opens": 0, "slot_map_full": 0,
  "slot_crc_failures": 0, "slot_read_fallbacks": 0, "slot_pages_decoded": 0,
@@ -476,6 +477,10 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   bytes: the rest of each read branch's baskets in the clusters the readers
   touched (`complete_chunks = on`). A basket a reader asks for later is not
   fetched again.
+- `fill_completed`, `fill_completed_bytes` — the same for byte-cache fills
+  (`recompress = off`, or a file with no replica): baskets fetched into the byte
+  cache beyond what the readers asked for, and the bytes fetched for them (whole
+  pages for those fetched after a single read's miss).
 - `cold_origin_failures` — origin reads sent on the first pass that failed. The
   request is served again from the start, twice at most, so a read the origin
   fails once or twice is answered; a third failure in a row reaches the reader,

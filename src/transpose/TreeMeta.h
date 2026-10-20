@@ -277,6 +277,14 @@ struct BasketKeyCheck {
 BasketKeyCheck checkBasketKey(const KeyInfo& k, const BasketHeader& b, const BranchInfo& br,
                               size_t basket, const std::string& treeName);
 
+// Where the tree's clusters start, as ROOT's cluster iterator steps them
+// (TTree::GetClusterIterator): each cluster range [previous end + 1, its end] in steps of its
+// cluster size, then fAutoFlush steps to the tree's entries. The tree's entries last. Empty when
+// the record does not say: a range with no cluster size, or entries past the ranges with no
+// fAutoFlush and more of them than the largest cluster before (ROOT estimates those from the read
+// cache's size).
+std::vector<int64_t> clusterStarts(const FileMeta& fm);
+
 // Where every basket of the file's tree starts, from the tree's own record:
 // each branch's basket seeks (seek > 0; branches whose baskets live in another
 // file are left out), sorted and unique.

@@ -28,6 +28,7 @@
 #include "Prefetch.h"
 #endif
 #ifdef UCACHE_HAVE_COLDRUN
+#include "ChunkComplete.h"
 #include "ReadRule.h"
 #endif
 
@@ -313,6 +314,7 @@ void forkPrepare() {
 #ifdef UCACHE_HAVE_COLDRUN
   coldForkPrepare(); // copies the shown layouts, lock released on return
   readRuleBeforeFork();
+  chunkCompleteBeforeFork();
 #endif
 }
 
@@ -331,6 +333,7 @@ void forkChild() {
 #ifdef UCACHE_HAVE_COLDRUN
   coldAfterForkChild();
   readRuleAfterForkChild();
+  chunkCompleteAfterForkChild();
 #endif
 #ifdef UCACHE_HAVE_PREFETCH
   Prefetcher::afterForkChild();

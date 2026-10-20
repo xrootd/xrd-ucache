@@ -483,11 +483,17 @@ void printStats(const StatsTotals& t) {
                 "clusters the readers touched)\n",
                 (unsigned long long)t.coldReplicaCompleted, t.coldReplicaCompleted == 1 ? "" : "s",
                 human(t.coldReplicaCompletedBytes).c_str());
+  if (t.fillCompleted) // complete_chunks on byte-cache fills
+    std::printf("  completed clusters %llu basket%s, %s fetched into the byte cache beyond the "
+                "reads\n",
+                (unsigned long long)t.fillCompleted, t.fillCompleted == 1 ? "" : "s",
+                human(t.fillCompletedBytes).c_str());
   if (t.coldReplicaWaits) // the first pass went at the pace of the cache's writes
-    std::printf("  waited for writes  %llu request%s, %.1f s in all (converted records waited to be "
-                "written to the cache disk)\n",
-                (unsigned long long)t.coldReplicaWaits, t.coldReplicaWaits == 1 ? "" : "s",
-                static_cast<double>(t.coldReplicaWaitUs) / 1e6);
+    std::printf(
+        "  waited for writes  %llu request%s, %.1f s in all (converted records waited to be "
+        "written to the cache disk)\n",
+        (unsigned long long)t.coldReplicaWaits, t.coldReplicaWaits == 1 ? "" : "s",
+        static_cast<double>(t.coldReplicaWaitUs) / 1e6);
   if (t.slotMapsMade || t.slotMapOpens || t.slotMapFull)
     std::printf("  mixed maps         %llu made, %llu open%s shown one%s\n",
                 (unsigned long long)t.slotMapsMade, (unsigned long long)t.slotMapOpens,

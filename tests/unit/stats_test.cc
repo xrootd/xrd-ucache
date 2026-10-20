@@ -64,6 +64,8 @@ TEST(Stats, JsonBodyHasAllCounters) {
   s.coldReplicaWaitUs = 10;
   s.coldReplicaCompleted = 11;
   s.coldReplicaCompletedBytes = 12;
+  s.fillCompleted = 13;
+  s.fillCompletedBytes = 14;
   s.slotMapsMade = 5;
   s.slotMapOpens = 6;
   s.reqReadBytes.add(4096);
@@ -92,6 +94,8 @@ TEST(Stats, JsonBodyHasAllCounters) {
   EXPECT_NE(j.find("\"cold_replica_wait_us\":10"), std::string::npos);
   EXPECT_NE(j.find("\"cold_replica_completed\":11"), std::string::npos);
   EXPECT_NE(j.find("\"cold_replica_completed_bytes\":12"), std::string::npos);
+  EXPECT_NE(j.find("\"fill_completed\":13"), std::string::npos);
+  EXPECT_NE(j.find("\"fill_completed_bytes\":14"), std::string::npos);
   EXPECT_NE(j.find("\"cold_replica_declined\":0"), std::string::npos); // its own counter
   EXPECT_NE(j.find("\"slot_maps_made\":5"), std::string::npos);
   EXPECT_NE(j.find("\"slot_map_opens\":6"), std::string::npos);

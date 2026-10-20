@@ -2985,47 +2985,6 @@ void ColdFill::ensureRelocatedOrig() {
   relocatedOrig = std::move(merged);
 }
 
-namespace {
-
-// Where the tree's clusters start, as ROOT's cluster iterator steps them
-// (TTree::GetClusterIterator): each cluster range [previous end + 1, its end] in steps of its
-// cluster size, then fAutoFlush steps to the tree's entries. The tree's entries last. Empty when
-// the record does not say: a range with no cluster size, or entries past the ranges with no
-// fAutoFlush and more of them than the largest cluster before (ROOT estimates those from the read
-// cache's size).
-std::vector<int64_t> clusterStarts(const tp::FileMeta& fm) {
-  std::vector<int64_t> out;
-  const int64_t n = fm.entries;
-  if (n <= 0)
-    return out;
-  int64_t at = 0, largest = 0;
-  for (size_t r = 0; r < fm.clusterRangeEnd.size() && at < n; ++r) {
-    const int64_t end = std::min<int64_t>(fm.clusterRangeEnd[r] + 1, n);
-    const int64_t size = r < fm.clusterSize.size() ? fm.clusterSize[r] : 0;
-    if (size <= 0 || end <= at)
-      return {};
-    for (int64_t e = at; e < end; e += size) {
-      out.push_back(e);
-      largest = std::max(largest, std::min(size, end - e));
-    }
-    at = end;
-  }
-  if (at < n) {
-    if (fm.autoFlush > 0) {
-      for (int64_t e = at; e < n; e += fm.autoFlush)
-        out.push_back(e);
-    } else if (largest > 0 && n - at <= largest) {
-      out.push_back(at);
-    } else {
-      return {};
-    }
-  }
-  out.push_back(n);
-  return out;
-}
-
-} // namespace
-
 void ColdFill::ensureChunks() {
   {
     std::lock_guard<std::mutex> g(mu);
@@ -3042,7 +3001,7 @@ void ColdFill::ensureChunks() {
       !tp::parseTreeBlob(blob.data(), blob.size(), keylen, fm) || !fm.error.empty())
     return;
   auto c = std::make_shared<Chunks>();
-  c->clusterStart = clusterStarts(fm);
+  c->clusterStart = tp::clusterStarts(fm);
   if (c->clusterStart.size() < 2)
     return;
   c->basketEntry.resize(fm.branches.size());
