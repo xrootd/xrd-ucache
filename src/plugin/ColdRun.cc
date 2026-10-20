@@ -189,6 +189,23 @@ class ColdFill : public tp::StoreMaps, public std::enable_shared_from_this<ColdF
   // slotFactor100, the slot table): StoreLayout.h; key, cacheDir, store,
   // entry, storeGone, mu, handles and the maps: StoreMaps.h.
   bool keepOriginals = false;
+  bool completeChunks = false; // complete_chunks (Config.h)
+  // complete_chunks: each branch's basket entry starts (basketEntry: basket i covers entries
+  // [i], [i+1]) and the tree's cluster starts (the tree's entries last), from the tree record the
+  // layout serves (decoded in memory: the event axis is the file's own, only the baskets' places
+  // are the slots'). Null when the record does not give them, or does not agree with the slot
+  // table: the file is then served without completion. Built once, under no lock (ensureChunks).
+  struct Chunks {
+    std::vector<std::vector<int64_t>> basketEntry; // per branch of the tree record
+    std::vector<int64_t> clusterStart;
+  };
+  std::shared_ptr<const Chunks> chunks; // under mu
+  bool chunksTried = false;             // under mu
+  void ensureChunks();
+  // The slots of the baskets of the branches in `need` that lie in the clusters `need`'s baskets
+  // overlap, `need`'s own left out (`need` sorted): what ROOT's read cache may read together with
+  // them in another layout.
+  void completion(const std::vector<uint32_t>& need, std::vector<uint32_t>& out);
   // Whether a block that fails its own checksum holds the read back (failOriginCheck): with
   // recompress = on, which checks every block it converts, or with check_origin_integrity on. A
   // job with neither that fills the unfilled slots of a store made earlier keeps such a block as
@@ -662,6 +679,7 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   cf->cacheDir = cfg.cacheDir;
   cf->entry = entry;
   cf->keepOriginals = cfg.recompressKeepOriginals;
+  cf->completeChunks = cfg.completeChunks;
   // check_origin_integrity as the handle that makes the slot run has it (forced for a file
   // failover is on for): a store shared by handles of other decisions keeps this one's.
   // KNOWN LIMIT (failover): a handle a trusted open left undecided (its server
@@ -2428,6 +2446,32 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
     }
   }
 
+  // complete_chunks: the other baskets of these branches in the clusters they lie in are fetched
+  // and converted with them, so that a later pass, whose read cache may read a cluster's baskets
+  // ahead in another layout (a map states them at their real length), finds them all. Only those
+  // nobody holds or is fetching: the request never waits for them, and no reader reads them here.
+  // Not for a file read directly (nothing is kept), nor once its store is gone.
+  if (cf.completeChunks && !need.empty() && !cf.direct() &&
+      !cf.storeGone.load(std::memory_order_relaxed)) {
+    cf.ensureChunks();
+    std::vector<uint32_t> more;
+    cf.completion(need, more);
+    uint64_t n = 0, bytes = 0;
+    for (uint32_t i : more) {
+      uint8_t expect = ColdFill::kAbsent;
+      if (cf.state[i].compare_exchange_strong(expect, ColdFill::kFetching,
+                                              std::memory_order_acq_rel)) {
+        req->claimed.push_back(i);
+        ++n;
+        bytes += cf.slot(i).origLen;
+      }
+    }
+    if (n && req->st->store) {
+      req->st->store->stats().coldReplicaCompleted.fetch_add(n, std::memory_order_relaxed);
+      req->st->store->stats().coldReplicaCompletedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+  }
+
   // Which original pages are worth keeping needs every relocated basket's
   // range: known before any of what is fetched arrives, on this thread.
   if (!req->claimed.empty() || !req->origPieces.empty())
@@ -2939,6 +2983,128 @@ void ColdFill::ensureRelocatedOrig() {
   merged->shrink_to_fit();
   std::lock_guard<std::mutex> g(mu);
   relocatedOrig = std::move(merged);
+}
+
+namespace {
+
+// Where the tree's clusters start, as ROOT's cluster iterator steps them
+// (TTree::GetClusterIterator): each cluster range [previous end + 1, its end] in steps of its
+// cluster size, then fAutoFlush steps to the tree's entries. The tree's entries last. Empty when
+// the record does not say: a range with no cluster size, or entries past the ranges with no
+// fAutoFlush and more of them than the largest cluster before (ROOT estimates those from the read
+// cache's size).
+std::vector<int64_t> clusterStarts(const tp::FileMeta& fm) {
+  std::vector<int64_t> out;
+  const int64_t n = fm.entries;
+  if (n <= 0)
+    return out;
+  int64_t at = 0, largest = 0;
+  for (size_t r = 0; r < fm.clusterRangeEnd.size() && at < n; ++r) {
+    const int64_t end = std::min<int64_t>(fm.clusterRangeEnd[r] + 1, n);
+    const int64_t size = r < fm.clusterSize.size() ? fm.clusterSize[r] : 0;
+    if (size <= 0 || end <= at)
+      return {};
+    for (int64_t e = at; e < end; e += size) {
+      out.push_back(e);
+      largest = std::max(largest, std::min(size, end - e));
+    }
+    at = end;
+  }
+  if (at < n) {
+    if (fm.autoFlush > 0) {
+      for (int64_t e = at; e < n; e += fm.autoFlush)
+        out.push_back(e);
+    } else if (largest > 0 && n - at <= largest) {
+      out.push_back(at);
+    } else {
+      return {};
+    }
+  }
+  out.push_back(n);
+  return out;
+}
+
+} // namespace
+
+void ColdFill::ensureChunks() {
+  {
+    std::lock_guard<std::mutex> g(mu);
+    if (chunks || chunksTried)
+      return;
+    chunksTried = true;
+  }
+  if (rnt)
+    return; // an RNTuple reader reads a cluster's pages together whatever the layout says
+  std::vector<uint8_t> blob;
+  uint16_t keylen = 0;
+  tp::FileMeta fm;
+  if (!tp::decodeMetaRecord(L, blob, keylen) ||
+      !tp::parseTreeBlob(blob.data(), blob.size(), keylen, fm) || !fm.error.empty())
+    return;
+  auto c = std::make_shared<Chunks>();
+  c->clusterStart = clusterStarts(fm);
+  if (c->clusterStart.size() < 2)
+    return;
+  c->basketEntry.resize(fm.branches.size());
+  for (size_t b = 0; b < fm.branches.size(); ++b) {
+    auto& be = fm.branches[b].basketEntry;
+    if (be.size() == static_cast<size_t>(fm.branches[b].writeBasket) + 1)
+      c->basketEntry[b] = std::move(be);
+  }
+  std::lock_guard<std::mutex> g(mu);
+  chunks = std::move(c);
+}
+
+void ColdFill::completion(const std::vector<uint32_t>& need, std::vector<uint32_t>& out) {
+  std::shared_ptr<const Chunks> c;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    c = chunks;
+  }
+  if (!c)
+    return;
+  const auto& cs = c->clusterStart;
+  for (uint32_t i : need) {
+    const tp::FillSlot& fs = slot(i); // decoded: the request found it
+    if (fs.branch >= c->basketEntry.size())
+      continue;
+    const auto& be = c->basketEntry[fs.branch];
+    if (fs.basket + 1 >= be.size())
+      continue;
+    // The clusters [e0, e1) overlaps, as entries [a, b).
+    const int64_t e0 = be[fs.basket], e1 = be[fs.basket + 1];
+    if (e1 <= e0)
+      continue;
+    auto lo = std::upper_bound(cs.begin(), cs.end(), e0);
+    auto hi = std::lower_bound(cs.begin(), cs.end(), e1);
+    if (lo == cs.begin() || hi == cs.end())
+      continue;
+    const int64_t a = *(lo - 1), b = *hi;
+    // The branch's baskets overlapping [a, b): basket j covers [be[j], be[j + 1]).
+    size_t j = static_cast<size_t>(std::upper_bound(be.begin(), be.end(), a) - be.begin());
+    j = j ? j - 1 : 0;
+    for (; j + 1 < be.size() && be[j] < b; ++j) {
+      if (j == fs.basket || be[j + 1] <= a)
+        continue;
+      // The branch's slots are its baskets in order: basket j is slot i - basket + j. Taken only
+      // where the slot table says so.
+      const int64_t k = static_cast<int64_t>(i) - fs.basket + static_cast<int64_t>(j);
+      if (k < 0 || k >= static_cast<int64_t>(nSlots()))
+        continue;
+      const uint32_t ks = static_cast<uint32_t>(k);
+      if (std::binary_search(need.begin(), need.end(), ks))
+        continue;
+      try {
+        const tp::FillSlot& o = slot(ks);
+        if (o.branch == fs.branch && o.basket == j)
+          out.push_back(ks);
+      } catch (const std::exception&) {
+        // its branch's slots cannot be decoded: not completed
+      }
+    }
+  }
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
 }
 
 std::vector<std::pair<uint64_t, uint64_t>> ColdFill::notRelocated(uint64_t rs, uint64_t re) {

@@ -244,6 +244,12 @@ struct Config {
   // on other machines with caches of their own (uproot.dask with remote
   // workers).
   bool mixedMaps = true;                         // UCACHE_MIXED_MAPS
+  // `complete_chunks`: when a first pass with recompress = on fetches baskets of a TTree branch,
+  // it also fetches and converts that branch's other baskets in the same clusters (the chunks of
+  // entries ROOT's read cache reads together), so that a later pass, whose read cache may read a
+  // cluster's baskets ahead in another layout (a map), finds them all and needs no origin. off =
+  // only the baskets the reader asks for.
+  bool completeChunks = true;                                // UCACHE_COMPLETE_CHUNKS
   std::vector<std::string> recompressCodecs{"lzma", "zlib"}; // UCACHE_RECOMPRESS_CODECS
   // `trace = io` writes a sampled per-operation JSON trace
   // next to the process's stats file; `trace_sample = N` records every Nth

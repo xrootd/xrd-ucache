@@ -26,7 +26,7 @@ redirector's role, or whose URL has a host pattern in `tried=` (USER_GUIDE.md,
 | What is the cache disk being asked to do? | `hit_disk_reads`, `hit_disk_bytes`, `replica_reads`, `replica_read_bytes`, `hist_*_read_bytes` |
 | Is the cache disk keeping up? | `buffer_stalls`, `buffer_stall_us`, `hist_hit_read_us`, `hist_flush_write_us` |
 | Did the replica tier get used? | `replica_bytes_served`, `cold_replica_files` |
-| Were replicas created as files were read? | `cold_replica_files`, `cold_replica_in_bytes`, `cold_replica_baskets_kept`, `cold_replica_declined`, `cold_replica_skipped`, `cold_replica_waits` |
+| Were replicas created as files were read? | `cold_replica_files`, `cold_replica_in_bytes`, `cold_replica_baskets_kept`, `cold_replica_declined`, `cold_replica_skipped`, `cold_replica_waits`, `cold_replica_completed` |
 | Were later passes shown the converted baskets at their real size? | `slot_maps_made`, `slot_map_opens`, `slot_map_full` |
 
 ## Where the numbers are written
@@ -73,7 +73,8 @@ the consumers together.
  "cold_replica_files": 0, "cold_replica_in_bytes": 0, "cold_replica_out_bytes": 0,
  "cold_replica_baskets": 0, "cold_replica_baskets_kept": 0, "cold_replica_convert_us": 0,
  "cold_replica_declined": 0, "cold_replica_skipped": 0, "cold_replica_waits": 0,
- "cold_replica_wait_us": 0, "cold_origin_failures": 0,
+ "cold_replica_wait_us": 0, "cold_replica_completed": 0, "cold_replica_completed_bytes": 0,
+ "cold_origin_failures": 0,
  "slot_maps_made": 0, "slot_map_opens": 0, "slot_map_full": 0,
  "slot_crc_failures": 0, "slot_read_fallbacks": 0, "slot_pages_decoded": 0,
  "kept_reads": 0, "kept_read_bytes": 0,
@@ -470,6 +471,11 @@ of its own. For an RNTuple file, read "page" wherever these say "basket".
   pace; the records were kept. After a commit that could not keep its records
   (no room, a failed write: `cold_replica_declined`) nothing waits until a
   commit keeps its records again.
+- `cold_replica_completed`, `cold_replica_completed_bytes` — baskets a first pass
+  fetched and converted beyond what its readers asked for, and their original
+  bytes: the rest of each read branch's baskets in the clusters the readers
+  touched (`complete_chunks = on`). A basket a reader asks for later is not
+  fetched again.
 - `cold_origin_failures` — origin reads sent on the first pass that failed. The
   request is served again from the start, twice at most, so a read the origin
   fails once or twice is answered; a third failure in a row reaches the reader,

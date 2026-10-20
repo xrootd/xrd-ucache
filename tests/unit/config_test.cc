@@ -381,6 +381,28 @@ TEST(Config, MixedMapsAndTheInUseWindow) {
   }
 }
 
+// complete_chunks: on by default; off from the conf; the per-job variable wins.
+TEST(Config, CompleteChunks) {
+  EnvGuard g;
+  {
+    Config c = Config::fromEnv();
+    EXPECT_TRUE(c.completeChunks);
+    EXPECT_EQ(c.valueOf("complete_chunks"), "on");
+  }
+  std::map<std::string, std::string> conf = {{"complete_chunks", "off"}};
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_FALSE(c.completeChunks);
+    EXPECT_EQ(c.valueOf("complete_chunks"), "off");
+    EXPECT_EQ(c.sources.at("complete_chunks"), "conf");
+  }
+  ::setenv("UCACHE_COMPLETE_CHUNKS", "on", 1);
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_TRUE(c.completeChunks) << "the per-job override wins";
+  }
+}
+
 // The slot factor is not a setting: where every slot sits follows from it, so
 // it is fixed. A conf line naming it is an unknown key: ignored, no source.
 TEST(Config, SlotFactorIsNotASetting) {

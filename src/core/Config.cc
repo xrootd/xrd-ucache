@@ -247,6 +247,8 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.logicalNamePrefixes = falsy(v) ? std::string("off") : v; // checked once, at the end
   else if (k == "mixed_maps")
     c.mixedMaps = !falsy(v); // default on; see Config.h
+  else if (k == "complete_chunks")
+    c.completeChunks = !falsy(v); // default on; see Config.h
   else if (k == "recompress_codecs")
     c.recompressCodecs = splitCommas(v);
   else if (k == "trace") {
@@ -469,6 +471,7 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"failover", "UCACHE_FAILOVER"},
       {"logical_name_prefixes", nullptr},
       {"mixed_maps", "UCACHE_MIXED_MAPS"},
+      {"complete_chunks", "UCACHE_COMPLETE_CHUNKS"},
       {"recompress_codecs", "UCACHE_RECOMPRESS_CODECS"},
       {"trace", "UCACHE_TRACE"},
       {"trace_sample", "UCACHE_TRACE_SAMPLE"},
@@ -659,6 +662,8 @@ std::string Config::valueOf(const std::string& key) const {
     return logicalNamePrefixes;
   if (key == "mixed_maps")
     return onoff(mixedMaps);
+  if (key == "complete_chunks")
+    return onoff(completeChunks);
   if (key == "recompress_codecs")
     return join(recompressCodecs);
   if (key == "trace")

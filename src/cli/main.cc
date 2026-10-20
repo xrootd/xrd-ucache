@@ -478,6 +478,11 @@ void printStats(const StatsTotals& t) {
                 human(t.coldReplicaOutBytes).c_str(), (unsigned long long)t.coldReplicaBaskets,
                 (unsigned long long)t.coldReplicaBasketsKept, static_cast<double>(t.coldReplicaConvertUs) / 1e6,
                 (unsigned long long)t.coldReplicaDeclined);
+  if (t.coldReplicaCompleted) // complete_chunks: fetched beyond what the readers asked for
+    std::printf("  completed clusters %llu basket%s, %s fetched beyond the reads (the rest of the "
+                "clusters the readers touched)\n",
+                (unsigned long long)t.coldReplicaCompleted, t.coldReplicaCompleted == 1 ? "" : "s",
+                human(t.coldReplicaCompletedBytes).c_str());
   if (t.coldReplicaWaits) // the first pass went at the pace of the cache's writes
     std::printf("  waited for writes  %llu request%s, %.1f s in all (converted records waited to be "
                 "written to the cache disk)\n",
