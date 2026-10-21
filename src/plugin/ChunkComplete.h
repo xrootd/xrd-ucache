@@ -8,10 +8,11 @@
 // the background (completeAfterMiss), which no reader waits for. A basket taken along that fails
 // its check is not kept and never fails the read.
 //
-// Only the branches readers have asked for are known, from the file's own records (read from the
-// byte cache, or from the origin for what it does not hold yet, and kept; the parse may open the
-// origin, as any miss would); only branches in a codec the sweep converts (recompress_codecs) are
-// completed; the background read is not made while the handle has no open origin; nothing is
+// Only the branches readers have asked for are known, from the file's own records, read from the
+// cache alone (ROOT's open read them through it; until they are there, a miss takes nothing along
+// and a later one looks again): completion makes no read of its own but the baskets it fetches.
+// Only branches in a codec the sweep converts (recompress_codecs) are completed; the background
+// read is not made while the handle has no open origin; nothing is
 // taken along for a file read directly (max_read_fraction), by a handle whose failover is still
 // undecided, or for bytes the cache holds or another fetch is bringing.
 //
@@ -34,9 +35,8 @@ class FileEntry;
 // The ranges ([off, end), one per basket, not page-rounded) to fetch with a miss of the original
 // ranges `asked` of `entry`: the rest of their clusters, as above, about 64 MiB of whole baskets at
 // most (past it the rest is not taken); `baskets` how many. Empty when nothing applies. May parse
-// the file's records (from the byte cache, or through `st` from the origin for what it does not
-// hold yet: synchronous reads), except on a client callback thread. For a vector read's miss,
-// whose fetch takes them along.
+// the file's records from the cache (never the origin), except on a client callback thread. For a
+// vector read's miss, whose fetch takes them along.
 std::vector<std::pair<uint64_t, uint64_t>>
 completionFor(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEntry>& entry,
               const std::vector<std::pair<uint64_t, uint64_t>>& asked, uint64_t& baskets);

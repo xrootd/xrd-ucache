@@ -41,6 +41,9 @@ struct OriginSource : transpose::Source {
   // `startUs`. Off for a parse on the executor, which never waits for a move.
   bool mayMove = false;
   uint64_t startUs = 0;
+  // Never the origin: a range the cache does not hold (pages still staged for writing count as
+  // held) fails the read. For a parse that must cost no read of its own.
+  bool cacheOnly = false;
 
   bool has(uint64_t off, uint64_t n) override {
     return off + n >= off && off + n <= entry->fileSize();
@@ -52,6 +55,8 @@ struct OriginSource : transpose::Source {
       fromCache = true;
       return true;
     }
+    if (cacheOnly)
+      return false;
     auto [ws, we] = roundSpan(entry->pageSize(), entry->fileSize(), off, n);
     return fetch(ws, we, dst, off, n);
   }
@@ -63,6 +68,8 @@ struct OriginSource : transpose::Source {
     const uint64_t n = std::min<uint64_t>(kHeadBlock, entry->fileSize());
     if (entry->hasRange(0, n))
       return true;
+    if (cacheOnly)
+      return false;
     std::vector<char> tmp(1);
     return fetch(0, n, tmp.data(), 0, 0);
   }

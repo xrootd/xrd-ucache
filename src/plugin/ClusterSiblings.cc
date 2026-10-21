@@ -29,8 +29,8 @@ void clusterSiblings(const std::vector<int64_t>& cs,
       size_t j = static_cast<size_t>(std::upper_bound(kb.entry.begin(), kb.entry.end(), ca) -
                                      kb.entry.begin());
       j = j ? j - 1 : 0;
-      for (; j + 1 < kb.entry.size() && j < kb.seek.size() && j < kb.bytes.size() &&
-             kb.entry[j] < cb;
+      for (;
+           j + 1 < kb.entry.size() && j < kb.seek.size() && j < kb.bytes.size() && kb.entry[j] < cb;
            ++j) {
         if (j == k || kb.entry[j + 1] <= ca || kb.seek[j] <= 0 || kb.bytes[j] <= 0)
           continue;

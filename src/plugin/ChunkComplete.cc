@@ -36,7 +36,7 @@ constexpr uint64_t kParseIntervalUs = 2'000'000; // ... and no more often than t
 constexpr int kMaxFails = 32; // looks that found no records or no new branch, tried
                               // again at the next misses
 constexpr uint64_t kMaxCompleteBytes = 64ull << 20; // fetched beyond one miss at most
-constexpr int kMaxTimeoutS = 60; // of a parse's reads and of a completing read: no reader asked
+constexpr int kMaxTimeoutS = 60;                    // of a completing read: no reader asked for it
 
 uint64_t nowMicros() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -100,21 +100,22 @@ bool converted(const tp::BranchInfo& b) {
   return std::find(codecs.begin(), codecs.end(), c) != codecs.end();
 }
 
-// The timeout of a read made for completion alone: the handle's, at most kMaxTimeoutS.
+// The timeout of the background read made for completion alone: the handle's, at most
+// kMaxTimeoutS.
 XrdTimeout completionTimeout(const std::shared_ptr<HandleState>& st) {
   const XrdTimeout t = st->originTimeout(0);
   return t > 0 && t < kMaxTimeoutS ? t : static_cast<XrdTimeout>(kMaxTimeoutS);
 }
 
-// Parse the file's records -- from the byte cache, or from the origin through `st` for what it
-// does not hold yet (a miss's pages are written after it is answered), kept. Outside t.mu.
+// Parse the file's records from the cache alone (pages still staged for writing included): ROOT's
+// own open read them through the cache, and completion costs no read of its own. A record not
+// there yet (its write still to come) fails the parse, and a later miss looks again. Outside t.mu.
 tp::FileMeta parseRecords(const std::shared_ptr<HandleState>& st,
                           const std::shared_ptr<FileEntry>& entry) {
   OriginSource src;
   src.st = st;
   src.entry = entry;
-  src.timeout = completionTimeout(st);
-  src.mayMove = false; // never waits for a move: it may run on the executor
+  src.cacheOnly = true;
   return tp::parseReaderTree(src, static_cast<int64_t>(entry->fileSize()));
 }
 

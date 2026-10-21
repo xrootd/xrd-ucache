@@ -1,5 +1,5 @@
-// complete_chunks' choice of baskets (ClusterSiblings.h): which other baskets of a branch lie in the
-// clusters the asked baskets are in.
+// complete_chunks' choice of baskets (ClusterSiblings.h): which other baskets of a branch lie in
+// the clusters the asked baskets are in.
 #include "ClusterSiblings.h"
 
 #include <gtest/gtest.h>
@@ -26,7 +26,9 @@ struct Fixture {
     }
     b.entry.push_back(per * nb);
   }
-  static std::pair<uint64_t, uint64_t> basket(uint32_t k) { return {1000 + 100 * k, 1050 + 100 * k}; }
+  static std::pair<uint64_t, uint64_t> basket(uint32_t k) {
+    return {1000 + 100 * k, 1050 + 100 * k};
+  }
   Ranges pick(const std::vector<int64_t>& clusters, const Ranges& asked, uint64_t& n) const {
     Ranges out;
     n = 0;

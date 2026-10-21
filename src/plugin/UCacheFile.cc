@@ -6970,20 +6970,20 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
     }
     return runs;
   };
-  // Elements of a run, cut where the protocol requires (below).
   const uint64_t ps = entry->pageSize();
-  auto elems = [ps](uint64_t s, uint64_t e) {
-    size_t n = 0;
-    for (uint64_t at = s; at < e; at = readvElemEnd(at, e, ps))
-      ++n;
-    return n;
-  };
   // complete_chunks: the rest of the clusters these baskets lie in go with them (ChunkComplete.h),
   // kept as the miss's pages are and served to no one now; only as many as the read's elements
   // allow beside the reader's own (a vector read carries at most kMaxReadvElems).
   std::vector<std::pair<uint64_t, uint64_t>> taken;
 #ifdef UCACHE_HAVE_COLDRUN
   if (!direct) {
+    // Elements of a run, cut where the protocol requires (below).
+    auto elems = [ps](uint64_t s, uint64_t e) {
+      size_t n = 0;
+      for (uint64_t at = s; at < e; at = readvElemEnd(at, e, ps))
+        ++n;
+      return n;
+    };
     std::vector<std::pair<uint64_t, uint64_t>> asked;
     asked.reserve(missIdx.size());
     for (size_t idx : missIdx)
