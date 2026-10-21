@@ -11,6 +11,21 @@ Recompression stays off unless you turn it on. Nothing is published unless you
 run `ucache publish`. Any XRootD 5.6 or newer 5.x client works; 6.x from
 v0.21.0.
 
+### v1.5.1 — 2026-10-21
+- Local file caching: files on local, network, or mounted
+  drives can now be cached using `root://local//abs/path`.
+- Improved cache isolation: if no new data is accessed by the
+  analysis, minor changes in how ROOT reads the data won't
+  require access to the origin. Enabled by default
+  (`complete_chunks`).
+- Slow cache disk protection: if the cache disk is too slow
+  for writing, uCache waits up to 2 seconds, then continues
+  without caching. It logs the issue and resumes caching when
+  the disk catches up.
+- The freshness window is set as a duration
+  (`revalidate_after`, default `7d`, replacing
+  `revalidate_seconds`) and applies to local files too.
+
 ## v1.5.0 — 2026-10-18
 - Failover: when a file is read through a redirector (as in CMS AAA) and a
   site stalls, fails or serves a damaged copy, uCache switches to another
