@@ -62,6 +62,11 @@ std::atomic<uint64_t> FileEntry::g_fillNotKeptAt_{0};
 namespace {
 // A drain past its cap that wrote nothing for this long: the cache disk is too slow to be filled.
 constexpr uint64_t kSlowFillUs = 2'000'000;
+// The time from `since` to `now`, 0 when `since` is later: a stamp another thread stored after
+// this one read the clock (a drain's progress, a start) must never wrap to an age of centuries.
+uint64_t usSince(uint64_t since, uint64_t now) {
+  return now > since ? now - since : 0;
+}
 // Episodes after the first are reported at most this often (a disk that stays slow comes and
 // goes as each drain ends).
 constexpr uint64_t kSlowWarnEveryUs = 60'000'000;
@@ -89,7 +94,7 @@ void FileEntry::startFillSlow(uint64_t stalledUs) {
   g_fillNotKeptAt_.store(stats_.fillNotKeptBytes.load(), std::memory_order_relaxed);
   stats_.slowCacheEpisodes.fetch_add(1, std::memory_order_relaxed);
   const uint64_t last = g_fillSlowWarnUs_.load(std::memory_order_relaxed);
-  if (!last || now - last >= kSlowWarnEveryUs) {
+  if (!last || usSince(last, now) >= kSlowWarnEveryUs) {
     g_fillSlowWarnUs_.store(now, std::memory_order_relaxed);
     UCACHE_WARN("the cache disk is too slow to be filled (a write of %s's staged pages made no "
                 "progress for %.1f s): what reads fetch is served and not kept until it catches "
@@ -104,12 +109,13 @@ void FileEntry::endFillSlowIfDrained() {
       !g_fillSlow_.exchange(false))
     return;
   const uint64_t now = nowUsSteady();
-  const uint64_t us = now - g_fillSlowSinceUs_.load(std::memory_order_relaxed);
+  const uint64_t us = usSince(g_fillSlowSinceUs_.load(std::memory_order_relaxed), now);
   stats_.slowCacheUs.fetch_add(us, std::memory_order_relaxed);
   const uint64_t at = g_fillNotKeptAt_.load(std::memory_order_relaxed);
   const uint64_t lost =
       stats_.fillNotKeptBytes.load() - std::min(at, stats_.fillNotKeptBytes.load());
-  if (now - g_fillSlowWarnUs_.load(std::memory_order_relaxed) <= us) // its start was reported
+  // Its start was reported.
+  if (usSince(g_fillSlowWarnUs_.load(std::memory_order_relaxed), now) <= us)
     UCACHE_WARN("the cache disk caught up after %.1f s: reads fill the cache again (%llu MiB "
                 "fetched meanwhile not kept)",
                 static_cast<double>(us) / 1e6, static_cast<unsigned long long>(lost >> 20));
@@ -677,9 +683,12 @@ void FileEntry::writePages(uint64_t off, uint64_t len, const void* buf) {
     if (flushInProgress_ &&
         (bufBytes_ >= (uint64_t(cfg_.fillBufferMb) << 20) ||
          g_bufTotal_.load(std::memory_order_relaxed) >= (uint64_t(cfg_.fillBufferTotalMb) << 20))) {
-      const uint64_t now = nowUsSteady(), since = flushProgressUs_.load(std::memory_order_relaxed);
-      if (since && now - since >= kSlowFillUs) {
-        startFillSlow(now - since);
+      // The drain's last progress read before the clock: it writes on without this lock, and a
+      // stamp it stores after the clock was read is younger than `now`.
+      const uint64_t since = flushProgressUs_.load(std::memory_order_acquire);
+      const uint64_t now = nowUsSteady();
+      if (since && usSince(since, now) >= kSlowFillUs) {
+        startFillSlow(usSince(since, now));
         stats_.fillNotKeptBytes.fetch_add(end - off, std::memory_order_relaxed);
         return;
       }

@@ -92,6 +92,12 @@ constexpr size_t kPartItems = 512;
 // complete_chunks: the most a request takes along, in original bytes (as a byte-cache miss does).
 constexpr uint64_t kExtraBytes = 64ull << 20;
 
+// The time from `since` to `now`, 0 when `since` is later (a stamp stored by another thread after
+// this one read the clock): never an age wrapped to centuries.
+uint64_t usSince(uint64_t since, uint64_t now) {
+  return now > since ? now - since : 0;
+}
+
 // Conversions run here, never on the executor that serves hits: they are
 // CPU-bound and as many as the reader has threads, and a hit must not queue
 // behind them. Leaked like the executor (threads end with the process).
@@ -2440,8 +2446,8 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
     const uint64_t now = nowUs();
     const uint64_t since = req->parkedSinceUs ? req->parkedSinceUs : now;
     const uint64_t parkAt = req->parkStartUs ? req->parkStartUs : now;
-    if (now - since >= kParkMaxUs) {
-      startSlowCommits(now - since);
+    if (usSince(since, now) >= kParkMaxUs) {
+      startSlowCommits(usSince(since, now));
     } else if (parkForCommits([req, since, parkAt] {
                  auto r2 = std::make_shared<ColdRequest>();
                  r2->st = req->st;
@@ -2466,7 +2472,7 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
     }
   }
   if (req->parkStartUs && req->st->store) // it waited, and goes on now
-    req->st->store->stats().coldReplicaWaitUs.fetch_add(nowUs() - req->parkStartUs,
+    req->st->store->stats().coldReplicaWaitUs.fetch_add(usSince(req->parkStartUs, nowUs()),
                                                         std::memory_order_relaxed);
   if (!need.empty() || !req->origPieces.empty()) // fetched, or waited for
     noteWaitTier(req->user, ReaderWait::kOrigin);
@@ -2824,7 +2830,7 @@ void startSlowCommits(uint64_t waitedUs) {
   if (store)
     store->stats().slowCacheEpisodes.fetch_add(1, std::memory_order_relaxed);
   const uint64_t now = nowUs(), last = g_slowWarnUs.load(std::memory_order_relaxed);
-  if (!last || now - last >= kSlowWarnEveryUs) {
+  if (!last || usSince(last, now) >= kSlowWarnEveryUs) {
     g_slowWarnUs.store(now, std::memory_order_relaxed);
     UCACHE_WARN("the cache disk is too slow for this pass (%llu MiB of converted records still "
                 "waiting to be written after %.1f s): the cache is not filled until it catches up; "
@@ -2840,7 +2846,7 @@ void endSlowCommitsIfDrained() {
   if (!g_commitsSlow.load(std::memory_order_relaxed) || waitingTotal() > pendingCap() / 2 ||
       !g_commitsSlow.exchange(false))
     return;
-  const uint64_t us = nowUs() - g_slowSinceUs.load(std::memory_order_relaxed);
+  const uint64_t us = usSince(g_slowSinceUs.load(std::memory_order_relaxed), nowUs());
   uint64_t lost = 0;
   if (auto store = globalStore()) {
     store->stats().slowCacheUs.fetch_add(us, std::memory_order_relaxed);
@@ -2848,7 +2854,8 @@ void endSlowCommitsIfDrained() {
     const uint64_t at = g_slowDeclinedAt.load(std::memory_order_relaxed);
     lost = now > at ? now - at : 0;
   }
-  if (nowUs() - g_slowWarnUs.load(std::memory_order_relaxed) <= us) // its start was reported
+  // Its start was reported.
+  if (usSince(g_slowWarnUs.load(std::memory_order_relaxed), nowUs()) <= us)
     UCACHE_WARN("the cache disk caught up after %.1f s: the cache is filled again (%llu converted "
                 "records not kept meanwhile)",
                 static_cast<double>(us) / 1e6, static_cast<unsigned long long>(lost));
