@@ -1,6 +1,7 @@
 // Local files: for a URL whose host is `local`, root://local//abs/path, the
 // plug-in reads the file /abs/path of this machine's file system, caches it,
-// and checks the cached entry against the file at every open.
+// and checks the cached entry against the file at an open past its freshness
+// window (revalidate_after), as for any URL.
 //
 //   local_probe <plugin library>
 //
@@ -37,7 +38,14 @@
 //      handle it inherited completes, within a watchdog.
 //   J. a missing file: the open fails, and an asynchronous open's answer carries
 //      a host list (an empty one: never none).
-//   K. the file removed after it was cached: the open fails.
+//   W0. with the freshness window at its default (7 days): an open compares the
+//      entry with the file (the earlier phases set no window, so none is open) and
+//      starts the window.
+//   W1. within the window, the file rewritten at
+//      another size and time: the cached bytes, and the file itself is not opened.
+//   W2. within the window, the file removed (as a mount that is down): the
+//      cached bytes, the file not opened.
+//   K. the file removed after it was cached, revalidate_after = 0: the open fails.
 //   L. a directory: the open is refused.
 //   M. logical names (/store/), two local files of one name, of one size and
 //      other bytes and times: (1) the first is read; (2) the second is served
@@ -48,7 +56,8 @@
 // In every phase but N the client's own log (Debug level, captured in the
 // child) must hold the local-file access's own lines (the log was captured)
 // and no connection, address lookup or channel: nothing is ever sent to a
-// server. The trust window and the freshness check keep their defaults; every
+// server. Every phase but the W ones runs with revalidate_after = 0 (every open
+// checked against the file); the freshness check keeps its default; every
 // UCACHE_* and XRD_* variable of the caller's environment is cleared.
 //
 // Exit 0: every check passed. 1: a check failed (each printed as "FAIL: ...";
@@ -504,6 +513,10 @@ int runPhase(const std::string& name, const std::string& url, const std::string&
     shortReadJob(url, path, name, kind == "short");
   } else if (kind == "fork") {
     forkJob(url, name);
+  } else if (kind == "window") { // trusted: served from the cache, the file not opened
+    readJob(url, path, version(v), name, false);
+    check(logged("trusted recent cache"), name + ": the open trusted the cached entry");
+    check(!logged("@file://localhost/"), name + ": the file itself was not opened");
   } else if (kind == "unbound") {
     XrdCl::File f;
     const XrdCl::XRootDStatus os = f.Open(url, XrdCl::OpenFlags::Read);
@@ -518,7 +531,7 @@ int runPhase(const std::string& name, const std::string& url, const std::string&
   // The plug-in's binding is logged before the capture starts (the client
   // reads its plug-in configuration when it sets up its log); the inner
   // File's own lines come after, and say the local-file access was used.
-  if (kind != "refused")
+  if (kind != "refused" && kind != "window")
     check(logged("@file://localhost/"),
           name + ": the client's log was captured (it holds the local-file access)");
   const std::string net = networkLine();
@@ -537,7 +550,9 @@ int runPhase(const std::string& name, const std::string& url, const std::string&
 // Runs a phase in a new process of this program, with the environment set up.
 // Kinds: "fs" (reads, then the requests on the host), "plain" (reads),
 // "same-process" (E), "disabled" (reads with UCACHE_DISABLE=1), "short" (H),
-// "after-short" (I), "fork" (O), "missing" (J), "refused" (K, L), "unbound" (N).
+// "after-short" (I), "fork" (O), "missing" (J), "validate" (W0: reads, with the
+// default freshness window), "window" (W1, W2: the same, the entry trusted),
+// "refused" (K, L), "unbound" (N).
 bool phase(const std::string& self, const char* name, const std::string& url,
            const std::string& path, int v, const char* kind) {
   std::fflush(stdout);
@@ -548,6 +563,10 @@ bool phase(const std::string& self, const char* name, const std::string& url,
     const std::string vs = std::to_string(v);
     if (std::strcmp(kind, "disabled") == 0)
       ::setenv("UCACHE_DISABLE", "1", 1);
+    if (std::strcmp(kind, "window") == 0 || std::strcmp(kind, "validate") == 0)
+      ::unsetenv("UCACHE_REVALIDATE_AFTER"); // its default: a window of 7 days
+    if (std::strcmp(kind, "window") == 0)
+      ::setenv("UCACHE_LOG", "info", 1); // the trusted open says so
     if (std::strcmp(kind, "unbound") ==
         0) { // a host that resolves somewhere is not waited for long
       ::setenv("XRD_CONNECTIONWINDOW", "3", 1);
@@ -629,6 +648,8 @@ int main(int argc, char** argv) {
     ::unsetenv(n.c_str());
   ::setenv("XRD_PLUGINCONFDIR", conf.c_str(), 1);
   ::setenv("UCACHE_DIR", cache.c_str(), 1);
+  // Every open compared with the file, but in the phases of the window (W1, W2).
+  ::setenv("UCACHE_REVALIDATE_AFTER", "0", 1);
 
   struct ::timespec t1{};
   if (!writeFile(path, version(1), O_TRUNC) || !mtimeOfPath(path, t1)) {
@@ -664,7 +685,13 @@ int main(int argc, char** argv) {
   ok = phase(self, "O a fork right after reads", url, path, 5, "fork") && ok;
 
   ok = phase(self, "J missing", url + ".missing", path, 5, "missing") && ok;
+  ok = phase(self, "W0 window: validated, the window starts", url, path, 5, "validate") && ok;
+  struct ::timespec t6 = t4;
+  t6.tv_sec += 200;
+  ok = writeFile(path, version(6), O_TRUNC) && setMtime(path, t6) && ok;
+  ok = phase(self, "W1 window: rewritten, the cached bytes", url, path, 5, "window") && ok;
   ok = ::unlink(path.c_str()) == 0 && ok;
+  ok = phase(self, "W2 window: removed, the cached bytes", url, path, 5, "window") && ok;
   ok = phase(self, "K removed after it was cached", url, path, 5, "refused") && ok;
   ok = phase(self, "L a directory", "root://local/" + data, data, 0, "refused") && ok;
 

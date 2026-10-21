@@ -147,7 +147,7 @@ fails a check, is refused (USER_GUIDE.md). The bit holds for the entry's freshne
 `.val` marker, below): within it a copy of another size is not accepted for the entry or
 for a handle that holds it, and a handle the entry answers without an open at the origin
 takes the size as confirmed, with no read of the header. Once the window has passed (with
-`UCACHE_REVALIDATE_S=0`, at every open) the next open validates at the origin and reads
+`revalidate_after = 0`, at every open) the next open validates at the origin and reads
 the copy's header again; a copy that passes at another size replaces the entry, and the
 new sidecar carries the bit when that copy confirms its own size. The bit is only ever
 set on a sidecar, and goes with the entry when the origin size changes (a new entry
@@ -496,10 +496,10 @@ server <host:port> <site name, or -> <domain> <count> <first failure> <last fail
 ## Cache-freshness marker (optional): `<hash>.val`
 
 An empty per-entry marker whose mtime records the last time the entry was
-validated against the origin (a real remote stat). Written only when
-`UCACHE_REVALIDATE_S > 0`; evicted / invalidated / orphan-swept with the
+validated against the origin (a real remote stat). Written only when the
+freshness window (`revalidate_after`) is not 0; evicted / invalidated / orphan-swept with the
 entry like the other sidecars. At open, if the marker is younger than
-`UCACHE_REVALIDATE_S` and a `.meta` is present, the plugin trusts the local
+the window and a `.meta` is present, the plugin trusts the local
 entry and skips the remote open+stat entirely — serving from the
 byte cache / replica, touching the origin only on a genuine miss (fail-open).
 A miss whose open of the origin ends at a copy of another size than the entry's

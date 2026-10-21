@@ -191,7 +191,16 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.prefetchMapCacheMb = ::atoi(v.c_str());
   else if (k == "revalidate_seconds")
     c.revalidateSeconds = ::atoi(v.c_str());
-  else if (k == "open_retries")
+  else if (k == "revalidate_after") {
+    uint64_t s = 0;
+    if (!Config::parseDuration(v, s)) {
+      UCACHE_WARN("%s: revalidate_after=%s invalid (a duration with its unit: 30m, 12h, 7d, 2w; "
+                  "or 0); ignored",
+                  src, v.c_str());
+      return false;
+    }
+    c.revalidateAfter = static_cast<int>(s);
+  } else if (k == "open_retries")
     c.openRetries = ::atoi(v.c_str());
   else if (k == "open_retry_base_ms")
     c.openRetryBaseMs = ::atoi(v.c_str());
@@ -350,6 +359,8 @@ void applyEnvLayer(Config& c, bool& explicitMax) {
 
 // Final validation + derived flags, applied once after all layers.
 void clampAndFinish(Config& c, bool explicitMax) {
+  if (c.revalidateAfter >= 0) // the window's own name wins over the one in seconds
+    c.revalidateSeconds = c.revalidateAfter;
   if (c.evictCheckSeconds < 0)
     c.evictCheckSeconds = 10;
   if (c.lowWater <= 0 || c.highWater > 1.0 || c.lowWater >= c.highWater) {
@@ -431,6 +442,55 @@ Config Config::fromEnv(const std::map<std::string, std::string>* pluginConf) {
   return c;
 }
 
+bool Config::parseDuration(const std::string& v, uint64_t& seconds) {
+  if (v == "0") {
+    seconds = 0;
+    return true;
+  }
+  size_t i = 0;
+  uint64_t n = 0;
+  while (i < v.size() && v[i] >= '0' && v[i] <= '9' && n <= (1ull << 40))
+    n = n * 10 + static_cast<uint64_t>(v[i++] - '0');
+  if (i == 0 || i + 1 != v.size())
+    return false; // no digits, no unit, or more after it
+  uint64_t unit = 0;
+  switch (v[i]) {
+  case 's':
+    unit = 1;
+    break;
+  case 'm':
+    unit = 60;
+    break;
+  case 'h':
+    unit = 3600;
+    break;
+  case 'd':
+    unit = 86400;
+    break;
+  case 'w':
+    unit = 604800;
+    break;
+  default:
+    return false;
+  }
+  if (n > static_cast<uint64_t>(INT_MAX) / unit)
+    return false;
+  seconds = n * unit;
+  return true;
+}
+
+std::string Config::formatDuration(uint64_t seconds) {
+  if (seconds == 0)
+    return "0";
+  if (seconds % 86400 == 0)
+    return std::to_string(seconds / 86400) + "d";
+  if (seconds % 3600 == 0)
+    return std::to_string(seconds / 3600) + "h";
+  if (seconds % 60 == 0)
+    return std::to_string(seconds / 60) + "m";
+  return std::to_string(seconds) + "s";
+}
+
 const std::vector<Config::KeyInfo>& Config::knownKeys() {
   static const std::vector<KeyInfo> kKeys = {
       {"dir", "UCACHE_DIR"},
@@ -457,6 +517,7 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"prefetch_threads", "UCACHE_PREFETCH_THREADS"},
       {"prefetch_map_cache_mb", "UCACHE_PREFETCH_MAP_CACHE_MB"},
       {"revalidate_seconds", "UCACHE_REVALIDATE_S"},
+      {"revalidate_after", "UCACHE_REVALIDATE_AFTER"},
       {"open_retries", "UCACHE_OPEN_RETRIES"},
       {"open_retry_base_ms", "UCACHE_OPEN_RETRY_BASE_MS"},
       {"open_retry_max_ms", "UCACHE_OPEN_RETRY_MAX_MS"},
@@ -634,6 +695,8 @@ std::string Config::valueOf(const std::string& key) const {
     return std::to_string(metaFlushSeconds);
   if (key == "revalidate_seconds")
     return std::to_string(revalidateSeconds);
+  if (key == "revalidate_after")
+    return formatDuration(static_cast<uint64_t>(std::max(revalidateSeconds, 0)));
   if (key == "open_retries")
     return std::to_string(openRetries);
   if (key == "open_retry_base_ms")

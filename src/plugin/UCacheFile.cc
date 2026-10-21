@@ -7278,29 +7278,10 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   }
   // A local file (root://local, UrlKey.h): read from this machine's file system, with no server
   // to fail over from or to ask anything of. Failover is off for it, decided here, so that no
-  // question about its server is ever asked (decideFederation, decideFederationLate), and every
-  // open of it compares the cached entry with the file itself (below).
+  // question about its server is ever asked (decideFederation, decideFederationLate). Its freshness
+  // is any URL's (revalidate_after); an open past it compares the cached entry with the file
+  // itself.
   const bool local = st_->localFile;
-  // A local file must be a regular file: a server refuses a directory at its open, and a FIFO
-  // would hold the open forever (the client's local-file access opens whatever the path names).
-  // A path that does not exist is left to the open, whose error is the file system's.
-  if (local) {
-    struct ::stat sb{};
-    if (::stat(localFilePath(url).c_str(), &sb) == 0 && !S_ISREG(sb.st_mode)) {
-      const bool dir = S_ISDIR(sb.st_mode);
-      auto* status = new XRootDStatus(
-          XrdCl::stError, XrdCl::errErrorResponse,
-          static_cast<uint32_t>(XProtocol::mapError(dir ? EISDIR : EINVAL)),
-          dir ? "uCache: a directory is not a file to open" : "uCache: not a regular file");
-      if (!handler) {
-        const XRootDStatus s = *status;
-        delete status;
-        return s;
-      }
-      Executor::instance().post([handler, status] { complete(handler, status, nullptr); });
-      return XRootDStatus();
-    }
-  }
   if (local) {
     st_->federation.store(false, std::memory_order_relaxed);
     {
@@ -7369,15 +7350,14 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
     // (every name of it), and the URL's own entry when one is left beside it (invalidateEntry).
     invalidateEntry(st_->store, cfg.entryKey(url));
   }
-  // Cache-freshness (UCACHE_REVALIDATE_S, default 7 days): if a
+  // Cache-freshness (revalidate_after, default 7 days): if a
   // recent local entry is trusted, skip the remote open+stat entirely and
   // serve from cache — the origin is touched only if a genuine miss forces a
   // lazy open (fail-open). This is the reliability control: warm reads don't
-  // depend on a flaky/loaded/WAN remote. UCACHE_REVALIDATE_S=0 (revalidate
-  // every open) never enters here, and neither does a local file: its open is
-  // a call to its own file system, never a request to a server, so every open
-  // compares the entry with the file as it is now (Config::validateFor).
-  if (!passthroughOnly_ && !local && cfg.revalidateSeconds > 0) {
+  // depend on a flaky/loaded/WAN remote, nor on a mount that is slow, hung or
+  // gone (a local file is trusted as any URL is: its file system is asked
+  // nothing). revalidate_after = 0 (revalidate every open) never enters here.
+  if (!passthroughOnly_ && cfg.revalidateSeconds > 0) {
     auto key = cfg.entryKey(url);
     {
       std::lock_guard<std::mutex> g(st_->mu);
@@ -7405,11 +7385,33 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
       st_->trustedAtOpen.store(true, std::memory_order_release);
       cacheOpen_ = true;
       UCACHE_INFO("trusted recent cache for %s; serving without remote open "
-                  "(UCACHE_REVALIDATE_S=%d)", url.c_str(), cfg.revalidateSeconds);
+                  "(revalidate_after %s)",
+                  url.c_str(), Config::formatDuration(cfg.revalidateSeconds).c_str());
       if (handler) {
         auto h = handler;
         Executor::instance().post([h] { complete(h, okStatus(), nullptr); });
       }
+      return XRootDStatus();
+    }
+  }
+  // A local file must be a regular file: a server refuses a directory at its open, and a FIFO
+  // would hold the open forever (the client's local-file access opens whatever the path names).
+  // A path that does not exist is left to the open, whose error is the file system's. Looked at
+  // only when the file is opened: an entry trusted above was a regular file when it was cached.
+  if (local) {
+    struct ::stat sb{};
+    if (::stat(localFilePath(url).c_str(), &sb) == 0 && !S_ISREG(sb.st_mode)) {
+      const bool dir = S_ISDIR(sb.st_mode);
+      auto* status = new XRootDStatus(
+          XrdCl::stError, XrdCl::errErrorResponse,
+          static_cast<uint32_t>(XProtocol::mapError(dir ? EISDIR : EINVAL)),
+          dir ? "uCache: a directory is not a file to open" : "uCache: not a regular file");
+      if (!handler) {
+        const XRootDStatus s = *status;
+        delete status;
+        return s;
+      }
+      Executor::instance().post([handler, status] { complete(handler, status, nullptr); });
       return XRootDStatus();
     }
   }

@@ -214,14 +214,14 @@ std::string humanAge(uint64_t atime, uint64_t now) {
 
 std::string freshnessSummary(const Config& cfg) {
   if (cfg.revalidateSeconds <= 0)
-    return "off — every open re-checks the origin (revalidate_seconds=0)";
+    return "off — every open re-checks the origin (revalidate_after=0)";
   uint64_t now = static_cast<uint64_t>(::time(nullptr));
   uint64_t w = static_cast<uint64_t>(cfg.revalidateSeconds);
   char buf[192];
   std::snprintf(buf, sizeof buf,
                 "%s — entries validated within this window are served with no origin "
-                "contact (revalidate_seconds=%d)",
-                humanAge(now - w, now).c_str(), cfg.revalidateSeconds);
+                "contact (revalidate_after=%s)",
+                humanAge(now - w, now).c_str(), Config::formatDuration(w).c_str());
   return buf;
 }
 
@@ -3715,6 +3715,16 @@ int cmdSet(const Config& cfg, const char* key, const char* value) {
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (v != "on" && v != "off" && v != "1" && v != "0" && v != "true" && v != "false") {
       std::fprintf(stderr, "set: failover takes on or off, not '%s'\n", value);
+      return 2;
+    }
+  }
+  if (k == "revalidate_after") {
+    uint64_t s = 0;
+    if (!Config::parseDuration(value, s)) {
+      std::fprintf(stderr,
+                   "set: revalidate_after takes a duration with its unit (30m, 12h, 7d, 2w) or 0, "
+                   "not '%s'\n",
+                   value);
       return 2;
     }
   }

@@ -1856,12 +1856,12 @@ TEST(OpenPolicy, StaleEntryAdvice) {
   EXPECT_EQ(staleEntryAdvice(5, 1756917, 1756917),
             "uCache holds an earlier copy of this file, last confirmed at an origin 5 seconds ago, "
             "holding the whole file (1.8 MB): a job run with a freshness window longer than that "
-            "(UCACHE_REVALIDATE_S=172800, or revalidate_seconds in ucache.conf) reads it from the "
+            "(UCACHE_REVALIDATE_AFTER=2d, or revalidate_after in ucache.conf) reads it from the "
             "cache without asking an origin");
   EXPECT_EQ(staleEntryAdvice(8 * 86400 + 5000, 131072, 1756917),
             "uCache holds an earlier copy of this file, last confirmed at an origin 8 days ago, "
             "holding 131.1 kB of its 1.8 MB (7%): a job run with a freshness window longer than "
-            "that (UCACHE_REVALIDATE_S=864000, or revalidate_seconds in ucache.conf) reads the "
+            "that (UCACHE_REVALIDATE_AFTER=10d, or revalidate_after in ucache.conf) reads the "
             "parts it holds from the cache without asking an origin; reads of the parts it does "
             "not hold will still fail");
   // A part rounds down, never to the whole file; a sliver says so.

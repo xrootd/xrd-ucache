@@ -39,7 +39,7 @@ $ ucache status
 cache dir : /data/you/ucache-cache
 budget    : keep 50.0 GiB free (no byte cap; uses the disk)
 headroom  : 371.2 GiB until eviction starts (disk free 421.2 GiB, floor 50.0 GiB)
-freshness : 7d — entries validated within this window are served with no origin contact (revalidate_seconds=604800)
+freshness : 7d — entries validated within this window are served with no origin contact (revalidate_after=7d)
 entries   : 1 (0 pinned)
 original  : 2.5 GiB (total size of the cached files at the origin)
 cached    : 450.3 MiB — 17.6% of the original bytes (median file: 17.6%)
@@ -63,7 +63,7 @@ stats across 1 process file(s):
 - **headroom** — how far the disk is from the eviction floor. `NONE` means
   every new fill evicts something (a revolving door — make the cache smaller
   or the disk bigger).
-- **freshness** — the revalidation window (`revalidate_seconds`, see
+- **freshness** — the revalidation window (`revalidate_after`, see
   `docs/USER_GUIDE.md`).
 - **entries / original / cached / disk used** — how many files, their total
   size at the origin, the bytes actually cached (with the coverage share),

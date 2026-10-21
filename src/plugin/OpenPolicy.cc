@@ -934,9 +934,9 @@ std::string staleEntryAdvice(uint64_t ageS, uint64_t held, uint64_t size) {
     out += bytesText(held) + " of its " + bytesText(size) + " (" +
            (pct == 0 ? std::string("less than 1%") : std::to_string(pct) + "%") + ")";
   }
-  out += ": a job run with a freshness window longer than that (UCACHE_REVALIDATE_S=" +
-         std::to_string(suggestedWindowS(ageS)) +
-         ", or revalidate_seconds in ucache.conf) reads ";
+  out += ": a job run with a freshness window longer than that (UCACHE_REVALIDATE_AFTER=" +
+         std::to_string(suggestedWindowS(ageS) / 86400) +
+         "d, or revalidate_after in ucache.conf) reads ";
   out += whole ? "it" : "the parts it holds";
   out += " from the cache without asking an origin";
   if (!whole)

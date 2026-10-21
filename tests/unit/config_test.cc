@@ -403,6 +403,56 @@ TEST(Config, CompleteChunks) {
   }
 }
 
+// revalidate_after: the freshness window as a duration with its unit; revalidate_seconds, the
+// same in seconds, still works, and where both are set the new name is used.
+TEST(Config, RevalidateAfter) {
+  EnvGuard g;
+  uint64_t s = 99;
+  EXPECT_TRUE(Config::parseDuration("0", s));
+  EXPECT_EQ(s, 0u);
+  EXPECT_TRUE(Config::parseDuration("90s", s));
+  EXPECT_EQ(s, 90u);
+  EXPECT_TRUE(Config::parseDuration("30m", s));
+  EXPECT_EQ(s, 1800u);
+  EXPECT_TRUE(Config::parseDuration("12h", s));
+  EXPECT_EQ(s, 43200u);
+  EXPECT_TRUE(Config::parseDuration("7d", s));
+  EXPECT_EQ(s, 604800u);
+  EXPECT_TRUE(Config::parseDuration("2w", s));
+  EXPECT_EQ(s, 1209600u);
+  s = 99;
+  for (const char* bad :
+       {"", "7", "604800", "d", "7x", "7 d", "-1d", "1.5d", "7dd", "7D", "99999w"})
+    EXPECT_FALSE(Config::parseDuration(bad, s)) << bad;
+  EXPECT_EQ(s, 99u) << "untouched on a refusal";
+  EXPECT_EQ(Config::formatDuration(0), "0");
+  EXPECT_EQ(Config::formatDuration(604800), "7d");
+  EXPECT_EQ(Config::formatDuration(7200), "2h");
+  EXPECT_EQ(Config::formatDuration(90), "90s");
+  {
+    Config c = Config::fromEnv();
+    EXPECT_EQ(c.revalidateSeconds, 604800);
+    EXPECT_EQ(c.valueOf("revalidate_after"), "7d");
+  }
+  std::map<std::string, std::string> conf = {{"revalidate_after", "12h"}};
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_EQ(c.revalidateSeconds, 43200);
+    EXPECT_EQ(c.valueOf("revalidate_after"), "12h");
+    EXPECT_EQ(c.sources.at("revalidate_after"), "conf");
+  }
+  std::map<std::string, std::string> bare = {{"revalidate_after", "3600"}};
+  EXPECT_EQ(Config::fromEnv(&bare).revalidateSeconds, 604800) << "a bare number is refused";
+  std::map<std::string, std::string> both = {{"revalidate_seconds", "60"},
+                                             {"revalidate_after", "0"}};
+  EXPECT_EQ(Config::fromEnv(&both).revalidateSeconds, 0) << "the new name wins";
+  ::setenv("UCACHE_REVALIDATE_S", "60", 1);
+  EXPECT_EQ(Config::fromEnv().revalidateSeconds, 60) << "the old name alone still works";
+  EXPECT_EQ(Config::fromEnv(&conf).revalidateSeconds, 43200) << "the new name wins over the old";
+  ::setenv("UCACHE_REVALIDATE_AFTER", "1d", 1);
+  EXPECT_EQ(Config::fromEnv(&conf).revalidateSeconds, 86400) << "the per-job override wins";
+}
+
 // The slot factor is not a setting: where every slot sits follows from it, so
 // it is fixed. A conf line naming it is an unknown key: ignored, no source.
 TEST(Config, SlotFactorIsNotASetting) {

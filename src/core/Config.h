@@ -133,16 +133,19 @@ struct Config {
   // a 1500-branch file is about 21 MB, and a map evicted between being parsed
   // and being used is parsed again.
   int prefetchMapCacheMb = 256;            // UCACHE_PREFETCH_MAP_CACHE_MB
-  // UCACHE_REVALIDATE_S: cache-freshness window (TTL). When a usable local
-  // entry was last validated against the origin within this many seconds,
-  // TRUST it — skip the remote Open+Stat and serve locally (the origin is
-  // touched only on a genuine cache miss, fail-open). Default 7 days:
+  // `revalidate_after` (UCACHE_REVALIDATE_AFTER): cache-freshness window (TTL), a duration with
+  // its unit (30m, 12h, 7d, 2w; 0 alone). When a usable local entry was last validated against the
+  // origin within it, TRUST it — skip the remote Open+Stat and serve locally (the origin is
+  // touched only on a genuine cache miss, fail-open). The same for every URL, a local file's
+  // (root://local) included: its file system is asked nothing either. Default 7 days:
   // HEP data is write-once and warm passes that never depend on a flaky/
   // loaded/WAN remote are the founding reliability motivation. Trade-off: a
   // file REPLACED at the origin under the same name serves stale bytes until
   // the window expires (`ucache rm <url>` forces a re-check). 0 = revalidate
-  // on every open (the pre-0.9.1 default).
-  int revalidateSeconds = 604800;         // UCACHE_REVALIDATE_S (7 days)
+  // on every open (the pre-0.9.1 default). `revalidate_seconds` (UCACHE_REVALIDATE_S), the same
+  // window in seconds, still works; where both are set, revalidate_after is used.
+  int revalidateSeconds = 604800; // the window in effect, in seconds (7 days)
+  int revalidateAfter = -1;       // revalidate_after as set, in seconds; -1: not set
   // UCACHE_OPEN_RETRIES (opt-in reliability control):
   // additional attempts after the first for a TRANSIENT open failure (flaky/
   // loaded/WAN remote). 0 = off (default; the Open path is unchanged). Each
@@ -335,6 +338,13 @@ struct Config {
   std::string valueOf(const std::string& key) const;
   // The CLI-managed current-values file.
   static std::string statePath(const std::string& cacheDir) { return cacheDir + "/state"; }
+
+  // A duration with its unit, as revalidate_after takes it: digits then s, m, h, d or w (`0` alone
+  // needs none), at most 2^31 - 1 seconds. False (`seconds` untouched) for anything else, a bare
+  // number among them.
+  static bool parseDuration(const std::string& v, uint64_t& seconds);
+  // `seconds` in the largest of d, h, m, s that writes it whole (604800 -> "7d"; 0 -> "0").
+  static std::string formatDuration(uint64_t seconds);
 
   // page size must be a power of two in [4 KiB, 1 MiB].
   static bool validPageSize(uint32_t p) {

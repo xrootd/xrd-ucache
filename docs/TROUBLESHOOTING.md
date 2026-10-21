@@ -159,21 +159,23 @@ the login request and is not involved in reading or caching a single byte.
 
 ## The file changed at the origin but uCache serves the old bytes
 
-Expected inside the freshness window (default 7 days, `revalidate_seconds`):
+Expected inside the freshness window (default 7 days, `revalidate_after`):
 a validated entry is served without contacting the origin, so a file
 *replaced under the same name* keeps serving the cached version until the
 window expires. Physics data is normally write-once, which is why the default
-trusts the cache. A local file (`root://local`) is not trusted so: it is
-checked at every open, on its size and modification time to the second (on its
+trusts the cache. The same holds for a local file (`root://local`); after the
+window it is checked on its size and modification time to the second (on its
 size alone when it is keyed by a logical name). When you know a file changed:
 
 - `ucache rm <url>` — drop that entry; the next open re-fetches. With
   `logical_name_prefixes` set and a path with a logical name, the entry is the
   file's for every URL that names it, and `rm` drops it (and the URL's own
   entry, if one is left from before).
-- `UCACHE_REVALIDATE_S=0 <your job>` — force origin re-checks for one run.
-- `revalidate_seconds = 0` in your `ucache.conf` — always re-check (the
+- `UCACHE_REVALIDATE_AFTER=0 <your job>` — force origin re-checks for one run.
+- `revalidate_after = 0` in your `ucache.conf` — always re-check (the
   pre-0.9.1 behavior; adds a remote open+stat to every open).
+- `revalidate_after = 1h` (any duration with its unit) — a shorter window, for
+  files that change.
 
 ## A copy of a file does not match the origin (size or checksum)
 
@@ -497,7 +499,7 @@ which writes the list of top-level objects and not the header, and then written 
 list and newest objects may lie past that end, inside the copy). So does a copy whose header
 places no list of top-level objects (its writer never saved the file): ROOT recovers what
 it can of it, and every copy is the same. A copy that passes the checks and whose size
-equals that end confirms the file's size, which the cache entry keeps for its freshness window (`revalidate_seconds`):
+equals that end confirms the file's size, which the cache entry keeps for its freshness window (`revalidate_after`):
 within it no copy of another size is taken for the entry, and a job's open that the entry
 answers (no open at the origin) takes the confirmed size from it and reads no header. The
 first open after the window checks the origin and reads the header again; a copy that passes
@@ -548,7 +550,7 @@ holds a character no host name has), which is ignored and not sent.
 ## The open fails, and the error says uCache holds an earlier copy
 
 With failover on, once the freshness window of the cache's entry for a file
-has passed (`revalidate_seconds`, 7 days by default), the next open checks the file at an
+has passed (`revalidate_after`, 7 days by default), the next open checks the file at an
 origin. When no copy passes (each is refused by the checks made at open, or none can be
 reached), the open fails with the one error that names every copy tried, and uCache does
 not serve the entry it holds on its own judgment: it cannot tell a bad copy from a file
@@ -557,7 +559,7 @@ that changed. When it holds one, the error ends with, for example:
 ```
 uCache holds an earlier copy of this file, last confirmed at an origin 8 days ago, holding
 the whole file (1.8 MB): a job run with a freshness window longer than that
-(UCACHE_REVALIDATE_S=864000, or revalidate_seconds in ucache.conf) reads it from the cache
+(UCACHE_REVALIDATE_AFTER=10d, or revalidate_after in ucache.conf) reads it from the cache
 without asking an origin
 ```
 
@@ -565,7 +567,7 @@ The age is the time since an open last validated the entry at an origin; the win
 suggested is that age and a day, rounded up to whole days. The copies named come first: a
 site that is down may come back, and a copy refused for what it is is worth reporting to its
 site. To go on meanwhile with what uCache holds, run the job with the window suggested
-(`UCACHE_REVALIDATE_S=864000 ./my_job`, or `revalidate_seconds` in ucache.conf): its opens
+(`UCACHE_REVALIDATE_AFTER=10d ./my_job`, or `revalidate_after` in ucache.conf): its opens
 of files whose entries were confirmed within that window are answered from the cache, with
 no request to any origin. That window applies to every file the job opens, not only this
 one, so a file rewritten at its origin within it is read as cached: set it for that job
@@ -580,7 +582,7 @@ marker is removed, so later opens check an origin again (and the advice is not g
 for that entry). The entry itself is kept: this failure does not drop it, an open that later
 finds a copy that passes validates it again (a copy that passes at another size replaces
 it), and eviction removes it as any other. An entry made only by jobs run with
-`revalidate_seconds = 0` has no record of when it was confirmed (no marker is written), and
+`revalidate_after = 0` has no record of when it was confirmed (no marker is written), and
 the error gives no advice for it.
 
 ## A server or a copy is tried last (`ucache sources`)
