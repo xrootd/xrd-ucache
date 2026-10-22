@@ -11,7 +11,7 @@ Recompression stays off unless you turn it on. Nothing is published unless you
 run `ucache publish`. Any XRootD 5.6 or newer 5.x client works; 6.x from
 v0.21.0.
 
-### v1.5.1 — 2026-10-21
+### v1.5.1 — 2026-10-22
 - Local file caching: files on local, network, or mounted
   drives can now be cached using `root://local//abs/path`.
 - Improved cache isolation: if no new data is accessed by the
