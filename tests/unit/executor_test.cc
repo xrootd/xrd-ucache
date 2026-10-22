@@ -346,11 +346,15 @@ TEST(ExecutorThreads, AWorkerAndNoTimerRunEveryTask) {
 TEST(ExecutorThreads, WorkersStartAsWorkNeedsThem) {
   auto& ex = *new Executor(4);
   EXPECT_EQ(ex.startedWorkers(), 1u) << "one worker at first";
-  // One task at a time: one worker is enough.
+  // One task at a time: one worker is enough. The worker goes back to idle only after its task has
+  // returned, which can be later than the task's own signal (a sanitizer's build is slow there): a
+  // post made at once finds it busy, and starts another worker, as it should. So each next task
+  // waits a moment longer.
   for (int i = 0; i < 20; ++i) {
     auto l = std::make_shared<Latch>();
     ex.post([l] { l->bump(); });
     ASSERT_TRUE(l->wait(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   EXPECT_LE(ex.startedWorkers(), 2u);
   // Six tasks that all block until released: the pool grows to its size, no further.
