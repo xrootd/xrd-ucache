@@ -747,6 +747,9 @@ int defaultRequestTimeoutS();
 // The client's request timeout as it holds it now (its Env, read at each call; the value a request
 // given timeout 0 gets): what a failure path that sends a request again counts the time left by.
 int currentRequestTimeoutS();
+// A setting of the client's environment (XrdCl::Env::GetInt), or `dflt` once the client goes away
+// at the process's end (its environment is deleted then), for threads of ours still running.
+int clientEnvInt(const char* name, int dflt);
 // True once the process has begun to exit (the plugin's exit handler has
 // started): an open trying other sites issues nothing more and ends with its
 // last error.

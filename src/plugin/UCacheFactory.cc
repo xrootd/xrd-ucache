@@ -38,6 +38,7 @@
 #include <XrdVersion.hh>
 
 #include <atomic>
+#include <chrono>
 #include <dlfcn.h>
 #include <mutex>
 #include <pthread.h>
@@ -59,6 +60,50 @@ std::shared_ptr<CacheStore>* gStore = nullptr;
 std::atomic<int> gRequestTimeoutS{XrdCl::DefaultRequestTimeout};
 std::atomic<bool> gExiting{false}; // the process has begun to exit (processExiting)
 
+// The client's own objects, its log and its environment, are deleted at the process's end by
+// DefaultEnv::Finalize, from the static destructors of the client's library. A thread of ours still
+// at work then (a completion, a fill's drain, a read's failure) must not touch them. Each use is a
+// ClientUse, counted while it lasts and refused once gClientGone is set; gClientGone is set by the
+// destructor of a static object of this library (ClientGoneAtExit), which runs before the client's:
+// this library is loaded after the client's, so its static destructors run first. (An atexit
+// handler is not enough: under the thread sanitizer it runs after the client's teardown.) The
+// destructor then waits for the uses in progress to end. A count, not a lock: a fork while a use
+// is in progress cannot leave the child holding it (the child resets the count, forkChild).
+std::atomic<bool> gClientGone{false};
+std::atomic<int> gClientUses{0};
+
+class ClientUse {
+ public:
+  ClientUse() : ok_(enter()) {}
+  ~ClientUse() {
+    if (ok_)
+      gClientUses.fetch_sub(1);
+  }
+  ClientUse(const ClientUse&) = delete;
+  ClientUse& operator=(const ClientUse&) = delete;
+  explicit operator bool() const { return ok_; }
+
+ private:
+  // Sequentially consistent, as the destructor's store and load: either it sees this use counted,
+  // or this use sees the flag.
+  static bool enter() {
+    gClientUses.fetch_add(1);
+    if (!gClientGone.load())
+      return true;
+    gClientUses.fetch_sub(1);
+    return false;
+  }
+  bool ok_;
+};
+
+struct ClientGoneAtExit {
+  ~ClientGoneAtExit() {
+    gClientGone.store(true);
+    for (int i = 0; i < 1000 && gClientUses.load() != 0; ++i) // a log line takes microseconds
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+} gClientGoneAtExit;
+
 // ---- the XRootD client's log ----------------------------------------------
 // uCache is part of the client a job runs, so it logs where the client does:
 // XRD_LOGLEVEL=Debug shows uCache's debug lines too, and XRD_LOGFILE takes
@@ -79,8 +124,12 @@ XrdCl::Log::LogLevel clientLevelOf(LogLevel l) {
   }
 }
 
-// A message the client's level admits goes through the client's log.
+// A message the client's level admits goes through the client's log; once the client is going away,
+// uCache writes it itself (false), as when there is no client log.
 bool toClientLog(LogLevel lvl, const char* msg) {
+  ClientUse use;
+  if (!use)
+    return false;
   XrdCl::Log* xl = XrdCl::DefaultEnv::GetLog();
   if (!xl || xl->GetLevel() < clientLevelOf(lvl))
     return false;
@@ -325,6 +374,7 @@ void forkParent() {
 }
 
 void forkChild() {
+  gClientUses.store(0); // a use in progress at the fork was another thread's, not in this process
   Executor::afterForkChild();
   if (gStore && *gStore)
     (*gStore)->afterForkChild();
@@ -440,13 +490,18 @@ std::shared_ptr<CacheStore> globalStore() {
 int defaultRequestTimeoutS() { return gRequestTimeoutS.load(std::memory_order_relaxed); }
 
 int currentRequestTimeoutS() {
-  // At the process's end the client's environment is deleted (DefaultEnv::Finalize), maybe between
-  // a load of it and its use here: the value read at load is taken instead.
+  // At the process's end the client's environment is deleted (DefaultEnv::Finalize): from then on
+  // the value read at load is taken instead.
   if (gExiting.load(std::memory_order_acquire))
     return defaultRequestTimeoutS();
-  int v = XrdCl::DefaultRequestTimeout;
-  if (XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv())
-    env->GetInt("RequestTimeout", v);
+  return clientEnvInt("RequestTimeout", XrdCl::DefaultRequestTimeout);
+}
+
+int clientEnvInt(const char* name, int dflt) {
+  int v = dflt;
+  if (ClientUse use; use)
+    if (XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv())
+      env->GetInt(name, v);
   return v;
 }
 

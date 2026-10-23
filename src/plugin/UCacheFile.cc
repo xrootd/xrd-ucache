@@ -1486,10 +1486,7 @@ void writeSiteMark(const std::shared_ptr<CacheStore>& store, const SiteFailure& 
 // The stream timeout in force is the job's own (streamTimeoutIsJobs): read at each decision, so
 // that a job that changes it later is seen (a lookup in the client's settings).
 bool jobStreamTimeout() {
-  int v = XrdCl::DefaultStreamTimeout;
-  if (XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv())
-    env->GetInt("StreamTimeout", v);
-  return streamTimeoutIsJobs(v);
+  return streamTimeoutIsJobs(clientEnvInt("StreamTimeout", XrdCl::DefaultStreamTimeout));
 }
 // The failure `f` of a request to a server (`kind`, siteFaultOf), of the request issued at
 // `startUs`: a fault of the server's own is marked at once; a stall is marked when another site
@@ -1962,12 +1959,8 @@ XRootDStatus avoidedStatus() {
 struct FailoverSeq {
   FailoverSeq(int readerTimeoutS, ucache::XrdTimeout deadline)
       : deadlineS(static_cast<int>(deadline)), readerT(readerTimeoutS), t0(nowUs()) {
-    int sew = XrdCl::DefaultStreamErrorWindow;
-    trS = XrdCl::DefaultTimeoutResolution;
-    if (XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv()) {
-      env->GetInt("StreamErrorWindow", sew);
-      env->GetInt("TimeoutResolution", trS);
-    }
+    const int sew = clientEnvInt("StreamErrorWindow", XrdCl::DefaultStreamErrorWindow);
+    trS = clientEnvInt("TimeoutResolution", XrdCl::DefaultTimeoutResolution);
     budget = budgetS(readerTimeoutS, sew, trS, gTestFailoverMaxS);
   }
   int64_t remainingMs() const {
